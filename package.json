@@ -16,6 +16,7 @@
     "build": "pnpm --filter @lct/web run build && pnpm --filter @lct/daemon run build",
     "start": "pnpm --filter @lct/daemon run start",
     "lint:craft": "tsx ./scripts/lint-craft-references.ts",
+    "check:boundary": "node ./scripts/check-presentation-boundary.mjs",
     "typecheck": "pnpm -r --filter @lct/web --filter @lct/daemon run typecheck"
   },
   "devDependencies": {

@@ -1,54 +1,70 @@
 # Repository distillation
 
-This fork is intentionally narrowed to the LCT/VK Tech presentation case. `CONTEXT.md` is the product source of truth.
+This fork is intentionally narrowed to the LCT/VK Tech presentation compiler. `CONTEXT.md` is the product source of truth.
 
-## Retained product surface
+## Runtime boundary after the second pass
 
-- `apps/web` — browser UI, workspace, preview and generative editing foundation.
-- `apps/daemon` — persistence, files, runtime orchestration, skills/design-system services and export foundations.
-- `packages/*` — only the dependency closure currently required by the retained web/daemon/dev runtime.
-- `design-systems` — schema plus two small fallback/reference systems (`default`, `corporate`). Arbitrary uploaded PPTX templates are expected to become project-specific presentation design systems.
-- `design-templates/guizang-ppt` — one deck implementation retained only as a reference/smoke-test fixture, not as the product's template strategy.
-- `skills/pptx-html-fidelity-audit` — code-backed presentation fidelity/audit workflow.
-- `skills/reference-design-contract` — reusable evidence-to-design-contract workflow that can be adapted to PPTX template understanding.
-- presentation-relevant craft rules: accessibility, anti-slop, color and typography.
-- `deploy` — deployment foundation kept because the hackathon requires a reproducible service setup.
+Only two pnpm workspaces remain:
+
+- `apps/web` — project workspace, source upload, editable text sources, design-system selection and live HTML preview.
+- `apps/daemon` — project metadata, project files, preview transport, presentation catalog and image generation.
+
+The daemon source closure is intentionally explicit: `cli`, startup, server, presentation store/files/catalog, and `media/`. It no longer depends on the former `packages/*` graph.
+
+Presentation assets retained outside the runtime are deliberately small:
+
+- `design-systems/_schema`, `design-systems/default`, `design-systems/corporate`;
+- `skills/pptx-html-fidelity-audit` and `skills/reference-design-contract`;
+- presentation-relevant craft rules;
+- `templates/deck-framework.html` as a neutral HTML preview/export shell.
+
+Arbitrary uploaded PPTX files, not a bundled style gallery, are expected to become project-specific presentation design systems.
 
 ## Removed by design
 
-The following upstream OpenDesign surfaces are outside the hackathon product and should not be reintroduced unless they become a concrete dependency of the presentation pipeline:
+The following upstream surfaces are outside the product boundary and were removed as whole dependency slices:
 
-- desktop/Electron, packaged and closure applications;
-- generic prototype/web/mobile generation catalogs;
-- video/audio creation flows and bundled prompt galleries;
-- Figma plugin and browser clipper products;
-- marketplace/community/plugin catalogs and preview data;
-- Kubernetes chart and desktop release/packaging tooling;
-- hundreds of bundled design systems and presentation style galleries;
-- catalogue-only skills that merely point to external repositories instead of carrying executable/reference material locally;
-- community pets, device-frame galleries and live-artifact examples;
-- upstream maintenance/migration/seed scripts unrelated to the retained runtime;
-- upstream GitHub automation, long-form docs/spec archives, privacy/quickstart material and deployment config that described removed product surfaces.
+- Electron/desktop, packaged and closure applications;
+- collaboration/team/cloud runtime and workspace SaaS machinery;
+- marketplace/community/plugin runtime and registry protocol layers;
+- AMR/Vela agent runtime, sidecars, launcher protocols and compatibility packages;
+- generic website/prototype/mobile catalogs and fixed presentation-style galleries;
+- generated video/audio provider stack, FFmpeg/Hyperframes and provider marketplace integrations;
+- Figma plugin, browser clipper, pets, device frames and community assets;
+- generic mocks/e2e corpus;
+- release/pack/dev/serve workspace tooling and old GitHub automation;
+- multi-cloud/deployment matrices and container infrastructure inherited from the upstream product;
+- old `OD_*` runtime configuration and the `od` CLI entrypoint.
 
-## What is deliberately not deleted yet
+## Preserved on purpose
 
-Some generic internals remain because `apps/web` or `apps/daemon` still imports them. They are candidates for later passes only after the retained application is green:
+The cleanup must not erase the primitives the future compiler needs:
 
-- plugin/runtime abstractions still referenced by the daemon;
-- sidecar/runtime protocol packages used by the current web/daemon transport;
-- generic UI modules inside `apps/web/src` and daemon routes inside `apps/daemon/src`;
-- existing mock/e2e infrastructure until it is replaced by presentation-specific regression coverage.
+- safe binary/source file storage, including PPT/PPTX/PDF and images;
+- editable HTML/CSS/JS/JSON/Markdown/text sources;
+- relative-resource-safe live HTML preview;
+- minimal design-system discovery/preview/static-asset serving;
+- image generation behind a small OpenAI-compatible boundary;
+- `jszip`, `pdf-lib` and `pptxgenjs` in the daemon dependency set as presentation import/export primitives for the next implementation stage.
 
-Distillation should proceed dependency-first: remove a product surface, remove its imports/routes/contracts/tests, then remove the underlying package. Do not keep dead compatibility code merely because it existed upstream, but do not break the retained presentation workflow to make the tree smaller.
+## Boundary guard
 
-## Lockfile / validation boundary
+`pnpm check:boundary` prevents deleted product surfaces from silently returning. It asserts that the workspace contains only `apps/web` and `apps/daemon`, rejects former generic roots, and rejects legacy workspace imports / `OD_*` runtime variables inside application source.
 
-The workspace graph changed substantially, so the old `pnpm-lock.yaml` is intentionally not retained: it referenced deleted apps/tools and would present a false reproducibility guarantee. After checking out this branch, run `pnpm install` with pnpm 10.33.2 and commit the newly generated lockfile before merging/releasing.
+## Validation boundary
 
-A temporary minimal GitHub Actions workflow was attempted during distillation, but the repository runner failed before executing any job steps, so the branch should remain draft until the retained workspace is installed and typechecked in a working runner/local checkout.
+The previous lockfile was intentionally removed because it described workspaces that no longer exist. Before merge/release, run a clean `pnpm install` with pnpm 10.33.2, commit the regenerated `pnpm-lock.yaml`, then run:
 
-## Target architecture
+```bash
+pnpm check:boundary
+pnpm typecheck
+pnpm build
+```
 
-`unknown PPTX -> template understanding -> presentation design system -> deck plan -> constrained slide/visual variants -> audit/repair -> preflight -> editable PPTX/PDF/HTML`
+A GitHub Actions attempt earlier in the distillation failed before executing job steps, so this branch remains a draft until it has been installed and validated in a functioning runner/local checkout.
 
-The next cleanup pass should reduce `apps/web` and `apps/daemon` around that architecture using import/route dependency boundaries, then introduce the presentation-specific parser/planner/renderer/audit modules and versioned skills.
+## Next implementation boundary
+
+The generic runtime extraction is now largely complete. New work should be presentation-specific rather than another compatibility layer:
+
+`PPTX ingest -> template semantics -> presentation design system -> deck plan -> constrained variants -> render -> audit/repair -> preflight -> editable PPTX/PDF/HTML`.

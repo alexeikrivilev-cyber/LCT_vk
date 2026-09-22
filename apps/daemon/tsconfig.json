@@ -21,7 +21,8 @@
     "src/server.ts",
     "src/presentation-store.ts",
     "src/presentation-files.ts",
-    "src/presentation-catalog.ts"
+    "src/presentation-catalog.ts",
+    "src/media/**/*.ts"
   ],
-  "exclude": ["tests", "dist"]
+  "exclude": ["dist"]
 }
