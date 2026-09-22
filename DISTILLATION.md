@@ -12,7 +12,6 @@ This fork is intentionally narrowed to the LCT/VK Tech presentation case. `CONTE
 - `skills/pptx-html-fidelity-audit` — code-backed presentation fidelity/audit workflow.
 - `skills/reference-design-contract` — reusable evidence-to-design-contract workflow that can be adapted to PPTX template understanding.
 - presentation-relevant craft rules: accessibility, anti-slop, color and typography.
-- image prompt templates; video prompt templates were removed.
 
 ## Removed by design
 
@@ -20,13 +19,14 @@ The following upstream OpenDesign surfaces are outside the hackathon product and
 
 - desktop/Electron and packaged shells;
 - generic prototype/web/mobile generation catalogs;
-- video/audio creation flows;
+- video/audio creation flows and bundled prompt galleries;
 - Figma plugin and browser clipper products;
 - marketplace/community/plugin catalogs and preview data;
 - Kubernetes chart and desktop release/packaging tooling;
 - hundreds of bundled design systems and presentation style galleries;
 - catalogue-only skills that merely point to external repositories instead of carrying executable/reference material locally;
-- community pets, frame gallery assets and live-artifact examples.
+- community pets, device-frame galleries and live-artifact examples;
+- upstream maintenance/migration/seed scripts unrelated to the retained runtime.
 
 ## What is deliberately not deleted yet
 
