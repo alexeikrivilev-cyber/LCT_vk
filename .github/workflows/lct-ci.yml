@@ -1,0 +1,55 @@
+name: LCT presentation CI
+
+on:
+  push:
+    branches:
+      - main
+      - distill/presentation-core
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Refresh lockfile after workspace distillation
+        if: github.event_name == 'push' && github.ref_name == 'distill/presentation-core'
+        run: |
+          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+          if ! git diff --quiet -- pnpm-lock.yaml; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add pnpm-lock.yaml
+            git commit -m 'chore: refresh lockfile after distillation'
+            git push
+          fi
+
+      - name: Install
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck retained workspaces
+        run: pnpm typecheck
+
+      - name: Validate craft references
+        run: pnpm lint:craft
