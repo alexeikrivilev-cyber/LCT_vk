@@ -1,17 +1,66 @@
 # Skills
 
-> **Distillation rule:** this fork keeps a small presentation-oriented skill surface. Presentation planning, template/design-system understanding, image assets, audit/repair, preview, and export are in scope. Treat upstream web/prototype/video/audio/marketplace catalog entries as removal candidates only after dependency mapping; do not mistake their presence in this inherited directory for an active product requirement.
+Skills contain reusable semantic workflows for the presentation compiler. They are versioned prompt/configuration assets, not a second implementation layer for geometry, persistence, rendering, or export.
 
-This directory contains **functional skills**: capabilities the agent invokes to do work on user input, such as briefs, audits, utilities, and asset packagers. Each folder has a `SKILL.md` and may include `assets/` or `references/`.
+## Current inventory
 
-Rendering shapes for prototypes, decks, documents, images, video, and audio belong in [`design-templates/`](../design-templates/), not here. The classification rule and migration history live in [`specs/current/skills-and-design-templates.md`](../specs/current/skills-and-design-templates.md).
+The repository currently keeps two substantive reference skills:
 
-## Adding a skill
+- `pptx-html-fidelity-audit` — presentation fidelity/audit workflow and supporting utilities.
+- `reference-design-contract` — evidence-to-design-contract workflow useful when deriving template semantics.
 
-Read [`docs/skills-protocol.md`](../docs/skills-protocol.md) for frontmatter, discovery, precedence, and mode semantics. Copy the closest functional skill, keep the folder self-contained, and use an explicit `od.mode` appropriate for work performed on user input.
+They are starting material, not the final orchestrator architecture.
 
-For a rendering template, follow [`docs/skills-contributing.md`](../docs/skills-contributing.md) and [`design-templates/CONTRIBUTING.md`](../design-templates/CONTRIBUTING.md) instead.
+## Target skill shape
 
-## License
+The target runtime has one thin orchestration skill plus narrow specialized skills, for example:
 
-Skills in this directory are Apache-2.0 unless their own `LICENSE` says otherwise. [`web-clone/`](web-clone/) is adapted from [Jane-xiaoer/claude-skill-web-clone](https://github.com/Jane-xiaoer/claude-skill-web-clone). The MIT-licensed `guizang-ppt` rendering template lives under [`design-templates/guizang-ppt/`](../design-templates/guizang-ppt/).
+```text
+presentation-orchestrator
+  -> template-semantics
+  -> deck-planner
+  -> layout-ranker
+  -> visual-planner
+  -> contextual-auditor
+  -> repair
+```
+
+Exact names may change. The responsibility split in `MODELS.md` and `ARCHITECTURE.md` must not.
+
+## Authoring rules
+
+A skill should:
+
+- solve one repeatable semantic task;
+- state its inputs, constraints, and structured output clearly;
+- reference canonical repository docs instead of copying long product rules;
+- operate on stable ids supplied by the application;
+- leave exact geometry, OOXML, native object construction, locks, persistence, and deterministic audit to code;
+- avoid provider credentials and transport details;
+- be small enough to benchmark and version independently.
+
+The top-level orchestrator coordinates stages. Do not turn it into a giant presentation handbook.
+
+Prefer constrained choices over unconstrained design instructions. For example, rank a supplied set of compatible layouts instead of asking the model to invent a slide.
+
+## Versioning
+
+Prompt/skill changes can materially change output and must be traceable. Record a version for accepted runtime instructions and include that version in generation metadata.
+
+Use the benchmark process in `TESTING.md` and `MODELS.md` before promoting a prompt/skill change.
+
+## Craft references
+
+`craft/` contains compact brand-agnostic presentation guidance. A skill may opt into the relevant references using the frontmatter format already supported by the retained skill files.
+
+After changing craft references, run:
+
+```bash
+pnpm lint:craft
+```
+
+Do not load every craft file into every model call. Use only what the current skill needs.
+
+## Licensing and provenance
+
+Keep any package-level `LICENSE`, source notice, or provenance file intact. If a retained skill has its own license, that license governs that package. Do not remove attribution as part of prompt cleanup.

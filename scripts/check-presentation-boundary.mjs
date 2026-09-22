@@ -22,6 +22,34 @@ for (const relative of forbiddenRoots) {
   if (existsSync(path.join(root, relative))) failures.push(`removed generic surface returned: ${relative}`);
 }
 
+const forbiddenFiles = ['DISTILLATION.md'];
+for (const relative of forbiddenFiles) {
+  if (existsSync(path.join(root, relative))) failures.push(`obsolete repository document returned: ${relative}`);
+}
+
+const requiredRootDocs = [
+  'AGENTS.md',
+  'README.md',
+  'CONTEXT.md',
+  'ARCHITECTURE.md',
+  'MODELS.md',
+  'AUDIT.md',
+  'TESTING.md',
+];
+
+for (const relative of requiredRootDocs) {
+  if (!existsSync(path.join(root, relative))) failures.push(`required source-of-truth document missing: ${relative}`);
+}
+
+const agentsPath = path.join(root, 'AGENTS.md');
+if (existsSync(agentsPath)) {
+  const agents = await readFile(agentsPath, 'utf8');
+  const lineCount = agents.split(/\r?\n/).length;
+  const byteCount = Buffer.byteLength(agents);
+  if (lineCount > 120) failures.push(`AGENTS.md must stay concise (<=120 lines); got ${lineCount}`);
+  if (byteCount > 12 * 1024) failures.push(`AGENTS.md must stay concise (<=12 KiB); got ${byteCount} bytes`);
+}
+
 const workspace = await readFile(path.join(root, 'pnpm-workspace.yaml'), 'utf8');
 const workspaceMembers = [...workspace.matchAll(/^\s*-\s+([^\n#]+)$/gm)]
   .map((match) => match[1].trim())
