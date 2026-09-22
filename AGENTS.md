@@ -2,72 +2,74 @@
 
 ## Mission
 
-Build LCT as a presentation compiler for arbitrary corporate PPTX templates. The product turns a template, source materials, and a brief into a recommended editable deck with controlled alternatives, audit, repair, and export.
+Build LCT as a presentation compiler. The product converts an arbitrary corporate PPTX template, supplied content, and a brief into a recommended editable presentation with controlled alternatives, audit, repair, and export.
 
-## Repository map
+The current UI/design implementation is replaceable. Do not preserve existing visual decisions when implementing the new product experience. Preserve product contracts, domain behavior, and architecture boundaries.
 
-Read the smallest relevant source of truth before changing code:
+## Source of truth map
 
-- `CONTEXT.md` — product behavior and non-negotiable UX.
-- `ARCHITECTURE.md` — layer boundaries, canonical data flow, and technical invariants.
-- `MODELS.md` — runtime model responsibilities, prompt/skill policy, and offline optimization.
-- `AUDIT.md` — deterministic/contextual checks, repair, and preflight.
-- `TESTING.md` — verification strategy and definition of done.
-- `skills/README.md` — skill boundaries and versioning.
-- `design-systems/README.md` — template-derived design-system contract.
-- `craft/README.md` — reusable presentation craft rules.
+Read only the documents relevant to the task:
 
-`README.md` is the operator entry point; it is not the product specification.
+- `CONTEXT.md` — product behavior and acceptance flow.
+- `ARCHITECTURE.md` — runtime boundaries and data contracts.
+- `MODELS.md` — model responsibilities and orchestration.
+- `AUDIT.md` — findings, repair, and preflight.
+- `TESTING.md` — verification requirements.
+- `skills/README.md`, `craft/README.md`, `design-systems/README.md` — reusable rules.
 
-## Non-negotiable product invariants
+Do not duplicate large product rules here.
 
+## Product invariants
+
+- The final goal is an autonomous presentation compiler, not a slide editor or image generator.
 - Unknown PPTX templates must work without template-specific code.
-- Produce a complete recommended deck first; alternatives never block progress.
-- Generate A/B/C alternatives for every slide from one shared deck plan.
-- Preserve coherent whole-deck A/B/C tracks for the hackathon requirement.
-- A visual slot has one planned semantic type. Offer three candidates inside that type; changing type is an explicit re-plan.
-- Locks/pins protect approved slides or blocks from unrelated regeneration and repair.
-- Prefer local regeneration over rebuilding the deck.
-- Audit is built into generation and supports user-selected repair.
-- PPTX export must contain native editable objects. A full-slide raster image is not an acceptable slide implementation.
-- HTML is a preview/export surface, never the source of truth for PPTX structure.
-- Do not build a heavy external research/fact-checking product; use the supplied content package correctly.
+- The system produces a complete recommended deck first.
+- Every slide has A/B/C alternatives derived from one shared plan.
+- Visual alternatives stay inside one planned semantic type; type changes require re-planning.
+- Users can lock approved slides or blocks. Regeneration and repair must respect locks.
+- Prefer local regeneration over full regeneration.
+- Audit and repair are part of the generation workflow.
+- Export must produce editable native presentation objects. Full-slide raster output is invalid.
+- The uploaded PPTX is an immutable source artifact.
+- The current product UI is not a source of truth; a future redesign must implement the documented workflow, not replicate old screens.
 
-## Architecture invariants
+## Architecture rules
 
-- `apps/web` owns interaction and presentation of state; it does not implement PPTX parsing, layout math, model orchestration, or export rules.
-- `apps/daemon` owns presentation domain services, persistence, model/media adapters, audit, rendering, and export.
-- Keep the uploaded PPTX immutable. Compile it into an internal template representation and retain stable references to masters/layouts/assets.
-- Models make semantic decisions. Deterministic code owns exact geometry, constraints, native object construction, locks, persistence, validation, and export correctness.
-- Never ask a model to invent unrestricted slide coordinates when a valid template layout/slot can be selected.
-- Prompts, skills, examples, and policy are versioned files, not large hard-coded strings in application code.
-- Keep the top-level orchestrator thin; specialized skills should have narrow inputs and structured outputs.
-- Parse/validate model output at boundaries before it reaches deterministic engines.
-- New provider or library integrations must sit behind a small adapter and must not leak provider-specific types through the domain.
+- `apps/web` owns interaction and state presentation only.
+- `apps/daemon` owns presentation domain logic, persistence, rendering, audit, export, and adapters.
+- Models decide semantic things: narrative, wording, ranking, classification, suggestions.
+- Deterministic code owns geometry, constraints, object creation, locks, persistence, validation, and export.
+- Never delegate exact layout calculations or PPTX structure to a model.
+- Keep integrations behind adapters.
+- Validate structured model output before use.
+- Keep orchestration thin; use specialized skills/modules with narrow contracts.
 
-## Working agreement
+## Autonomous execution
 
-Act as an autonomous senior engineer: inspect the relevant code and docs, make reasonable implementation choices, implement end-to-end, validate, and refine without waiting for approval at every step.
+Work as a senior engineer: inspect, decide, implement, verify, and refine.
 
-Within the invariants above, choose data structures, algorithms, refactors, and local module organization freely. Ask only when a decision changes product behavior, breaks a documented invariant, introduces a major dependency/service, or cannot be inferred safely.
+Within documented invariants choose implementation details freely. Ask only when a decision changes product behavior, breaks an invariant, introduces a major dependency, or cannot be safely inferred.
 
-Prefer the smallest complete vertical slice over speculative framework work. Avoid generic platform features that do not serve the presentation workflow.
+Prefer the smallest complete vertical slice over speculative infrastructure.
 
-When architecture or product behavior changes, update the corresponding source-of-truth document in the same change. Do not duplicate long rules across documents; link to the canonical one.
+## Required self-checks
 
-Do not claim tests or builds passed unless they were actually run.
+Before declaring work complete:
 
-## Validation
+1. Re-read the relevant source-of-truth documents.
+2. Check that the change improves the final product goal, not only the local implementation.
+3. Check for contradictions with architecture, UX, model boundaries, and export rules.
+4. Update documentation when behavior or architecture changes.
+5. Run the narrowest meaningful validation commands.
+6. Report checks actually executed; never claim unrun checks passed.
 
-Run the narrowest relevant checks after changes and fix failures before finishing:
+Validation:
 
 ```bash
 pnpm check:boundary
-pnpm lint:craft        # when skills/craft references change
+pnpm lint:craft        # when skills/craft/design rules change
 pnpm typecheck         # when TypeScript changes
 pnpm build             # when runtime/UI/build behavior changes
 ```
 
-Also run targeted tests for the subsystem changed. Presentation parser, renderer, audit, lock, and export work must add or update automated coverage as described in `TESTING.md`.
-
-If the environment prevents a required check, state exactly what was not run and why.
+If a check cannot run, state the exact limitation.
