@@ -1,6 +1,6 @@
 import type { NextConfig } from 'next';
 
-const daemonPort = Number(process.env.OD_PORT) || 7456;
+const daemonPort = Number(process.env.LCT_PORT) || 7456;
 const daemonOrigin = `http://127.0.0.1:${daemonPort}`;
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -14,11 +14,7 @@ const nextConfig: NextConfig = {
       }
     : {
         async rewrites() {
-          return [
-            { source: '/api/:path*', destination: `${daemonOrigin}/api/:path*` },
-            { source: '/artifacts/:path*', destination: `${daemonOrigin}/artifacts/:path*` },
-            { source: '/frames/:path*', destination: `${daemonOrigin}/frames/:path*` },
-          ];
+          return [{ source: '/api/:path*', destination: `${daemonOrigin}/api/:path*` }];
         },
       }),
 };

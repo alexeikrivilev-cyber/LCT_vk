@@ -1,7 +1,0 @@
-{
-  "toolName": "tools-dev",
-  "packageName": "@lct/tools-dev",
-  "buildCommand": "pnpm --filter @lct/tools-dev build",
-  "distEntries": ["dist/index.mjs"],
-  "inputs": ["src", "meta.json", "package.json", "esbuild.config.mjs", "tsconfig.json"]
-}

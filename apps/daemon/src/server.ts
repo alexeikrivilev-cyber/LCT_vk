@@ -1,11 +1,11 @@
-// Presentation-only daemon surface.
-// Generic OpenDesign collaboration, marketplace, campaign, AMR, deployment,
-// connector and automation planes intentionally do not register here.
+// Presentation-only daemon surface. Generic OpenDesign collaboration,
+// marketplace, campaign, AMR, connector, automation and multi-media planes
+// intentionally do not register here.
 
 import express from 'express';
 import multer from 'multer';
 import fs from 'node:fs';
-import { mkdir, stat } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Server } from 'node:http';
@@ -23,7 +23,6 @@ import {
   ensurePresentationProjectDir,
   listPresentationFiles,
   mimeForPresentationFile,
-  readPresentationFile,
   removePresentationProjectDir,
   resolvePresentationFilePath,
   writePresentationFile,
@@ -34,8 +33,8 @@ import {
   resolveDesignSystemFile,
   resolveDesignSystemPreview,
 } from './presentation-catalog.js';
-import { generateMedia } from './media/index.js';
-import { modelsForSurface } from './media/models.js';
+import { generatePresentationImage } from './media/index.js';
+import { presentationImageModels } from './media/models.js';
 
 export interface StartServerOptions {
   host?: string;
@@ -59,8 +58,8 @@ function repoRootFromModule(): string {
 }
 
 function resolveDataDir(projectRoot: string, configured?: string): string {
-  const raw = configured?.trim() || process.env.OD_DATA_DIR?.trim();
-  if (!raw) return path.join(projectRoot, '.od');
+  const raw = configured?.trim() || process.env.LCT_DATA_DIR?.trim();
+  if (!raw) return path.join(projectRoot, '.lct');
   return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(projectRoot, raw);
 }
 
@@ -119,7 +118,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
           : { projectKind: 'presentation' },
       });
       await ensurePresentationProjectDir(projectsRoot, project.id);
-      res.status(201).json({ project, conversationId: null });
+      res.status(201).json({ project });
     } catch (error) {
       apiError(res, 400, error);
     }
@@ -135,13 +134,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     try {
       const project = patchPresentationProject(db, req.params.id, {
         ...(typeof req.body?.name === 'string' ? { name: req.body.name } : {}),
-        ...(req.body && Object.prototype.hasOwnProperty.call(req.body, 'skillId')
+        ...(Object.prototype.hasOwnProperty.call(req.body ?? {}, 'skillId')
           ? { skillId: typeof req.body.skillId === 'string' ? req.body.skillId : null }
           : {}),
-        ...(req.body && Object.prototype.hasOwnProperty.call(req.body, 'designSystemId')
+        ...(Object.prototype.hasOwnProperty.call(req.body ?? {}, 'designSystemId')
           ? { designSystemId: typeof req.body.designSystemId === 'string' ? req.body.designSystemId : null }
           : {}),
-        ...(req.body && Object.prototype.hasOwnProperty.call(req.body, 'pendingPrompt')
+        ...(Object.prototype.hasOwnProperty.call(req.body ?? {}, 'pendingPrompt')
           ? { pendingPrompt: typeof req.body.pendingPrompt === 'string' ? req.body.pendingPrompt : null }
           : {}),
         ...(req.body?.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)
@@ -183,8 +182,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       const encoding = req.body?.encoding === 'base64' ? 'base64' : 'utf8';
       const raw = typeof req.body?.content === 'string' ? req.body.content : '';
       const content = encoding === 'base64' ? Buffer.from(raw, 'base64') : raw;
-      const file = await writePresentationFile(projectsRoot, req.params.id, name, content);
-      res.json({ file });
+      res.json({ file: await writePresentationFile(projectsRoot, req.params.id, name, content) });
     } catch (error) {
       apiError(res, 400, error);
     }
@@ -213,15 +211,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       const name = typeof req.query.file === 'string' ? req.query.file : '';
       if (!name) return apiError(res, 400, new Error('file query parameter is required'));
       await resolvePresentationFilePath(projectsRoot, req.params.id, name, { requireExisting: true });
-      res.json({ url: encodedRawUrl(req.params.id, name), expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+      res.json({ url: encodedRawUrl(req.params.id, name) });
     } catch (error) {
       apiError(res, 404, error);
     }
   });
 
-  // Raw project files are the preview transport too. Keeping the URL rooted at
-  // the file's directory means relative CSS/images/scripts keep resolving after
-  // generic Live Artifact and capability-scope machinery is gone.
   app.use('/api/projects/:id/raw', async (req, res, next) => {
     if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'DELETE') return next();
     try {
@@ -269,43 +264,24 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   });
 
   app.get('/api/media/models', (_req, res) => {
-    res.json({
-      image: modelsForSurface('image'),
-      video: modelsForSurface('video'),
-      audio: modelsForSurface('audio'),
-    });
+    res.json({ image: presentationImageModels() });
   });
 
   app.post('/api/media/generate', async (req, res) => {
     try {
       const projectId = typeof req.body?.projectId === 'string' ? req.body.projectId : '';
-      const surface = req.body?.surface;
-      const model = typeof req.body?.model === 'string' ? req.body.model : '';
       if (!projectId || !getPresentationProject(db, projectId)) return projectNotFound(res);
-      if (!['image', 'video', 'audio'].includes(surface) || !model) {
-        return apiError(res, 400, new Error('projectId, surface and model are required'));
+      if (req.body?.surface && req.body.surface !== 'image') {
+        return apiError(res, 400, new Error('presentation media generation supports images only'));
       }
-      const result = await generateMedia({
-        projectRoot,
+      const result = await generatePresentationImage({
         projectsRoot,
         projectId,
-        surface,
-        model,
-        prompt: typeof req.body?.prompt === 'string' ? req.body.prompt : undefined,
+        prompt: typeof req.body?.prompt === 'string' ? req.body.prompt : '',
+        model: typeof req.body?.model === 'string' ? req.body.model : undefined,
         output: typeof req.body?.output === 'string' ? req.body.output : undefined,
         aspect: typeof req.body?.aspect === 'string' ? req.body.aspect : undefined,
         quality: typeof req.body?.quality === 'string' ? req.body.quality : undefined,
-        resolution: typeof req.body?.resolution === 'string' ? req.body.resolution : undefined,
-        length: typeof req.body?.length === 'number' ? req.body.length : undefined,
-        duration: typeof req.body?.duration === 'number' ? req.body.duration : undefined,
-        voice: typeof req.body?.voice === 'string' ? req.body.voice : undefined,
-        audioKind: req.body?.audioKind,
-        language: typeof req.body?.language === 'string' ? req.body.language : undefined,
-        loop: req.body?.loop === true,
-        promptInfluence: typeof req.body?.promptInfluence === 'number' ? req.body.promptInfluence : undefined,
-        compositionDir: typeof req.body?.compositionDir === 'string' ? req.body.compositionDir : undefined,
-        image: typeof req.body?.image === 'string' ? req.body.image : undefined,
-        images: Array.isArray(req.body?.images) ? req.body.images.filter((value: unknown) => typeof value === 'string') : undefined,
       });
       res.json(result);
     } catch (error) {
@@ -316,8 +292,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     }
   });
 
-  const serveWeb = options.serveWeb !== false;
-  if (serveWeb) {
+  if (options.serveWeb !== false) {
     const webOut = path.join(projectRoot, 'apps', 'web', 'out');
     const indexFile = path.join(webOut, 'index.html');
     if (fs.existsSync(webOut)) {
@@ -338,8 +313,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     });
   });
 
-  const host = options.host?.trim() || '127.0.0.1';
-  const port = Number.isInteger(options.port) ? Number(options.port) : (Number(process.env.OD_PORT) || 7456);
+  const host = options.host?.trim() || process.env.LCT_BIND_HOST?.trim() || '127.0.0.1';
+  const port = Number.isInteger(options.port) ? Number(options.port) : (Number(process.env.LCT_PORT) || 7456);
   const server = await new Promise<Server>((resolve, reject) => {
     const listening = app.listen(port, host, () => resolve(listening));
     listening.once('error', reject);

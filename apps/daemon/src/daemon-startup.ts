@@ -26,7 +26,7 @@ function openUrl(url: string): void {
     const child = spawn(command.bin, command.args, { detached: true, stdio: 'ignore' });
     child.unref();
   } catch {
-    // Browser opening is a convenience only; the daemon remains usable.
+    // Browser opening is convenience only.
   }
 }
 
@@ -38,8 +38,8 @@ export function normalizeDaemonBindHost(input: unknown): string {
 export function parseDaemonCliStartupArgs(argv: string[]):
   | { ok: true; config: { host: string; port: number; open: boolean } }
   | { ok: false; kind: 'help' | 'error'; message?: string } {
-  let host = normalizeDaemonBindHost(process.env.OD_BIND_HOST);
-  let port = Number(process.env.OD_PORT) || 7456;
+  let host = normalizeDaemonBindHost(process.env.LCT_BIND_HOST);
+  let port = Number(process.env.LCT_PORT) || 7456;
   let open = true;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -55,7 +55,7 @@ export function parseDaemonCliStartupArgs(argv: string[]):
         return { ok: false, kind: 'error', message: 'invalid port' };
       }
       port = value;
-    } else if (arg === 'daemon') {
+    } else if (arg === 'daemon' || arg === 'serve') {
       continue;
     } else {
       return { ok: false, kind: 'error', message: `unknown option or command: ${arg}` };
@@ -97,7 +97,7 @@ export async function runDaemonCliStartup(argv: string[]): Promise<void> {
   const parsed = parseDaemonCliStartupArgs(argv);
   if (!parsed.ok) {
     if (parsed.kind === 'help') {
-      console.log('Usage: od [daemon] [--host HOST] [--port PORT] [--no-open]');
+      console.log('Usage: lct [serve] [--host HOST] [--port PORT] [--no-open]');
       return;
     }
     console.error(parsed.message ?? 'invalid arguments');

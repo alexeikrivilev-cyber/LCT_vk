@@ -6,7 +6,7 @@
   "main": "./dist/cli.js",
   "types": "./dist/cli.d.ts",
   "bin": {
-    "od": "./bin/od.mjs"
+    "lct": "./bin/lct.mjs"
   },
   "exports": {
     ".": {
@@ -18,25 +18,17 @@
   "files": ["bin", "dist", "package.json"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "daemon": "pnpm run build && node dist/cli.js --no-open",
     "dev": "pnpm run build && node dist/cli.js --no-open",
     "start": "pnpm run build && node dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@ffmpeg-installer/ffmpeg": "1.1.0",
-    "@lct/contracts": "workspace:*",
-    "@lct/sidecar-proto": "workspace:*",
     "better-sqlite3": "12.10.0",
-    "cheerio": "1.2.0",
     "express": "5.2.1",
-    "hyperframes": "0.8.1",
     "jszip": "3.10.1",
     "multer": "2.2.0",
     "pdf-lib": "1.17.1",
-    "postcss": "8.5.15",
-    "pptxgenjs": "4.0.1",
-    "undici": "7.29.0"
+    "pptxgenjs": "4.0.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
