@@ -1,0 +1,47 @@
+{
+  "name": "@lct/packaged",
+  "version": "0.23.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.mjs"
+    },
+    "./headless": {
+      "default": "./dist/headless.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node ./esbuild.config.mjs && tsc -p tsconfig.json --emitDeclarationOnly",
+    "test": "vitest run -c vitest.config.ts",
+    "typecheck": "pnpm --filter @lct/desktop build && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit"
+  },
+  "dependencies": {
+    "@lct/contracts": "workspace:*",
+    "@lct/daemon": "workspace:*",
+    "@lct/desktop": "workspace:*",
+    "@lct/launcher-proto": "workspace:*",
+    "@lct/platform": "workspace:*",
+    "@lct/release": "workspace:*",
+    "@lct/sidecar": "workspace:*",
+    "@lct/sidecar-proto": "workspace:*",
+    "@lct/web": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.2",
+    "electron": "41.3.0",
+    "esbuild": "0.28.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.6"
+  },
+  "engines": {
+    "node": "~24"
+  }
+}

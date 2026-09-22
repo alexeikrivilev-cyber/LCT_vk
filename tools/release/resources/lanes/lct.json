@@ -1,0 +1,30 @@
+{
+  "lanes": {
+    "beta": {
+      "channel": "beta",
+      "storagePrefix": "beta",
+      "productName": "LCT Beta"
+    },
+    "betas": {
+      "channel": "betas",
+      "storagePrefix": "betas",
+      "productName": "LCT Betas",
+      "publicOrigin": "https://s3.nexu.space/od-releases"
+    },
+    "prerelease": {
+      "channel": "prerelease",
+      "storagePrefix": "prerelease",
+      "productName": "LCT Prerelease"
+    },
+    "preview": {
+      "channel": "preview",
+      "storagePrefix": "preview",
+      "productName": "LCT Preview"
+    },
+    "stable": {
+      "channel": "stable",
+      "storagePrefix": "stable",
+      "productName": "LCT"
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "@lct/desktop",
+  "version": "0.23.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main/index.js",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./main": {
+      "types": "./dist/main/index.d.ts",
+      "default": "./dist/main/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run -c vitest.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit"
+  },
+  "dependencies": {
+    "@lct/contracts": "workspace:*",
+    "@lct/diagnostics": "workspace:*",
+    "@lct/download": "workspace:*",
+    "@lct/host": "workspace:*",
+    "@lct/launcher-proto": "workspace:*",
+    "@lct/platform": "workspace:*",
+    "@lct/release": "workspace:*",
+    "@lct/sidecar": "workspace:*",
+    "@lct/sidecar-proto": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.2",
+    "electron": "41.3.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.6"
+  },
+  "engines": {
+    "node": "~24"
+  }
+}
