@@ -1,14 +1,11 @@
+import { spawn } from 'node:child_process';
 import type { Server } from 'node:http';
-
 import type { StartServerOptions } from './server.js';
 
-type StartedServer = {
+export type StartedDaemonRuntime = {
   server: Server;
   url: string;
   shutdown?: () => Promise<void>;
-};
-
-export type StartedDaemonRuntime = StartedServer & {
   stop(): Promise<void>;
 };
 
@@ -17,162 +14,106 @@ type DaemonRuntimeOptions = Omit<StartServerOptions, 'returnServer'> & {
   logListening?: boolean;
 };
 
-export type DaemonCliStartupConfig = {
-  host: string;
-  open: boolean;
-  port: number;
-};
-
-export type DaemonCliStartupParseResult =
-  | { ok: true; config: DaemonCliStartupConfig }
-  | { ok: false; kind: 'help' }
-  | { ok: false; kind: 'error'; message: string };
-
 export const DEFAULT_DAEMON_BIND_HOST = '127.0.0.1';
+
+function openUrl(url: string): void {
+  const command = process.platform === 'darwin'
+    ? { bin: 'open', args: [url] }
+    : process.platform === 'win32'
+      ? { bin: 'cmd', args: ['/c', 'start', '', url] }
+      : { bin: 'xdg-open', args: [url] };
+  try {
+    const child = spawn(command.bin, command.args, { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch {
+    // Browser opening is a convenience only; the daemon remains usable.
+  }
+}
 
 export function normalizeDaemonBindHost(input: unknown): string {
   const host = String(input ?? '').trim();
   return host || DEFAULT_DAEMON_BIND_HOST;
 }
 
-function requiredOptionValue(flag: string, value: string | undefined, label: string): string | DaemonCliStartupParseResult {
-  if (value == null || value.startsWith('-')) {
-    return { ok: false, kind: 'error', message: `${flag} requires ${label}` };
-  }
-  return value;
-}
-
-export function parseDaemonCliStartupArgs(
-  argv: string[],
-  env: NodeJS.ProcessEnv = process.env,
-): DaemonCliStartupParseResult {
-  let port = Number(env.OD_PORT) || 7456;
-  let host = normalizeDaemonBindHost(env.OD_BIND_HOST);
+export function parseDaemonCliStartupArgs(argv: string[]):
+  | { ok: true; config: { host: string; port: number; open: boolean } }
+  | { ok: false; kind: 'help' | 'error'; message?: string } {
+  let host = normalizeDaemonBindHost(process.env.OD_BIND_HOST);
+  let port = Number(process.env.OD_PORT) || 7456;
   let open = true;
-
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a == null) continue;
-    if (a === '-p' || a === '--port') {
-      const next = requiredOptionValue(a, argv[++i], 'a port');
-      if (typeof next !== 'string') return next;
-      const parsedPort = Number(next);
-      if (!Number.isInteger(parsedPort) || parsedPort <= 0 || parsedPort > 65535) {
-        return { ok: false, kind: 'error', message: `invalid port: ${next}` };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--no-open') open = false;
+    else if (arg === '-h' || arg === '--help') return { ok: false, kind: 'help' };
+    else if (arg === '--host') {
+      const value = argv[++index];
+      if (!value) return { ok: false, kind: 'error', message: '--host requires an address' };
+      host = normalizeDaemonBindHost(value);
+    } else if (arg === '-p' || arg === '--port') {
+      const value = Number(argv[++index]);
+      if (!Number.isInteger(value) || value <= 0 || value > 65535) {
+        return { ok: false, kind: 'error', message: 'invalid port' };
       }
-      port = parsedPort;
-    } else if (a === '--host') {
-      const next = requiredOptionValue(a, argv[++i], 'an address');
-      if (typeof next !== 'string') return next;
-      host = normalizeDaemonBindHost(next);
-    } else if (a === '--no-open') {
-      open = false;
-    } else if (a === '-h' || a === '--help') {
-      return { ok: false, kind: 'help' };
-    } else if (a.startsWith('-')) {
-      return { ok: false, kind: 'error', message: `unknown option: ${a}` };
+      port = value;
+    } else if (arg === 'daemon') {
+      continue;
     } else {
-      return { ok: false, kind: 'error', message: `unknown command: od ${a}` };
+      return { ok: false, kind: 'error', message: `unknown option or command: ${arg}` };
     }
   }
-
-  return { ok: true, config: { host, open, port } };
+  return { ok: true, config: { host, port, open } };
 }
 
-export async function closeHttpServer(
-  server: Server,
-  { closeTimeoutMs = 5_000, idleCloseMs = 1_000 } = {},
-): Promise<void> {
+export async function closeHttpServer(server: Server): Promise<void> {
   if (!server.listening) return;
-  await new Promise<void>((resolveClose, rejectClose) => {
-    let resolved = false;
-    const resolveOnce = () => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(idleTimer);
-      clearTimeout(hardTimer);
-      resolveClose();
-    };
-    const rejectOnce = (error: Error) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(idleTimer);
-      clearTimeout(hardTimer);
-      rejectClose(error);
-    };
-    const idleTimer = setTimeout(() => {
-      server.closeIdleConnections?.();
-    }, Math.min(idleCloseMs, closeTimeoutMs));
-    const hardTimer = setTimeout(() => {
+  await new Promise<void>((resolve) => {
+    const hardStop = setTimeout(() => {
       server.closeAllConnections?.();
-      resolveOnce();
-    }, closeTimeoutMs);
-    idleTimer.unref?.();
-    hardTimer.unref?.();
-    server.close((error) => (error == null ? resolveOnce() : rejectOnce(error)));
-  }).finally(() => {
-    server.closeIdleConnections?.();
+      resolve();
+    }, 5000);
+    hardStop.unref?.();
+    server.close(() => {
+      clearTimeout(hardStop);
+      resolve();
+    });
+    setTimeout(() => server.closeIdleConnections?.(), 500).unref?.();
   });
 }
 
 export async function startDaemonRuntime(options: DaemonRuntimeOptions = {}): Promise<StartedDaemonRuntime> {
-  const { openBrowser: shouldOpenBrowser = false, logListening = false, ...serverOptions } = options;
+  const { openBrowser = false, logListening = false, ...serverOptions } = options;
   const { startServer } = await import('./server.js');
-  const started = await startServer({
-    ...serverOptions,
-    returnServer: true,
-  }) as string | StartedServer;
-  if (typeof started === 'string') {
-    throw new Error('daemon startServer did not return a server handle');
-  }
-
+  const started = await startServer({ ...serverOptions, returnServer: true });
+  if (typeof started === 'string') throw new Error('presentation server did not return a server handle');
   const stop = async () => {
-    const closePromise = closeHttpServer(started.server);
-    const shutdownPromise = started.shutdown?.().catch((error: unknown) => {
-      console.error('daemon shutdown cleanup failed', error);
-    }) ?? Promise.resolve();
-    await Promise.allSettled([shutdownPromise, closePromise]);
+    await Promise.allSettled([closeHttpServer(started.server), started.shutdown?.() ?? Promise.resolve()]);
   };
-
-  if (logListening) {
-    console.log(`[od] listening on ${started.url}`);
-  }
-  if (shouldOpenBrowser) {
-    const { openBrowser } = await import('./browser/index.js');
-    openBrowser(started.url);
-  }
-
-  return {
-    ...started,
-    stop,
-  };
+  if (logListening) console.log(`[lct] presentation core listening on ${started.url}`);
+  if (openBrowser) openUrl(started.url);
+  return { ...started, stop };
 }
 
-export async function runDaemonCliStartup(argv: string[], options: { printHelp?: () => void } = {}): Promise<void> {
+export async function runDaemonCliStartup(argv: string[]): Promise<void> {
   const parsed = parseDaemonCliStartupArgs(argv);
   if (!parsed.ok) {
-    if (parsed.kind === 'error') {
-      console.error(parsed.message);
-      options.printHelp?.();
-      process.exit(2);
+    if (parsed.kind === 'help') {
+      console.log('Usage: od [daemon] [--host HOST] [--port PORT] [--no-open]');
+      return;
     }
-    options.printHelp?.();
+    console.error(parsed.message ?? 'invalid arguments');
+    process.exitCode = 2;
     return;
   }
-  const { host, open, port } = parsed.config;
-
   const runtime = await startDaemonRuntime({
-    host,
+    host: parsed.config.host,
+    port: parsed.config.port,
+    openBrowser: parsed.config.open,
     logListening: true,
-    openBrowser: open,
-    port,
   });
-  let shuttingDown = false;
+  let stopping = false;
   const stop = () => {
-    if (shuttingDown) {
-      process.exit(0);
-    }
-    shuttingDown = true;
+    if (stopping) return;
+    stopping = true;
     void runtime.stop().finally(() => process.exit(0));
   };
   process.on('SIGINT', stop);
