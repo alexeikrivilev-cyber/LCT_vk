@@ -7,9 +7,8 @@
     <meta
       name="description"
       content="Reference fixture for design-systems/default. Every visible
-        value comes from tokens.css; if the agent paste-replaces the
-        :root block and reuses the component selectors below verbatim,
-        the artifact passes lint without further audit."
+        value comes from tokens.css. Reuse the component selectors with
+        the matching :root block, then review the rendered artifact."
     />
 
     <style>
@@ -256,8 +255,8 @@
         flex-direction: column;
         gap: var(--space-3);
       }
-      /* No left-border accent on cards — that pattern is in the
-         lint's P0 list (`left-accent-card`). Use a hairline border
+      /* No left-border accent on cards — that pattern is avoided in
+         this reference system. Use a hairline border
          all-around or rely on the surface contrast against --bg. */
 
       /* ─── Badges ────────────────────────────────────────────── */

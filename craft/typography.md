@@ -110,7 +110,7 @@ Most well-crafted UIs use exactly 3 weights:
 Weight 700+ is rarely needed. If your design uses bold for "emphasis on
 emphasis," it likely lacks weight discipline elsewhere.
 
-## Common mistakes (lint these)
+## Common mistakes (review these)
 
 - ALL CAPS without `letter-spacing` ≥ `0.06em`.
 - Display text (≥32 px) without negative tracking (Latin only — see the CJK overrides).

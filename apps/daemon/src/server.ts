@@ -176,13 +176,14 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
 
   app.post('/api/projects/:id/files', async (req, res) => {
     try {
-      if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+      const projectId = req.params.id as string;
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
       const name = typeof req.body?.name === 'string' ? req.body.name : '';
       if (!name) return apiError(res, 400, new Error('file name is required'));
       const encoding = req.body?.encoding === 'base64' ? 'base64' : 'utf8';
       const raw = typeof req.body?.content === 'string' ? req.body.content : '';
       const content = encoding === 'base64' ? Buffer.from(raw, 'base64') : raw;
-      res.json({ file: await writePresentationFile(projectsRoot, req.params.id, name, content) });
+      res.json({ file: await writePresentationFile(projectsRoot, projectId, name, content) });
     } catch (error) {
       apiError(res, 400, error);
     }
@@ -190,13 +191,14 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
 
   app.post('/api/projects/:id/upload', upload.array('files', 64), async (req, res) => {
     try {
-      if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+      const projectId = req.params.id as string;
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
       const requestedDir = typeof req.body?.dir === 'string' ? req.body.dir.trim().replace(/^\/+/, '') : '';
       const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : [];
       const written = [];
       for (const file of files) {
         const name = requestedDir ? `${requestedDir}/${file.originalname}` : file.originalname;
-        const saved = await writePresentationFile(projectsRoot, req.params.id, name, file.buffer);
+        const saved = await writePresentationFile(projectsRoot, projectId, name, file.buffer);
         written.push({ ...saved, originalName: file.originalname });
       }
       res.json({ files: written });

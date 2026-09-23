@@ -11,8 +11,7 @@
  * Why this file exists:
  *   DESIGN.md gives humans context ("Accent #2F6FEB — primary CTAs"),
  *   but agents have to translate prose names like "Accent" into the
- *   standard token names the lint enforces (`--accent`). That
- *   translation is where token misuse happens. This file pre-translates
+ *   standard token names such as `--accent`. This file pre-translates
  *   the brand once, so agents copy structure instead of inventing it.
  *
  * Contract sources:
@@ -21,12 +20,11 @@
  *        / --success / --warn / --danger)
  *   - Display-face contract: craft/anti-ai-slop.md
  *       (--font-display, must be referenced via var())
- *   - Lint enforcement: apps/daemon/src/lint-artifact.ts
- *       (raw-hex >12 outside :root → P1; indigo laundering → P0)
+ *   - Craft guidance: the current repository does not automatically
+ *       lint generated artifacts against these token conventions.
  *
- * Schema notes (the shared schema grew from kami's stress test —
- * see design-systems/kami/tokens.css for the rich form, and the
- * #Gap N tags below for what each addition resolves):
+ * Schema notes (the #Gap N tags below describe additions to this
+ * starter token set):
  *   #Gap 1  — 4-level foreground ramp (fg / fg-2 / muted / meta)
  *   #Gap 2  — 3-level surface (bg / surface / surface-warm)
  *   #Gap 3  — 2-level border (border / border-soft)
@@ -72,8 +70,8 @@
 
   /* ─── Accent ──────────────────────────────────────────────────────
    * Cobalt — primary CTAs, links, ONE hero element per screen.
-   * Hard cap of 2 visible uses per screen is enforced by lint
-   * (`accent-overuse` P1 fires at >6 inline occurrences). */
+   * Keep visible accent use selective; this is authoring guidance and
+   * is not automatically checked in the current repository. */
   --accent: #2f6feb;
   --accent-on: #ffffff; /* fg when accent is the bg (e.g. button label) */
 
@@ -95,7 +93,7 @@
    *   - cross-mode reversal (dark-mode hover should mix white, not
    *     black — token re-binding is one line per mode)
    *   - cross-brand customization (formula breaks on light accents)
-   *   - lint-enforceable contract (every brand must provide these)
+   *   - shared authoring convention (every brand should provide these)
    * Other inline `color-mix(...)` calls in components don't yet hit
    * any of the above — promote them to tokens when a second use
    * appears. */

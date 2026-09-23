@@ -52,6 +52,14 @@ Work as a senior engineer: inspect, decide, implement, verify, and refine. Withi
 
 Ask only when a decision changes product behavior, breaks an invariant, introduces a major dependency/service, or cannot be safely inferred. Prefer the smallest complete vertical slice over speculative framework work.
 
+For substantial work, define acceptance from the request and canonical docs, inspect the current Git state and affected behavior, and run a baseline before editing. Deliver the smallest runnable, observable end-to-end slice that meets that acceptance; avoid speculative frameworks and unrelated cleanup. Do not rewrite a functioning subsystem without a measurable reason and evidence for the replacement.
+
+Delegate only bounded work with an explicit owner, scope, expected output, and read-only/editable status. The root agent owns shared contracts, integration, final diff review, and verification. Give each shared file one editor at a time; parallelize independent read-only reviews. Check reviewer claims against the repository before relying on them.
+
+Treat this repository's canonical docs and accepted contracts as authoritative. Research or donor repositories are evidence only; validate any proposed behavior or interface against this repository before carrying it over. Use an independent read-only verifier for substantial changes and add a skeptic for risky or cross-cutting changes; resolve findings in the root review.
+
+Report evidence with these states: `DOCUMENTED TARGET`, `IMPLEMENTED`, `VERIFIED`, `PARTIALLY VERIFIED`, or `BLOCKED`. Use `VERIFIED` only for behavior covered by an executed check, and name the check. For substantial work, summarize changed files, behavior, checks and outcomes, limitations, exact next step, and final Git status.
+
 ## Required self-checks
 
 Before declaring work complete:
@@ -67,6 +75,7 @@ Before declaring work complete:
 ```bash
 pnpm check:boundary
 pnpm lint:craft        # when skills/craft/design rules change
+pnpm test              # when behavior or verification tooling changes
 pnpm typecheck         # when TypeScript changes
 pnpm build             # when runtime/UI/build behavior changes
 ```

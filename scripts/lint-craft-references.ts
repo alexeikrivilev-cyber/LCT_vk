@@ -1,19 +1,10 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-
-import { parseFrontmatter } from "../packages/plugin-runtime/src/parsers/frontmatter.ts";
+import { parse } from "yaml";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const craftRoot = path.join(repoRoot, "craft");
-const futureSectionsPath = path.join(craftRoot, "FUTURE_SECTIONS.md");
-const skillManifestRoots = [
-  "skills",
-  "design-templates",
-  "plugins/_official/examples",
-  "docs/examples",
-];
-const pluginManifestRoot = "plugins/_official";
 const slugPattern = /^[a-z0-9][a-z0-9-]*$/;
 
 export type CraftReference = {
@@ -48,7 +39,11 @@ function toRepositoryPath(root: string, filePath: string): string {
 }
 
 export function extractCraftRequiresSlugs(source: string): unknown[] {
-  const { data } = parseFrontmatter(source);
+  const match = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(source);
+  if (!match?.[1]) return [];
+
+  const data: unknown = parse(match[1]);
+  if (!isRecord(data)) return [];
   const od = data["od"];
   if (!isRecord(od)) return [];
 
@@ -59,24 +54,19 @@ export function extractCraftRequiresSlugs(source: string): unknown[] {
   return Array.isArray(requires) ? [...requires] : [];
 }
 
-export function extractPluginManifestContextCraftSlugs(source: string): unknown[] {
+export function extractDesignSystemCraftSlugs(source: string): unknown[] {
   const manifest: unknown = JSON.parse(source);
   if (!isRecord(manifest)) return [];
-
-  const od = manifest["od"];
-  if (!isRecord(od)) return [];
-
-  const context = od["context"];
-  if (!isRecord(context)) return [];
-
-  const craft = context["craft"];
-  return Array.isArray(craft) ? [...craft] : [];
+  const craft = manifest["craft"];
+  if (!isRecord(craft)) return [];
+  return ["applies", "suggested", "exemptions"].flatMap((key) =>
+    Array.isArray(craft[key]) ? [...craft[key]] : [],
+  );
 }
 
 export function findCraftReferenceViolations(
   references: CraftReference[],
   existingSlugs: ReadonlySet<string>,
-  futureSlugs: ReadonlySet<string>,
 ): CraftReferenceViolation[] {
   const violations: CraftReferenceViolation[] = [];
 
@@ -85,7 +75,7 @@ export function findCraftReferenceViolations(
       violations.push({ ...reference, kind: "invalid" });
       continue;
     }
-    if (!existingSlugs.has(reference.slug) && !futureSlugs.has(reference.slug)) {
+    if (!existingSlugs.has(reference.slug)) {
       violations.push({ ...reference, kind: "unresolved" });
     }
   }
@@ -112,22 +102,23 @@ async function collectNamedManifests(directory: string, fileName: string): Promi
 }
 
 export async function collectCraftReferences(root: string = repoRoot): Promise<CraftReference[]> {
-  const skillManifests = (
-    await Promise.all(
-      skillManifestRoots.map((manifestRoot) =>
-        collectNamedManifests(path.join(root, manifestRoot), "SKILL.md"),
-      ),
-    )
-  ).flat();
-  const pluginManifests = await collectNamedManifests(
-    path.join(root, pluginManifestRoot),
-    "lct.json",
+  const skillManifests = await collectNamedManifests(path.join(root, "skills"), "SKILL.md");
+  const designSystemManifests = await collectNamedManifests(
+    path.join(root, "design-systems"),
+    "manifest.json",
   );
   const references: CraftReference[] = [];
 
   for (const manifestPath of skillManifests) {
-    const source = await readFile(manifestPath, "utf8");
-    for (const slug of extractCraftRequiresSlugs(source)) {
+    let slugs: unknown[];
+    try {
+      slugs = extractCraftRequiresSlugs(await readFile(manifestPath, "utf8"));
+    } catch (error) {
+      throw new Error(`Could not read craft references from ${toRepositoryPath(root, manifestPath)}.`, {
+        cause: error,
+      });
+    }
+    for (const slug of slugs) {
       references.push({
         manifestPath: toRepositoryPath(root, manifestPath),
         slug,
@@ -135,9 +126,16 @@ export async function collectCraftReferences(root: string = repoRoot): Promise<C
     }
   }
 
-  for (const manifestPath of pluginManifests) {
-    const source = await readFile(manifestPath, "utf8");
-    for (const slug of extractPluginManifestContextCraftSlugs(source)) {
+  for (const manifestPath of designSystemManifests) {
+    let slugs: unknown[];
+    try {
+      slugs = extractDesignSystemCraftSlugs(await readFile(manifestPath, "utf8"));
+    } catch (error) {
+      throw new Error(`Could not read craft references from ${toRepositoryPath(root, manifestPath)}.`, {
+        cause: error,
+      });
+    }
+    for (const slug of slugs) {
       references.push({
         manifestPath: toRepositoryPath(root, manifestPath),
         slug,
@@ -156,27 +154,10 @@ async function collectExistingCraftSlugs(): Promise<Set<string>> {
     if (!entry.isFile() || path.extname(entry.name) !== ".md") continue;
 
     const slug = path.basename(entry.name, ".md");
-    if (slug === "README" || slug === "FUTURE_SECTIONS") continue;
     if (slugPattern.test(slug)) slugs.add(slug);
   }
 
   return slugs;
-}
-
-function extractFutureCraftSlugs(source: string): Set<string> {
-  const slugs = new Set<string>();
-
-  for (const line of source.split(/\r?\n/)) {
-    const match = /^\s*[-*]\s+`?([a-z0-9][a-z0-9-]*)`?\s*$/.exec(line);
-    if (match?.[1]) slugs.add(match[1]);
-  }
-
-  return slugs;
-}
-
-async function collectFutureCraftSlugs(): Promise<Set<string>> {
-  if (!(await pathExists(futureSectionsPath))) return new Set();
-  return extractFutureCraftSlugs(await readFile(futureSectionsPath, "utf8"));
 }
 
 function formatSlug(slug: unknown): string {
@@ -200,15 +181,14 @@ function printViolations(violations: CraftReferenceViolation[]): void {
     for (const violation of unresolved) {
       console.error(`- ${violation.manifestPath}: ${formatSlug(violation.slug)}`);
     }
-    console.error("Add craft/<slug>.md, fix the typo, or list an intentional forward reference in craft/FUTURE_SECTIONS.md.");
+    console.error("Add craft/<slug>.md or correct the manifest reference.");
   }
 }
 
 export async function checkCraftReferences(): Promise<boolean> {
   const references = await collectCraftReferences();
   const existingSlugs = await collectExistingCraftSlugs();
-  const futureSlugs = await collectFutureCraftSlugs();
-  const violations = findCraftReferenceViolations(references, existingSlugs, futureSlugs);
+  const violations = findCraftReferenceViolations(references, existingSlugs);
   const manifestCount = new Set(references.map((reference) => reference.manifestPath)).size;
 
   if (violations.length > 0) {
@@ -217,7 +197,7 @@ export async function checkCraftReferences(): Promise<boolean> {
   }
 
   console.log(
-    `Craft reference check passed: ${references.length} references across ${manifestCount} manifests resolve or are explicitly planned.`,
+    `Craft reference check passed: ${references.length} references across ${manifestCount} manifests resolve.`,
   );
   return true;
 }

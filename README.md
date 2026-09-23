@@ -80,16 +80,24 @@ Requirements:
 
 - Node.js 24
 - pnpm 10.33.2
+- mise to install and select the project-pinned versions (or install those exact versions with your existing tool manager)
 
 ```bash
-pnpm install
-pnpm check:boundary
-pnpm typecheck
-pnpm build
-pnpm dev
+mise install
+mise exec -- node --version
+mise exec -- pnpm --version
+mise exec -- pnpm install --frozen-lockfile
+mise exec -- pnpm check:boundary
+mise exec -- pnpm lint:craft
+mise exec -- pnpm test
+mise exec -- pnpm typecheck
+mise exec -- pnpm build
+mise exec -- pnpm dev
 ```
 
-The repository currently has no committed lockfile after the workspace reduction. Regenerate `pnpm-lock.yaml` with pnpm 10.33.2 and commit it before treating a build as release-reproducible.
+`.node-version`, `mise.toml`, and the root `packageManager` field pin the project toolchain. Keep `pnpm-lock.yaml` in sync with package manifests and use `--frozen-lockfile` for clean installs.
+
+If the pinned Node.js and pnpm versions are already active in your shell, run the `pnpm` commands directly; `mise` is only needed for selecting/installing those versions.
 
 Runtime data defaults to `.lct/`. The current server/media adapter remains deliberately small and provider details must not leak into presentation-domain contracts.
 

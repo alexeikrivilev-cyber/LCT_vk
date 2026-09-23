@@ -1,8 +1,8 @@
 # Color craft rules
 
 Universal color rules applied on top of the active `DESIGN.md`. The
-design system supplies the palette tokens; this file enforces how to
-*use* them.
+design system supplies the palette tokens; apply them according to the
+rules in this file.
 
 > Adapted from [refero_skill](https://github.com/referodesign/refero_skill)
 > (MIT). All examples reference LCT's standard tokens
@@ -76,10 +76,10 @@ Always name tokens by **purpose**, never by hue:
 
 - **Indigo `#6366f1`** (Tailwind `indigo-500`) is the most reliable
   AI-slop tell. The active `DESIGN.md` provides `--accent`; use it. If
-  the brief truly needs indigo, make the user say so explicitly. If
-  your `DESIGN.md` encodes indigo as `--accent`, that is intentional —
-  the linter only flags hardcoded hex, so `var(--accent)` uses are
-  unaffected even when the resolved color happens to be `#6366f1`.
+  the brief truly needs indigo, make the user say so explicitly. A
+  `DESIGN.md` that intentionally binds `--accent` to indigo records that
+  choice. Artifact color compliance is reviewed manually; the current
+  repository has no automatic artifact linter.
 - **Two-stop "trust" gradient** (purple → blue, blue → cyan, etc.) on a
   hero is the second most reliable tell. A flat surface + one
   type-driven hierarchy beats it every time.

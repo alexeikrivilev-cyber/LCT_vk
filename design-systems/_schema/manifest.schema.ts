@@ -1,23 +1,23 @@
 /* ─────────────────────────────────────────────────────────────────────────
  * design-systems/_schema/manifest.schema.ts
  *
- * Canonical contract for an LCT Design System Project.
+ * Reference schema for an LCT Design System Project manifest.
+ * This module has no current runtime imports, so its types and validator
+ * are not an enforced application contract.
  *
  * `DESIGN.md` remains the prose source that agents read. The project
- * manifest is the stable discovery layer around it: picker / daemon /
- * importer code can find the canonical design prose, compiled tokens,
- * optional component fixtures, and optional preview/assets directories
- * without guessing from folder contents.
+ * manifest is intended to be a discovery layer around it: future picker,
+ * daemon, or importer code could locate canonical design prose, compiled
+ * tokens, optional component fixtures, and preview/assets directories.
  *
  * PR0 for the import-project structure also defines optional index fields
  * for richer imported systems (`USAGE.md`, preview pages, source evidence,
  * and a rebuildable component manifest cache). These fields are structural
- * only in PR0: guards validate their paths and JSON shape, but runtime
- * behavior remains unchanged until later PRs consume them.
+ * only as schema fields here. The validator checks paths and JSON shape
+ * when called directly; no current runtime guard invokes it.
  *
- * PR1 deliberately defines the contract without changing runtime
- * discovery. Existing DESIGN.md-only systems stay valid; this schema is
- * enforced only for folders that choose to ship `manifest.json`.
+ * Existing DESIGN.md-only systems stay valid. Runtime discovery does not
+ * currently enforce this schema for folders that ship `manifest.json`.
  * ─────────────────────────────────────────────────────────────────── */
 
 export const DESIGN_SYSTEM_PROJECT_SCHEMA_VERSION = "od-design-system-project/v1" as const;
@@ -129,7 +129,7 @@ export type DesignSystemProjectManifest = {
   readonly componentsManifest?: string;
   /** Importer mode metadata. Defaults to hybrid for imported packages. */
   readonly importMode?: DesignSystemProjectImportMode;
-  /** Optional craft metadata consumed by prompt assembly and guard checks. */
+  /** Optional craft metadata reserved for future prompt assembly and guard checks. */
   readonly craft?: DesignSystemProjectCraft;
   /** Optional webfont files copied into the package. */
   readonly fonts?: readonly DesignSystemProjectFont[];

@@ -17,6 +17,7 @@
     "start": "pnpm --filter @lct/daemon run start",
     "lint:craft": "tsx ./scripts/lint-craft-references.ts",
     "check:boundary": "node ./scripts/check-presentation-boundary.mjs",
+    "test": "node --test",
     "typecheck": "pnpm -r --filter @lct/web --filter @lct/daemon run typecheck"
   },
   "devDependencies": {
@@ -28,14 +29,5 @@
   "engines": {
     "node": "~24",
     "pnpm": ">=10.33.2 <11"
-  },
-  "pnpm": {
-    "overrides": {
-      "devalue": "5.8.1",
-      "fast-uri": "3.1.5",
-      "qs": "6.15.2",
-      "yaml": "2.9.0"
-    },
-    "onlyBuiltDependencies": ["better-sqlite3"]
   }
 }

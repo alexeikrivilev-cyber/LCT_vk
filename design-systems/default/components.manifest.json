@@ -7,7 +7,7 @@
   },
   "fixture": {
     "title": "Neutral Modern — reference components",
-    "description": "Reference fixture for design-systems/default. Every visible value comes from tokens.css; if the agent paste-replaces the :root block and reuses the component selectors below verbatim, the artifact passes lint without further audit.",
+    "description": "Reference fixture for design-systems/default. Visible token values come from tokens.css; reuse the component selectors with the matching :root block, then review the rendered artifact.",
     "styleBlockCount": 1,
     "selectorCount": 50,
     "classCount": 25,

@@ -24,11 +24,14 @@ Run the relevant commands before finishing work:
 ```bash
 pnpm check:boundary
 pnpm lint:craft
+pnpm test
 pnpm typecheck
 pnpm build
 ```
 
 `pnpm lint:craft` is required when skill/craft bindings change. Typecheck/build are required when the corresponding code paths change.
+
+`pnpm test` runs the current Node built-in baseline for existing file-path safeguards and craft-reference tooling. These tests cover repository foundation behavior; they do not imply that the documented compiler, generation, inference, or export gates are implemented.
 
 ## Deterministic unit tests
 
