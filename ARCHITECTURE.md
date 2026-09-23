@@ -2,16 +2,16 @@
 
 ## Goal
 
-The system is a presentation compiler. It converts an arbitrary PPTX template plus user content into a constrained internal representation, makes semantic decisions with models, renders native presentation objects deterministically, audits the result, and exports editable deliverables.
+The system is a presentation compiler. It converts an arbitrary PPTX template plus user content into constrained internal state, makes semantic decisions with models, renders native presentation objects deterministically, audits the result, and exports editable deliverables.
 
-Implementation details may evolve. The boundaries in this document are architectural invariants.
+Implementation details may evolve. The boundaries and state semantics below are architectural invariants.
 
 ## Runtime topology
 
 ```text
 Browser / Next.js
       |
-      | HTTP
+      | HTTP + incremental generation events
       v
 Presentation daemon / Express
       |
@@ -20,20 +20,19 @@ Presentation daemon / Express
       |     +-- template compiler
       |     +-- content compiler
       |     +-- deck planner
-      |     +-- variant engine
+      |     +-- slide-pack generator
       |     +-- visual engine
-      |     +-- renderer/exporter
+      |     +-- renderer
       |     +-- deterministic audit
-      |     +-- repair / preflight
+      |     +-- repair / preflight / export
       |
       +-- semantic inference adapter
       |        |
       |        v
-      |   GPU inference host
-      |     +-- scheduler / deadline manager
-      |     +-- one Qwen3.8-27B weight set
-      |     +-- worker session + KV cache
-      |     +-- supervisor session + KV cache
+      |   logical Qwen3.8-27B service
+      |     +-- worker session/cache namespace
+      |     +-- supervisor session/cache namespace
+      |     +-- scheduler/deadline manager
       |
       +-- image adapter
                |
@@ -41,325 +40,229 @@ Presentation daemon / Express
           Qwen-Image media service
 ```
 
-`apps/web` is a client. Presentation-domain logic belongs in `apps/daemon` or future presentation-specific services, not in React components.
+`apps/web` is a client. Presentation-domain logic belongs in `apps/daemon` or presentation-specific services, not in React components.
 
-The GPU serving implementation may be Python and may use a dedicated inference engine. The daemon talks to it through narrow adapters. Serving-engine types, CUDA details, and provider request objects must not leak into presentation domain contracts.
-
-`INFERENCE.md` is the canonical source for precision, cache isolation, GPU residency, request scheduling, and the five-minute deadline.
+The semantic inference service may run on one physical GPU or span multiple GPUs. Physical placement, precision, sharding, prompt-prefix warmup, and scheduler policy are defined in `INFERENCE.md`; domain code must see one logical inference boundary.
 
 ## Current foundation
 
 Implemented today:
 
 - project persistence and safe project files;
-- source upload;
-- text-source editing;
+- source upload and text-source editing;
 - live HTML preview with relative resources;
 - built-in design-system and skill discovery;
 - image-generation adapter;
 - presentation-oriented Node/TypeScript runtime;
-- PPTX/PDF primitives already available to the daemon.
+- PPTX/PDF primitives available to the daemon.
 
-The compiler and GPU-orchestration modules below are target architecture for the next implementation stages. Documentation must distinguish implemented behavior from target behavior.
+The compiler, progressive generation, and GPU orchestration described below are target architecture. Documentation must distinguish implemented behavior from target behavior.
 
 ## Canonical pipeline
 
 ```text
-PPTX
-  -> ingest + OOXML parse
-  -> TemplateIR
-  -> PresentationDesignSystem
-content package
-  -> ContentIR
+PPTX -> deterministic ingest/OOXML parse -> TemplateIR -> PresentationDesignSystem
+content package -> ContentIR
 
 TemplateIR + PresentationDesignSystem + ContentIR + brief
-  -> worker: DeckPlan
-  -> supervisor: bounded plan review
-  -> SlideSpec candidates A/B/C
-  -> deterministic render + audit
-  -> supervisor: targeted slide review/repair
-  -> VisualSlot candidates A/B/C
-  -> image generation only for image slots
-  -> supervisor: targeted visual review
+  -> worker DeckPlan
+  -> bounded supervisor plan review
+  -> continuous slide-pack pipeline
+       slide 1: A/B/C -> validate/render/audit -> publish
+       slide 2: A/B/C -> validate/render/audit -> publish
+       ...
+       slide N: A/B/C -> validate/render/audit -> publish
+  -> visual candidates arrive/update slots asynchronously
+  -> targeted supervisor review/repair of completed checkpoints
   -> SelectedDeck
-  -> native renderer
-  -> deterministic audit
-  -> contextual audit / bounded repair
   -> preflight
   -> PPTX / PDF / HTML
 ```
 
-Each arrow is a typed/validated boundary. Do not allow one giant agent call to own the whole pipeline. The supervisor is a shadow review/repair role, not a second independent generation pipeline.
+Do not implement this as one giant agent call or as three unrelated full-deck generations.
+
+## Progressive slide-pack pipeline
+
+A `SlidePack` is the A/B/C candidate set for one `DeckPlan` slide. It is the unit of progressive publication.
+
+Required behavior:
+
+1. create a shared `DeckPlan` first;
+2. generate one slide pack from that plan;
+3. validate its three `SlideSpec` candidates;
+4. render enough state for inspection and run required deterministic checks;
+5. persist the pack atomically;
+6. emit `slide-pack.ready`/progress state;
+7. immediately continue forward generation without waiting for user acknowledgement.
+
+User-visible pack order follows deck order. Internal scheduling may precompute/pipeline adjacent work when that improves throughput, but it must not expose incoherent ordering or partial candidate groups.
+
+The generator stops only when:
+
+- the planned deck is complete;
+- the user explicitly pauses/cancels;
+- an explicit user change invalidates future plan state and requires a scoped re-plan;
+- a blocking failure prevents safe continuation.
+
+Switching a candidate, locking a ready object, or editing a completed slide locally does not pause unrelated future work.
+
+## Incremental state and events
+
+Generation state is durable application state, not model-chat state. The daemon should expose incremental events; transport may be SSE, WebSocket, streaming HTTP, or another suitable mechanism.
+
+Canonical event meanings include:
+
+```text
+generation.started
+generation.progress
+slide-pack.ready
+visual-candidates.ready
+audit.updated
+slide.updated
+generation.completed
+generation.failed
+```
+
+Event payloads carry project/generation/checkpoint ids and stable slide/object ids. The client treats events as state notifications and can always recover current state from persisted project data after reconnect.
+
+Do not make the browser connection the source of truth for a running generation.
 
 ## Sources of truth
 
 ### Original template
 
-The uploaded PPTX is immutable. Keep it available throughout generation/export. Never destructively normalize the only copy.
+The uploaded PPTX is immutable. Never destructively normalize the only copy.
 
 ### `TemplateIR`
 
-Exact structural facts extracted from PPTX/OOXML:
-
-- slide dimensions;
-- masters/layouts;
-- relationships;
-- placeholder types and geometry;
-- shape/text properties;
-- theme/font/color data;
-- assets;
-- existing charts/tables;
-- stable source identifiers.
-
-Exact information is parsed by code, not inferred from screenshots.
+Exact structural facts extracted by code: dimensions, masters/layouts, relationships, placeholders/geometry, theme/font/color data, assets, existing charts/tables, and stable source ids.
 
 ### `PresentationDesignSystem`
 
-A compact derivative used by planning and rendering. It contains semantic tokens, layout/composition families, typography hierarchy, chart/table/image conventions, reusable assets, and rules. It references exact `TemplateIR` entities instead of duplicating or approximating them.
-
-A model may help label semantics, but deterministic values remain sourced from the PPTX.
+Compact semantic derivative of the template: tokens, composition/layout families, typography hierarchy, visual conventions, reusable assets, and rules. It references exact `TemplateIR` entities instead of approximating them.
 
 ### `ContentIR`
 
-Normalized user material needed for planning: sections, statements, metrics, series, comparisons, chronology, entities, processes, tables, images, and other useful content units.
+Normalized user material needed for planning: sections, claims, metrics, series, comparisons, chronology, processes, tables, images, and supporting content units.
 
 ### `DeckPlan`
 
-Narrative decisions only:
-
-- slide order;
-- slide purpose;
-- takeaway;
-- supporting content references;
-- semantic visual type;
-- target density.
-
-`DeckPlan` does not contain free-form absolute geometry.
+Narrative decisions only: slide order, purpose, takeaway, content references, semantic visual type, and target density. No unrestricted absolute geometry.
 
 ### `SlideSpec`
 
-A renderable presentation decision:
+Renderable decision for one slide variant: stable ids, selected template layout/family, slot mapping, text/content, visual-slot refs, style refs, lock state, and lineage/version metadata.
 
-- stable slide/variant id;
-- selected template layout/layout family;
-- slot-to-content mapping;
-- text/content;
-- visual-slot references;
-- style references;
-- lock state;
-- lineage/version metadata.
+### `SlidePack`
 
-Any custom geometry introduced by deterministic layout code must remain constrained by template rules.
+Three validated `SlideSpec` variants for one planned slide plus a recommended candidate and track labels A/B/C. Pack publication is atomic from the product's point of view.
 
 ### `VisualSlotSpec`
 
-One semantic visual type plus candidates of that same type. Candidate selection can change content/treatment; it cannot silently change the slot type.
-
-### `AuditFinding`
-
-A structured finding tied to slide/object ids with deterministic/contextual provenance and an optional local repair action. See `AUDIT.md`.
+One semantic visual type plus candidate state. Candidate selection may change content/treatment, not silently change semantic type.
 
 ### `SupervisorDecision`
 
-A structured runtime review result tied to an immutable checkpoint version. It may contain pass/warn/repair/local-replan status, target ids, findings, and bounded patch operations.
+Structured review result tied to an immutable checkpoint version. It is advisory until validated by the normal mutation layer; stale and lock-conflicting patches are rejected.
 
-A `SupervisorDecision` is advisory until validated by the application/mutation layer. Stale-version and lock-conflicting decisions are rejected.
+### `AuditFinding`
+
+Structured deterministic/contextual finding tied to stable slide/object ids. See `AUDIT.md`.
 
 ## Layer responsibilities
 
-### 1. Ingest and template compiler
+### Template and content compilation
 
-Responsibilities:
+Parse exact PPTX facts deterministically, preserve round-trip-relevant unknown structure where practical, derive semantic template labels where useful, and normalize the supplied content package. Do not grow content compilation into a generic research system.
 
-- validate PPTX input;
-- unzip/parse OOXML safely;
-- build stable ids for masters/layouts/slides/placeholders/assets;
-- preserve relationships needed for native output;
-- render source-slide previews when useful;
-- derive semantic layout/composition labels;
-- emit `TemplateIR` and `PresentationDesignSystem`.
+### Worker / deck planning
 
-Prefer round-trip-safe handling. Unknown XML/features should be preserved when possible rather than deleted because the parser does not understand them.
+The worker owns forward semantic generation: narrative, slide intent/takeaway, wording, layout ranking among valid candidates, visual type, A/B/C slide decisions, and requested local semantic edits.
 
-### 2. Content compiler
+It may batch decisions when useful, but persistent `DeckPlan`/`SlidePack` state remains the application source of truth.
 
-Normalize the supplied content package into `ContentIR`. Keep this bounded to information needed by presentation planning; do not grow it into a generic research platform.
+### Supervisor
 
-### 3. Deck planner / worker
+The supervisor reviews versioned checkpoints using the same logical semantic model with isolated mutable context. It may detect semantic/compositional problems and propose bounded patch operations or local re-plan requests.
 
-The worker produces structured `DeckPlan` data: narrative, slide intents, takeaway-style titles, content allocation, and semantic visual types.
+It does not create a competing deck, bypass locks, write OOXML, invent unrestricted coordinates, or require approval after every pack. Except for genuine blocking issues, its work is asynchronous to forward slide-pack generation.
 
-Planning occurs before expensive slide rendering. Batch decisions where practical so the runtime does not spend the five-minute budget on dozens of tiny semantic calls.
+### Layout/variant engine
 
-### 4. Supervisor review
+For each planned slide, retrieve compatible layouts, reject invalid candidates deterministically, rank valid structures, and build A/B/C `SlideSpec` variants that preserve meaning while differing in controlled composition/density/grouping/visual treatment.
 
-The supervisor reviews versioned checkpoints using the same semantic model weights with a separate instruction/context and separate KV-cache namespace.
+### Visual engine
 
-It is allowed to:
+Fix semantic visual type first, then produce/select up to three candidates inside that type. Image/photo slots may call the image model. Charts, tables, diagrams, icons, and SmartArt-like structures should remain native/deterministic where practical.
 
-- detect semantic inconsistencies and likely design failures;
-- review screenshots when visual evidence matters;
-- prioritize deterministic findings that need semantic repair;
-- propose bounded patch operations;
-- request a local re-plan when a repair changes meaning or visual type.
+Visual candidate completion is independent of slide-pack publication. A ready structural pack may carry a `generating` image slot; when candidates arrive, persist them and emit `visual-candidates.ready` without blocking generation of later slides.
 
-It is not allowed to:
+### Renderer, audit, repair, export
 
-- create a competing full deck;
-- bypass lock/mutation validation;
-- write OOXML;
-- invent unrestricted coordinates;
-- turn every worker operation into a mandatory serial review.
+Rendering is deterministic and uses validated specs/template references. Deterministic audit runs as soon as renderable state exists. Repairs are local, lock-aware mutations. Preflight verifies integrity, template compliance, editability, and blocking findings before export.
 
-See `MODELS.md` and `INFERENCE.md`.
+HTML is a preview/export surface, not the canonical PPTX representation. Whole-slide rasterization is prohibited as a normal export strategy.
 
-### 5. Layout resolver and variant engine
+## Mutation, locks, and concurrent generation
 
-For each planned slide:
+All mutations use stable ids and expected checkpoint versions.
 
-1. retrieve layouts compatible with the slide intent and slots;
-2. reject candidates that violate deterministic constraints;
-3. rank/select valid structures;
-4. build A/B/C `SlideSpec` variants with controlled differences.
+A local edit to a ready slide and background generation of a future slide may proceed concurrently when their state scopes do not overlap. Conflicting mutations must fail/retry through version checks rather than silently overwrite newer state.
 
-A/B/C variants share meaning but differ in composition/density/grouping/visual treatment. Keep coherent track labels so Deck A/B/C can also be reconstructed.
+Locks are programmatic constraints, not prompt suggestions. Supervisor repair has no privileged bypass.
 
-Do not generate three unrelated decks independently.
-
-### 6. Visual engine
-
-After a visual slot type is fixed, create/select up to three candidates inside that type.
-
-Examples:
-
-- image slot -> image A/B/C;
-- chart slot -> chart treatment A/B/C;
-- diagram slot -> diagram A/B/C.
-
-The system selects a default candidate. Type changes route back through planning/layout resolution.
-
-Only image/photo slots should require the image-generation model. Charts, tables, diagrams, icons, and SmartArt-like structures should remain native/deterministic where practical.
-
-### 7. Native renderer
-
-The renderer is deterministic. It consumes validated specs and template references, then creates native PPTX objects.
-
-Prefer original masters/layouts and reusable template assets. HTML may be generated for preview/export, but HTML DOM/CSS is not the canonical representation for PPTX.
-
-Whole-slide rasterization is prohibited as a normal export strategy. Isolated raster assets are acceptable when the semantic object is inherently raster or unsupported and the slide remains structurally editable.
-
-### 8. Audit and repair
-
-Run deterministic checks after rendering and contextual checks against the rendered slide/spec where needed.
-
-Deterministic audit should run before expensive supervisor review so the supervisor sees focused evidence instead of rediscovering machine-checkable failures.
-
-Repair operates on specific findings and returns a new local spec/render. It must preserve locks and unrelated selections.
-
-### 9. Export/preflight
-
-Preflight validates file integrity, template compliance, geometry, editability, and unresolved blocking findings. Export produces native PPTX and derivative PDF/HTML.
-
-## Two-agent inference boundary
-
-The worker and supervisor are two logical agents, not two model processes.
-
-Required invariant:
-
-```text
-one Qwen3.8-27B weight set
-        |
-        +-- worker request history / KV cache
-        +-- supervisor request history / KV cache
-```
-
-Mutable cache/history is isolated. Shared immutable model weights are required. Engine-level immutable prefix reuse is acceptable only when it does not merge agent histories.
-
-The application service owns checkpoint versions and state transitions. The model server never becomes the source of truth for project/deck state.
-
-## GPU scheduler and deadline boundary
-
-All semantic/media inference goes through a small GPU scheduler/arbiter described in `INFERENCE.md`.
-
-The scheduler must:
-
-- distinguish worker, supervisor, and media workloads;
-- preserve cache/session isolation;
-- prioritize worker forward progress;
-- cancel stale requests;
-- bound supervisor token/retry budgets;
-- expose deadline remaining;
-- collect latency/KV/VRAM telemetry.
-
-A normal 10–15 slide deck has a hard 300-second generation budget. Treat this as an architectural requirement, not a late optimization.
-
-The runtime must be warm before accepting timed generation. Cold startup is measured separately.
-
-## Mutation and lock semantics
-
-All regeneration/repair mutations must pass through a lock-aware mutation boundary.
-
-A lock identifies stable object/slide ids, not ephemeral array indexes. Mutation code must either preserve the lock or return a conflict explaining why the requested operation cannot be completed.
-
-Do not rely on prompt wording alone to preserve locks.
-
-Supervisor repair uses the same mutation boundary; it has no privileged path around locks.
-
-## Model boundary
+## Inference boundary
 
 Models are semantic components, not renderers.
 
-Allowed model decisions include narrative, wording, semantic layout ranking, visual type, candidate ranking, contextual audit, and bounded repair suggestions.
+Allowed semantic decisions: narrative, wording, semantic labeling/ranking, visual type, recommended candidate, contextual review, and bounded semantic repair.
 
-Programmatic code owns exact template values, layout compatibility, geometry, object construction, persistence, locks, deterministic audit, deadline accounting, and export.
+Programmatic code owns exact template values, layout compatibility, geometry, native object construction, locks, state/versioning, deterministic audit, scheduler/deadline state, and export correctness.
 
-See `MODELS.md`.
+`MODELS.md` defines role/prompt policy. `INFERENCE.md` defines physical serving/cache/performance policy.
 
 ## Persistence
 
-A project should be able to persist, at minimum:
+Persist enough structured state to resume/reconnect without relying on model KV cache:
 
 ```text
 original template
 derived template/design-system state
-source content
-brief
+source content + brief
 DeckPlan
-slide variants
-visual candidates
+generation state / next publish index
+slide packs A/B/C
+visual candidates + generating/ready state
 current selections
 locks
-audit results
 checkpoint versions
 supervisor findings/accepted repairs
+audit results
 export metadata
-prompt/skill/model versions used
-inference profile + media profile
+prompt/skill/model/inference versions
 ```
 
-Persist stable ids and version metadata so local regeneration does not invalidate unrelated state.
-
-Do not persist opaque mutable KV-cache blobs as canonical product state. Agent caches are runtime acceleration/state and may be rebuilt from structured checkpoints when necessary.
+KV caches are runtime acceleration/state only and are never canonical project storage.
 
 ## Performance
 
-A normal 10–15 slide deck must complete within 300 seconds.
+A normal 10–15 slide deck must complete within 300 seconds with a warm inference service.
 
-Use concurrency where work is independent:
+Optimize end-to-end flow, not isolated calls:
 
-- render/analyze independent source slides;
-- generate slide candidates after the shared plan exists;
-- render/audit independent slides in parallel;
-- batch compatible image-generation jobs;
-- let supervisor review completed batches while the worker continues when the scheduler has capacity.
+- precompute/cache guaranteed prompt prefixes as defined in `INFERENCE.md`;
+- keep worker forward progress prioritized;
+- pipeline deterministic render/audit with semantic generation;
+- publish completed slide packs immediately instead of waiting for the full deck;
+- batch media jobs where practical;
+- review completed checkpoints with the supervisor opportunistically;
+- cancel stale work and avoid GPU/model thrash.
 
-Do not parallelize work that duplicates planning, creates conflicting state, or causes GPU thrash.
+Track time-to-first-slide-pack, steady pack cadence, total generation time, media latency, supervisor overhead, queue latency, KV pressure, and peak VRAM.
 
-Prefer one shared semantic model instance with two bounded caches over two replicas. Choose FP8/BF16/FP16 from end-to-end benchmark evidence as defined in `INFERENCE.md`.
+## Target module shape
 
-## Target module layout
-
-The exact files may change, but the dependency shape should converge toward:
+Exact files may change; dependency direction should converge toward:
 
 ```text
 apps/daemon/src/presentation/
@@ -367,6 +270,7 @@ apps/daemon/src/presentation/
   template/
   content/
   planning/
+  generation/
   variants/
   visuals/
   render/
@@ -376,31 +280,17 @@ apps/daemon/src/presentation/
   application/
   adapters/
 
-services/inference/             # optional Python/service boundary
+services/inference/             # optional service boundary
   semantic/
   scheduler/
   media/
   telemetry/
 ```
 
-`services/inference/` is a logical boundary, not a requirement to create a new workspace before needed. The implementation may live elsewhere if the same dependency direction is preserved.
-
-Domain contracts should not import HTTP, React, CUDA, Diffusers, or provider SDKs. HTTP routes call application services; application services orchestrate domain engines and adapters.
+Domain contracts do not import React, HTTP transport, CUDA, Diffusers, or provider SDK types.
 
 ## Architectural change policy
 
-An implementation is free to choose algorithms and local abstractions. A change requires documentation review when it alters:
+Review/update documentation when a change alters a source of truth, domain boundary, progressive publication semantics, model-vs-code responsibility, worker/supervisor roles, cache/session isolation, GPU scheduling, variant/visual semantics, lock behavior, native export strategy, audit/preflight gating, or a major runtime dependency/model.
 
-- a source of truth;
-- a domain boundary;
-- model-vs-code responsibility;
-- worker/supervisor role boundaries;
-- cache/session isolation;
-- GPU scheduling or deadline semantics;
-- variant/visual semantics;
-- lock behavior;
-- native export strategy;
-- audit/preflight gating;
-- a major runtime dependency/service or model.
-
-If a rule proves important repeatedly, prefer encoding it in tests or structural checks instead of adding more prose to `AGENTS.md`.
+If a rule repeatedly matters, encode it in tests or structural checks instead of expanding `AGENTS.md` indefinitely.

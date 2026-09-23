@@ -2,73 +2,67 @@
 
 ## Mission
 
-Build LCT as a presentation compiler. The product converts an arbitrary corporate PPTX template, supplied content, and a brief into a recommended editable presentation with controlled alternatives, audit, repair, and export.
+Build LCT as a presentation compiler. It converts an arbitrary corporate PPTX template, supplied content, and a brief into a recommended editable presentation with controlled alternatives, continuous background generation, audit, repair, and export.
 
-The current UI/design implementation is replaceable. Do not preserve existing visual decisions when implementing the new product experience. Preserve product contracts, domain behavior, and architecture boundaries.
+The current UI/design is temporary and replaceable. Preserve product contracts, domain behavior, and architecture boundaries; do not preserve legacy visual decisions for their own sake.
 
-## Source of truth map
+## Source-of-truth map
 
-Read only the documents relevant to the task:
+Read only what the task needs:
 
-- `CONTEXT.md` — product behavior and acceptance flow.
-- `ARCHITECTURE.md` — runtime boundaries and data contracts.
-- `MODELS.md` — model responsibilities and two-agent orchestration.
-- `INFERENCE.md` — GPU serving, precision, cache isolation, scheduling, media model, and the five-minute budget.
+- `CONTEXT.md` — product behavior and user workflow.
+- `ARCHITECTURE.md` — domain boundaries, state flow, and incremental generation.
+- `MODELS.md` — worker/supervisor responsibilities and prompt/skill policy.
+- `INFERENCE.md` — GPU profiles, cache/prefix strategy, scheduling, media inference, and the five-minute budget.
 - `AUDIT.md` — findings, repair, and preflight.
-- `TESTING.md` — verification requirements.
-- `skills/README.md`, `craft/README.md`, `design-systems/README.md` — reusable rules.
+- `TESTING.md` — verification and release gates.
+- `skills/README.md`, `craft/README.md`, `design-systems/README.md` — reusable authoring rules.
 
-Do not duplicate large product rules here.
+Do not duplicate long rules here.
 
 ## Product invariants
 
-- The final goal is an autonomous presentation compiler, not a slide editor or image generator.
+- The final product is an autonomous presentation compiler, not a slide editor or image generator.
 - Unknown PPTX templates must work without template-specific code.
-- The system produces a complete recommended deck first.
-- Every slide has A/B/C alternatives derived from one shared plan.
+- The system produces a complete recommended deck without requiring user decisions.
+- Every slide has A/B/C alternatives derived from one shared deck plan; coherent whole-deck A/B/C tracks must remain reconstructable.
+- After planning, generation runs continuously. A ready slide pack means A/B/C for one slide; publish packs progressively and continue with the next slide without waiting for acknowledgement.
+- The UI may surface unobtrusive progress/new-slide notifications, but generation stops only on completion, explicit pause/cancel, or a true blocking failure.
 - Visual alternatives stay inside one planned semantic type; type changes require re-planning.
-- Users can lock approved slides or blocks. Regeneration and repair must respect locks.
-- Prefer local regeneration over full regeneration.
-- Audit and repair are part of the generation workflow.
+- Users can inspect, switch, or lock already-ready slides while later slides continue generating. Local changes must not restart unrelated work.
+- Audit and repair are part of the generation workflow. Supervisor review must not become a serial approval gate for every slide.
 - Export must produce editable native presentation objects. Full-slide raster output is invalid.
-- The uploaded PPTX is an immutable source artifact.
-- The current product UI is not a source of truth; a future redesign must implement the documented workflow, not replicate old screens.
+- The uploaded PPTX is immutable source material.
 
 ## Runtime and architecture invariants
 
-- `apps/web` owns interaction and state presentation only.
-- `apps/daemon` owns presentation domain logic, persistence, rendering, audit, export, and adapters.
-- Runtime semantic inference uses one shared `Qwen/Qwen3.8-27B` model instance per GPU serving unit, not one model copy per agent.
-- There are two logical agents over that model: the worker drives generation; the supervisor reviews checkpoints and proposes bounded repairs.
-- Worker and supervisor must use separate mutable conversation/KV-cache namespaces. They may share immutable model weights and engine-level immutable prefix optimizations only.
-- The five-minute generation limit is an architectural constraint. Do not add model/media work without accounting for the deadline and GPU memory budget.
-- Models decide semantic things: narrative, wording, ranking, classification, and repair suggestions.
-- Deterministic code owns geometry, constraints, object creation, locks, persistence, validation, and export.
-- Never delegate exact layout calculations or PPTX structure to a model.
-- Keep integrations behind adapters and validate structured model output before use.
-- Keep orchestration thin; use specialized skills/modules with narrow contracts.
+- `apps/web` owns interaction and presentation of state only.
+- `apps/daemon` owns presentation domain logic, persistence, rendering, audit, export, orchestration, and adapters.
+- Runtime semantic inference uses one logical `Qwen/Qwen3.8-27B` model service. Its weights may reside on one GPU or be sharded across multiple GPUs; worker and supervisor do not get separate model replicas.
+- Worker drives forward generation. Supervisor reviews versioned checkpoints and proposes bounded repairs/local re-plans.
+- Worker and supervisor have isolated mutable session/KV state. Shared immutable weights and safe immutable prefix-cache reuse are allowed.
+- Guaranteed runtime instructions/pipeline prefixes should be prewarmed before timed generation; mutable project context remains scoped and validated.
+- The normal 10–15 slide deck must complete within 300 seconds. Do not add model/media work without accounting for latency, VRAM, and scheduler impact.
+- Models make semantic decisions. Deterministic code owns exact geometry, constraints, native object construction, locks, persistence, validation, scheduling state, and export correctness.
+- Keep integrations behind adapters and validate structured model output before mutation/rendering.
 
 ## Autonomous execution
 
-Work as a senior engineer: inspect, decide, implement, verify, and refine.
+Work as a senior engineer: inspect, decide, implement, verify, and refine. Within documented invariants choose local algorithms, data structures, refactors, and module layout freely.
 
-Within documented invariants choose implementation details freely. Ask only when a decision changes product behavior, breaks an invariant, introduces a major dependency, or cannot be safely inferred.
-
-Prefer the smallest complete vertical slice over speculative infrastructure.
+Ask only when a decision changes product behavior, breaks an invariant, introduces a major dependency/service, or cannot be safely inferred. Prefer the smallest complete vertical slice over speculative framework work.
 
 ## Required self-checks
 
 Before declaring work complete:
 
-1. Re-read the relevant source-of-truth documents.
-2. Check that the change improves the final product goal, not only the local implementation.
-3. Check for contradictions with architecture, UX, model boundaries, export rules, and the five-minute runtime contract.
-4. If inference is affected, verify: one shared weight set, two isolated agent caches, bounded supervisor work, VRAM headroom, and deadline behavior.
-5. Update documentation when behavior or architecture changes.
-6. Run the narrowest meaningful validation commands.
-7. Report checks actually executed; never claim unrun checks passed.
-
-Validation:
+1. Re-read the relevant source-of-truth docs.
+2. Check that the change improves the final product goal, not only a local implementation detail.
+3. Check for contradictions across product UX, architecture, model roles, audit/export, and the 300-second runtime contract.
+4. If generation flow changed, verify progressive slide-pack publication, no per-pack user gate, stable A/B/C semantics, and local edits that do not reset unrelated pending work.
+5. If inference changed, verify one logical model, isolated worker/supervisor state, eager prefix warmup, measured VRAM headroom, hardware-profile behavior, and deadline degradation.
+6. Update the canonical document when behavior or architecture changes; avoid copying the same policy into multiple files.
+7. Run the narrowest meaningful validation and report only checks actually executed.
 
 ```bash
 pnpm check:boundary
@@ -77,4 +71,4 @@ pnpm typecheck         # when TypeScript changes
 pnpm build             # when runtime/UI/build behavior changes
 ```
 
-If a check cannot run, state the exact limitation.
+If a required check cannot run, state the exact limitation.
