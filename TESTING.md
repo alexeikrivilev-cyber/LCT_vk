@@ -2,19 +2,18 @@
 
 ## Goal
 
-Tests must prove the system works on unseen templates, preserves the architectural contracts, and meets the five-minute runtime budget. Passing isolated unit tests is not sufficient if the end-to-end deck misses the deadline or the two-agent runtime violates cache/state isolation.
+Tests must prove the system works on unseen templates, preserves domain/runtime contracts, publishes usable results progressively, and completes a normal deck within 300 seconds. Isolated green unit tests are insufficient if the end-to-end product stalls, leaks agent state, or misses the deadline.
 
-The most important regression surface is:
+The main regression surface is:
 
 ```text
 unknown PPTX + content + brief
-  -> design system
-  -> worker plan
-  -> supervisor review
-  -> A/B/C variants
-  -> native render
+  -> template/design-system compilation
+  -> shared DeckPlan
+  -> continuous A/B/C slide packs
+  -> incremental visual candidates
   -> audit/repair
-  -> media candidates
+  -> selected native deck
   -> preflight/export
 ```
 
@@ -29,198 +28,213 @@ pnpm typecheck
 pnpm build
 ```
 
-`pnpm lint:craft` is required when skills/craft bindings change. Typecheck/build are required when their corresponding code paths change.
+`pnpm lint:craft` is required when skill/craft bindings change. Typecheck/build are required when the corresponding code paths change.
 
-Add subsystem tests as the compiler modules land; do not defer all verification to one final E2E demo.
+## Deterministic unit tests
 
-## Test layers
+Prioritize exact programmatic contracts:
 
-### Unit tests
-
-Prioritize deterministic code:
-
-- OOXML/PPTX parsing helpers;
-- geometry and unit conversion;
+- OOXML/PPTX parsing and unit conversion;
 - template token/style extraction;
-- layout compatibility;
-- slot mapping;
+- layout compatibility and slot mapping;
+- `DeckPlan`/`SlideSpec`/`SlidePack` validation;
+- stable ids/checkpoint/version conflict detection;
 - lock-aware mutation;
-- checkpoint/version conflict detection;
-- density calculations;
-- deterministic audit rules;
-- export relationship/object construction;
-- deadline accounting and scheduler priority rules.
+- generation queue and next-publish-index logic;
+- density and deterministic audit rules;
+- event/state serialization;
+- export relationships/native object construction;
+- deadline accounting/scheduler priority rules.
 
-Tests should use small fixtures and exact assertions.
+Use small fixtures and exact assertions.
 
-### Golden template fixtures
+## Golden template fixtures
 
-Maintain several compact PPTX fixtures with known expected extraction results:
+Maintain compact PPTX fixtures with known expected extraction results: masters/layouts, placeholder geometry/types, theme colors/fonts, repeated assets, charts/tables, and unusual valid structures.
 
-- masters/layout ids and counts;
-- placeholder geometry/types;
-- theme colors/fonts;
-- repeated assets;
-- chart/table examples;
-- unusual but valid structures.
+Compare normalized `TemplateIR`/design-system state, not unstable ZIP timestamps or irrelevant relationship ordering.
 
-Golden output should compare normalized `TemplateIR`/design-system data, not unstable ZIP timestamps or relationship ordering that has no semantic meaning.
+## Progressive-generation integration tests
 
-### Integration tests
+This is a first-class product contract.
 
-Exercise boundaries:
+Test a multi-slide `DeckPlan` and verify:
 
-- upload template/source files;
-- compile template;
-- persist/reload project state;
-- plan deck from structured content;
-- run supervisor plan review;
-- generate A/B/C slide specs;
-- generate same-type visual candidates;
-- render native PPTX;
-- run audit;
-- apply a local worker or supervisor repair;
-- export/reopen result.
+- generation starts once and does not require acknowledgement between slides;
+- slide packs become visible incrementally before the full deck is complete;
+- each published pack contains all three A/B/C structural candidates and one recommended default;
+- visible pack order follows deck order even if internal work is pipelined;
+- progress is monotonic and reconnect can recover current persisted state;
+- Worker begins/continues future slide work after publishing the previous pack;
+- local selection/lock/edit on a ready slide does not pause or reset unrelated pending slides;
+- a scoped future-plan change invalidates only the affected pending scope;
+- explicit pause/cancel stops forward generation cleanly;
+- a blocking failure preserves already-ready slide packs/project state.
 
-### Variant invariants
+Test incremental events such as `generation.progress`, `slide-pack.ready`, `visual-candidates.ready`, `audit.updated`, and terminal completion/failure. The exact transport may vary; event meanings/state recovery may not.
+
+## Variant invariants
 
 For every planned slide:
 
-- three candidates exist when requested;
-- candidates preserve the same core slide intent/takeaway;
+- three candidates exist when the pack is published;
+- candidates preserve the same core intent/takeaway;
 - each candidate uses an allowed template layout/family;
 - coherent Deck A/B/C tracks can be reconstructed;
-- user-selected mixed deck remains valid.
+- a user-selected mixed deck remains valid.
 
 For visual slots:
 
-- candidate type equals planned slot type;
-- switching candidate does not change layout semantics unexpectedly;
+- candidate type equals the planned semantic type;
+- candidate switching does not silently change type/layout semantics;
 - explicit type change goes through re-plan;
-- image generation is used only for image/photo slots unless a documented exception exists.
+- image generation is used only for image/photo slots unless a documented exception exists;
+- a structural slide pack may be ready while an image slot is still `generating`, then updates in place when three candidates arrive.
 
-### Lock tests
+## Lock and concurrent-mutation tests
 
-Locks require dedicated regression coverage:
+Verify:
 
-- locked slide survives unrelated regeneration;
-- locked visual survives slide regeneration;
-- worker repair targeting another object does not alter locks;
-- supervisor repair targeting another object does not alter locks;
-- conflicting worker/supervisor action returns a conflict instead of mutating the lock;
-- save/reload preserves lock ids.
+- locked slide survives unrelated background generation;
+- locked visual survives slide-local regeneration;
+- Worker/Supervisor repair targeting another object does not alter locks;
+- conflicting mutations fail/retry by checkpoint version rather than overwrite newer state;
+- save/reload preserves lock ids and generation progress;
+- user edits on completed slides and background generation of later slides can coexist safely when scopes do not overlap.
 
-### Supervisor tests
+## Worker/Supervisor tests
 
-The supervisor is a bounded runtime role, not a second deck generator. Test that:
+Supervisor is bounded and asynchronous to normal forward progress.
 
-- its output is tied to a checkpoint version;
-- stale decisions are rejected;
-- invalid target ids are rejected;
-- lock-conflicting patches are rejected;
-- `local-replan` routes back through the worker rather than mutating broad state directly;
-- repeated low-value warnings are bounded/deduplicated;
-- it can inspect screenshots where visual context is required;
-- it cannot bypass deterministic validation/render/export contracts.
+Verify:
 
-Maintain benchmark examples where the supervisor should catch a clear contextual error and examples where it should pass a good slide. Measure false-positive/repair value rather than rewarding finding count.
+- one logical semantic model serves both roles;
+- Worker/Supervisor mutable session/cache identities are distinct;
+- Supervisor output is tied to a checkpoint version;
+- stale/invalid/lock-conflicting patches are rejected;
+- `local-replan` routes through Worker/application state;
+- Supervisor cannot bypass deterministic validation/render/export;
+- low-value repeated warnings are bounded/deduplicated;
+- Supervisor can inspect screenshots where visual context matters;
+- normal Supervisor review does not become a mandatory gate between slide packs.
 
-### Audit tests
+Maintain positive/negative benchmark examples and measure useful accepted fixes versus false positives/latency, not finding count.
 
-Follow `AUDIT.md`.
+## Audit/export tests
 
-Deterministic findings use exact fixture assertions. Contextual checks use a benchmark set with expected pass/fail tendencies and reviewable outputs.
+Follow `AUDIT.md` for rule coverage.
 
-### Native PPTX/export tests
+Export validation should confirm:
 
-Validate the exported file structurally:
-
-- ZIP/OOXML opens;
+- PPTX ZIP/OOXML opens;
 - slide relationships resolve;
 - text remains text;
 - images remain image objects;
 - supported charts/tables remain native where expected;
-- slide is not one full-slide image;
+- no normal slide is one full-slide image;
 - dimensions/master/layout references are valid;
-- presentation can be reopened by the parser.
+- the exported presentation can be reopened by the parser.
 
-Where practical, render exported slides to images and compare with expected geometry/tolerance; visual comparison supplements structural checks and never replaces them.
+Visual rendering comparison may supplement structural checks; it never replaces them.
 
-### Browser smoke tests
+## Browser/product smoke test
 
-Cover the main desktop journey:
+Cover the redesigned product behavior rather than legacy pixels:
 
-- create project;
-- upload template/content;
-- inspect template;
-- view outline;
-- view/switch slide alternatives;
-- switch a visual candidate;
-- lock;
-- local regenerate;
-- open audit;
-- repair selected issue;
-- export.
+1. create project;
+2. upload template/content and brief;
+3. inspect template understanding;
+4. view/accept outline;
+5. start generation once;
+6. observe progress/new slide packs appearing continuously;
+7. switch/lock a ready slide while later slides keep generating;
+8. observe visual candidates update a ready slot;
+9. perform local regeneration;
+10. open audit and repair one issue;
+11. export.
 
-Do not preserve tests for the current visual design when the product UI is redesigned. Browser tests should anchor on behavior, stable roles/labels/test ids, and product state rather than brittle styling or pixel-perfect legacy screens.
+Anchor tests on stable roles/state/test ids, not current styling. The UI is expected to be redesigned.
 
-## Two-agent inference tests
+## Prompt-prefix and cache tests
 
-`INFERENCE.md` defines the runtime contract. Before an inference configuration is accepted, verify:
+`INFERENCE.md` defines the cache contract.
 
-- one semantic model weight set serves both worker and supervisor;
-- worker and supervisor use distinct session/cache identities;
-- worker history cannot appear in supervisor context unless explicitly supplied as structured checkpoint data;
-- supervisor history cannot leak into worker requests;
-- no cross-project context leakage occurs after cache reuse/eviction;
-- cache pressure/eviction for one role does not corrupt the other's active state;
-- request cancellation rejects stale supervisor work;
-- worker progress has scheduler priority under contention;
-- supervisor token/retry limits are enforced;
-- the model server is warm before readiness is reported.
+Before an inference profile is accepted, verify:
 
-If the serving engine has an immutable prefix cache, test that prefix reuse does not merge mutable agent histories.
+- Worker and Supervisor required role/stage instruction prefixes are warmed before timed generation readiness;
+- the first normal stage can reuse the warmed prefix instead of re-prefilling all static instructions;
+- instruction-version changes invalidate stale prefix entries;
+- Worker generated tokens never leak into Supervisor history and vice versa;
+- no cross-project mutable context leakage occurs after cache reuse/eviction;
+- project-scoped cached summaries respect project/checkpoint versioning;
+- optional craft/retrieval content is not blindly injected into every call;
+- cache pressure/eviction for one role does not corrupt the other.
 
-## Precision and VRAM benchmark
+Record prefix-prefill latency/hit behavior when the serving engine exposes it.
 
-Do not choose FP8, BF16/FP16, or any quantization profile by intuition.
+## Hardware-profile benchmark
 
-For every candidate serving profile measure the same representative workload:
+Do not choose precision, GPU count, or sharding by intuition.
 
-- model load/resident memory;
-- peak memory with worker + supervisor KV caches;
-- representative context lengths;
-- time-to-first-token and decode throughput;
-- continuous-batch behavior with both agents active;
-- semantic quality on fixed prompts/decks;
-- media coexistence or model-swap cost;
-- end-to-end deck wall time.
+Benchmark the same representative deck workload for candidate profiles.
 
-The initial H100 target is `Qwen/Qwen3.8-27B-FP8`. BF16/FP16 may replace it only if the full benchmark is better while retaining VRAM safety margin and the five-minute SLO.
+### Primary profile
 
-A release profile must record model revision, precision, inference engine, GPU SKU, CUDA/runtime versions, context budgets, and scheduler settings.
+```text
+1 x H100-class
+Qwen/Qwen3.8-27B-FP8 initially
+```
+
+Also benchmark BF16/FP16 when practical. Replace FP8 only if end-to-end quality/performance and memory headroom are better while still passing the 300-second gate.
+
+### Fallback profile
+
+If the primary profile misses the gate or is unavailable, benchmark:
+
+```text
+2 x RTX 5090-class
+one logical Qwen3.8-27B instance
+weights sharded/partitioned across devices
+```
+
+Test supported tensor/pipeline/other sharding modes. Do not assume linear speedup. Measure communication overhead, per-device memory, KV placement, batching behavior, and media residency/swap cost.
+
+A fallback profile must preserve the same Worker/Supervisor and product semantics; it is not permission to assign a full independent model to each role.
+
+For every profile record:
+
+- model revision/precision;
+- serving engine/runtime/CUDA versions;
+- GPU SKU/count/topology and sharding strategy;
+- resident and peak memory per device;
+- Worker + Supervisor KV/prefix-cache footprint;
+- TTFT/decode throughput/continuous batching;
+- queue latency;
+- semantic quality on fixed cases;
+- time-to-first-slide-pack and pack cadence;
+- end-to-end deck time;
+- media coexistence or model-swap overhead.
 
 ## Media inference tests
 
-For the preferred `Qwen/Qwen-Image-2.1` media profile measure:
+For preferred `Qwen/Qwen-Image-2.1`, measure:
 
 - load/residency memory;
-- single-image and batched candidate latency;
-- target aspect-ratio behavior;
+- single/batched candidate latency;
+- aspect-ratio behavior;
 - candidate diversity/relevance;
-- impact on semantic model KV/VRAM headroom;
-- co-resident versus staged residency;
-- model-swap overhead when staged.
+- impact on semantic KV/prefix/VRAM headroom;
+- co-resident versus staged behavior;
+- swap overhead where staged;
+- incremental update latency for already-published image slots.
 
-The media adapter must be swappable without presentation-domain changes.
+The media adapter must remain swappable without domain changes.
 
-Before qualification/final freeze, explicitly re-check the media-model license against the case rules. If Qwen-Image-2.1 remains outside the permitted license class and no organizer exception exists, the compliant fallback path must be exercised, not merely documented.
+Before qualification/final freeze, re-check the media-model license against case rules and exercise a compliant fallback if needed.
 
 ## Five-minute performance gate
 
-A normal 10–15 slide benchmark is a release gate, not a stretch goal.
-
-Measure from generation start with validated inputs and a warm inference service through a usable generated deck, required A/B/C slide variants, media candidates required by the scenario, audit/repair pass, and preflight/export readiness.
+Measure from generation start with validated inputs and a warm model/prefix state through complete usable deck and preflight/export readiness.
 
 Hard gate:
 
@@ -234,80 +248,54 @@ Engineering target:
 wall time <= 270 s
 ```
 
-The remaining buffer protects the live demo from export/UI jitter.
+Also track progressive UX metrics:
 
-Track per stage:
+- time to first `slide-pack.ready`;
+- inter-pack cadence;
+- percentage of deck available over time;
+- time to image-candidate readiness;
+- Supervisor latency contribution;
+- remaining deadline headroom.
 
-- deterministic ingest/template/content compilation;
-- worker calls;
-- supervisor calls;
-- render/audit;
-- media generation;
-- repairs/replans;
-- preflight/export;
-- queue/model-swap overhead.
+Cold model load and static instruction-prefix warmup are measured separately as readiness/startup costs and must not be hidden inconsistently across runs.
 
-Also report cold startup separately. The service must pre-warm models before accepting timed generation; cold startup cannot be silently included only in favorable benchmark runs.
-
-Test deadline degradation policy by injecting slow calls. Confirm that the system cancels stale work, narrows supervisor review, reduces optional polish, and preserves native export/locks/A-B-C semantics instead of looping past the deadline.
+Inject slow calls to test degradation policy. Confirm stale work is cancelled, Supervisor breadth/optional polish are reduced first, and required A/B/C/native/lock semantics plus forward slide generation survive.
 
 ## Hackathon benchmark
 
-Maintain a repeatable benchmark separate from ad-hoc demos.
+Maintain repeatable cases across structurally different templates and text/data/visual-heavy content. Include tables/charts/diagrams, density edge cases, and at least one held-out template not used for skill tuning.
 
-At minimum include:
+Rehearsal must demonstrate the required three full variants on the same content across multiple templates while also validating the product's per-slide A/B/C experience.
 
-- multiple structurally different templates;
-- text-heavy, data-heavy, and visual content packs;
-- tables/charts/diagrams;
-- long/short titles and edge-case density;
-- at least one template intentionally held out from prompt/skill tuning.
-
-Qualification/final rehearsal should cover three layout variants on the same content across three templates, producing the required nine variant outputs.
-
-Track:
-
-- generation success rate;
-- total runtime and deadline headroom;
-- worker/supervisor call counts and latency;
-- deterministic audit pass rate;
-- overflow/overlap counts;
-- template compliance;
-- native-object/editability checks;
-- lock preservation;
-- contextual audit/supervisor quality;
-- peak VRAM/KV-cache pressure;
-- failures by pipeline stage.
+Track generation success, total/progressive latency, audit pass/failures, template compliance, native editability, lock preservation, Supervisor value, peak VRAM/cache pressure, and failures by pipeline stage.
 
 ## Prompt/skill regression
 
-Prompt and skill changes are code changes.
+Prompt/skill changes are code changes.
 
 For a candidate change:
 
-1. run the fixed benchmark with the current version;
-2. run the candidate version;
-3. compare deterministic metrics, runtime, and reviewed contextual quality;
-4. inspect regressions by failure class;
-5. accept only when aggregate quality improves without violating hard gates such as native export, locks, or 300-second runtime;
-6. record the new version.
+1. run fixed baseline benchmark;
+2. run candidate;
+3. compare deterministic quality, reviewed semantic quality, progressive latency, and total runtime;
+4. inspect failure-class regressions;
+5. reject any change that violates hard gates even if prose quality improves;
+6. version accepted instructions/prefix bundles.
 
-Benchmark worker and supervisor instructions separately where possible. A supervisor prompt that catches more issues but doubles runtime or creates noisy repairs is a regression.
-
-Do not tune only on the live demo templates.
+Benchmark Worker and Supervisor instruction changes separately where possible.
 
 ## Definition of done
 
 A feature is done when:
 
-- the requested behavior works end-to-end;
-- relevant deterministic contracts have tests;
-- failure states are handled without corrupting project state;
-- locks and selections remain stable where applicable;
-- supervisor/checkpoint semantics are covered when affected;
-- audit/preflight implications are covered;
-- inference changes have measured cache/VRAM/deadline behavior;
-- source-of-truth documentation is updated if behavior/architecture changed;
-- applicable repository checks have run successfully, or the exact blocked checks are reported.
+- requested behavior works end-to-end;
+- deterministic contracts have relevant tests;
+- failure states preserve project/ready-slide state;
+- progressive generation semantics remain correct when affected;
+- locks/version conflicts are covered;
+- audit/preflight/export implications are covered;
+- inference changes include measured cache/VRAM/profile/deadline behavior;
+- canonical documentation is updated without conflicting duplicates;
+- applicable repository checks actually pass, or blocked checks are reported precisely.
 
-A screenshot or one successful manual run is not sufficient evidence for parser, renderer, audit, export, or inference-scheduler changes.
+One screenshot or one successful manual run is not sufficient evidence for parser, generator, renderer, audit, export, or inference changes.

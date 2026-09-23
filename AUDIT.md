@@ -7,11 +7,9 @@ Audit is a first-class product stage. It detects presentation defects, shows the
 The system keeps two classes separate:
 
 - **deterministic findings** — reproducible checks with programmatic evidence;
-- **contextual findings** — semantic/design judgments that may use the runtime supervisor.
+- **contextual findings** — semantic/design judgments normally handled by the runtime Supervisor.
 
-A finding must say which class produced it.
-
-The two-agent runtime remains intact: contextual audit is normally a supervisor capability/skill, not a third semantic agent. The worker owns broad generation/re-planning; deterministic code owns machine-checkable audit.
+A finding must say which class produced it. Contextual audit is a Supervisor capability, not a third semantic agent.
 
 ## Finding contract
 
@@ -32,7 +30,7 @@ suggestedAction      optional
 checkpointVersion    when model review/repair is involved
 ```
 
-Use stable slide/object ids so findings survive UI refreshes and can target local repair.
+Use stable slide/object ids so findings survive UI refresh/reconnect and can target local repair.
 
 Suggested severities:
 
@@ -42,7 +40,7 @@ Suggested severities:
 
 ## Deterministic checks
 
-These checks should not call an LLM.
+These checks do not call an LLM.
 
 ### Geometry and layout
 
@@ -59,25 +57,25 @@ These checks should not call an LLM.
 - excessive font families on one slide;
 - font size outside the template scale;
 - color outside allowed palette/roles;
-- slide not based on an allowed template layout/derived layout family;
-- moved or altered protected logo/header/footer;
-- insufficient text/background contrast where measurable.
+- slide not based on an allowed template layout/derived family;
+- moved/altered protected logo/header/footer;
+- insufficient measurable contrast.
 
 ### Density
 
-- more than six bullets unless the template explicitly supports it;
+- more than six bullets unless the template supports it;
 - overly long bullet copy;
 - table beyond practical row/column limits;
 - chart with too many simultaneous series;
 - obvious underfill/overfill against slide-density bounds.
 
-The exact threshold can be template-aware, but default case thresholds should remain stable and testable.
+Thresholds may be template-aware, but default case thresholds remain stable and testable.
 
 ### Integrity
 
 - PPTX cannot be opened/parsed after export;
 - placeholder/test/prompt text leaked into output;
-- empty or title-only slide without an intentional semantic role;
+- empty/title-only slide without intentional role;
 - full slide exported as one raster image;
 - chart missing required axes/units/legend;
 - duplicate slides;
@@ -85,13 +83,13 @@ The exact threshold can be template-aware, but default case thresholds should re
 
 ## Contextual checks
 
-These are normally executed by the supervisor against a versioned checkpoint and may use rendered screenshots. Return structured findings/evidence summaries, not hidden chain-of-thought.
+Supervisor contextual review may use rendered screenshots plus structured checkpoint state. Return structured findings/evidence summaries, not hidden chain-of-thought.
 
 Check whether:
 
-- the title states a useful conclusion rather than merely naming a topic;
+- title states a useful conclusion rather than only a topic;
 - content supports the title/takeaway;
-- the slide can be summarized by one clear sentence;
+- the slide has one clear takeaway;
 - substantive content is present;
 - images/icons/diagrams are relevant;
 - prompt/system/speaker-note garbage leaked into visible content;
@@ -99,25 +97,32 @@ Check whether:
 - table rows/legend items/chart series serve the slide point;
 - adjacent slides form a coherent narrative.
 
-Source consistency may be checked against the supplied content package where tractable. Do not turn this into an external research/fact-checking subsystem.
+Source consistency may be checked against supplied content where tractable. Do not turn this into external research/fact-checking.
 
-The supervisor should not re-audit every slide with a long model call. Deterministic findings, ambiguity, risk, and deadline remaining should decide where contextual review is valuable.
+Supervisor should not re-audit every slide with a long call. Deterministic findings, ambiguity, risk, and remaining deadline decide where contextual review is worth the latency.
 
-## When audit runs
+## Audit during progressive generation
 
-Recommended stages:
+Audit must support continuous slide-pack generation rather than forcing a serial review workflow.
 
-1. **Spec validation** — before rendering; reject impossible slots/layout mappings.
-2. **Post-render deterministic audit** — geometry, style, density, object integrity.
-3. **Supervisor contextual review** — on high-value/ambiguous rendered/spec states and batches, using deterministic findings as evidence.
-4. **Repair loop** — user-selected, supervisor-proposed, or safe automatic local fixes.
-5. **Preflight** — final blocking checks immediately before export.
+For each slide pack:
+
+1. validate the three `SlideSpec` candidates before publication;
+2. run blocking deterministic render/integrity checks required for a usable pack;
+3. publish the valid A/B/C pack;
+4. continue generation of later slides immediately;
+5. run non-blocking deterministic/contextual review and safe repair asynchronously where appropriate;
+6. emit `audit.updated` / `slide.updated` when later findings or repairs change an already-ready slide.
+
+A severe deterministic problem may prevent publication of the affected pack until repaired. Ordinary warnings and contextual Supervisor review must not hold the entire generation queue.
+
+Visual candidates that arrive later receive their own deterministic/contextual checks without resetting the slide pack or blocking unrelated future slides.
 
 Audit must also be runnable on demand.
 
 ## Visual Audit UX
 
-The presentation view should overlay findings on the affected regions where coordinates/object ids are known.
+The presentation view should overlay findings on affected regions where coordinates/object ids are known.
 
 The issue panel should support:
 
@@ -128,56 +133,57 @@ The issue panel should support:
 - jump to slide/object;
 - show resolved/unresolved state.
 
-The user is not required to repair every warning before export unless it is a preflight-blocking error.
+The user is not required to repair every warning before export unless it is preflight-blocking.
 
 ## Repair contract
 
 Repair is local.
 
-A repair receives the finding, current `SlideSpec`, relevant template/design-system context, locks, and the expected checkpoint version. It returns an explicit mutation, a local re-plan request, or a conflict.
+A repair receives the finding, current `SlideSpec`, relevant template/design-system context, locks, and expected checkpoint version. It returns an explicit mutation, a local re-plan request, or a conflict.
 
 Rules:
 
 - never change locked objects silently;
 - reject stale checkpoint-targeted patches;
 - do not regenerate unrelated slides;
-- deterministic repairs should stay deterministic when possible;
-- semantic repairs may be proposed by the supervisor but must pass schema/constraint/mutation validation;
-- broad narrative or visual-type changes route back to the worker as a local re-plan;
-- rerun affected deterministic checks after every repair;
-- keep repair lineage for undo/debugging.
+- deterministic repairs stay deterministic when possible;
+- Supervisor semantic repairs must pass schema/constraint/mutation validation;
+- broad narrative or visual-type changes route back to Worker as a local re-plan;
+- rerun affected deterministic checks after repair;
+- keep repair lineage for undo/debugging;
+- do not pause unrelated background slide generation unless the repair invalidates shared future state.
 
 Examples:
 
-- overflow -> shorten/fitsafe text or choose compatible text treatment;
-- palette violation -> map to nearest allowed semantic color role;
+- overflow -> shorten/fitsafe text or compatible text treatment;
+- palette violation -> map to allowed semantic color role;
 - moved protected footer -> restore template position;
-- weak title -> supervisor proposes title-only semantic patch;
+- weak title -> title-only semantic patch;
 - irrelevant image -> request/select new image candidates for the same image slot type.
 
-The supervisor has no privileged mutation path. Its repair proposal uses the same lock-aware application boundary as user/worker edits.
+Supervisor has no privileged mutation path.
 
 ## Automatic repair
 
-Safe, meaning-preserving deterministic fixes may run automatically if they are reversible and cannot materially change the user's chosen design/content.
+Safe, meaning-preserving deterministic fixes may run automatically when reversible and unable to materially change the user's chosen design/content.
 
-A supervisor-proposed semantic repair may be auto-applied only when product policy explicitly classifies that repair as safe, it passes validation, it does not touch locks, and the change remains visible/reversible. Otherwise surface it for selection or route through normal repair UX.
+A Supervisor-proposed semantic repair may be auto-applied only when product policy marks it safe, validation passes, locks are untouched, and the change remains visible/reversible. Otherwise surface it for selection or route through normal repair UX.
 
-Anything that changes meaning, chart semantics, layout family, visual type, or a locked item requires explicit user action or a clearly visible re-plan.
+Anything that changes meaning, chart semantics, layout family, visual type, or a locked item requires explicit action or visible re-plan.
 
 ## Preflight gates
 
-PPTX export should be blocked or clearly fail when:
+PPTX export should block/fail when:
 
 - the file cannot be produced/opened;
-- a slide is represented primarily as a full-slide raster;
+- a slide is primarily a full-slide raster;
 - severe overflow/out-of-bounds content remains;
-- required protected template elements are corrupted;
+- protected template elements are corrupted;
 - a required relationship/asset is broken.
 
-Other warnings can remain exportable with visible status.
+Other warnings may remain exportable with visible status.
 
-Preflight should report a compact summary, e.g.:
+Example summary:
 
 ```text
 15/15 slides structurally valid
@@ -188,14 +194,12 @@ native object checks passed
 3 non-blocking warnings
 ```
 
-Preflight must respect the generation deadline. Never replace deterministic preflight with one more unbounded supervisor pass.
+Preflight respects the generation deadline. Never replace deterministic preflight with an unbounded Supervisor pass.
 
 ## Determinism and tests
 
-Every deterministic rule needs fixture-based tests with both positive and negative examples.
+Every deterministic rule needs positive/negative fixture tests. Given the same rendered/spec state and audit version, deterministic findings must be identical.
 
-Given the same rendered/spec state and audit version, deterministic findings must be identical.
+Contextual rules use benchmark examples/regression scoring. Track Supervisor false positives, accepted repairs, regressions, and latency contribution.
 
-Contextual rules need benchmark examples and regression scoring rather than pretending to be bit-for-bit deterministic. Track supervisor false positives, accepted repairs, regressions, and latency contribution.
-
-`TESTING.md` defines the broader coverage strategy.
+`TESTING.md` defines broader coverage.
