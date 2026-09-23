@@ -54,6 +54,9 @@ Implemented today:
 - deterministic PPTX structural inspection, canonical `TemplateIR` v1 mapping, and a structural `PresentationDesignSystem` summary;
 - on-demand project template compilation through the daemon API, persisted in a project-local hidden JSON sidecar with source-hash invalidation;
 - a workspace panel for observed canvas, slides, masters/layouts, theme/style facts, assets, unsupported features, and warnings;
+- bounded ContentIR v1 compilation for selected text, Markdown, JSON, CSV/TSV, image references, and inventory-only unsupported files;
+- validated Brief v1 and narrative-only DeckPlan v1 planning through the semantic adapter, with bounded Supervisor review/repair/re-plan;
+- project-local planning persistence, input-fingerprint staleness checks, planning API, and a compact workspace planning panel;
 - live HTML preview with relative resources;
 - built-in design-system and skill discovery;
 - image-generation adapter;
@@ -62,17 +65,19 @@ Implemented today:
 - presentation-oriented Node/TypeScript runtime;
 - PPTX/PDF primitives available to the daemon.
 
-Content ingestion, narrative planning, progressive generation, native rendering, audit/export, and actual GPU serving/orchestration described below remain target architecture. The inference adapter carries caller-supplied stateless requests; it does not create persistent Worker/Supervisor sessions or KV namespaces. Template understanding v1 is implemented as a deterministic structural scan; it does not establish universal arbitrary-template compatibility.
+The planning vertical slice is implemented through persisted DeckPlan and API/UI presentation. ContentIR v1 only deterministically compiles user-supplied `.txt`, `.md`, `.json`, `.csv`, and `.tsv` text; images become references and other binary files are inventory-only with warnings. It does not parse PDF/Office content, create semantic summaries, or perform research. SlidePack generation, progressive publication, native rendering, audit/export, and actual GPU serving/orchestration remain target architecture. The inference adapter carries caller-supplied stateless requests; it does not create persistent Worker/Supervisor sessions or KV namespaces. Template understanding v1 is a deterministic structural scan and does not establish universal arbitrary-template compatibility.
 
 ## Canonical pipeline
 
 ```text
 PPTX -> deterministic ingest/OOXML parse -> TemplateIR -> PresentationDesignSystem
-content package -> ContentIR
+selected user sources + Brief -> ContentIR
 
-TemplateIR + PresentationDesignSystem + ContentIR + brief
-  -> worker DeckPlan
-  -> bounded supervisor plan review
+TemplateIR + PresentationDesignSystem + ContentIR + Brief
+  -> Worker -> canonical DeckPlan -> bounded Supervisor plan review
+  -> persisted planning state / API / UI
+
+  -> SlidePack generation (target)
   -> continuous slide-pack pipeline
        slide 1: A/B/C -> validate/render/audit -> publish
        slide 2: A/B/C -> validate/render/audit -> publish
@@ -149,11 +154,11 @@ The implemented v1 is a deterministic structural summary referencing `TemplateIR
 
 ### `ContentIR`
 
-Normalized user material needed for planning: sections, claims, metrics, series, comparisons, chronology, processes, tables, images, and supporting content units.
+Implemented v1 is a deterministic, provenance-preserving compilation of selected user-supplied files. It keeps exact source identity/hash and byte locators; extracts bounded text/Markdown heading units, JSON values with lexical numbers, CSV/TSV cells, and image references. Unsupported files retain metadata/hash and a warning. It performs no model interpretation or web research. Rich semantic structures such as inferred claims, comparisons, chronology, or processes remain future work.
 
 ### `DeckPlan`
 
-Narrative decisions only: slide order, purpose, takeaway, content references, semantic visual type, and target density. No unrestricted absolute geometry.
+Implemented v1 persists a strictly validated narrative plan: working title, narrative summary, and slides with app-assigned ids/order, narrative role, purpose, takeaway, valid ContentIR references, bounded semantic visual type, and target density. It contains no unrestricted absolute geometry or renderer objects.
 
 ### `SlideSpec`
 

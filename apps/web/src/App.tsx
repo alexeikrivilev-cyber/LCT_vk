@@ -39,6 +39,22 @@ type TemplateCompileResponse = {
   presentationDesignSystem?: unknown;
 };
 
+type PlanningResponse = {
+  status?: string;
+  templateStatus?: string;
+  contentFiles?: string[];
+  brief?: unknown;
+  contentIR?: unknown;
+  deckPlan?: unknown;
+  checkpoint?: unknown;
+  review?: unknown;
+  telemetry?: unknown;
+  promptVersions?: unknown;
+  failure?: unknown;
+  warnings?: unknown;
+  updatedAt?: string | null;
+};
+
 type DataRecord = Record<string, unknown>;
 
 const TEXT_EXTENSIONS = new Set([
@@ -331,6 +347,16 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const [templateScan, setTemplateScan] = useState<TemplateCompileResponse | null>(null);
   const [templateLoading, setTemplateLoading] = useState(false);
   const [templateError, setTemplateError] = useState<string | null>(null);
+  const [planning, setPlanning] = useState<PlanningResponse | null>(null);
+  const [planningLoading, setPlanningLoading] = useState(false);
+  const [planningGenerating, setPlanningGenerating] = useState(false);
+  const [planningError, setPlanningError] = useState<string | null>(null);
+  const [selectedContentFiles, setSelectedContentFiles] = useState<string[]>([]);
+  const [briefAudience, setBriefAudience] = useState('');
+  const [briefPurpose, setBriefPurpose] = useState('');
+  const [briefExpectedOutcome, setBriefExpectedOutcome] = useState('');
+  const [briefPreferences, setBriefPreferences] = useState('');
+  const [requestedSlideCount, setRequestedSlideCount] = useState('');
   const [editorText, setEditorText] = useState('');
   const [editorDirty, setEditorDirty] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -374,14 +400,38 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     }
   }, [projectId]);
 
+  const loadPlanning = useCallback(async () => {
+    setPlanningLoading(true);
+    setPlanningError(null);
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/planning`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      const body = await response.json() as PlanningResponse;
+      setPlanning(body);
+      setSelectedContentFiles(Array.isArray(body.contentFiles) ? body.contentFiles.slice(0, 12) : []);
+      const brief = record(body.brief);
+      setBriefAudience(stringValue(brief?.audience));
+      setBriefPurpose(stringValue(brief?.purpose));
+      setBriefExpectedOutcome(stringValue(brief?.expectedOutcome));
+      setBriefPreferences(Array.isArray(brief?.preferences)
+        ? brief.preferences.filter((item): item is string => typeof item === 'string').join('\n')
+        : '');
+      setRequestedSlideCount(typeof brief?.requestedSlideCount === 'number' ? String(brief.requestedSlideCount) : '');
+    } catch (err) {
+      setPlanningError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPlanningLoading(false);
+    }
+  }, [projectId]);
+
   const reload = useCallback(async () => {
     setError(null);
     try {
-      await Promise.all([loadProject(), loadFiles(), loadDesignSystems(), loadTemplateScan()]);
+      await Promise.all([loadProject(), loadFiles(), loadDesignSystems(), loadTemplateScan(), loadPlanning()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [loadDesignSystems, loadFiles, loadProject, loadTemplateScan]);
+  }, [loadDesignSystems, loadFiles, loadPlanning, loadProject, loadTemplateScan]);
 
   useEffect(() => { void reload(); }, [reload]);
 
@@ -454,6 +504,91 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     ...arrayValue(presentationDesignSystem, ['warnings']),
   ];
   const matchingScan = Boolean(templateIR && !scanSelectionMismatch);
+  const excludedPlanningPath = templateFile ?? scanSourcePath;
+  const planningSourceFiles = files.filter((file) => filePath(file) !== excludedPlanningPath);
+  const availablePlanningPaths = new Set(planningSourceFiles.map(filePath));
+  const planningSelectedPaths = selectedContentFiles.filter((path) => availablePlanningPaths.has(path)).slice(0, 12);
+  const planningDeckPlan = record(planning?.deckPlan);
+  const planningSlides = arrayValue(planningDeckPlan, ['slides']);
+  const contentIR = record(planning?.contentIR);
+  const sourcePathById = new Map(arrayValue(contentIR, ['sources']).flatMap((source) => {
+    const item = record(source);
+    const sourceId = stringValue(firstValue(item, ['id']));
+    const path = stringValue(firstValue(item, ['sourcePath']));
+    return sourceId && path ? [[sourceId, path] as const] : [];
+  }));
+  const unitSourceById = new Map(arrayValue(contentIR, ['units']).flatMap((unit) => {
+    const item = record(unit);
+    const unitId = stringValue(firstValue(item, ['id']));
+    const sourceId = stringValue(firstValue(item, ['sourceId']));
+    return unitId && sourceId ? [[unitId, sourceId] as const] : [];
+  }));
+  const planningReview = record(planning?.review);
+  const planningFindings = arrayValue(planningReview, ['findings']);
+  const planningWarnings = arrayValue(planning, ['warnings']);
+  const planningFailure = record(planning?.failure);
+
+  const togglePlanningFile = (path: string, checked: boolean) => {
+    setPlanningError(null);
+    const validCurrent = selectedContentFiles.filter((item) => availablePlanningPaths.has(item));
+    if (!checked) {
+      setSelectedContentFiles(validCurrent.filter((item) => item !== path));
+      return;
+    }
+    if (validCurrent.includes(path)) return;
+    if (validCurrent.length >= 12) {
+      setPlanningError('Select no more than 12 source files.');
+      return;
+    }
+    setSelectedContentFiles([...validCurrent, path]);
+  };
+
+  const generatePlan = async () => {
+    setPlanningError(null);
+    if (planningSelectedPaths.length < 1 || planningSelectedPaths.length > 12) {
+      setPlanningError('Select between 1 and 12 project source files.');
+      return;
+    }
+    if (!briefAudience.trim() || !briefPurpose.trim() || !briefExpectedOutcome.trim()) {
+      setPlanningError('Audience, purpose, and expected outcome are required.');
+      return;
+    }
+    const count = requestedSlideCount.trim() ? Number(requestedSlideCount) : undefined;
+    if (count !== undefined && (!Number.isInteger(count) || count < 1 || count > 30)) {
+      setPlanningError('Requested slide count must be an integer from 1 to 30.');
+      return;
+    }
+    const preferences = briefPreferences.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+    if (preferences.length > 12 || preferences.some((item) => item.length > 200)) {
+      setPlanningError('Enter at most 12 preferences, with no more than 200 characters per line.');
+      return;
+    }
+    const brief = {
+      audience: briefAudience.trim(),
+      purpose: briefPurpose.trim(),
+      expectedOutcome: briefExpectedOutcome.trim(),
+      preferences,
+      ...(count === undefined ? {} : { requestedSlideCount: count }),
+    };
+    setPlanningGenerating(true);
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/planning/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contentFiles: planningSelectedPaths, brief }),
+      });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      const body = await response.json() as PlanningResponse;
+      setPlanning(body);
+      setSelectedContentFiles(Array.isArray(body.contentFiles) ? body.contentFiles.slice(0, 12) : planningSelectedPaths);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await loadPlanning();
+      setPlanningError(message);
+    } finally {
+      setPlanningGenerating(false);
+    }
+  };
 
   const analyzeTemplate = async () => {
     if (!templateFile) return;
@@ -472,8 +607,10 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         throw new Error(failed?.failure ? templateFailureText(failed.failure) : `Request failed (${response.status})`);
       }
       setTemplateScan(parseTemplateCompileResponse(body));
+      await loadPlanning();
     } catch (err) {
       setTemplateError(err instanceof Error ? err.message : String(err));
+      await loadPlanning();
     } finally {
       setTemplateLoading(false);
     }
@@ -546,6 +683,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       setEditorDirty(false);
       await loadFiles();
       await refreshPreview();
+      await loadPlanning();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -594,6 +732,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         : incomingTemplate?.name ?? null;
       if (uploadedPath) setTemplateFile(uploadedPath);
       await loadTemplateScan();
+      await loadPlanning();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -808,6 +947,149 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
               ) : <p className="template-muted">No unsupported features or warnings were reported. This does not imply complete PowerPoint compatibility.</p>}
             </section>
           </div>
+        ) : null}
+      </section>
+
+      <section className="planning-panel" aria-labelledby="planning-panel-title">
+        <div className="planning-panel-head">
+          <div>
+            <span className="eyebrow">CONTENT PLANNING</span>
+            <h2 id="planning-panel-title">Build a presentation outline</h2>
+            <p>Select source files and describe the intended presentation. The plan is reviewed before it is saved.</p>
+          </div>
+          <div className="planning-head-actions">
+            <span className={`planning-status planning-status-${planningGenerating ? 'generating' : planning?.status ?? 'loading'}`} role="status">
+              {planningLoading ? 'Loading' : planningGenerating ? 'Generating' : planning?.status?.replaceAll('_', ' ') ?? 'Unavailable'}
+            </span>
+            <button className="quiet" onClick={() => void loadPlanning()} disabled={planningLoading || planningGenerating}>Reload plan</button>
+          </div>
+        </div>
+
+        {planning?.templateStatus !== 'ready' || !matchingScan ? (
+          <div className="planning-notice" role="status">
+            Analyze the selected PowerPoint template before generating a plan.
+          </div>
+        ) : null}
+        {planningLoading && !planning ? <div className="planning-notice">Loading saved planning inputs…</div> : null}
+        {planningError ? <div className="error-banner planning-error" role="alert">{planningError}</div> : null}
+        {planning?.status === 'stale' ? <div className="planning-notice planning-notice-warning" role="status">
+          This saved outline uses earlier template, source, brief, or prompt inputs. Generate a new plan to refresh it.
+        </div> : null}
+        {planningFailure?.message ? <div className="planning-notice planning-notice-warning" role="status">
+          {stringValue(planningFailure.message)}{planningFailure.code ? ` (${stringValue(planningFailure.code)})` : ''}
+        </div> : null}
+
+        <div className="planning-form-grid">
+          <fieldset className="planning-file-picker">
+            <legend>Source files <span>{planningSelectedPaths.length}/12 selected</span></legend>
+            {planningSourceFiles.length ? (
+              <div className="planning-file-list">
+                {planningSourceFiles.map((file) => {
+                  const path = filePath(file);
+                  return (
+                    <label className="planning-file-option" key={path} title={path}>
+                      <input
+                        type="checkbox"
+                        checked={planningSelectedPaths.includes(path)}
+                        onChange={(event) => togglePlanningFile(path, event.target.checked)}
+                        disabled={planningGenerating || (!planningSelectedPaths.includes(path) && planningSelectedPaths.length >= 12)}
+                      />
+                      <span>{path}</span>
+                      <small>{formatBytes(file.size)}</small>
+                    </label>
+                  );
+                })}
+              </div>
+            ) : <p className="planning-muted">Upload source material to choose files for the outline.</p>}
+          </fieldset>
+
+          <div className="planning-brief">
+            <label>Audience
+              <input maxLength={500} value={briefAudience} onChange={(event) => setBriefAudience(event.target.value)} disabled={planningGenerating} placeholder="Who will use this presentation?" />
+            </label>
+            <label>Purpose
+              <textarea maxLength={1000} value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)} disabled={planningGenerating} rows={2} placeholder="What should the presentation explain or support?" />
+            </label>
+            <label>Expected outcome
+              <textarea maxLength={1000} value={briefExpectedOutcome} onChange={(event) => setBriefExpectedOutcome(event.target.value)} disabled={planningGenerating} rows={2} placeholder="What should the audience understand or do?" />
+            </label>
+            <label>Preferences <span className="planning-label-note">one per line</span>
+              <textarea value={briefPreferences} onChange={(event) => setBriefPreferences(event.target.value)} disabled={planningGenerating} rows={2} placeholder="Optional style, emphasis, or constraints" />
+            </label>
+            <label className="planning-slide-count">Requested slide count <span className="planning-label-note">optional · 1–30</span>
+              <input type="number" min="1" max="30" step="1" value={requestedSlideCount} onChange={(event) => setRequestedSlideCount(event.target.value)} disabled={planningGenerating} placeholder="Auto" />
+            </label>
+            <div className="planning-submit-row">
+              <span className="planning-muted">Requires a ready template and at least one source file.</span>
+              <button className="primary" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateLoading || planning?.templateStatus !== 'ready' || !matchingScan}>
+                {planningGenerating ? 'Generating…' : 'Generate plan'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {planningWarnings.length ? (
+          <div className="planning-warnings"><strong>Source warnings</strong><ul>{planningWarnings.map((warning, index) => <li key={`planning-warning-${index}`}>{readableValue(warning)}</li>)}</ul></div>
+        ) : null}
+
+        {planningDeckPlan ? (
+          <section className="planning-result" aria-labelledby="planning-result-title">
+            <div className="planning-result-head">
+              <div>
+                <span className="eyebrow">{planningDeckPlan.id ? `PLAN ${stringValue(planningDeckPlan.id)}` : 'GENERATED OUTLINE'}</span>
+                <h3 id="planning-result-title">{stringValue(planningDeckPlan.workingTitle, 'Presentation outline')}</h3>
+                <p>{stringValue(planningDeckPlan.narrativeSummary)}</p>
+              </div>
+              {planning?.updatedAt ? <span className="planning-updated">Updated {new Date(planning.updatedAt).toLocaleString()}</span> : null}
+            </div>
+            <div className="planning-slide-grid">
+              {planningSlides.map((slide, index) => {
+                const item = record(slide);
+                const refs = arrayValue(item, ['contentRefs']).filter((ref): ref is string => typeof ref === 'string');
+                const paths = [...new Set(refs.map((ref) => unitSourceById.get(ref)).filter((sourceId): sourceId is string => Boolean(sourceId))
+                  .map((sourceId) => sourcePathById.get(sourceId)).filter((path): path is string => Boolean(path)))];
+                return (
+                  <article className="planning-slide-card" key={stringValue(firstValue(item, ['id']), `slide-${index + 1}`)}>
+                    <div className="planning-slide-card-head">
+                      <strong>{stringValue(firstValue(item, ['order']), String(index + 1)).padStart(2, '0')}</strong>
+                      <span>{stringValue(firstValue(item, ['narrativeRole']), 'slide').replaceAll('-', ' ')}</span>
+                    </div>
+                    <h4>{stringValue(firstValue(item, ['purpose']), 'Purpose not reported')}</h4>
+                    <p className="planning-takeaway">{stringValue(firstValue(item, ['takeaway']), 'Takeaway not reported')}</p>
+                    <div className="planning-slide-meta">
+                      <span>{stringValue(firstValue(item, ['semanticVisualType']), 'Visual not reported')}</span>
+                      <span>{stringValue(firstValue(item, ['targetDensity']), 'Density not reported')}</span>
+                    </div>
+                    <div className="planning-source-paths">
+                      <strong>Sources</strong>
+                      {paths.length ? paths.map((path) => <span key={path} title={path}>{path}</span>) : <span>No source path cited</span>}
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        ) : null}
+
+        {planningReview ? (
+          <section className="planning-review" aria-label="Supervisor review">
+            <div className="planning-review-head">
+              <h3>Supervisor review</h3>
+              <span className={`planning-review-outcome outcome-${stringValue(planningReview.outcome, 'unknown')}`}>
+                {stringValue(planningReview.outcome, 'Outcome not reported').replaceAll('-', ' ')}
+              </span>
+            </div>
+            {planningFindings.length ? (
+              <ul>{planningFindings.map((finding, index) => {
+                const item = record(finding);
+                return <li key={`finding-${index}`}>
+                  <span className={`finding-severity severity-${stringValue(firstValue(item, ['severity']), 'unknown')}`}>{stringValue(firstValue(item, ['severity']), 'finding')}</span>
+                  <span>{stringValue(firstValue(item, ['reason']), 'Finding details not reported.')}</span>
+                  <small>{stringValue(firstValue(item, ['targetType']), 'deck')}{firstValue(item, ['slideId']) ? ` · ${stringValue(firstValue(item, ['slideId']))}` : ''}</small>
+                </li>;
+              })}</ul>
+            ) : <p className="planning-muted">No findings were reported.</p>}
+          </section>
         ) : null}
       </section>
 

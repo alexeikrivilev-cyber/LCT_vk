@@ -116,6 +116,67 @@ button:disabled { cursor: default; opacity: .5; }
 .template-notes-section ul { display: grid; gap: 5px; margin: 9px 0 0; padding-left: 19px; color: #55554f; font-size: 11px; line-height: 1.5; }
 .template-notes-section p { margin: 8px 0 0; }
 
+.planning-panel { margin: 0 18px 18px; padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 8px 24px rgba(0,0,0,.035); }
+.planning-panel-head, .planning-result-head, .planning-review-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.planning-panel-head h2 { margin: 5px 0; font-size: 21px; letter-spacing: -.035em; }
+.planning-panel-head p, .planning-result-head p { max-width: 680px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.planning-head-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.planning-status, .planning-review-outcome { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 6px 9px; background: #f8f8f5; color: #55554f; font-size: 10px; font-weight: 750; text-transform: uppercase; letter-spacing: .045em; }
+.planning-status-ready, .planning-review-outcome.outcome-pass { border-color: #b8d4c0; background: #eff8f1; color: #255c35; }
+.planning-status-failed, .planning-review-outcome.outcome-repair, .planning-review-outcome.outcome-local-replan { border-color: #e3c49b; background: #fff7e9; color: #80511c; }
+.planning-status-generating { border-color: #c8c8c0; background: #f1f1ee; }
+.planning-notice { margin-top: 12px; padding: 10px 12px; border: 1px dashed #c9c9c2; border-radius: 8px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.planning-notice-warning { border-style: solid; border-color: #e3c49b; background: #fffaf1; color: #704c22; }
+.planning-error { margin-top: 11px; }
+.planning-form-grid { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(320px, 1.2fr); gap: 14px; margin-top: 14px; }
+.planning-file-picker { min-width: 0; min-height: 0; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; }
+.planning-file-picker legend { padding: 0 4px; color: var(--strong); font-size: 11px; font-weight: 700; }
+.planning-file-picker legend span { margin-left: 8px; color: var(--muted); font-weight: 500; }
+.planning-file-list { max-height: 210px; display: flex; flex-direction: column; gap: 2px; overflow: auto; }
+.planning-file-option { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; border-radius: 6px; padding: 6px 5px; color: #33332e; cursor: pointer; }
+.planning-file-option:hover { background: #f3f3ef; }
+.planning-file-option input { width: 14px; height: 14px; margin: 0; accent-color: #171717; }
+.planning-file-option > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.planning-file-option small { color: var(--muted); font-size: 9px; }
+.planning-brief { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 8px; }
+.planning-brief label { min-width: 0; display: flex; flex-direction: column; gap: 5px; color: #55554f; font-size: 10px; font-weight: 700; }
+.planning-brief input, .planning-brief textarea { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 7px; padding: 8px 9px; background: #fafaf8; color: var(--strong); outline: none; font-size: 11px; font-weight: 400; line-height: 1.4; resize: vertical; }
+.planning-brief input:focus, .planning-brief textarea:focus { border-color: #a8a8a0; box-shadow: 0 0 0 3px rgba(0,0,0,.05); }
+.planning-label-note { color: var(--muted); font-size: 9px; font-weight: 400; }
+.planning-slide-count { grid-column: 1; }
+.planning-slide-count input { max-width: 120px; }
+.planning-submit-row { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 2px; }
+.planning-muted { margin: 7px 3px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.planning-warnings { margin-top: 13px; padding: 10px 12px; border: 1px solid #e3c49b; border-radius: 8px; background: #fffaf1; color: #704c22; font-size: 10px; }
+.planning-warnings ul { display: grid; gap: 4px; margin: 6px 0 0; padding-left: 17px; line-height: 1.45; }
+.planning-result { margin-top: 17px; border-top: 1px solid var(--line); padding-top: 14px; }
+.planning-result-head { align-items: flex-end; margin-bottom: 11px; }
+.planning-result-head .eyebrow { margin-bottom: 4px; font-size: 9px; }
+.planning-result-head h3, .planning-review h3 { margin: 0 0 5px; font-size: 16px; letter-spacing: -.025em; }
+.planning-updated { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.planning-slide-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.planning-slide-card { min-width: 0; padding: 11px; border: 1px solid var(--line); border-radius: 8px; background: #fcfcfa; }
+.planning-slide-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.planning-slide-card-head strong { color: #77776f; font: 700 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.planning-slide-card-head span { border-radius: 5px; padding: 4px 6px; background: #efefeb; color: #55554f; font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+.planning-slide-card h4 { margin: 9px 0 5px; font-size: 12px; line-height: 1.35; }
+.planning-slide-card p { margin: 0; color: #484842; font-size: 11px; line-height: 1.45; }
+.planning-takeaway { padding-left: 8px; border-left: 2px solid #c9c9c2; }
+.planning-slide-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+.planning-slide-meta span { border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; color: var(--muted); font-size: 9px; }
+.planning-source-paths { display: grid; gap: 4px; margin-top: 9px; color: var(--muted); font-size: 9px; }
+.planning-source-paths strong { color: #55554f; font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+.planning-source-paths span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.planning-review { margin-top: 13px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fafaf8; }
+.planning-review-head { align-items: center; }
+.planning-review h3 { margin: 0; font-size: 12px; }
+.planning-review ul { display: grid; gap: 7px; margin: 10px 0 0; padding: 0; list-style: none; }
+.planning-review li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 8px; color: #44443f; font-size: 10px; line-height: 1.45; }
+.planning-review li small { color: var(--muted); font-size: 9px; }
+.finding-severity { border-radius: 4px; padding: 3px 5px; background: #efefeb; color: #55554f; font-size: 8px; font-weight: 750; text-transform: uppercase; }
+.severity-high, .severity-critical { background: #fff0ed; color: #9d2a22; }
+.severity-medium { background: #fff7e9; color: #80511c; }
+
 .workspace-grid { min-height: calc(100vh - 68px); display: grid; grid-template-columns: 260px minmax(360px, 1fr) minmax(360px, .86fr); }
 .workspace-sidebar, .preview-panel, .editor-panel { min-width: 0; min-height: 0; }
 .workspace-sidebar { border-right: 1px solid var(--line); background: #fafaf8; overflow: auto; }
@@ -161,6 +222,17 @@ button:disabled { cursor: default; opacity: .5; }
   .workspace-topbar { height: auto; min-height: 72px; grid-template-columns: auto 1fr; padding: 10px; }
   .topbar-actions { grid-column: 1 / -1; }
   .template-panel { margin: 10px; padding: 13px; }
+  .planning-panel { margin: 0 10px 12px; padding: 13px; }
+  .planning-panel-head { flex-direction: column; }
+  .planning-head-actions { width: 100%; justify-content: space-between; }
+  .planning-panel-head h2 { font-size: 18px; }
+  .planning-form-grid { grid-template-columns: 1fr; }
+  .planning-file-list { max-height: 170px; }
+  .planning-brief { grid-template-columns: 1fr; }
+  .planning-slide-grid { grid-template-columns: 1fr; }
+  .planning-review li { grid-template-columns: auto minmax(0, 1fr); }
+  .planning-review li small { grid-column: 2; }
+  .planning-result-head { align-items: flex-start; flex-direction: column; }
   .template-panel-head { align-items: flex-start; gap: 10px; }
   .template-panel-head h2 { font-size: 18px; }
   .template-panel-head p { font-size: 12px; }

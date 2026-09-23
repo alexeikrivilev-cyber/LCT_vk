@@ -34,6 +34,10 @@ Supervisor must not independently regenerate a deck, maintain a competing plan, 
 
 Supervisor output is a validated `SupervisorDecision` tied to a checkpoint version. Stale/invalid/lock-conflicting decisions are rejected by code.
 
+### Implemented planning slice
+
+The current first planning slice uses the versioned assets `apps/daemon/prompts/worker-deck-plan.v1.md` and `apps/daemon/prompts/supervisor-plan-review.v1.md`. Worker receives the validated brief, compact text/structured ContentIR evidence, and a bounded PresentationDesignSystem summary; it returns a DeckPlan draft without app ids, geometry, or renderer state. Image-only metadata is omitted from Worker context because no VLM extraction exists; image references remain in canonical ContentIR but cannot be cited as factual evidence. The application assigns canonical ids/order and validates all textual/structured content references. TemplateIR/PDS hashes, source and brief hashes, and both prompt-file SHA-256 values feed the input fingerprint. Supervisor reviews that immutable checkpoint and may pass, warn, propose an allowlisted patch, or request one local Worker re-plan. The application validates and persists the result. This slice is exercised with fake inference; it does not verify Qwen quality or remote serving behavior.
+
 ## Responsibility split
 
 Use the model for semantic decisions:

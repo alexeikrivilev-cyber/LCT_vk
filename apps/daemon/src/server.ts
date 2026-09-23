@@ -36,6 +36,12 @@ import {
 import { generatePresentationImage } from './media/index.js';
 import { presentationImageModels } from './media/models.js';
 import {
+  OpenAICompatibleSemanticInferenceAdapter,
+  semanticInferenceConfigFromEnvironment,
+} from './presentation/adapters/openai-compatible-semantic-inference.js';
+import type { SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
+import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
+import {
   compileTemplate,
   getTemplateCompilation,
   TemplateCompilerError,
@@ -48,6 +54,8 @@ export interface StartServerOptions {
   projectRoot?: string;
   serveWeb?: boolean;
   returnServer?: boolean;
+  semanticInferenceAdapter?: SemanticInferenceAdapter;
+  semanticInferenceAdapterFactory?: () => SemanticInferenceAdapter;
 }
 
 export interface StartedPresentationServer {
@@ -89,6 +97,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   await mkdir(projectsRoot, { recursive: true });
 
   const db = openPresentationStore(dataDir);
+  const planningService = new PlanningService({
+    projectRoot,
+    projectsRoot,
+    getInferenceAdapter: () => options.semanticInferenceAdapter
+      ?? options.semanticInferenceAdapterFactory?.()
+      ?? new OpenAICompatibleSemanticInferenceAdapter(semanticInferenceConfigFromEnvironment()),
+  });
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '32mb' }));
@@ -239,6 +254,34 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       return res.status(500).json({
         status: 'failed',
         failure: { code: 'TEMPLATE_COMPILE_FAILED', message: 'Template compilation failed.' },
+      });
+    }
+  });
+
+  app.get('/api/projects/:id/planning', async (req, res) => {
+    if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+    try {
+      res.json(await planningService.get(req.params.id));
+    } catch (error) {
+      if (error instanceof PlanningServiceError) {
+        return res.status(error.status).json({ error: { code: error.code, message: error.message } });
+      }
+      return res.status(500).json({
+        error: { code: 'PLANNING_STATE_UNAVAILABLE', message: 'Saved planning state could not be loaded.' },
+      });
+    }
+  });
+
+  app.post('/api/projects/:id/planning/generate', async (req, res) => {
+    if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+    try {
+      res.json(await planningService.generate(req.params.id, req.body));
+    } catch (error) {
+      if (error instanceof PlanningServiceError) {
+        return res.status(error.status).json({ error: { code: error.code, message: error.message } });
+      }
+      return res.status(500).json({
+        error: { code: 'PLANNING_FAILED', message: 'Planning failed. Check the project sources and retry.' },
       });
     }
   });
