@@ -4,7 +4,11 @@
 
 This is the canonical infrastructure contract for semantic and image inference. A normal 10–15 slide deck must complete within 300 seconds with a warm service while preserving the product guarantees in `CONTEXT.md` and `ARCHITECTURE.md`.
 
-The presentation domain talks to one logical semantic inference service. Physical GPU count, precision, sharding, prefix-cache implementation, and serving engine are deployment details selected by benchmark.
+The presentation application uses a provider-neutral semantic inference port. Its OpenAI-compatible adapter sends stateless requests to one logical semantic inference service; physical GPU count, precision, sharding, prefix-cache implementation, and serving engine are deployment details selected by benchmark. The local adapter and fake-service tests are implemented; actual model serving and deployment have not been verified.
+
+The implemented adapter accepts `LCT_SEMANTIC_BASE_URL`, optional `LCT_SEMANTIC_API_KEY`, and `LCT_SEMANTIC_MODEL`. It sends a strict JSON Schema request and validates the returned value again with the caller's runtime validator. It bounds request/response sizes, supports deadlines and `AbortSignal`, returns typed failures and prompt-free telemetry, and carries role/operation labels. Caller-provided Worker and Supervisor messages are independent. The adapter does not depend on Cloud.ru, vLLM, or persistent conversation state.
+
+`services/inference/` contains a pinned vLLM Docker RUN development/benchmark artifact and an explicit remote benchmark harness. Normal tests use a local fake endpoint. No model weights were downloaded and no Cloud.ru deployment was performed for this integration.
 
 ## Semantic model
 
@@ -14,7 +18,7 @@ Primary runtime model:
 Qwen/Qwen3.8-27B
 ```
 
-The runtime has one logical copy of the semantic model weights. Worker and supervisor share those weights and use isolated mutable session/KV state. If the model spans several GPUs, the weights are partitioned/sharded rather than duplicated per agent.
+The target runtime has one logical copy of the semantic model weights. Worker and supervisor share those weights and the application supplies each role's messages/context independently. The adapter does not provide persistent sessions or role-specific KV namespaces. If the model spans several GPUs, the weights are partitioned/sharded rather than duplicated per agent.
 
 The serving path must support image inputs because the supervisor may inspect rendered slide screenshots.
 
@@ -22,11 +26,11 @@ The serving path must support image inputs because the supervisor may inspect re
 
 ### Primary: single H100-class GPU
 
-The first production benchmark profile is a single H100-class GPU with the official `Qwen/Qwen3.8-27B-FP8` checkpoint.
+The first controlled benchmark target is a single H100-class GPU with the official `Qwen/Qwen3.8-27B-FP8` checkpoint. The checkpoint is pinned in the development image to revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` under Apache-2.0. The official [vLLM Qwen3.8-27B recipe](https://github.com/vllm-project/recipes/blob/main/models/Qwen/Qwen3.8-27B.yaml) lists H100 support and estimates 38 GB minimum VRAM; the [pinned Hugging Face revision](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a) exists and carries Apache-2.0. These are compatibility/model artifact facts, not Cloud.ru or project workload measurements. Actual image build, serving, VRAM headroom, and performance remain unverified.
 
-FP8 is the initial profile because Hopper provides native FP8 acceleration and the official FP8 checkpoint leaves materially more memory headroom than a non-FP8 weight set for two agent caches, batching, activations, and media/runtime allocations.
+FP8 is the initial profile because Hopper provides native FP8 acceleration and the FP8 checkpoint is smaller than the non-FP8 weights. Measure actual headroom for request context, batching, activations, and media/runtime allocations before accepting the profile.
 
-BF16/FP16 remains a benchmark candidate. It replaces FP8 only if end-to-end measurements show equal/better quality and total throughput while preserving two-cache capacity, media scheduling, safety headroom, and the 300-second gate.
+BF16/FP16 remains a benchmark candidate. It replaces FP8 only if end-to-end measurements show equal/better quality and total throughput while preserving serving memory headroom, media scheduling, safety margin, and the 300-second gate.
 
 Do not choose generic Q8/INT8 merely because it is 8-bit. Benchmark the actual checkpoint, kernels, engine, and workload.
 
@@ -39,7 +43,8 @@ The serving engine may use tensor parallelism, pipeline parallelism, or another 
 Required invariants for the dual-GPU profile:
 
 - do not run a full worker model replica on one card and a full supervisor replica on the other;
-- worker and supervisor still share one logical semantic model and retain isolated mutable caches;
+- worker and supervisor still share one logical semantic model and receive independent application contexts;
+- correctness does not depend on persistent sessions, role-specific KV namespaces, or cache persistence;
 - sharding details stay behind the inference adapter;
 - the presentation pipeline and product behavior are unchanged;
 - record device topology and parallelism settings in benchmark/release metadata.
@@ -74,7 +79,7 @@ Supervisor does not generate a competing deck, write OOXML, bypass locks, invent
 
 Guaranteed runtime instructions should not be re-prefilled from scratch on every call.
 
-Before timed deck generation begins, warm the model and prefill immutable prompt-prefix entries inside the two role namespaces.
+Before timed deck generation begins, the serving deployment should warm the model and any reusable immutable prompt prefixes it supports. The current adapter has no warmup API and does not create role namespaces.
 
 Worker prefix set should cover the guaranteed worker pipeline, including:
 
@@ -101,7 +106,7 @@ visual-relevance-review stage instructions
 bounded repair/local-replan instructions
 ```
 
-These may be represented as separate immutable prefix-cache entries inside each role namespace rather than one enormous concatenated prompt. The objective is that every guaranteed stage can start without repeatedly paying the full static instruction prefill cost.
+The serving runtime may reuse identical immutable prefixes to reduce prefill work. This is an optimization: it does not provide role-specific cache namespaces, restore history, or establish application context isolation.
 
 Do **not** confuse preloaded instructions with project context. Raw content packages, all PPTX XML, every layout, optional craft rules, and mutable project history do not belong in a global prefix merely because memory is available.
 
@@ -110,22 +115,15 @@ Use two layers:
 1. **eager immutable prefixes** — role instructions, required pipeline/skill instructions, tool/schema contracts, stable safety/architecture rules;
 2. **scoped mutable/project context** — current brief/content slice, relevant design-system/layout candidates, locks, checkpoint state, findings, and rendered evidence.
 
-Optional skills/craft/retrieval content remains lazy unless the pipeline guarantees it will be used. Project-specific immutable summaries may receive their own prefix-cache entries after they are compiled, but they stay project-scoped and versioned.
+Optional skills/craft/retrieval content remains lazy unless the pipeline guarantees it will be used. Project-specific immutable summaries may benefit from exact-prefix reuse after compilation, but their source stays project/version scoped in application state; do not treat a serving cache entry as an application object.
 
-Worker and supervisor mutable histories must never be merged by prefix reuse.
+Worker and supervisor messages are built independently by the application and sent with each request. Prefix reuse must not merge or restore mutable history.
 
 ## Cache and context isolation
 
-Required properties:
+Application-level context isolation is required: callers build Worker and Supervisor messages independently and include only the evidence needed by that call. The current stateless adapter has no persistent sessions or explicit KV namespaces. Correctness must not rely on per-role cache identities, prefix persistence, or eviction behavior. A serving runtime may reuse exact immutable prefixes to reduce prefill work, but cache reuse is not a history or isolation boundary. Include project/generation/checkpoint metadata where available and keep project evidence scoped and versioned.
 
-- distinct worker/supervisor session ids and mutable KV-cache namespaces;
-- no cross-project mutable cache reuse;
-- no generated-token visibility between roles unless explicitly copied into structured checkpoint state;
-- cache eviction/compaction for one role must not corrupt the other;
-- every request carries project/generation/checkpoint version information;
-- cache/prefix entries are invalidated when their instruction or project-summary version changes.
-
-Do not grow mutable context to the model maximum by default. Stable instructions are prefetched; changing project evidence remains narrow.
+Do not grow mutable context to the model maximum by default. The serving runtime may prefill stable instructions; changing project evidence remains narrow.
 
 ## Continuous-generation scheduler
 
@@ -142,7 +140,7 @@ Priority is forward user value:
 The scheduler must:
 
 - tag `worker`, `supervisor`, and `media` work;
-- preserve role/cache isolation;
+- preserve independent application request contexts and avoid relying on serving cache placement;
 - maintain the next slide-pack publish index;
 - keep generation running without waiting for user acknowledgement;
 - use continuous batching or equivalent when supported;
@@ -220,8 +218,7 @@ Benchmark peak memory including:
 
 ```text
 semantic weights/shards
-+ worker KV/session cache
-+ supervisor KV/session cache
++ serving KV allocation for concurrent requests
 + immutable prefix-cache entries
 + batch activations
 + image model weights/activations
@@ -250,7 +247,8 @@ Required capabilities:
 
 - Qwen3.8-27B multimodal inference;
 - chosen FP8/BF16/FP16/sharded profile;
-- isolated worker/supervisor sessions;
+- independent Worker/Supervisor request contexts;
+- serving-side session isolation only if a selected runtime provides and verifies it;
 - immutable prefix caching/prefill;
 - continuous batching or equivalent;
 - request cancellation/deadlines;
@@ -269,7 +267,7 @@ Capture per generation/profile:
 - worker/supervisor request counts, tokens, TTFT, decode throughput;
 - prefix-cache prefill time and hit rate;
 - queue latency/cancellations/retries/timeouts;
-- KV usage/evictions by role;
+- serving KV usage/evictions and any runtime role attribution it exposes;
 - per-device utilization and peak memory;
 - media count/latency/residency or swap cost;
 - supervisor findings and accepted/rejected repairs;
@@ -282,8 +280,9 @@ Record model revision, precision, serving engine, GPU SKU/count/topology, shardi
 A profile is eligible for final use only when:
 
 - one logical semantic model serves both roles;
-- worker/supervisor mutable cache isolation tests pass;
-- required role/stage instruction prefixes are prewarmed before timed generation;
+- application tests confirm independent Worker/Supervisor request contexts;
+- any serving-side session/cache guarantees relied on by a deployment are verified at that runtime;
+- required role/stage instruction prefixes are warmed before timed generation where the serving runtime supports reusable prefixes;
 - no cross-project context bleed is observed;
 - progressive slide packs appear without per-pack approval stalls;
 - normal 10–15 slide benchmark decks complete within 300 seconds;

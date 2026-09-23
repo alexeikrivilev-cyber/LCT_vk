@@ -17,7 +17,7 @@
     "start": "pnpm --filter @lct/daemon run start",
     "lint:craft": "tsx ./scripts/lint-craft-references.ts",
     "check:boundary": "node ./scripts/check-presentation-boundary.mjs",
-    "test": "node --test",
+    "test": "node --import tsx --test",
     "typecheck": "pnpm -r --filter @lct/web --filter @lct/daemon run typecheck"
   },
   "devDependencies": {

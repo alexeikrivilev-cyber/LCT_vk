@@ -30,8 +30,9 @@ Presentation daemon / Express
       |        |
       |        v
       |   logical Qwen3.8-27B service
-      |     +-- worker session/cache namespace
-      |     +-- supervisor session/cache namespace
+      |     +-- Worker request/context (supplied by caller)
+      |     +-- Supervisor request/context (supplied by caller)
+      |     +-- optional shared immutable prefix reuse
       |     +-- scheduler/deadline manager
       |
       +-- image adapter
@@ -56,10 +57,12 @@ Implemented today:
 - live HTML preview with relative resources;
 - built-in design-system and skill discovery;
 - image-generation adapter;
+- provider-neutral semantic inference port and OpenAI-compatible adapter, verified with local fake HTTP tests;
+- Cloud.ru Docker RUN development/benchmark artifact (deployment and model serving unverified);
 - presentation-oriented Node/TypeScript runtime;
 - PPTX/PDF primitives available to the daemon.
 
-Content ingestion, narrative planning, progressive generation, native rendering, audit/export, and GPU orchestration described below remain target architecture. Template understanding v1 is implemented as a deterministic structural scan; it does not establish universal arbitrary-template compatibility.
+Content ingestion, narrative planning, progressive generation, native rendering, audit/export, and actual GPU serving/orchestration described below remain target architecture. The inference adapter carries caller-supplied stateless requests; it does not create persistent Worker/Supervisor sessions or KV namespaces. Template understanding v1 is implemented as a deterministic structural scan; it does not establish universal arbitrary-template compatibility.
 
 ## Canonical pipeline
 
@@ -186,7 +189,7 @@ It may batch decisions when useful, but persistent `DeckPlan`/`SlidePack` state 
 
 ### Supervisor
 
-The supervisor reviews versioned checkpoints using the same logical semantic model with isolated mutable context. It may detect semantic/compositional problems and propose bounded patch operations or local re-plan requests.
+The supervisor reviews versioned checkpoints using the same logical semantic model. The application supplies its request context independently from Worker calls; the adapter does not provide persistent role sessions or guarantee serving-side KV isolation. It may detect semantic/compositional problems and propose bounded patch operations or local re-plan requests.
 
 It does not create a competing deck, bypass locks, write OOXML, invent unrestricted coordinates, or require approval after every pack. Except for genuine blocking issues, its work is asynchronous to forward slide-pack generation.
 

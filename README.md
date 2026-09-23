@@ -27,7 +27,7 @@ Generation does not stop after each slide pack. The UI progressively exposes rea
 
 ## Runtime target
 
-Semantic inference uses one logical `Qwen/Qwen3.8-27B` service with two isolated roles:
+Semantic inference targets one logical `Qwen/Qwen3.8-27B` service. Worker and Supervisor are distinct application roles with separately constructed request contexts:
 
 ```text
 shared logical Qwen3.8-27B
@@ -35,7 +35,7 @@ shared logical Qwen3.8-27B
   -> Supervisor  # bounded checkpoint review/repair
 ```
 
-The model may run on one GPU or be sharded across several devices; Worker and Supervisor do not get separate model replicas. Guaranteed role/stage instruction prefixes are prewarmed before timed generation so normal pipeline stages do not repeatedly pay static prompt-prefill cost.
+The model may run on one GPU or be sharded across several devices; Worker and Supervisor do not get separate model replicas. The serving target prewarms reusable role/stage instruction prefixes where supported; the current stateless adapter does not provide session or cache namespaces.
 
 Primary hardware target is a single H100-class GPU. If that profile cannot reliably meet the five-minute gate, the documented fallback is a dual RTX 5090-class sharded profile selected by benchmark rather than assumed linear scaling.
 
@@ -56,7 +56,7 @@ The repository contains the minimal product shell:
 - `craft/` — compact presentation craft guidance.
 - `templates/deck-framework.html` — neutral HTML preview shell.
 
-Deterministic PPTX structural understanding is implemented: upload a `.pptx` into a project, choose **Analyze as template**, and review the saved `TemplateIR`/structural design summary in the workspace. Recompiling the same source is deterministic; changing the source marks the saved result stale. This scan has partial OOXML/style coverage and does not claim universal arbitrary-template or native rendering compatibility. Content planning, progressive generation, native rendering, audit/export, and GPU inference remain target behavior.
+Deterministic PPTX structural understanding is implemented: upload a `.pptx` into a project, choose **Analyze as template**, and review the saved `TemplateIR`/structural design summary in the workspace. Recompiling the same source is deterministic; changing the source marks the saved result stale. This scan has partial OOXML/style coverage and does not claim universal arbitrary-template or native rendering compatibility. A provider-neutral semantic inference adapter, local fake-service tests, and a Cloud.ru Docker RUN development artifact are also implemented; actual Qwen serving, Cloud.ru deployment, and product orchestration remain unverified or target behavior. See [`services/inference/README.md`](./services/inference/README.md).
 
 The current visual UI is temporary and expected to be redesigned. Product/domain contracts are stable; existing screen styling/composition is not.
 
@@ -109,4 +109,4 @@ Out of scope unless a concrete requirement appears: multiplayer collaboration, e
 
 ## Verification
 
-Before finishing a change, run the checks applicable to it. `TESTING.md` defines coverage for parser/planner/variants, progressive publication, local edits during background generation, audit/locks/export, prompt-prefix warmup, two-agent isolation, hardware profiles, media inference, and the five-minute end-to-end gate.
+Before finishing a change, run the checks applicable to it. `TESTING.md` defines coverage for parser/planner/variants, progressive publication, local edits during background generation, audit/locks/export, prompt-prefix warmup, independent two-agent request contexts, hardware profiles, media inference, and the five-minute end-to-end gate.

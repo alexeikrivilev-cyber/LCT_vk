@@ -31,7 +31,7 @@ pnpm build
 
 `pnpm lint:craft` is required when skill/craft bindings change. Typecheck/build are required when the corresponding code paths change.
 
-`pnpm test` runs the Node built-in suite for project-file safeguards, the private Python inspector, the deterministic TemplateIR/PDS mapper, the template compile API, and craft-reference tooling. Synthetic Transitional and Strict OOXML fixtures exercise the implemented structural-inspection path, including linked versus ambiguous themes, nested master/layout groups, direct sRGB/scheme/system color observations, slide/master/layout backgrounds and color-map evidence, unresolved rotated group geometry, and notes inventory. These tests do not imply full arbitrary-template compatibility, inherited style resolution, native PowerPoint rendering, content planning, inference, or export.
+`pnpm test` runs the Node built-in suite for project-file safeguards, the private Python inspector, the deterministic TemplateIR/PDS mapper, the template compile API, craft-reference tooling, the semantic inference adapter, and the inference benchmark harness. Inference tests use a local fake HTTP server; they do not contact Cloud.ru, download model weights, or require a GPU. They verify independent role requests, structured output validation, bounded payloads, cancellation/deadlines, and client overlap only. Synthetic Transitional and Strict OOXML fixtures exercise the implemented structural-inspection path, including linked versus ambiguous themes, nested master/layout groups, direct sRGB/scheme/system color observations, slide/master/layout backgrounds and color-map evidence, unresolved rotated group geometry, and notes inventory. These tests do not imply full arbitrary-template compatibility, inherited style resolution, native PowerPoint rendering, content planning, actual inference serving, or export.
 
 The Template Compiler integration test uploads a synthetic PPTX through the project API, compiles and reloads its canonical state across a daemon restart, checks stable hashes and source-byte immutability, detects source changes as stale, and verifies controlled missing/invalid-file behavior, failed-path sanitization, and preservation of the last successful result. Mapper tests separately check deterministic IDs/hashes, exact relationships/placeholders/geometry/style/background facts, unsupported/warning retention, and PDS references to valid TemplateIR entities.
 
@@ -109,12 +109,13 @@ Verify:
 
 ## Worker/Supervisor tests
 
-Supervisor is bounded and asynchronous to normal forward progress.
+The local adapter tests exercise separately constructed Worker/Supervisor requests against a fake service. They do not prove model quality, remote request routing, persistent sessions, or GPU overlap. Full product tests should verify Supervisor is bounded and asynchronous to normal forward progress.
 
 Verify:
 
 - one logical semantic model serves both roles;
-- Worker/Supervisor mutable session/cache identities are distinct;
+- Worker/Supervisor messages and mutable application context are supplied independently;
+- do not infer distinct serving sessions or KV-cache namespaces from application role labels;
 - Supervisor output is tied to a checkpoint version;
 - stale/invalid/lock-conflicting patches are rejected;
 - `local-replan` routes through Worker/application state;
@@ -162,18 +163,18 @@ Anchor tests on stable roles/state/test ids, not current styling. The UI is expe
 
 ## Prompt-prefix and cache tests
 
-`INFERENCE.md` defines the cache contract.
+`INFERENCE.md` defines the serving cache target. The adapter sends complete stateless requests; local tests do not prove serving-side prefix reuse, persistent KV state, or per-role cache namespaces.
 
 Before an inference profile is accepted, verify:
 
-- Worker and Supervisor required role/stage instruction prefixes are warmed before timed generation readiness;
-- the first normal stage can reuse the warmed prefix instead of re-prefilling all static instructions;
+- Worker and Supervisor required role/stage instruction prefixes are warmed before timed generation readiness when supported by the chosen serving runtime;
+- measure whether normal stages reuse warmed immutable prefixes instead of re-prefilling static instructions;
 - instruction-version changes invalidate stale prefix entries;
-- Worker generated tokens never leak into Supervisor history and vice versa;
-- no cross-project mutable context leakage occurs after cache reuse/eviction;
+- Worker generated tokens do not enter Supervisor requests unless the application explicitly copies them into structured checkpoint evidence;
+- no cross-project mutable application context is sent after requests overlap or serving caches are reused/evicted;
 - project-scoped cached summaries respect project/checkpoint versioning;
 - optional craft/retrieval content is not blindly injected into every call;
-- cache pressure/eviction for one role does not corrupt the other.
+- prefix-cache pressure/eviction affects performance only and does not alter application context or correctness.
 
 Record prefix-prefill latency/hit behavior when the serving engine exposes it.
 
@@ -212,7 +213,7 @@ For every profile record:
 - serving engine/runtime/CUDA versions;
 - GPU SKU/count/topology and sharding strategy;
 - resident and peak memory per device;
-- Worker + Supervisor KV/prefix-cache footprint;
+- serving KV/prefix-cache footprint under Worker + Supervisor workload;
 - TTFT/decode throughput/continuous batching;
 - queue latency;
 - semantic quality on fixed cases;

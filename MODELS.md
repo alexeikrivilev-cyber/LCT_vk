@@ -2,7 +2,7 @@
 
 ## Runtime policy
 
-The semantic runtime uses `Qwen/Qwen3.8-27B` through one logical inference service. Worker and supervisor share the same semantic weights and keep isolated mutable session/KV state.
+The semantic runtime target uses `Qwen/Qwen3.8-27B` through one logical inference service. Worker and supervisor share the same semantic weights and receive independently supplied request contexts. The current adapter is stateless and does not create persistent sessions or distinct KV namespaces.
 
 `INFERENCE.md` is canonical for physical GPU profiles, precision, sharding, prefix-cache warmup, scheduling, media inference, and the 300-second deadline. Do not duplicate those deployment details here.
 
@@ -76,7 +76,7 @@ Separate **static instructions** from **mutable project evidence**.
 
 ### Static instructions
 
-Guaranteed worker/supervisor pipeline instructions, role rules, stage prompts, tool/schema contracts, and stable architecture constraints are versioned assets. They should be prewarmed into immutable prefix-cache entries as defined in `INFERENCE.md`.
+Guaranteed worker/supervisor pipeline instructions, role rules, stage prompts, tool/schema contracts, and stable architecture constraints are versioned assets. A serving runtime may prewarm reusable immutable prompt prefixes as described in `INFERENCE.md`; the adapter itself sends complete requests and does not provide role-specific cache namespaces.
 
 This means a stage does not repeatedly pay the cost of prefilling instructions that are known in advance to be required during every normal generation.
 
@@ -100,9 +100,9 @@ Supervisor examples:
 - locks;
 - deadline remaining.
 
-Do not put raw PPTX XML, the whole content package, every layout, all project history, or optional craft material into every call. Eagerly cache stable instructions; keep changing evidence narrow.
+Do not put raw PPTX XML, the whole content package, every layout, all project history, or optional craft material into every call. Keep changing evidence narrow; a serving runtime may reuse stable instruction prefixes as an optimization.
 
-Project-specific immutable summaries may be prefix-cached after compilation when reuse is measurable, but they remain project/version scoped.
+Project-specific immutable summaries may be prefix-cached after compilation when reuse is measurable, but they remain project/version scoped in application requests. Cache reuse is an optimization, not session history or an isolation boundary.
 
 ## Skill architecture
 

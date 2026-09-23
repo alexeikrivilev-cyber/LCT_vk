@@ -40,8 +40,8 @@ Do not duplicate long rules here.
 - `apps/daemon` owns presentation domain logic, persistence, rendering, audit, export, orchestration, and adapters.
 - Runtime semantic inference uses one logical `Qwen/Qwen3.8-27B` model service. Its weights may reside on one GPU or be sharded across multiple GPUs; worker and supervisor do not get separate model replicas.
 - Worker drives forward generation. Supervisor reviews versioned checkpoints and proposes bounded repairs/local re-plans.
-- Worker and supervisor have isolated mutable session/KV state. Shared immutable weights and safe immutable prefix-cache reuse are allowed.
-- Guaranteed runtime instructions/pipeline prefixes should be prewarmed before timed generation; mutable project context remains scoped and validated.
+- Worker and supervisor calls carry independently supplied application messages/context. The semantic adapter is stateless and does not provide persistent sessions or distinct KV namespaces; serving-side prefix reuse is an optimization and must not affect correctness.
+- Guaranteed runtime instructions/pipeline prefixes should be prewarmed before timed generation where the selected serving runtime supports it; mutable project context remains scoped and validated.
 - The normal 10–15 slide deck must complete within 300 seconds. Do not add model/media work without accounting for latency, VRAM, and scheduler impact.
 - Models make semantic decisions. Deterministic code owns exact geometry, constraints, native object construction, locks, persistence, validation, scheduling state, and export correctness.
 - Keep integrations behind adapters and validate structured model output before mutation/rendering.
@@ -68,7 +68,7 @@ Before declaring work complete:
 2. Check that the change improves the final product goal, not only a local implementation detail.
 3. Check for contradictions across product UX, architecture, model roles, audit/export, and the 300-second runtime contract.
 4. If generation flow changed, verify progressive slide-pack publication, no per-pack user gate, stable A/B/C semantics, and local edits that do not reset unrelated pending work.
-5. If inference changed, verify one logical model, isolated worker/supervisor state, eager prefix warmup, measured VRAM headroom, hardware-profile behavior, and deadline degradation.
+5. If inference changed, verify one logical model boundary and independent Worker/Supervisor request contexts. Mark serving-specific sessions, prefix warmup, VRAM headroom, hardware behavior, and deadline degradation as unverified until measured at that layer.
 6. Update the canonical document when behavior or architecture changes; avoid copying the same policy into multiple files.
 7. Run the narrowest meaningful validation and report only checks actually executed.
 
