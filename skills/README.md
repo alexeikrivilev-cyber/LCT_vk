@@ -1,6 +1,6 @@
 # Skills
 
-Skills contain reusable semantic workflows for the presentation compiler. They are versioned prompt/configuration assets, not a second implementation layer for geometry, persistence, rendering, scheduling, or export.
+Skills are versioned semantic workflows for the presentation compiler. They are prompt/configuration assets, not a second implementation layer for geometry, persistence, scheduling, rendering, or export.
 
 ## Current inventory
 
@@ -13,66 +13,89 @@ They are starting material, not the final orchestrator architecture.
 
 ## Target skill shape
 
-The runtime has one thin orchestration layer and two logical agent roles over the same Qwen3.8-27B model weights.
+The runtime has two logical semantic roles over the same base model weights.
 
-Worker-oriented skills:
+Worker-oriented capabilities:
 
 ```text
 presentation-orchestrator
   -> template-semantics
   -> deck-planner
-  -> layout-ranker
+  -> layout-ranker / slide-pack planner
   -> visual-planner
-  -> local-repair/replan
+  -> local-repair / re-plan
 ```
 
-Supervisor-oriented skills:
+Supervisor-oriented capabilities:
 
 ```text
 supervisor-review
   -> plan-review
-  -> slide/contextual-audit
+  -> slide/contextual-review
   -> visual-relevance-review
-  -> bounded-repair-proposal
+  -> bounded-repair proposal
 ```
 
-These are skills/capabilities, not extra agents. The runtime still has exactly two semantic roles: worker and supervisor. Contextual audit runs under the supervisor rather than introducing a third model persona.
+These are skills/capabilities, not extra agents. Contextual audit belongs to Supervisor rather than introducing a third model persona.
 
-Exact names may change. The responsibility split in `MODELS.md`, `ARCHITECTURE.md`, and `INFERENCE.md` must not.
+Exact names may change. Responsibility boundaries in `MODELS.md`, `ARCHITECTURE.md`, and `INFERENCE.md` must not.
 
 ## Authoring rules
 
 A skill should:
 
 - solve one repeatable semantic task;
-- state its inputs, constraints, checkpoint/version expectations, and structured output clearly;
-- reference canonical repository docs instead of copying long product rules;
+- state inputs, constraints, checkpoint/version expectations, and structured output;
+- reference canonical docs rather than copy long product rules;
 - operate on stable ids supplied by the application;
 - leave exact geometry, OOXML, native object construction, locks, persistence, deadline scheduling, and deterministic audit to code;
 - avoid provider credentials and transport details;
-- be small enough to benchmark and version independently.
+- be independently benchmarkable/versionable.
 
-The top-level orchestrator coordinates stages. Do not turn it into a giant presentation handbook.
+The top-level orchestrator coordinates stages; it must not become a giant presentation handbook.
 
-Prefer constrained choices over unconstrained design instructions. Rank a supplied set of compatible layouts instead of asking the model to invent a slide.
+Prefer constrained choices over unconstrained design instructions. Rank supplied valid layouts instead of asking the model to invent a slide.
 
-Supervisor skills should return targeted findings/patch operations, never a replacement full deck. They must treat locks, checkpoint versions, and deadline remaining as explicit constraints.
+Supervisor skills return targeted findings/patch operations, never a replacement deck. They treat locks, checkpoint versions, and deadline remaining as explicit constraints.
 
-## Context and cache discipline
+## Instruction bundles and prefix warmup
 
-Skills must not assume that worker and supervisor share conversation history. Pass required facts explicitly through structured project/checkpoint state.
+Guaranteed normal-generation skills are known in advance. Their stable instruction/schema prefixes should be packaged so the inference runtime can prewarm them before timed generation, as defined in `INFERENCE.md`.
 
-Do not stuff the entire project into every skill call. Retrieve the smallest relevant content/design slice. Long-lived context growth hurts latency and KV-cache headroom and is constrained by `INFERENCE.md`.
+This is a serving optimization, not permission to concatenate every skill into every request.
+
+Keep two concepts separate:
+
+- **required static skill prefixes** — prewarmed because the normal pipeline will use them;
+- **optional/retrieved guidance** — loaded only when relevant, such as specialized craft sections or unusual repair instructions.
+
+Worker and Supervisor instruction bundles remain separate and independently versioned. Prefix/cache reuse must never imply shared mutable conversation history.
+
+## Progressive-generation contract
+
+Skills that produce slide decisions must operate on the shared `DeckPlan` and one slide scope at a time or in bounded batches that preserve slide-pack semantics.
+
+A slide pack contains A/B/C for the same planned slide. Once the application validates/publishes a pack, the orchestrator should continue toward the next planned slide without requiring user approval.
+
+Local edits to an already-ready slide are separate mutations and must not reset unrelated pending generation.
+
+## Context discipline
+
+Prewarm stable instructions; keep mutable evidence narrow.
+
+Pass required facts through structured project/checkpoint state. Do not stuff raw project history, every layout, every craft file, or the complete content package into each skill call.
+
+Project-specific summaries may be cached after compilation when useful, but remain project/version scoped.
 
 ## Versioning
 
-Prompt/skill changes can materially change output and must be traceable. Record versions for accepted worker and supervisor instructions and include them in generation metadata.
+Prompt/skill changes can materially change output. Record accepted Worker/Supervisor instruction-bundle versions and include them in generation metadata.
 
-Use the benchmark process in `TESTING.md` and `MODELS.md` before promoting a prompt/skill change.
+Use the benchmark process in `TESTING.md` and `MODELS.md` before promoting a change.
 
 ## Craft references
 
-`craft/` contains compact brand-agnostic presentation guidance. A skill may opt into the relevant references using the frontmatter format already supported by the retained skill files.
+`craft/` contains compact brand-agnostic presentation guidance. A skill may opt into relevant references using the supported frontmatter format.
 
 After changing craft references, run:
 
@@ -80,8 +103,8 @@ After changing craft references, run:
 pnpm lint:craft
 ```
 
-Do not load every craft file into every model call. Use only what the current skill needs.
+Do not load optional craft files merely because they exist; use them when the active skill needs them.
 
 ## Licensing and provenance
 
-Keep any package-level `LICENSE`, source notice, or provenance file intact. If a retained skill has its own license, that license governs that package. Do not remove attribution as part of prompt cleanup.
+Keep package-level `LICENSE`, source notices, and provenance files intact. A retained skill's own license governs that package.

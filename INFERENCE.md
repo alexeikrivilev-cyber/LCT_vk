@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This document is the canonical infrastructure contract for semantic and image inference. The product must generate a normal 10–15 slide presentation within 300 seconds, while preserving the product and native-PPTX guarantees in `CONTEXT.md` and `ARCHITECTURE.md`.
+This is the canonical infrastructure contract for semantic and image inference. A normal 10–15 slide deck must complete within 300 seconds with a warm service while preserving the product guarantees in `CONTEXT.md` and `ARCHITECTURE.md`.
 
-The design assumes a high-memory NVIDIA Hopper-class GPU server, with an H100-class device as the primary target. Exact serving software and GPU SKU are implementation choices; the contracts below are not.
+The presentation domain talks to one logical semantic inference service. Physical GPU count, precision, sharding, prefix-cache implementation, and serving engine are deployment details selected by benchmark.
 
 ## Semantic model
 
@@ -14,149 +14,180 @@ Primary runtime model:
 Qwen/Qwen3.8-27B
 ```
 
-Use one loaded model weight set per GPU serving unit. Two agents do **not** mean two model replicas.
+The runtime has one logical copy of the semantic model weights. Worker and supervisor share those weights and use isolated mutable session/KV state. If the model spans several GPUs, the weights are partitioned/sharded rather than duplicated per agent.
 
-The serving layer must support image inputs because the supervisor may inspect rendered slide screenshots in addition to structured state.
+The serving path must support image inputs because the supervisor may inspect rendered slide screenshots.
 
-### Precision policy
+## Hardware profiles
 
-The first production benchmark profile is the official `Qwen/Qwen3.8-27B-FP8` checkpoint on H100-class hardware.
+### Primary: single H100-class GPU
 
-Reasoning:
+The first production benchmark profile is a single H100-class GPU with the official `Qwen/Qwen3.8-27B-FP8` checkpoint.
 
-- H100 has native FP8 Tensor Core support.
-- An official FP8 checkpoint exists for Qwen3.8-27B.
-- FP8 materially reduces resident weight memory versus the non-FP8 checkpoint, leaving room for two agent KV caches, batching, rendering buffers, and media inference.
-- The five-minute limit favors throughput and memory headroom over an unmeasured preference for FP16.
+FP8 is the initial profile because Hopper provides native FP8 acceleration and the official FP8 checkpoint leaves materially more memory headroom than a non-FP8 weight set for two agent caches, batching, activations, and media/runtime allocations.
 
-BF16/FP16 remains a supported benchmark candidate. It may replace FP8 only when an end-to-end benchmark shows that quality, throughput, peak VRAM, two-cache capacity, and media scheduling all fit the required budget with safety headroom.
+BF16/FP16 remains a benchmark candidate. It replaces FP8 only if end-to-end measurements show equal/better quality and total throughput while preserving two-cache capacity, media scheduling, safety headroom, and the 300-second gate.
 
-Do not treat generic Q8/INT8 as the default merely because it is 8-bit. On Hopper, benchmark the actual kernels/checkpoints used. Precision is a deployment parameter selected by evidence.
+Do not choose generic Q8/INT8 merely because it is 8-bit. Benchmark the actual checkpoint, kernels, engine, and workload.
 
-Record the selected model revision, precision, serving engine, CUDA/runtime versions, and benchmark profile with every release candidate.
+### Fallback: dual RTX 5090-class GPUs
+
+If the single-H100 profile cannot reliably meet the 300-second gate or is unavailable, the next target profile is two RTX 5090-class GPUs serving the **same logical Qwen3.8-27B instance** with weights partitioned across both devices.
+
+The serving engine may use tensor parallelism, pipeline parallelism, or another supported sharding strategy. Choose by end-to-end benchmark. Do not assume two consumer GPUs provide linear speedup; cross-device communication, scheduler behavior, KV placement, and media/model swapping are part of the measurement.
+
+Required invariants for the dual-GPU profile:
+
+- do not run a full worker model replica on one card and a full supervisor replica on the other;
+- worker and supervisor still share one logical semantic model and retain isolated mutable caches;
+- sharding details stay behind the inference adapter;
+- the presentation pipeline and product behavior are unchanged;
+- record device topology and parallelism settings in benchmark/release metadata.
+
+Before reducing required product behavior, test the dual-5090 profile if the primary H100 profile misses the time gate.
 
 ## Two-agent topology
 
-The runtime has exactly two logical semantic agents for a deck generation.
+### Worker
 
-### Worker agent
+Worker owns forward progress:
 
-The worker owns forward progress. It performs the semantic tasks required to build the deck:
-
-- template semantic labeling after deterministic PPTX extraction;
+- template semantic labeling after deterministic extraction;
 - content understanding and `DeckPlan`;
-- slide intent/title/copy decisions;
-- layout ranking within allowed candidates;
-- visual-type planning;
-- A/B/C slide-spec decisions;
-- local regeneration and requested semantic edits.
+- titles/copy and slide intent;
+- ranking among valid layouts;
+- semantic visual type;
+- A/B/C slide-pack decisions;
+- requested local regeneration/semantic edits.
 
-The worker is the only agent allowed to initiate broad generation/re-planning. It should make batched decisions whenever that reduces calls without creating an oversized context.
+Worker is the only role allowed to initiate broad planning/re-planning.
 
-### Supervisor agent
+### Supervisor
 
-The supervisor is a bounded critic/repair agent using the same model weights with a different system instruction and independent context.
+Supervisor is a bounded critic/repair role over the same model weights with a separate instruction set and mutable context.
 
-It observes immutable checkpoints and looks for mistakes while generation is in progress. Typical inputs are:
+It reviews versioned checkpoints, structured specs, screenshots, deterministic findings, locks, and remaining deadline. Its output is a structured `pass | warn | repair | local-replan` decision tied to a checkpoint version.
 
-- validated `TemplateIR` / design-system summaries;
-- `DeckPlan`;
-- batches of `SlideSpec` candidates;
-- rendered slide screenshots;
-- deterministic audit findings;
-- locks/selections;
-- remaining deadline budget.
+Supervisor does not generate a competing deck, write OOXML, bypass locks, invent unrestricted geometry, or force a serial approval after every slide pack. Repairs go through the same validated mutation/rendering path as normal edits.
 
-It returns a structured decision such as:
+## Eager instruction and pipeline prefix warmup
+
+Guaranteed runtime instructions should not be re-prefilled from scratch on every call.
+
+Before timed deck generation begins, warm the model and prefill immutable prompt-prefix entries inside the two role namespaces.
+
+Worker prefix set should cover the guaranteed worker pipeline, including:
 
 ```text
-status: pass | warn | repair | local-replan
-severity
-checkpointVersion
-targetIds[]
-findings[]
-patchOps[]
+worker core/system contract
+presentation orchestration rules
+structured output/tool schemas
+template-semantics stage instructions
+deck-planning stage instructions
+layout/variant stage instructions
+visual-planning stage instructions
+local repair/re-plan stage instructions
 ```
 
-The supervisor does **not** generate a second deck in parallel. It does not rewrite OOXML, bypass locks, invent geometry, or perform unrestricted global replanning.
+Supervisor prefix set should cover:
 
-Repairs are applied by the normal validated mutation/rendering path. If a supervisor patch targets a stale checkpoint or conflicts with a lock, reject it. A local semantic issue may be repaired directly through a validated patch; a material narrative/visual-type change is routed back to the worker as a local re-plan.
+```text
+supervisor core/system contract
+review/repair policy
+structured output/tool schemas
+plan-review stage instructions
+slide/contextual-review stage instructions
+visual-relevance-review stage instructions
+bounded repair/local-replan instructions
+```
 
-### Review checkpoints
+These may be represented as separate immutable prefix-cache entries inside each role namespace rather than one enormous concatenated prompt. The objective is that every guaranteed stage can start without repeatedly paying the full static instruction prefill cost.
 
-Use the supervisor where it has leverage, not continuously:
+Do **not** confuse preloaded instructions with project context. Raw content packages, all PPTX XML, every layout, optional craft rules, and mutable project history do not belong in a global prefix merely because memory is available.
 
-1. after template semantic compilation when ambiguity is material;
-2. after `DeckPlan`;
-3. after slide-spec/render batches, especially slides with deterministic findings or low-confidence decisions;
-4. after media is inserted for visual relevance/composition checks;
-5. before final preflight only for unresolved contextual blockers.
+Use two layers:
 
-Deterministic audits run independently and should filter what needs supervisor attention.
+1. **eager immutable prefixes** — role instructions, required pipeline/skill instructions, tool/schema contracts, stable safety/architecture rules;
+2. **scoped mutable/project context** — current brief/content slice, relevant design-system/layout candidates, locks, checkpoint state, findings, and rendered evidence.
+
+Optional skills/craft/retrieval content remains lazy unless the pipeline guarantees it will be used. Project-specific immutable summaries may receive their own prefix-cache entries after they are compiled, but they stay project-scoped and versioned.
+
+Worker and supervisor mutable histories must never be merged by prefix reuse.
 
 ## Cache and context isolation
 
-Worker and supervisor use separate mutable KV-cache/session namespaces.
-
 Required properties:
 
-- no mutable conversation history is shared between agents;
-- no cross-project cache reuse that can leak context;
-- each generation has stable worker/supervisor session ids;
-- cache eviction/compaction for one agent must not corrupt the other;
-- both agents receive explicit project/checkpoint versions in their inputs.
+- distinct worker/supervisor session ids and mutable KV-cache namespaces;
+- no cross-project mutable cache reuse;
+- no generated-token visibility between roles unless explicitly copied into structured checkpoint state;
+- cache eviction/compaction for one role must not corrupt the other;
+- every request carries project/generation/checkpoint version information;
+- cache/prefix entries are invalidated when their instruction or project-summary version changes.
 
-The serving engine may reuse an immutable prompt prefix internally, but this must not merge agent histories or make one agent's generated tokens visible to the other.
+Do not grow mutable context to the model maximum by default. Stable instructions are prefetched; changing project evidence remains narrow.
 
-Do not use the model's maximum context length by default. Keep context compact with structured state, retrieval, and checkpoint summaries. Context budgets are tuning parameters and must be chosen from latency/VRAM benchmarks.
+## Continuous-generation scheduler
 
-## GPU scheduler
+All semantic/media requests go through a small scheduler/arbiter.
 
-Place a small scheduler/arbiter in front of the inference engine.
+Priority is forward user value:
 
-Responsibilities:
+1. keep Worker producing the next slide pack;
+2. validate/render/audit completed packs;
+3. generate required visual candidates;
+4. run Supervisor opportunistically on completed/high-risk checkpoints;
+5. spend remaining budget on non-essential polish.
 
-- tag requests as `worker`, `supervisor`, or `media`;
-- preserve separate semantic-agent sessions;
-- prioritize worker forward progress;
-- cap supervisor concurrency, token budget, and retries;
-- use continuous batching when the serving engine supports it;
-- expose deadline remaining to orchestration;
-- cancel stale requests after a newer checkpoint supersedes them;
-- publish queue latency, token throughput, KV-cache use, and peak VRAM.
+The scheduler must:
 
-The supervisor should run opportunistically between/alongside worker steps. It may block forward progress only for a high-severity issue whose repair is cheaper than allowing the error to propagate.
+- tag `worker`, `supervisor`, and `media` work;
+- preserve role/cache isolation;
+- maintain the next slide-pack publish index;
+- keep generation running without waiting for user acknowledgement;
+- use continuous batching or equivalent when supported;
+- cancel stale work after checkpoint changes;
+- cap Supervisor token budget/concurrency/retries;
+- expose deadline remaining;
+- publish queue latency, token throughput, prefix-cache hit/pre-fill cost, KV usage, and peak VRAM.
 
-Do not create a permanent serial chain `worker -> supervisor -> worker -> supervisor` for every tiny operation; that would waste the five-minute budget.
+A Supervisor pass for slide N normally runs while Worker advances toward slide N+1. Only a true high-severity blocker should stop forward progress.
 
 ## Five-minute deadline
 
-Treat 300 seconds as a hard end-to-end generation deadline for a normal 10–15 slide deck once validated inputs are ready and generation starts. The inference service must be warm before it reports ready; cold model startup is measured separately and is not allowed to surprise a live generation.
+Treat 300 seconds as a hard end-to-end gate after validated inputs are ready and generation starts. The model and guaranteed instruction prefixes must be warm before readiness is reported; cold model load and static-prefix prefill are startup/readiness work, not hidden inside a favorable generation benchmark.
 
-Internally target completion by about 270 seconds to keep a final buffer for preflight/export/UI jitter.
+Internally target about 270 seconds to retain final preflight/export/UI headroom.
 
-Use a deadline-aware budget rather than fixed sleeps. A practical initial budget envelope is:
+A useful initial budget envelope is:
 
 ```text
-0–45 s      deterministic ingest/template/content compilation
-45–80 s     worker deck planning + bounded supervisor plan review
-80–210 s    A/B/C slide specs + deterministic rendering/audit, batched/parallel
-210–260 s   media candidates + targeted supervisor visual review/repairs
-260–300 s   preflight/export reserve
+0–45 s      deterministic template/content compilation + project setup
+45–80 s     worker DeckPlan + bounded supervisor plan review
+80–240 s    continuous slide packs, render/audit, visual candidates, targeted supervisor work
+240–270 s   remaining local repairs/finalization
+270–300 s   preflight/export reserve
 ```
 
-These are starting budgets, not protocol boundaries. Measure and rebalance them.
+This is a tuning envelope, not a required serial schedule. Slide packs should become visible during the 80–240 second window rather than waiting for the whole phase to finish.
 
-### Degradation order
+Track both total wall time and progressive latency:
 
-When the deadline is threatened:
+- time to first ready slide pack;
+- time between ready slide packs;
+- time to visual-candidate readiness;
+- time to complete deck.
 
-1. cancel stale/duplicate model work;
-2. reduce supervisor breadth to only blocking/high-risk slides;
-3. reduce reasoning/token budgets and retries;
-4. reduce image preview resolution/steps before reducing required candidate semantics;
-5. defer non-essential polish/upscale/history work;
-6. preserve deterministic audit, locks, native PPTX correctness, and coherent A/B/C slide variants.
+### Deadline degradation order
+
+When time is threatened:
+
+1. cancel stale/duplicate work;
+2. narrow Supervisor review to blocking/high-risk slides;
+3. reduce Supervisor/Worker optional reasoning/retries;
+4. reduce media preview resolution/steps before dropping required semantics;
+5. defer non-essential upscale/polish/history work;
+6. preserve locks, deterministic audit, native PPTX correctness, coherent A/B/C tracks, and continuous forward slide generation.
 
 Never spend the remaining budget on a second full-deck critique while the primary deck is incomplete.
 
@@ -168,101 +199,96 @@ Preferred image model:
 Qwen/Qwen-Image-2.1
 ```
 
-Use it behind the media adapter. The presentation domain should request semantic image jobs; it must not depend on Diffusers/provider-specific request objects.
+The presentation domain requests semantic image jobs through a media adapter; it does not depend on provider/Diffusers request types.
 
-For an image slot, create the required same-type candidate set efficiently:
+For image/photo slots:
 
+- keep the semantic type fixed before generation;
+- produce three useful candidates efficiently;
 - batch compatible prompts/seeds when supported;
-- generate at review-appropriate resolution first;
-- avoid generating image alternatives for slots whose semantic type is not image;
-- avoid repeated model swaps for one image at a time;
-- allow selected-media refinement only if the deadline permits.
+- generate review-resolution candidates first;
+- update the already-visible slide slot when candidates arrive;
+- refine only the selected image if time permits.
 
-Charts, tables, diagrams, icons, and SmartArt-like structures should normally be rendered as native/deterministic presentation objects rather than sent to the image model.
+Charts, tables, diagrams, icons, and SmartArt-like structures should normally remain native/deterministic presentation objects.
 
-### GPU residency
+## Media residency
 
-Do not assume both models fit safely just because raw weight files fit.
+Do not assume semantic and image models fit concurrently because raw weight sizes fit.
 
-At startup/release benchmarking, measure:
+Benchmark peak memory including:
 
 ```text
-LLM weights
-+ worker KV cache
-+ supervisor KV cache
-+ max semantic batch activations
-+ image-model weights/activations
-+ rendering/runtime allocations
+semantic weights/shards
++ worker KV/session cache
++ supervisor KV/session cache
++ immutable prefix-cache entries
++ batch activations
++ image model weights/activations
++ runtime/render allocations
 + safety margin
 ```
 
-Support two deployment modes:
+Support:
 
-- `co-resident` — semantic and image models stay resident only when measured peak VRAM leaves a safe margin;
-- `staged` — group semantic work, run a batched image phase, then restore semantic inference for final supervisor checks. Avoid repeated load/unload thrashing.
+- `co-resident` — keep semantic and image models resident only with measured safety headroom;
+- `staged` — group semantic/media phases enough to avoid repeated load/unload thrash while preserving progressive slide publication.
 
-If the server later has more than one GPU, the media adapter may move to another device without changing presentation-domain contracts.
+On a dual-GPU semantic profile, do not opportunistically move shards around merely to fit one image request. Use an explicit measured media placement/residency strategy.
 
 ## License/compliance gate
 
-There is a current hackathon-compliance risk that must not be hidden.
+Qwen-Image-2.1 is the preferred technical media target, but its upstream license must be re-checked against the hackathon's allowed license class before qualification/final freeze.
 
-As of 2026-09-23, the upstream `Qwen/Qwen-Image-2.1` model card declares the Qwen Research License, while the case materials supplied to this project require generative model licenses in the Apache-2.0/MIT class. Therefore:
-
-- keep Qwen-Image-2.1 as the preferred technical media target;
-- do not treat it as an automatically valid final-submission dependency;
-- re-check the upstream license immediately before the qualification/final freeze;
-- obtain explicit organizer confirmation if the license remains outside the stated case rule;
-- keep the adapter capable of switching to a compliant fallback without domain changes.
-
-`Qwen/Qwen-Image` is currently an Apache-2.0 fallback candidate if the final rules reject Qwen-Image-2.1. This fallback is a compliance escape hatch, not a change to the preferred product model.
+If it is not permitted and no organizer exception exists, switch through the media adapter to a compliant fallback without changing presentation-domain contracts. Keep the fallback path exercised, not merely documented.
 
 ## Serving implementation freedom
 
-The serving implementation may use vLLM, SGLang, Transformers, or another compatible engine. Choose by benchmark.
+The service may use vLLM, SGLang, Transformers, or another compatible engine. Choose by benchmark.
 
 Required capabilities:
 
 - Qwen3.8-27B multimodal inference;
-- FP8/BF16/FP16 profile support as benchmarked;
-- separate worker/supervisor request/session identities;
-- continuous batching or equivalent efficient scheduling;
+- chosen FP8/BF16/FP16/sharded profile;
+- isolated worker/supervisor sessions;
+- immutable prefix caching/prefill;
+- continuous batching or equivalent;
 - request cancellation/deadlines;
 - structured-output-friendly API;
-- observability for token throughput, queue time, KV-cache pressure, and VRAM;
 - warmup/readiness;
-- OpenAI-compatible HTTP is preferred but not an architectural requirement.
+- observability for queue, tokens, prefix/KV cache, VRAM, and device utilization.
 
-The TypeScript daemon talks to the inference host through a small adapter. Python may be used for GPU serving; provider/runtime-specific types must not leak into presentation domain contracts.
+The TypeScript daemon talks to the inference host through a small adapter. Python is allowed for GPU serving; runtime-specific types must not leak into domain contracts.
 
-## Required telemetry
+## Telemetry and release metadata
 
-Capture per generation:
+Capture per generation/profile:
 
-- total wall time and time by pipeline stage;
-- worker vs supervisor request count;
-- prompt/output tokens and reasoning settings;
-- time-to-first-token and tokens/second;
-- queue latency;
-- KV-cache usage/evictions per agent;
-- peak GPU memory;
-- media generation count and latency;
-- supervisor findings/repairs and their accepted/rejected status;
-- retries/cancellations/timeouts;
+- total and per-stage wall time;
+- time-to-first-slide-pack and slide-pack cadence;
+- worker/supervisor request counts, tokens, TTFT, decode throughput;
+- prefix-cache prefill time and hit rate;
+- queue latency/cancellations/retries/timeouts;
+- KV usage/evictions by role;
+- per-device utilization and peak memory;
+- media count/latency/residency or swap cost;
+- supervisor findings and accepted/rejected repairs;
 - final deadline headroom.
 
-Performance work is evaluated end-to-end. A faster isolated model call does not matter if model swaps, oversized contexts, supervisor loops, or image generation make the deck exceed five minutes.
+Record model revision, precision, serving engine, GPU SKU/count/topology, sharding strategy, CUDA/runtime versions, prompt/prefix versions, context budgets, and scheduler settings.
 
 ## Readiness gates
 
-An inference configuration is eligible for final use only when:
+A profile is eligible for final use only when:
 
-- one semantic weight set serves both agents;
-- worker/supervisor cache isolation tests pass;
+- one logical semantic model serves both roles;
+- worker/supervisor mutable cache isolation tests pass;
+- required role/stage instruction prefixes are prewarmed before timed generation;
 - no cross-project context bleed is observed;
+- progressive slide packs appear without per-pack approval stalls;
 - normal 10–15 slide benchmark decks complete within 300 seconds;
 - peak VRAM leaves measured safety headroom;
-- A/B/C slide variants and required media candidates are produced;
-- supervisor improves/catches failures without becoming the dominant latency source;
-- final model/license choices satisfy the hackathon rules;
-- the exact configuration is recorded and reproducible.
+- Supervisor improves/catches failures without dominating latency;
+- required A/B/C slide/visual semantics remain intact;
+- final model/license choices satisfy case rules;
+- the exact deployment profile is reproducible.
