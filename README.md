@@ -56,7 +56,7 @@ The repository contains the minimal product shell:
 - `craft/` — compact presentation craft guidance.
 - `templates/deck-framework.html` — neutral HTML preview shell.
 
-The compiler, progressive-generation state machine, and GPU inference service described in the architecture docs are target behavior under active implementation. Documentation distinguishes existing foundation from required target behavior.
+Deterministic PPTX structural understanding is implemented: upload a `.pptx` into a project, choose **Analyze as template**, and review the saved `TemplateIR`/structural design summary in the workspace. Recompiling the same source is deterministic; changing the source marks the saved result stale. This scan has partial OOXML/style coverage and does not claim universal arbitrary-template or native rendering compatibility. Content planning, progressive generation, native rendering, audit/export, and GPU inference remain target behavior.
 
 The current visual UI is temporary and expected to be redesigned. Product/domain contracts are stable; existing screen styling/composition is not.
 

@@ -45,12 +45,15 @@ class ElementRecord:
     geometry: Geometry | None
     text: str = ""
     placeholder_role: str | None = None
+    placeholder_identity: dict[str, str | int | None] | None = None
     style: dict[str, Any] = field(default_factory=dict)
     relationship: dict[str, Any] | None = None
     source_part: str = ""
     parent_id: str | None = None
     warnings: list[str] = field(default_factory=list)
     effective_geometry: Geometry | None = None
+    geometry_resolution_unknown: bool = False
+    source_order: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -59,13 +62,16 @@ class ElementRecord:
             "element_id": self.element_id,
             "geometry": self.geometry.as_dict() if self.geometry else None,
             "effective_geometry": self.effective_geometry.as_dict() if self.effective_geometry else None,
+            "geometry_resolution_unknown": self.geometry_resolution_unknown,
             "text": self.text,
             "placeholder_role": self.placeholder_role,
+            "placeholder_identity": self.placeholder_identity,
             "style": self.style,
             "relationship": self.relationship,
             "source_part": self.source_part,
             "parent_id": self.parent_id,
             "warnings": self.warnings,
+            "source_order": self.source_order,
         }
 
 
@@ -78,6 +84,8 @@ class SlideRecord:
     elements: list[ElementRecord] = field(default_factory=list)
     design_elements: list[ElementRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    relationships: list[dict[str, Any]] = field(default_factory=list)
+    background: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +96,8 @@ class SlideRecord:
             "elements": [element.as_dict() for element in self.elements],
             "design_elements": [element.as_dict() for element in self.design_elements],
             "warnings": self.warnings,
+            "relationships": self.relationships,
+            "background": self.background,
         }
 
 
@@ -98,10 +108,11 @@ class Inspection:
     slide_size: dict[str, Any]
     slide_count: int
     slides: list[SlideRecord]
-    theme: dict[str, Any]
+    theme: dict[str, Any] | None
     unsupported: list[dict[str, Any]]
     warnings: list[str] = field(default_factory=list)
     notes_parts: list[str] = field(default_factory=list)
+    media_parts: list[str] = field(default_factory=list)
     # The template library is intentionally a raw, replaceable observation
     # surface.  It inventories every slideLayout/slideMaster part, including
     # parts that no current slide references; it is not a renderer contract.
@@ -118,5 +129,6 @@ class Inspection:
             "unsupported": self.unsupported,
             "warnings": self.warnings,
             "notes_parts": self.notes_parts,
+            "media_parts": self.media_parts,
             "template_library": self.template_library,
         }

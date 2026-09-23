@@ -163,12 +163,12 @@ def _validate_archive(zf: zipfile.ZipFile, path: str) -> list[str]:
     return sorted(names)
 
 
-def _relationships(zf: zipfile.ZipFile, part: str) -> dict[str, tuple[str, str]]:
+def _relationships(zf: zipfile.ZipFile, part: str) -> dict[str, tuple[str, str | None, str, str, str]]:
     rels_part = _rels_path(part)
     if rels_part not in zf.namelist():
         return {}
     root = _read_xml(zf, rels_part)
-    result: dict[str, tuple[str, str]] = {}
+    result: dict[str, tuple[str, str | None, str, str, str]] = {}
     for rel in root.findall("rel:Relationship", _ns()):
         rel_id = rel.get("Id")
         if not rel_id:
@@ -176,9 +176,14 @@ def _relationships(zf: zipfile.ZipFile, part: str) -> dict[str, tuple[str, str]]
         if rel_id in result:
             raise ValueError(f"relationship part {rels_part} contains duplicate relationship Id {rel_id!r}")
         target = rel.get("Target", "")
+        target_mode = rel.get("TargetMode")
+        if target_mode not in {None, "External"}:
+            raise ValueError(f"relationship part {rels_part} contains unsupported TargetMode {target_mode!r}")
+        mode = "external" if target_mode == "External" else "internal"
         # External targets are URLs and must not be normalized as package paths.
-        resolved = target if rel.get("TargetMode") == "External" else _part_target(part, target)
-        result[rel_id] = (rel.get("Type", "").rsplit("/", 1)[-1], resolved)
+        target_part = None if mode == "external" else _part_target(part, target)
+        full_type = rel.get("Type", "")
+        result[rel_id] = (full_type.rsplit("/", 1)[-1], target_part, mode, full_type, target)
     return result
 
 
@@ -219,6 +224,8 @@ def _geometry(sppr: ET.Element | None) -> Geometry | None:
 def _group_affine(element: ET.Element) -> Affine | None:
     xfrm = element.find("p:grpSpPr/a:xfrm", _ns())
     if xfrm is None:
+        return None
+    if xfrm.get("rot", "0") not in {"0", "0.0"} or xfrm.get("flipH", "0") in {"1", "true", "True"} or xfrm.get("flipV", "0") in {"1", "true", "True"}:
         return None
     off = xfrm.find("a:off", _ns())
     ext = xfrm.find("a:ext", _ns())
@@ -278,8 +285,26 @@ def _text(element: ET.Element) -> str:
 def _color(parent: ET.Element | None) -> str | None:
     if parent is None:
         return None
-    color = parent.find(".//a:srgbClr", _ns())
-    return color.get("val") if color is not None else None
+    color_tags = {"srgbClr", "schemeClr", "sysClr", "prstClr", "scrgbClr", "hslClr"}
+    for color in parent.iter():
+        color_type = _tag(color)
+        if color_type not in color_tags:
+            continue
+        attributes = dict(color.attrib)
+        if color_type == "srgbClr":
+            return attributes.get("val")
+        if color_type == "schemeClr":
+            return f"scheme:{attributes['val']}" if attributes.get("val") else None
+        if color_type == "sysClr":
+            name = attributes.get("val")
+            fallback = attributes.get("lastClr")
+            if name:
+                return f"system:{name}/{fallback}" if fallback else f"system:{name}"
+            return None
+        if color_type == "prstClr":
+            return f"preset:{attributes['val']}" if attributes.get("val") else None
+        return f"{color_type}:" + ",".join(f"{key}={value}" for key, value in sorted(attributes.items()))
+    return None
 
 
 def _style(element: ET.Element) -> dict[str, object]:
@@ -338,10 +363,13 @@ def _name_id(element: ET.Element) -> tuple[str, str | None]:
 def _record_element(
     element: ET.Element,
     slide_part: str,
-    rels: dict[str, tuple[str, str]],
+    rels: dict[str, tuple[str, str | None, str, str, str]],
     parent_id: str | None = None,
     inherited_geometry: Geometry | None = None,
     parent_transform: Affine | None = None,
+    parent_transform_known: bool = True,
+    slide_index: int | None = None,
+    source_order: int = 0,
 ) -> Iterable[ElementRecord]:
     tag = _tag(element)
     name, element_id = _name_id(element)
@@ -354,7 +382,7 @@ def _record_element(
     geometry = _geometry(source_sppr)
     if geometry is None:
         geometry = inherited_geometry
-    effective_geometry = _apply_affine(geometry, parent_transform)
+    effective_geometry = _apply_affine(geometry, parent_transform) if parent_transform_known else None
     text = _text(element)
     warnings: list[str] = []
     relationship = None
@@ -376,8 +404,8 @@ def _record_element(
                 rel_id = blip.get(_profile().r_link)
                 relation_mode = "external"
         if rel_id and rel_id in rels:
-            rel_type, target = rels[rel_id]
-            relationship = {"id": rel_id, "type": rel_type, "target": target}
+            rel_type, target_part, mode, full_type, raw_target = rels[rel_id]
+            relationship = {"id": rel_id, "type": full_type, "target": raw_target, "targetPart": target_part, "mode": mode}
             if relation_mode:
                 relationship["mode"] = relation_mode
     elif tag == "graphicFrame":
@@ -390,14 +418,25 @@ def _record_element(
             chart = element.find(".//c:chart", _ns())
             rel_id = chart.get(_profile().r_id) if chart is not None else None
             if rel_id and rel_id in rels:
-                rel_type, target = rels[rel_id]
-                relationship = {"id": rel_id, "type": rel_type, "target": target}
+                rel_type, target_part, mode, full_type, raw_target = rels[rel_id]
+                relationship = {"id": rel_id, "type": full_type, "target": raw_target, "targetPart": target_part, "mode": mode}
         else:
             warnings.append("graphic frame subtype was not recognized")
     elif tag == "contentPart":
         warnings.append("content part is detected but not interpreted")
     elif element_type == "unsupported":
         warnings.append(f"unsupported slide object tag: {tag}")
+    group_transform = None
+    group_transform_known = parent_transform_known
+    if tag == "grpSp":
+        local_transform = _group_affine(element)
+        if local_transform is None:
+            warnings.append("group transform is incomplete or uses rotation/reflection; child resolved geometry is unknown")
+            group_transform_known = False
+        elif parent_transform_known:
+            group_transform = _compose_affine(parent_transform, local_transform)
+        else:
+            group_transform_known = False
 
     record = ElementRecord(
         type=element_type,
@@ -406,31 +445,42 @@ def _record_element(
         geometry=geometry,
         text=text,
         placeholder_role=_placeholder(element),
+        placeholder_identity=_placeholder_observation(element, slide_index=slide_index),
         style=_style(element),
         relationship=relationship,
         source_part=slide_part,
         parent_id=parent_id,
         warnings=warnings,
         effective_geometry=effective_geometry if parent_transform is not None else None,
+        geometry_resolution_unknown=not parent_transform_known,
+        source_order=source_order,
     )
     yield record
     if tag == "grpSp":
-        group_transform = _compose_affine(parent_transform, _group_affine(element))
-        for child in element:
+        for child_order, child in enumerate(element):
             if _tag(child) in {"nvGrpSpPr", "grpSpPr", "extLst"}:
                 continue
-            yield from _record_element(child, slide_part, rels, parent_id=element_id, parent_transform=group_transform)
+            yield from _record_element(
+                child, slide_part, rels, parent_id=element_id, parent_transform=group_transform,
+                parent_transform_known=group_transform_known, slide_index=slide_index, source_order=child_order,
+            )
 
 
 def _theme(
     zf: zipfile.ZipFile,
     parts: list[str],
-    presentation_rels: dict[str, tuple[str, str]],
-) -> dict[str, object]:
-    linked_theme = next((target for rel_type, target in presentation_rels.values() if rel_type == "theme"), None)
-    themes = [linked_theme] if linked_theme in parts else [part for part in parts if part.startswith("ppt/theme/") and part.endswith(".xml")]
-    if not themes:
-        return {}
+    presentation_rels: dict[str, tuple[str, str | None, str, str, str]],
+    master_parts: list[str],
+) -> dict[str, object] | None:
+    relationships = list(presentation_rels.values())
+    for master_part in master_parts:
+        relationships.extend(_relationships(zf, master_part).values())
+    theme_links = [(target, mode) for rel_type, target, mode, _full_type, _raw_target in relationships if rel_type == "theme"]
+    if any(mode != "internal" or target is None or target not in parts or not target.startswith("ppt/theme/") for target, mode in theme_links):
+        return None
+    themes = sorted({target for target, _mode in theme_links})
+    if len(themes) != 1:
+        return None
     root = _read_xml(zf, themes[0])
     clr_scheme = root.find(".//a:clrScheme", _ns())
     colors: dict[str, str] = {}
@@ -457,23 +507,83 @@ def _placeholder_key(element: ET.Element) -> tuple[str | None, str]:
     return placeholder.get("idx"), placeholder.get("type", "body")
 
 
-def _placeholder_observation(element: ET.Element) -> dict[str, str] | None:
+def _placeholder_observation(element: ET.Element, *, slide_index: int | None = None) -> dict[str, str | int | None] | None:
     """Return the stable placeholder identity used by layout inheritance."""
 
     idx, role = _placeholder_key(element)
     if not role:
         return None
-    return {"idx": idx, "type": role}
+    return {"slideIndex": slide_index, "idx": idx, "type": role}
 
 
-def _relationship_observations(zf: zipfile.ZipFile, part: str) -> list[dict[str, str]]:
+def _relationship_observations(zf: zipfile.ZipFile, part: str) -> list[dict[str, object]]:
     return [
-        {"id": rel_id, "type": rel_type, "target": target}
-        for rel_id, (rel_type, target) in sorted(_relationships(zf, part).items())
+        {"id": rel_id, "type": full_type, "target": raw_target, "targetPart": target_part, "mode": mode}
+        for rel_id, (_rel_type, target_part, mode, full_type, raw_target) in sorted(_relationships(zf, part).items())
     ]
 
 
-def _background_observation(root: ET.Element) -> dict[str, object] | None:
+def _internal_targets(
+    relationships: dict[str, tuple[str, str | None, str, str, str]],
+    kind: str,
+    context: str,
+) -> list[str]:
+    targets: list[str] = []
+    for rel_type, target_part, mode, _full_type, raw_target in relationships.values():
+        if rel_type != kind:
+            continue
+        if mode != "internal" or target_part is None:
+            raise ValueError(f"{context} has an external {kind} relationship: {raw_target!r}")
+        targets.append(target_part)
+    return targets
+
+
+def _background_fill_observation(
+    fill: ET.Element | None,
+    rels: dict[str, tuple[str, str | None, str, str, str]],
+) -> dict[str, object] | None:
+    if fill is None:
+        return None
+    colors: list[dict[str, object]] = []
+    color_tags = {"srgbClr", "schemeClr", "sysClr", "prstClr", "scrgbClr", "hslClr"}
+
+    def visit(element: ET.Element, position: str | None = None) -> None:
+        current_position = element.get("pos") if _tag(element) == "gs" else position
+        if _tag(element) in color_tags:
+            colors.append({
+                "type": _tag(element),
+                "attributes": dict(sorted(element.attrib.items())),
+                "position": current_position,
+            })
+        for child in list(element):
+            visit(child, current_position)
+
+    visit(fill)
+    relation: dict[str, object] | None = None
+    blip = fill.find(".//a:blip", _ns())
+    if blip is not None:
+        rel_id = blip.get(_profile().r_embed) or blip.get(_profile().r_link)
+        if rel_id and rel_id in rels:
+            rel_type, target_part, mode, full_type, raw_target = rels[rel_id]
+            relation = {
+                "id": rel_id,
+                "type": full_type,
+                "target": raw_target,
+                "targetPart": target_part,
+                "mode": mode,
+            }
+    return {
+        "kind": _tag(fill),
+        "attributes": dict(sorted(fill.attrib.items())),
+        "colors": colors,
+        "relationship": relation,
+    }
+
+
+def _background_observation(
+    root: ET.Element,
+    rels: dict[str, tuple[str, str | None, str, str, str]],
+) -> dict[str, object] | None:
     background = root.find("p:cSld/p:bg", _ns())
     if background is None:
         return None
@@ -484,8 +594,16 @@ def _background_observation(root: ET.Element) -> dict[str, object] | None:
             "kind": "bgRef",
             "idx": ref.get("idx"),
             "scheme_color": color.get("val") if color is not None else None,
+            "scheme_color_type": _tag(color) if color is not None else None,
+            "fill": None,
         }
-    return {"kind": "explicit", "element": _tag(next(iter(background), background))}
+    properties = background.find("p:bgPr", _ns())
+    fill = next(iter(properties), None) if properties is not None else None
+    return {
+        "kind": "explicit",
+        "element": _tag(fill) if fill is not None else "unknown",
+        "fill": _background_fill_observation(fill, rels),
+    }
 
 
 def _color_mapping_observation(root: ET.Element) -> dict[str, object] | None:
@@ -503,33 +621,42 @@ def _color_mapping_observation(root: ET.Element) -> dict[str, object] | None:
 
 
 def _template_element_observation(
-    element: ET.Element,
-    source_part: str,
-    rels: dict[str, tuple[str, str]],
+    record: ElementRecord,
     *,
-    resolved_geometry: Geometry | None = None,
-    geometry_provenance: str = "layout_explicit",
+    master_root: ET.Element | None = None,
 ) -> dict[str, object]:
-    """Serialize one raw master/layout shape with explicit inheritance evidence."""
-
-    record = next(iter(_record_element(element, source_part, rels)))
-    placeholder = _placeholder_observation(element)
+    """Serialize one master/layout shape with its direct and resolved evidence."""
     direct = record.geometry
-    resolved = resolved_geometry if resolved_geometry is not None else direct
+    placeholder = record.placeholder_identity
+    if record.geometry_resolution_unknown:
+        resolved = None
+        provenance = "unknown"
+    elif record.effective_geometry is not None:
+        resolved = record.effective_geometry
+        provenance = "group_transformed"
+    elif direct is not None:
+        resolved = direct
+        provenance = "layout_explicit"
+    elif placeholder and record.parent_id is None:
+        resolved = _placeholder_geometry(master_root, (placeholder["idx"], placeholder["type"] or ""))
+        provenance = "master_inherited" if resolved else "unknown"
+    else:
+        resolved = None
+        provenance = "unknown"
     return {
         "schema_status": SCHEMA_STATUS,
         **record.as_dict(),
         "placeholder": placeholder,
         "raw_geometry": direct.as_dict() if direct else None,
         "resolved_geometry": resolved.as_dict() if resolved else None,
-        "geometry_provenance": geometry_provenance if resolved else "unknown",
+        "geometry_provenance": provenance,
     }
 
 
 def _template_shapes(
     root: ET.Element | None,
     source_part: str,
-    rels: dict[str, tuple[str, str]],
+    rels: dict[str, tuple[str, str | None, str, str, str]],
     *,
     master_root: ET.Element | None = None,
 ) -> list[dict[str, object]]:
@@ -539,33 +666,14 @@ def _template_shapes(
     if tree is None:
         return []
     observations: list[dict[str, object]] = []
+    source_order = 0
     for child in tree:
         if _tag(child) in {"nvGrpSpPr", "grpSpPr", "extLst"}:
             continue
-        placeholder = _placeholder_observation(child)
-        if _tag(child) == "graphicFrame":
-            source_geometry = child.find("p:xfrm", _ns())
-        elif _tag(child) == "grpSp":
-            source_geometry = child.find("p:grpSpPr", _ns())
-        else:
-            source_geometry = child.find("p:spPr", _ns())
-        direct = _geometry(source_geometry)
-        resolved = direct
-        provenance = "layout_explicit"
-        if placeholder and direct is None:
-            resolved = _placeholder_geometry(master_root, (placeholder["idx"], placeholder["type"]))
-            provenance = "master_inherited" if resolved else "unknown"
-        elif not direct:
-            provenance = "unknown"
-        observations.append(
-            _template_element_observation(
-                child,
-                source_part,
-                rels,
-                resolved_geometry=resolved,
-                geometry_provenance=provenance,
-            )
-        )
+        for record in _record_element(child, source_part, rels, source_order=source_order):
+            record.source_order = len(observations)
+            observations.append(_template_element_observation(record, master_root=master_root))
+        source_order = len(observations)
     return observations
 
 
@@ -573,7 +681,7 @@ def _template_library(
     zf: zipfile.ZipFile,
     parts: list[str],
     presentation: ET.Element,
-    presentation_rels: dict[str, tuple[str, str]],
+    presentation_rels: dict[str, tuple[str, str | None, str, str, str]],
     slide_size: dict[str, int | str],
 ) -> dict[str, object]:
     """Inventory all masters/layouts independently of slide instances.
@@ -587,29 +695,33 @@ def _template_library(
     for master_id in presentation.findall("p:sldMasterIdLst/p:sldMasterId", _ns()):
         rel_id = master_id.get(_profile().r_id)
         if rel_id and rel_id in presentation_rels:
-            target = presentation_rels[rel_id][1]
+            rel_type, target, mode, _full_type, raw_target = presentation_rels[rel_id]
+            if rel_type != "slideMaster" or mode != "internal" or target is None:
+                raise ValueError(f"presentation master relationship {rel_id!r} is invalid: {raw_target!r}")
             if target in parts and target not in listed_masters:
                 listed_masters.append(target)
     master_parts = sorted(set(listed_masters) | {part for part in parts if part.startswith("ppt/slideMasters/") and part.endswith(".xml")})
     layout_parts = sorted(part for part in parts if part.startswith("ppt/slideLayouts/") and part.endswith(".xml"))
 
     master_roots: dict[str, ET.Element] = {part: _read_xml(zf, part) for part in master_parts}
-    master_rels: dict[str, dict[str, tuple[str, str]]] = {part: _relationships(zf, part) for part in master_parts}
+    master_rels: dict[str, dict[str, tuple[str, str | None, str, str, str]]] = {part: _relationships(zf, part) for part in master_parts}
     layout_master: dict[str, str] = {}
     for layout_part in layout_parts:
         rels = _relationships(zf, layout_part)
-        master_targets = [target for rel_type, target in rels.values() if rel_type == "slideMaster"]
+        master_targets = _internal_targets(rels, "slideMaster", f"layout {layout_part}")
         if len(master_targets) > 1:
             raise ValueError(f"layout {layout_part} has multiple slide master relationships")
         master = master_targets[0] if master_targets else None
         if master:
+            if master is None:
+                raise ValueError(f"layout {layout_part} has external slide master relationship")
             if not master.startswith("ppt/slideMasters/") or master not in parts:
                 raise ValueError(f"layout {layout_part} points to missing or invalid master part: {master}")
             layout_master[layout_part] = master
     for master_part, rels in master_rels.items():
-        for rel_type, target in rels.values():
+        for rel_type, target, mode, _full_type, raw_target in rels.values():
             if rel_type == "slideLayout":
-                if not target.startswith("ppt/slideLayouts/") or target not in layout_parts:
+                if mode != "internal" or target is None or not target.startswith("ppt/slideLayouts/") or target not in layout_parts:
                     raise ValueError(f"master {master_part} points to missing or invalid layout part: {target}")
                 layout_master.setdefault(target, master_part)
 
@@ -630,7 +742,7 @@ def _template_library(
                 "layout_parts": sorted(part for part, owner in layout_master.items() if owner == master_part),
                 "design_elements": elements,
                 "relationships": _relationship_observations(zf, master_part),
-                "background": _background_observation(root),
+                "background": _background_observation(root, rels),
                 "color_mapping": _color_mapping_observation(root),
             }
         )
@@ -656,10 +768,11 @@ def _template_library(
                 "matching_name": root.get("matchingName"),
                 "preserve": root.get("preserve") in {"1", "true", "True"},
                 "placeholders": placeholders,
+                "elements": elements,
                 "design_elements": direct_design,
                 "master_design_elements": master_design.get(master_part or "", []),
                 "relationships": _relationship_observations(zf, layout_part),
-                "background": _background_observation(root),
+                "background": _background_observation(root, rels),
                 "color_mapping": _color_mapping_observation(root),
             }
         )
@@ -771,17 +884,17 @@ def _inspect_pptx(path: str) -> Inspection:
             rel_id = slide_id.get(_profile().r_id)
             if not rel_id or rel_id not in presentation_rels:
                 raise ValueError(f"slide {index} has no resolvable relationship")
-            relation_type, slide_part = presentation_rels[rel_id]
-            if relation_type != "slide" or not slide_part.startswith("ppt/slides/"):
+            relation_type, slide_part, relation_mode, _full_type, raw_target = presentation_rels[rel_id]
+            if relation_type != "slide" or relation_mode != "internal" or slide_part is None or not slide_part.startswith("ppt/slides/"):
                 raise ValueError(
                     f"slide {index} relationship {rel_id!r} does not target a presentation slide: "
-                    f"type={relation_type!r}, target={slide_part!r}"
+                    f"type={relation_type!r}, target={raw_target!r}"
                 )
             if slide_part not in parts:
                 raise ValueError(f"slide relationship points to missing part: {slide_part}")
             slide_root = _read_xml(zf, slide_part)
             slide_rels = _relationships(zf, slide_part)
-            layout_targets = [target for rel_type, target in slide_rels.values() if rel_type == "slideLayout"]
+            layout_targets = _internal_targets(slide_rels, "slideLayout", f"slide {index}")
             if len(layout_targets) > 1:
                 raise ValueError(f"slide {index} has multiple slide layout relationships")
             layout_part = layout_targets[0] if layout_targets else None
@@ -791,7 +904,7 @@ def _inspect_pptx(path: str) -> Inspection:
             layout_root = _read_xml(zf, layout_part) if layout_part else None
             if layout_part:
                 layout_rels = _relationships(zf, layout_part)
-                master_targets = [target for rel_type, target in layout_rels.values() if rel_type == "slideMaster"]
+                master_targets = _internal_targets(layout_rels, "slideMaster", f"layout {layout_part}")
                 if len(master_targets) > 1:
                     raise ValueError(f"layout {layout_part} has multiple slide master relationships")
                 master_part = master_targets[0] if master_targets else None
@@ -810,7 +923,9 @@ def _inspect_pptx(path: str) -> Inspection:
                         continue
                     # Keep direct source geometry in the spike; inherited layout/master matching
                     # is heuristic and belongs in a later explicitly designed mapper.
-                    elements.extend(_record_element(child, slide_part, slide_rels))
+                    elements.extend(_record_element(child, slide_part, slide_rels, slide_index=index, source_order=len(elements)))
+                for source_order, element in enumerate(elements):
+                    element.source_order = source_order
             for design_part, design_root in ((layout_part, layout_root), (master_part, master_root)):
                 if not design_part or design_root is None:
                     continue
@@ -821,7 +936,9 @@ def _inspect_pptx(path: str) -> Inspection:
                 for child in design_tree:
                     if _tag(child) in {"nvGrpSpPr", "grpSpPr", "extLst"}:
                         continue
-                    design_elements.extend(_record_element(child, design_part, design_rels))
+                    design_elements.extend(_record_element(child, design_part, design_rels, source_order=len(design_elements)))
+                for source_order, element in enumerate(design_elements):
+                    element.source_order = source_order
             for element in elements:
                 warnings.extend(element.warnings)
             for element in design_elements:
@@ -835,11 +952,23 @@ def _inspect_pptx(path: str) -> Inspection:
                     elements=elements,
                     design_elements=design_elements,
                     warnings=sorted(set(warnings)),
+                    relationships=_relationship_observations(zf, slide_part),
+                    background=_background_observation(slide_root, slide_rels),
                 )
             )
+        notes_parts = [part for part in parts if part.startswith("ppt/notesSlides/") or part.startswith("ppt/notesMasters/")]
+        media_parts = [part for part in parts if part.startswith("ppt/media/")]
+        template_library = _template_library(
+            zf,
+            parts,
+            presentation,
+            presentation_rels,
+            {"width": width, "height": height, "unit": "EMU"},
+        )
         unsupported = _unsupported_parts(parts)
+        parser_warnings = {warning for slide in slides for warning in slide.warnings}
         for slide in slides:
-            for rel_id, (rel_type, target) in _relationships(zf, slide.part).items():
+            for rel_id, (rel_type, _target_part, _mode, _full_type, raw_target) in _relationships(zf, slide.part).items():
                 if rel_type.lower() in {"audio", "video", "media", "quicktime"}:
                     unsupported.append(
                         {
@@ -847,11 +976,11 @@ def _inspect_pptx(path: str) -> Inspection:
                             "slide": str(slide.index),
                             "part": slide.part,
                             "relationship_id": rel_id,
-                            "target": target,
+                            "target": raw_target,
                             "reason": f"{rel_type} media relationship is inventoried but not interpreted",
                         }
                     )
-            for element in [*slide.elements, *slide.design_elements]:
+            for element in slide.elements:
                 if element.type == "unsupported" or element.warnings:
                     unsupported.append(
                         {
@@ -862,22 +991,42 @@ def _inspect_pptx(path: str) -> Inspection:
                             "reason": "; ".join(element.warnings) or "object type was not interpreted",
                         }
                     )
-        notes_parts = [part for part in parts if part.startswith("ppt/notesSlides/") or part.startswith("ppt/notesMasters/")]
-        template_library = _template_library(
-            zf,
-            parts,
-            presentation,
-            presentation_rels,
-            {"width": width, "height": height, "unit": "EMU"},
-        )
+        template_elements = [
+            (master["master_part"], element)
+            for master in template_library["masters"]
+            for element in master["design_elements"]
+        ] + [
+            (layout["layout_part"], element)
+            for layout in template_library["layouts"]
+            for element in layout["elements"]
+        ]
+        for container_part, element in template_elements:
+            element_warnings = element.get("warnings", [])
+            parser_warnings.update(element_warnings)
+            if element.get("type") == "unsupported" or element_warnings:
+                unsupported.append(
+                    {
+                        "kind": "unsupported_object",
+                        "element": element.get("name", ""),
+                        "part": container_part,
+                        "reason": "; ".join(element_warnings) or "object type was not interpreted",
+                    }
+                )
         return Inspection(
             schema_status=SCHEMA_STATUS,
             source=str(path),
             slide_size={"width": width, "height": height, "unit": "EMU"},
             slide_count=len(slides),
             slides=slides,
-            theme=_theme(zf, parts, presentation_rels),
+            theme=_theme(
+                zf,
+                parts,
+                presentation_rels,
+                [master["master_part"] for master in template_library["masters"]],
+            ),
             unsupported=unsupported,
             notes_parts=notes_parts,
+            media_parts=media_parts,
             template_library=template_library,
+            warnings=sorted(parser_warnings),
         )

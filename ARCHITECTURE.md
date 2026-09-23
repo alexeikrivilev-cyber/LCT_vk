@@ -50,13 +50,16 @@ Implemented today:
 
 - project persistence and safe project files;
 - source upload and text-source editing;
+- deterministic PPTX structural inspection, canonical `TemplateIR` v1 mapping, and a structural `PresentationDesignSystem` summary;
+- on-demand project template compilation through the daemon API, persisted in a project-local hidden JSON sidecar with source-hash invalidation;
+- a workspace panel for observed canvas, slides, masters/layouts, theme/style facts, assets, unsupported features, and warnings;
 - live HTML preview with relative resources;
 - built-in design-system and skill discovery;
 - image-generation adapter;
 - presentation-oriented Node/TypeScript runtime;
 - PPTX/PDF primitives available to the daemon.
 
-The compiler, progressive generation, and GPU orchestration described below are target architecture. Documentation must distinguish implemented behavior from target behavior.
+Content ingestion, narrative planning, progressive generation, native rendering, audit/export, and GPU orchestration described below remain target architecture. Template understanding v1 is implemented as a deterministic structural scan; it does not establish universal arbitrary-template compatibility.
 
 ## Canonical pipeline
 
@@ -135,11 +138,11 @@ The uploaded PPTX is immutable. Never destructively normalize the only copy.
 
 ### `TemplateIR`
 
-Exact structural facts extracted by code: dimensions, masters/layouts, relationships, placeholders/geometry, theme/font/color data, assets, existing charts/tables, and stable source ids.
+Implemented v1 records exact source identity, slide dimensions, master/layout/slide relationships, placeholder identity, observed direct and resolved geometry with provenance, selected direct style facts, partial theme colors/fonts, explicit or scheme-reference backgrounds and color-map observations, notes/media part inventories, unsupported details, and warnings under deterministic source-scoped IDs. Background fills preserve basic kind, attributes, color nodes, and image relationship identity; gradient/image fill geometry and nested color transforms are not fully represented, and theme system colors retain their fallback color only. Master/layout nested group members are inventoried; geometry affected by unsupported group rotation/reflection remains unresolved. Theme/style coverage is partial; chart/table internals and inherited style cascades are not interpreted, and missing facts remain unknown. The uploaded PPTX remains immutable.
 
 ### `PresentationDesignSystem`
 
-Compact semantic derivative of the template: tokens, composition/layout families, typography hierarchy, visual conventions, reusable assets, and rules. It references exact `TemplateIR` entities instead of approximating them.
+The implemented v1 is a deterministic structural summary referencing `TemplateIR`: canvas/aspect ratio, observed fonts and sizes, recurring direct colors, source layouts with placeholder/element counts and usage, and asset references. It does not assign semantic layout labels or infer a typography hierarchy. Future rules may extend this derivative when supported by evidence.
 
 ### `ContentIR`
 

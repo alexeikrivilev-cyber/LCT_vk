@@ -35,6 +35,11 @@ import {
 } from './presentation-catalog.js';
 import { generatePresentationImage } from './media/index.js';
 import { presentationImageModels } from './media/models.js';
+import {
+  compileTemplate,
+  getTemplateCompilation,
+  TemplateCompilerError,
+} from './presentation/application/template-compiler.js';
 
 export interface StartServerOptions {
   host?: string;
@@ -204,6 +209,37 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       res.json({ files: written });
     } catch (error) {
       apiError(res, 400, error);
+    }
+  });
+
+  app.get('/api/projects/:id/template', async (req, res) => {
+    try {
+      if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+      res.json(await getTemplateCompilation(projectsRoot, req.params.id));
+    } catch (error) {
+      if (error instanceof TemplateCompilerError) {
+        return res.status(error.status).json({ status: 'failed', failure: { code: error.code, message: error.message } });
+      }
+      return res.status(500).json({
+        status: 'failed',
+        failure: { code: 'TEMPLATE_STATE_UNAVAILABLE', message: 'Saved template understanding could not be loaded.' },
+      });
+    }
+  });
+
+  app.post('/api/projects/:id/template/compile', async (req, res) => {
+    if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+    const filePath = typeof req.body?.filePath === 'string' ? req.body.filePath : '';
+    try {
+      res.json(await compileTemplate(projectsRoot, req.params.id, filePath));
+    } catch (error) {
+      if (error instanceof TemplateCompilerError) {
+        return res.status(error.status).json({ status: 'failed', failure: { code: error.code, message: error.message } });
+      }
+      return res.status(500).json({
+        status: 'failed',
+        failure: { code: 'TEMPLATE_COMPILE_FAILED', message: 'Template compilation failed.' },
+      });
     }
   });
 

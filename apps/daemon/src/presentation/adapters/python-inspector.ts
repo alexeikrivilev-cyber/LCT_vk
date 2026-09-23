@@ -60,14 +60,49 @@ export interface InspectionGeometry {
 }
 
 /** @internal */
+export interface InspectionPlaceholderIdentity {
+  slideIndex: number | null;
+  idx: string | null;
+  type: string;
+}
+
+/** @internal */
+export interface InspectionRelationship {
+  id: string;
+  type: string;
+  target: string;
+  targetPart: string | null;
+  mode: 'internal' | 'external';
+}
+
+/** @internal */
+export interface InspectionStyle {
+  fonts?: string[];
+  font_sizes_pt?: number[];
+  bold?: boolean;
+  italic?: boolean;
+  fill_color?: string;
+  line_color?: string;
+}
+
+/** @internal */
 export interface InspectionElement {
   type: string;
   name: string;
   elementId: string | null;
   text: string;
   placeholderRole: string | null;
-  geometry: InspectionGeometry | null;
+  placeholderIdentity: InspectionPlaceholderIdentity | null;
+  rawGeometry: InspectionGeometry | null;
+  resolvedGeometry: InspectionGeometry | null;
+  geometryProvenance: 'direct' | 'group_transformed' | 'layout_explicit' | 'master_inherited' | 'unknown';
+  geometryResolutionUnknown: boolean;
+  style: InspectionStyle;
+  relationship: InspectionRelationship | null;
   sourcePart: string;
+  parentId: string | null;
+  warnings: string[];
+  sourceOrder: number;
 }
 
 /** @internal */
@@ -84,10 +119,40 @@ export interface InspectionEnvelope {
       layoutPart: string | null;
       masterPart: string | null;
       elements: InspectionElement[];
+      designElements: InspectionElement[];
+      relationships: InspectionRelationship[];
+      background: Record<string, unknown> | null;
+      warnings: string[];
     }>;
-    masters: Array<{ part: string; layoutParts: string[]; elements: InspectionElement[] }>;
-    layouts: Array<{ part: string; masterPart: string | null; elements: InspectionElement[] }>;
-    unsupportedParts: string[];
+    masters: Array<{
+      part: string;
+      declaredName: string;
+      layoutParts: string[];
+      elements: InspectionElement[];
+      designElements: InspectionElement[];
+      relationships: InspectionRelationship[];
+      background: Record<string, unknown> | null;
+      colorMapping: Record<string, unknown> | null;
+    }>;
+    layouts: Array<{
+      part: string;
+      masterPart: string | null;
+      declaredName: string;
+      declaredType: string | null;
+      matchingName: string | null;
+      preserve: boolean;
+      placeholders: InspectionElement[];
+      elements: InspectionElement[];
+      designElements: InspectionElement[];
+      relationships: InspectionRelationship[];
+      background: Record<string, unknown> | null;
+      colorMapping: Record<string, unknown> | null;
+    }>;
+    theme: { part: string; colors: Record<string, string>; fonts: Record<string, string> } | null;
+    notesParts: string[];
+    mediaParts: string[];
+    unsupportedDetails: Array<Record<string, unknown>>;
+    parserWarnings: string[];
   };
 }
 
@@ -259,26 +324,141 @@ function validGeometry(value: unknown): value is InspectionGeometry | null {
     && value.unit === 'EMU';
 }
 
-function validElement(value: unknown): value is InspectionElement {
-  if (!isRecord(value) || !hasKeys(value, ['type', 'name', 'elementId', 'text', 'placeholderRole', 'geometry', 'sourcePart'])) return false;
-  return isString(value.type)
-    && isString(value.name)
-    && isNullableString(value.elementId)
-    && isString(value.text)
-    && isNullableString(value.placeholderRole)
-    && validGeometry(value.geometry)
-    && validPart(value.sourcePart);
-}
-
-function validElements(value: unknown): value is InspectionElement[] {
-  return Array.isArray(value) && value.length <= 100_000 && value.every(validElement);
+function validStringArray(value: unknown, maxLength = 100_000): value is string[] {
+  return Array.isArray(value) && value.length <= maxLength && value.every(isString);
 }
 
 function validPartArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.length <= 4096 && value.every(validPart);
 }
 
-function validateEnvelope(value: unknown): InspectionEnvelope {
+function validStringRecord(value: unknown): value is Record<string, string> {
+  return isRecord(value) && Object.values(value).every(isString);
+}
+
+function validPlaceholder(value: unknown, expectedSlideIndex: number | null): value is InspectionPlaceholderIdentity | null {
+  if (value === null) return true;
+  return isRecord(value) && hasKeys(value, ['slideIndex', 'idx', 'type'])
+    && (value.slideIndex === null || (Number.isSafeInteger(value.slideIndex) && (value.slideIndex as number) > 0))
+    && value.slideIndex === expectedSlideIndex
+    && isNullableString(value.idx)
+    && isString(value.type);
+}
+
+function validStyle(value: unknown): value is InspectionStyle {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.some((key) => !['fonts', 'font_sizes_pt', 'bold', 'italic', 'fill_color', 'line_color'].includes(key))) return false;
+  if (Object.hasOwn(value, 'fonts') && !validStringArray(value.fonts, 4096)) return false;
+  if (Object.hasOwn(value, 'font_sizes_pt')
+      && (!Array.isArray(value.font_sizes_pt) || value.font_sizes_pt.length > 4096
+        || !value.font_sizes_pt.every((size) => typeof size === 'number' && Number.isFinite(size)))) return false;
+  if (Object.hasOwn(value, 'bold') && typeof value.bold !== 'boolean') return false;
+  if (Object.hasOwn(value, 'italic') && typeof value.italic !== 'boolean') return false;
+  if (Object.hasOwn(value, 'fill_color') && !isString(value.fill_color)) return false;
+  if (Object.hasOwn(value, 'line_color') && !isString(value.line_color)) return false;
+  return true;
+}
+
+function validRelationship(value: unknown): value is InspectionRelationship {
+  if (!isRecord(value) || !hasKeys(value, ['id', 'type', 'target', 'targetPart', 'mode'])) return false;
+  return isString(value.id) && value.id.length > 0
+    && isString(value.type) && value.type.length > 0
+    && isString(value.target)
+    && (value.targetPart === null || validPart(value.targetPart))
+    && (value.mode === 'internal' || value.mode === 'external')
+    && ((value.mode === 'external' && value.targetPart === null)
+      || (value.mode === 'internal' && value.targetPart !== null));
+}
+
+function validRelationships(value: unknown): value is InspectionRelationship[] {
+  return Array.isArray(value) && value.length <= 4096 && value.every(validRelationship);
+}
+
+const ELEMENT_KEYS = [
+  'type', 'name', 'elementId', 'text', 'placeholderRole', 'placeholderIdentity', 'rawGeometry',
+  'resolvedGeometry', 'geometryProvenance', 'geometryResolutionUnknown', 'style', 'relationship', 'sourcePart', 'parentId', 'warnings', 'sourceOrder',
+];
+
+function validElement(value: unknown, expectedSlideIndex: number | null): value is InspectionElement {
+  if (!isRecord(value) || !hasKeys(value, ELEMENT_KEYS)) return false;
+  return isString(value.type)
+    && isString(value.name)
+    && isNullableString(value.elementId)
+    && isString(value.text)
+    && isNullableString(value.placeholderRole)
+    && validPlaceholder(value.placeholderIdentity, expectedSlideIndex)
+    && validGeometry(value.rawGeometry)
+    && validGeometry(value.resolvedGeometry)
+    && ['direct', 'group_transformed', 'layout_explicit', 'master_inherited', 'unknown'].includes(String(value.geometryProvenance))
+    && typeof value.geometryResolutionUnknown === 'boolean'
+    && (!value.geometryResolutionUnknown || (value.resolvedGeometry === null && value.geometryProvenance === 'unknown'))
+    && validStyle(value.style)
+    && (value.relationship === null || validRelationship(value.relationship))
+    && validPart(value.sourcePart)
+    && isNullableString(value.parentId)
+    && validStringArray(value.warnings, 4096)
+    && Number.isSafeInteger(value.sourceOrder) && (value.sourceOrder as number) >= 0;
+}
+
+function validElements(value: unknown, expectedSlideIndex: number | null): value is InspectionElement[] {
+  return Array.isArray(value) && value.length <= 100_000 && value.every((element) => validElement(element, expectedSlideIndex));
+}
+
+function validBackgroundFill(value: unknown): boolean {
+  if (!isRecord(value) || !hasKeys(value, ['kind', 'attributes', 'colors', 'relationship'])
+      || !isString(value.kind) || !validStringRecord(value.attributes) || !Array.isArray(value.colors)) return false;
+  if (!value.colors.every((color) => isRecord(color) && hasKeys(color, ['type', 'attributes', 'position'])
+      && isString(color.type) && validStringRecord(color.attributes) && isNullableString(color.position))) return false;
+  return value.relationship === null || validRelationship(value.relationship);
+}
+
+function validBackground(value: unknown): boolean {
+  if (value === null) return true;
+  if (!isRecord(value)) return false;
+  if (value.kind === 'bgRef') {
+    return hasKeys(value, ['kind', 'idx', 'scheme_color', 'scheme_color_type', 'fill'])
+      && isNullableString(value.idx) && isNullableString(value.scheme_color)
+      && isNullableString(value.scheme_color_type) && value.fill === null;
+  }
+  return value.kind === 'explicit' && hasKeys(value, ['kind', 'element', 'fill']) && isString(value.element)
+    && (value.fill === null || validBackgroundFill(value.fill));
+}
+
+function validColorMapping(value: unknown): boolean {
+  if (value === null) return true;
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  if (!keys.length || keys.some((key) => !['master_mapping', 'layout_override'].includes(key))) return false;
+  if (Object.hasOwn(value, 'master_mapping') && !validStringRecord(value.master_mapping)) return false;
+  if (Object.hasOwn(value, 'layout_override')) {
+    if (!Array.isArray(value.layout_override) || !value.layout_override.every((entry) => isRecord(entry)
+      && hasKeys(entry, ['element', 'attributes']) && isString(entry.element) && validStringRecord(entry.attributes))) return false;
+  }
+  return true;
+}
+
+function validTheme(value: unknown): boolean {
+  if (value === null) return true;
+  if (!isRecord(value) || !hasKeys(value, ['part', 'colors', 'fonts']) || !validPart(value.part)
+      || !validStringRecord(value.colors) || !isRecord(value.fonts)) return false;
+  return Object.keys(value.fonts).every((key) => ['major', 'minor'].includes(key))
+    && Object.values(value.fonts).every(isString);
+}
+
+function validUnsupportedDetails(value: unknown): boolean {
+  const allowed = ['kind', 'part', 'reason', 'slide', 'element', 'relationship_id', 'target'];
+  return Array.isArray(value) && value.length <= 100_000 && value.every((detail) => {
+    if (!isRecord(detail)) return false;
+    const keys = Object.keys(detail);
+    if (keys.some((key) => !allowed.includes(key)) || !['kind', 'part', 'reason'].every((key) => Object.hasOwn(detail, key))) return false;
+    if (!isString(detail.kind) || !validPart(detail.part) || !isString(detail.reason)) return false;
+    return ['slide', 'element', 'relationship_id', 'target'].every((key) => !Object.hasOwn(detail, key) || isString(detail[key]));
+  });
+}
+
+/** @internal Test seam for exact validation of the private replaceable envelope. */
+export function validateInspectionEnvelope(value: unknown): InspectionEnvelope {
   if (!isRecord(value) || !hasKeys(value, ['protocolVersion', 'schemaStatus', 'inspectionMs', 'inspection'])) {
     throw failure('INVALID_ENVELOPE', 'Python inspector returned an unexpected envelope object');
   }
@@ -287,7 +467,7 @@ function validateEnvelope(value: unknown): InspectionEnvelope {
     throw failure('INVALID_ENVELOPE', 'Python inspector returned unsupported protocol metadata');
   }
   const inspection = value.inspection;
-  if (!isRecord(inspection) || !hasKeys(inspection, ['schemaStatus', 'slideSize', 'slides', 'masters', 'layouts', 'unsupportedParts'])
+  if (!isRecord(inspection) || !hasKeys(inspection, ['schemaStatus', 'slideSize', 'slides', 'masters', 'layouts', 'theme', 'notesParts', 'mediaParts', 'unsupportedDetails', 'parserWarnings'])
       || inspection.schemaStatus !== SCHEMA_STATUS) {
     throw failure('INVALID_ENVELOPE', 'Python inspector returned invalid inspection metadata');
   }
@@ -298,25 +478,35 @@ function validateEnvelope(value: unknown): InspectionEnvelope {
     throw failure('INVALID_ENVELOPE', 'Python inspector returned invalid slide dimensions');
   }
   if (!Array.isArray(inspection.slides) || inspection.slides.length > 4096 || !inspection.slides.every((slide) => {
-    if (!isRecord(slide) || !hasKeys(slide, ['index', 'part', 'layoutPart', 'masterPart', 'elements'])) return false;
+    if (!isRecord(slide) || !hasKeys(slide, ['index', 'part', 'layoutPart', 'masterPart', 'elements', 'designElements', 'relationships', 'background', 'warnings'])) return false;
     return Number.isSafeInteger(slide.index) && (slide.index as number) > 0
       && validPart(slide.part) && (slide.layoutPart === null || validPart(slide.layoutPart))
-      && (slide.masterPart === null || validPart(slide.masterPart)) && validElements(slide.elements);
+      && (slide.masterPart === null || validPart(slide.masterPart))
+      && validElements(slide.elements, slide.index as number)
+      && validElements(slide.designElements, slide.index as number)
+      && validRelationships(slide.relationships) && validBackground(slide.background) && validStringArray(slide.warnings, 4096);
   })) {
     throw failure('INVALID_ENVELOPE', 'Python inspector returned invalid slide observations');
   }
   if (!Array.isArray(inspection.masters) || inspection.masters.length > 4096 || !inspection.masters.every((master) =>
-    isRecord(master) && hasKeys(master, ['part', 'layoutParts', 'elements']) && validPart(master.part)
-      && validPartArray(master.layoutParts) && validElements(master.elements))) {
+    isRecord(master) && hasKeys(master, ['part', 'declaredName', 'layoutParts', 'elements', 'designElements', 'relationships', 'background', 'colorMapping'])
+      && validPart(master.part) && isString(master.declaredName)
+      && validPartArray(master.layoutParts) && validElements(master.elements, null) && validElements(master.designElements, null)
+      && validRelationships(master.relationships) && validBackground(master.background) && validColorMapping(master.colorMapping))) {
     throw failure('INVALID_ENVELOPE', 'Python inspector returned invalid master observations');
   }
   if (!Array.isArray(inspection.layouts) || inspection.layouts.length > 4096 || !inspection.layouts.every((layout) =>
-    isRecord(layout) && hasKeys(layout, ['part', 'masterPart', 'elements']) && validPart(layout.part)
-      && (layout.masterPart === null || validPart(layout.masterPart)) && validElements(layout.elements))) {
+    isRecord(layout) && hasKeys(layout, ['part', 'masterPart', 'declaredName', 'declaredType', 'matchingName', 'preserve', 'placeholders', 'elements', 'designElements', 'relationships', 'background', 'colorMapping'])
+      && validPart(layout.part) && (layout.masterPart === null || validPart(layout.masterPart))
+      && isString(layout.declaredName) && isNullableString(layout.declaredType) && isNullableString(layout.matchingName)
+      && typeof layout.preserve === 'boolean' && validElements(layout.placeholders, null)
+      && validElements(layout.elements, null) && validElements(layout.designElements, null)
+      && validRelationships(layout.relationships) && validBackground(layout.background) && validColorMapping(layout.colorMapping))) {
     throw failure('INVALID_ENVELOPE', 'Python inspector returned invalid layout observations');
   }
-  if (!validPartArray(inspection.unsupportedParts)) {
-    throw failure('INVALID_ENVELOPE', 'Python inspector returned invalid unsupported-part observations');
+  if (!validTheme(inspection.theme) || !validPartArray(inspection.notesParts) || !validPartArray(inspection.mediaParts)
+      || !validUnsupportedDetails(inspection.unsupportedDetails) || !validStringArray(inspection.parserWarnings, 100_000)) {
+    throw failure('INVALID_ENVELOPE', 'Python inspector returned invalid inspection details');
   }
   return value as unknown as InspectionEnvelope;
 }
@@ -415,7 +605,7 @@ export function runInspectorProcess(
         return;
       }
       try {
-        resolve(validateEnvelope(parsed));
+        resolve(validateInspectionEnvelope(parsed));
       } catch (error) {
         reject(error instanceof InspectionAdapterError ? error : failure('INVALID_ENVELOPE', 'Python inspector returned an invalid envelope'));
       }

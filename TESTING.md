@@ -31,7 +31,9 @@ pnpm build
 
 `pnpm lint:craft` is required when skill/craft bindings change. Typecheck/build are required when the corresponding code paths change.
 
-`pnpm test` runs the current Node built-in baseline for existing file-path safeguards and craft-reference tooling. These tests cover repository foundation behavior; they do not imply that the documented compiler, generation, inference, or export gates are implemented.
+`pnpm test` runs the Node built-in suite for project-file safeguards, the private Python inspector, the deterministic TemplateIR/PDS mapper, the template compile API, and craft-reference tooling. Synthetic Transitional and Strict OOXML fixtures exercise the implemented structural-inspection path, including linked versus ambiguous themes, nested master/layout groups, direct sRGB/scheme/system color observations, slide/master/layout backgrounds and color-map evidence, unresolved rotated group geometry, and notes inventory. These tests do not imply full arbitrary-template compatibility, inherited style resolution, native PowerPoint rendering, content planning, inference, or export.
+
+The Template Compiler integration test uploads a synthetic PPTX through the project API, compiles and reloads its canonical state across a daemon restart, checks stable hashes and source-byte immutability, detects source changes as stale, and verifies controlled missing/invalid-file behavior, failed-path sanitization, and preservation of the last successful result. Mapper tests separately check deterministic IDs/hashes, exact relationships/placeholders/geometry/style/background facts, unsupported/warning retention, and PDS references to valid TemplateIR entities.
 
 ## Deterministic unit tests
 
