@@ -22,7 +22,8 @@
     "src/presentation-store.ts",
     "src/presentation-files.ts",
     "src/presentation-catalog.ts",
-    "src/media/**/*.ts"
+    "src/media/**/*.ts",
+    "src/presentation/**/*.ts"
   ],
   "exclude": ["dist"]
 }

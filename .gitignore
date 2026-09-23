@@ -28,3 +28,6 @@ playwright-report/
 .codex/
 .agents/
 .task/
+# Python-generated runtime bytecode.
+__pycache__/
+*.py[cod]
