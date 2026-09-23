@@ -6,13 +6,7 @@ LABEL org.opencontainers.image.description="One vLLM server for concurrent LCT W
 RUN uv pip install --system "transformers==5.8.0"
 
 ENV PORT=8080 \
-    MODEL_ID=Qwen/Qwen3.8-27B-FP8 \
-    MODEL_REVISION=017b9c7af6b5689d5dd426a76e0bc077eb5ca20a \
-    SERVED_MODEL_NAME=Qwen/Qwen3.8-27B \
-    MAX_MODEL_LEN=32768 \
-    MAX_NUM_SEQS=2 \
-    MAX_NUM_BATCHED_TOKENS=4096 \
-    GPU_MEMORY_UTILIZATION=0.90 \
+    LCT_INFERENCE_PROFILE=A100_BF16 \
     HOME=/tmp/lct-home \
     XDG_CACHE_HOME=/tmp/lct-home/.cache \
     HF_HOME=/tmp/lct-huggingface \

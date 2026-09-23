@@ -11,48 +11,70 @@ LCT daemon.
 
 - Engine image: the Qwen3.8-specific `vllm/vllm-openai:qwen38` image from the
   official vLLM recipe, pinned to its Linux/amd64 manifest digest in the
-  Dockerfile. The official recipe reports test runs on a fork build in the
-  v0.27 range and says older releases are unverified; this repository has not
-  built this exact image or verified it serving the selected model.
+  Dockerfile. One image is used for both supported profiles. The official
+  recipe reports tests on a fork build in the v0.27 range; this repository
+  has not built or run the pinned image with these profiles.
 - Transformers: 5.8.0 is pinned at image build for the Qwen3-VL processor
-  classes required by the official recipe. The image build has not yet
-  verified that installation against this exact base image.
-- Model repository: Qwen/Qwen3.8-27B-FP8, pinned to revision
-  017b9c7af6b5689d5dd426a76e0bc077eb5ca20a.
+  classes required by the multimodal model. The image build has not yet
+  verified this installation against the exact base image.
+- Default profile `A100_BF16`: `Qwen/Qwen3.8-27B`, revision
+  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, dtype `bfloat16`,
+  `max-model-len=16384`, `max-num-seqs=2`, and
+  `gpu-memory-utilization=0.90`. The revision exists and is Apache-2.0:
+  [pinned BF16 checkpoint](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0).
+- Alternate profile `H100_FP8`: `Qwen/Qwen3.8-27B-FP8`, revision
+  `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, dtype `auto`,
+  `max-model-len=32768`, `max-num-seqs=2`, and
+  `gpu-memory-utilization=0.90`. The revision exists and is Apache-2.0:
+  [pinned FP8 checkpoint](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a).
 - Public API model alias: Qwen/Qwen3.8-27B.
-- Model license: Apache-2.0.
-- Default profile: one GPU, 32,768-token model limit, at most two active
-  sequences, prefix caching enabled. vLLM continuous batching schedules
-  active requests together; it does not promise equal GPU time per role.
+- The `H100_FP8` profile uses `--dtype auto` so vLLM follows the checkpoint's
+  native FP8 quantization metadata.
+- The entrypoint enables `--reasoning-parser qwen3`. The parser separates
+  reasoning from final content; the daemon consumes only `message.content`
+  and validates it against the requested strict JSON Schema. Fake-response
+  tests verify this boundary. The parser/structured-output interaction still
+  needs a real model smoke test.
+- Both profiles serve one model process under the stable API alias. vLLM
+  continuous batching schedules concurrent requests; it does not promise
+  equal GPU time per role.
 
-The official vLLM recipe declares H100 support and estimates 38 GB minimum
-VRAM for this FP8 checkpoint. That is a compatibility declaration, not a
-measurement on a Cloud.ru H100. Use a GPU with at least 80 GB for the first
-controlled run. The exact Cloud.ru device, storage quota, model-load time,
-and maximum startup duration still need a deployment check.
+The official vLLM recipe estimates 67 GB minimum VRAM for the BF16 checkpoint
+and 38 GB for the FP8 checkpoint. It declares H100 for the FP8 variant but
+does not list A100 as a verified Qwen3.8-27B device. A100 BF16 is the first
+qualification target because the checkpoint is native BF16 and the card has
+80 GB; successful loading, headroom, and performance remain unverified until
+a GPU test. The recipe estimates do not account for Cloud.ru's allocation
+boundary or actual runtime buffers.
 
 ## Build
 
 From this directory:
 
+    docker buildx build --check --platform linux/amd64 .
     docker build --platform linux/amd64 -t lct-qwen-inference:dev .
 
-The build downloads the pinned vLLM base image and pinned Transformers
-package. It does not download model weights, require a GPU, or contact
+The first command checks the Docker build definition without building the
+image or retrieving model weights. The second builds the serving image and
+downloads the pinned base image and Transformers package, but never the Qwen
+weights.
+
+The build does not download model weights, require a GPU, or contact
 Cloud.ru. The model is fetched from Hugging Face when the container starts.
-Hugging Face, vLLM, Triton, config,
-and home caches use writable paths under /tmp; do not assume they survive scale-to-zero.
+Hugging Face, vLLM, Triton, config, and home caches use writable paths under
+/tmp; do not assume they survive scale-to-zero.
 The image has no Docker VOLUME, listens on 8080 by default, and runs as UID 1000.
 
-For a local hardware smoke run:
+After an image build, a local hardware smoke run can check the API:
 
     docker run --rm --gpus all -p 8080:8080 lct-qwen-inference:dev
     curl http://localhost:8080/health
     curl http://localhost:8080/v1/models
 
-This local model smoke requires a compatible NVIDIA GPU and enough disk for
-the model download. A successful image build alone does not prove the model
-loads or generates.
+This model smoke requires a compatible NVIDIA GPU and enough disk for the
+model download. A successful image build alone does not prove the model
+loads, the A100 profile works, or structured output remains valid under
+reasoning.
 
 ## Cloud.ru Docker RUN deployment
 
@@ -62,30 +84,41 @@ loads or generates.
    lct-qwen-inference:dev. A registry from another project must be public
    according to the Docker RUN image requirements.
 2. In AI Factory / ML Inference, create a Serverless inference service using
-   Docker RUN and the pushed image. Choose Linux/amd64, port 8080, and an
-   H100 80 GB GPU for the initial profile. Set minimum instances to 0 and
-   maximum instances to 1 for the controlled experiment.
+   Docker RUN and the pushed image. Choose Linux/amd64, port 8080, and A100
+   NVLINK 80 GB. Set `LCT_INFERENCE_PROFILE=A100_BF16`, minimum instances to
+   0, and maximum instances to 1. Do not enable «Не выключать модель». This
+   is the first qualification profile; it is not a claim that the 300-second
+   gate has been met.
 3. Select Concurrency scaling and set its target to 2 if the console offers
    that threshold. Cloud.ru documents Concurrency as an autoscaling metric;
    its public documentation does not establish that two overlapping requests
    are forwarded into one custom Docker RUN container. Maximum instances 1
    prevents another model instance from being created, but the overlap still
    has to be measured against the deployed URL.
-4. Configure readiness as HTTP GET /health on port 8080 if the deployment
-   form exposes probes. vLLM serves this endpoint after the model server is
-   ready. Use the generated service URL with /v1 as the daemon base URL.
+4. If the deployment form exposes probes, configure HTTP GET `/health` on
+   port 8080 as a readiness check, with a startup grace period long enough for
+   model download and load. Do not use model-load readiness failures as a
+   liveness restart trigger. vLLM's `/health` checks the engine; after it is
+   healthy, GET `/v1/models` and confirm it lists `Qwen/Qwen3.8-27B`. The
+   image adds no Docker `HEALTHCHECK`. Use the generated service URL with
+   `/v1` as the daemon base URL.
 5. Keep platform authentication enabled for any non-public use. Cloud.ru's
    Docker RUN guide documents optional service-account authentication, but
    does not document a caller token format or secret injection for custom
    containers. The container does not configure an application API key, so
    verify that platform authentication protects the generated URL before
    exposing it. Never place a live key in the image, source, or command history.
-6. Wait for readiness, then call /v1/models and the adapter smoke contract.
+6. Wait for readiness, then call the strict-schema adapter smoke contract.
    Check Terminal/System logs for startup errors. The first request at
    minimum=0 can include container startup, model download, and model load.
    Cloud.ru describes scale-to-zero behavior but does not publish a Docker
    RUN request timeout or a numeric startup deadline. Do not treat a cold
    failure as an inference result.
+
+If the A100 profile cannot load the pinned BF16 model or measured performance
+requires a faster device, use the same image on an H100 NVLINK GPU with
+`LCT_INFERENCE_PROFILE=H100_FP8`. Worker and Supervisor remain requests to
+one model server; do not run two model processes or replicas on one GPU.
 
 Cloud.ru deployment facts were checked against the official [Docker RUN image
 requirements](https://cloud.ru/docs/ml-inference/ug/topics/concepts__image-requirements),
@@ -95,7 +128,9 @@ requirements](https://cloud.ru/docs/ml-inference/ug/topics/concepts__image-requi
 [GPU FAQ](https://cloud.ru/docs/ml-inference/ug/topics/faq__gpus),
 and [Docker logs guide](https://cloud.ru/docs/ml-inference/ug/topics/guides__logs-docker).
 Model and serving compatibility are based on the official [Qwen FP8 model
-card](https://huggingface.co/Qwen/Qwen3.8-27B-FP8), the [vLLM Qwen recipe](https://github.com/vllm-project/recipes/blob/main/models/Qwen/Qwen3.8-27B.yaml),
+card](https://huggingface.co/Qwen/Qwen3.8-27B-FP8), [Qwen BF16 model card](https://huggingface.co/Qwen/Qwen3.8-27B),
+the [vLLM Qwen recipe](https://github.com/vllm-project/recipes/blob/main/models/Qwen/Qwen3.8-27B.yaml),
+the [Qwen reasoning parser](https://docs.vllm.ai/en/latest/features/reasoning_outputs/),
 and the [vLLM structured output guide](https://docs.vllm.ai/en/stable/examples/features/structured_outputs/).
 
 ## Daemon configuration
@@ -121,12 +156,22 @@ From the repository root, with a ready deployment:
 
     $env:LCT_SEMANTIC_BASE_URL = 'https://<generated-service-host>/v1'
     $env:LCT_SEMANTIC_API_KEY = '<optional-bearer-key>'
+    $env:LCT_INFERENCE_PROFILE = 'A100_BF16'
+    $env:MODEL_ID = 'Qwen/Qwen3.8-27B'
+    $env:MODEL_REVISION = '1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0'
+    $env:MODEL_DTYPE = 'bfloat16'
+    $env:LCT_BENCHMARK_GPU = 'A100 NVLINK 80GB'
     node services/inference/benchmark.mjs warm --repetitions 3
 
 Warm mode makes Worker and Supervisor warm-up requests, then records
 Worker-only, Supervisor-only, serial-pair, and overlapping-pair cases for
-each repetition. It reports per-request latency, first streamed token time,
-token usage when returned, and pair wall time. Case order rotates between
+each repetition. The report includes the requested profile/checkpoint labels,
+per-request and pair wall time, first generated-token and first final-content
+token times, and token usage when returned. TTFT includes reasoning tokens
+when the server emits them separately; content TTFT starts at the first JSON
+content token. Set the matching `MODEL_ID`, `MODEL_REVISION`, and
+`MODEL_DTYPE` values for H100 reports. These are caller-supplied labels, not
+server attestation. Case order rotates between
 repetitions to reduce simple order effects; the summary reports medians rather
 than a P95 estimate from this small sample.
 

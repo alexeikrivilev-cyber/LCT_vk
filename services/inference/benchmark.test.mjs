@@ -30,6 +30,12 @@ async function startServer(t) {
     reply.write(event({
       id: 'benchmark-' + role,
       model: 'Qwen/Qwen3.8-27B',
+      choices: [{ index: 0, delta: { role: 'assistant', reasoning: 'private reasoning' } }],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    reply.write(event({
+      id: 'benchmark-' + role,
+      model: 'Qwen/Qwen3.8-27B',
       choices: [{ index: 0, delta: { role: 'assistant', content: content.slice(0, 24) } }],
     }));
     await new Promise((resolve) => setTimeout(resolve, 2));
@@ -64,7 +70,7 @@ async function startServer(t) {
   };
 }
 
-function runBenchmark(baseUrl, args, timeoutMs = 5000) {
+function runBenchmark(baseUrl, args, timeoutMs = 5000, profileMetadata = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [benchmark, ...args], {
       env: {
@@ -73,6 +79,12 @@ function runBenchmark(baseUrl, args, timeoutMs = 5000) {
         LCT_SEMANTIC_MODEL: 'Qwen/Qwen3.8-27B',
         LCT_SEMANTIC_API_KEY: '',
         LCT_BENCHMARK_TIMEOUT_MS: String(timeoutMs),
+        LCT_INFERENCE_PROFILE: 'A100_BF16',
+        MODEL_ID: 'Qwen/Qwen3.8-27B',
+        MODEL_REVISION: '1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0',
+        MODEL_DTYPE: 'bfloat16',
+        LCT_BENCHMARK_GPU: 'A100 80GB',
+        ...profileMetadata,
       },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -102,11 +114,16 @@ test('warm benchmark records isolated, serial, and overlapping structured calls'
   assert.equal(result.code, 0, result.stderr);
   const report = JSON.parse(result.stdout);
   assert.equal(report.mode, 'warm');
+  assert.equal(report.profile, 'A100_BF16');
+  assert.equal(report.checkpoint, 'Qwen/Qwen3.8-27B');
+  assert.equal(report.dtype, 'bfloat16');
+  assert.equal(report.gpu, 'A100 80GB');
   assert.equal(report.results.length, 4);
   assert.deepEqual(report.summary.map((item) => item.name), [
     'worker-only', 'supervisor-only', 'serial-pair', 'overlapping-pair',
   ]);
   assert.ok(report.results.every((row) => row.requests.every((request) => request.ttftMs >= 0)));
+  assert.ok(report.results.every((row) => row.requests.every((request) => request.contentTtftMs >= request.ttftMs)));
   assert.ok(report.results.every((row) => row.requests.every((request) => request.promptTokens === 31)));
   assert.ok(server.maximumActive >= 2);
   assert.ok(Number.isFinite(report.serialVsOverlapP50WallTimeReductionPercent));
@@ -142,8 +159,17 @@ test('benchmark maps timeout while draining a provider error body', async (t) =>
     server.close(() => resolve());
   }));
 
-  const result = await runBenchmark('http://127.0.0.1:' + address.port + '/v1', ['warm'], 40);
+  const result = await runBenchmark('http://127.0.0.1:' + address.port + '/v1', ['warm'], 40, {
+    LCT_INFERENCE_PROFILE: 'H100_FP8',
+    MODEL_ID: 'Qwen/Qwen3.8-27B-FP8',
+    MODEL_REVISION: '017b9c7af6b5689d5dd426a76e0bc077eb5ca20a',
+    MODEL_DTYPE: 'auto',
+    LCT_BENCHMARK_GPU: 'H100 80GB',
+  });
   assert.equal(result.code, 1);
   assert.match(result.stderr, /TIMEOUT: inference request exceeded its client deadline/);
+  const failure = JSON.parse(result.stderr);
+  assert.equal(failure.profile, 'H100_FP8');
+  assert.equal(failure.role, 'worker');
   assert.doesNotMatch(result.stderr, /controller is not defined/);
 });

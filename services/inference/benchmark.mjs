@@ -2,6 +2,11 @@
 import { performance } from 'node:perf_hooks';
 
 const MODEL = process.env.LCT_SEMANTIC_MODEL || 'Qwen/Qwen3.8-27B';
+const PROFILE = process.env.LCT_INFERENCE_PROFILE || 'unspecified';
+const CHECKPOINT = process.env.MODEL_ID || 'unspecified';
+const MODEL_REVISION = process.env.MODEL_REVISION || 'unspecified';
+const MODEL_DTYPE = process.env.MODEL_DTYPE || 'unspecified';
+const GPU_LABEL = process.env.LCT_BENCHMARK_GPU || 'unspecified';
 const API_KEY = process.env.LCT_SEMANTIC_API_KEY;
 const BASE_URL = process.env.LCT_SEMANTIC_BASE_URL?.trim().replace(/\/+$/, '');
 const REQUEST_TIMEOUT_MS = Number(process.env.LCT_BENCHMARK_TIMEOUT_MS || 300_000);
@@ -132,6 +137,7 @@ async function runRequest(role) {
   const started = performance.now();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let firstTokenMs;
+  let contentTtftMs;
   let outputText = '';
   let usage;
   let responseId;
@@ -158,8 +164,14 @@ async function runRequest(role) {
     if (!Array.isArray(payload.choices)) return;
     for (const choice of payload.choices) {
       if (!isRecord(choice) || !isRecord(choice.delta)) continue;
+      const reasoning = (typeof choice.delta.reasoning === 'string' && choice.delta.reasoning.length > 0)
+        || (typeof choice.delta.reasoning_content === 'string' && choice.delta.reasoning_content.length > 0);
+      if ((reasoning || (typeof choice.delta.content === 'string' && choice.delta.content.length > 0))
+          && firstTokenMs === undefined) {
+        firstTokenMs = performance.now() - started;
+      }
       if (typeof choice.delta.content === 'string' && choice.delta.content.length > 0) {
-        if (firstTokenMs === undefined) firstTokenMs = performance.now() - started;
+        if (contentTtftMs === undefined) contentTtftMs = performance.now() - started;
         outputText += choice.delta.content;
       }
     }
@@ -260,11 +272,15 @@ async function runRequest(role) {
       requestId: responseId,
       wallTimeMs: round(wallTimeMs),
       ttftMs: firstTokenMs === undefined ? undefined : round(firstTokenMs),
+      contentTtftMs: contentTtftMs === undefined ? undefined : round(contentTtftMs),
       promptTokens,
       completionTokens,
       tokensPerSecond: completionTokens !== undefined && generationMs > 0
         ? round(completionTokens / (generationMs / 1000)) : undefined,
     };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'UNKNOWN_ERROR';
+    throw new Error(`${role}: ${message}`, { cause: error });
   } finally {
     clearTimeout(timer);
   }
@@ -301,6 +317,7 @@ function summarize(rows) {
     const requestRows = selected.flatMap((row) => row.requests);
     const latencies = requestRows.map((request) => request.wallTimeMs);
     const ttfts = requestRows.map((request) => request.ttftMs).filter(Number.isFinite);
+    const contentTtfts = requestRows.map((request) => request.contentTtftMs).filter(Number.isFinite);
     const promptTokens = requestRows.map((request) => request.promptTokens).filter(Number.isFinite);
     const completionTokens = requestRows.map((request) => request.completionTokens).filter(Number.isFinite);
     return {
@@ -309,6 +326,7 @@ function summarize(rows) {
       wallTimeP50Ms: percentile(selected.map((row) => row.wallTimeMs), 0.5),
       requestLatencyP50Ms: percentile(latencies, 0.5),
       ttftP50Ms: percentile(ttfts, 0.5),
+      contentTtftP50Ms: percentile(contentTtfts, 0.5),
       promptTokens: promptTokens.length === requestRows.length ? promptTokens : undefined,
       completionTokens: completionTokens.length === requestRows.length ? completionTokens : undefined,
     };
@@ -321,6 +339,11 @@ async function main() {
   const output = {
     mode,
     model: MODEL,
+    profile: PROFILE,
+    checkpoint: CHECKPOINT,
+    revision: MODEL_REVISION,
+    dtype: MODEL_DTYPE,
+    gpu: GPU_LABEL,
     endpointHost: new URL(BASE_URL).host,
     startedAt: new Date().toISOString(),
     coldMeasurement: mode === 'cold'
@@ -380,6 +403,11 @@ async function main() {
 
 main().catch((error) => {
   const message = error instanceof Error ? error.message.slice(0, 300) : 'UNKNOWN_ERROR';
-  process.stderr.write(JSON.stringify({ status: 'failed', error: message }) + '\n');
+  const role = /^(worker|supervisor):/.exec(message)?.[1];
+  process.stderr.write(JSON.stringify({
+    status: 'failed', profile: PROFILE, model: MODEL, checkpoint: CHECKPOINT,
+    revision: MODEL_REVISION, dtype: MODEL_DTYPE, gpu: GPU_LABEL,
+    ...(role ? { role } : {}), error: message,
+  }) + '\n');
   process.exitCode = 1;
 });

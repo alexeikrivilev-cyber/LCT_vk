@@ -20,7 +20,7 @@ function openAIResponse(content, options = {}) {
   return {
     id: 'chatcmpl-local-fixture',
     model: options.model ?? model,
-    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+    choices: [{ index: 0, message: { role: 'assistant', ...options.message, content }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 42, completion_tokens: 13 },
   };
 }
@@ -184,6 +184,24 @@ test('fails closed for malformed JSON, wrong schemas, empty answers, and wrong m
     });
     await assert.rejects(adapter(baseUrl).infer(workerSmokeRequest()), errorCode(code));
   }
+});
+
+test('keeps a separate reasoning field out of strict JSON content and rejects reasoning mixed into content', async (t) => {
+  const structured = JSON.stringify({ status: 'ok', summary: 'final answer', nextAction: 'continue' });
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    reply.writeHead(200, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify(openAIResponse(structured, {
+      message: { reasoning: 'private reasoning that is not JSON' },
+    })));
+  });
+  const result = await adapter(baseUrl).infer(workerSmokeRequest());
+  assert.deepEqual(result.value, { status: 'ok', summary: 'final answer', nextAction: 'continue' });
+
+  const contaminated = await startServer(t, async (_request, reply) => {
+    reply.writeHead(200, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify(openAIResponse('<think>private reasoning</think>' + structured)));
+  });
+  await assert.rejects(adapter(contaminated.baseUrl).infer(workerSmokeRequest()), errorCode('INVALID_JSON'));
 });
 
 test('applies caller cancellation and bounded request deadlines', async (t) => {

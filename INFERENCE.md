@@ -24,13 +24,19 @@ The serving path must support image inputs because the supervisor may inspect re
 
 ## Hardware profiles
 
-### Primary: single H100-class GPU
+### First qualification profile: one A100 80GB
 
-The first controlled benchmark target is a single H100-class GPU with the official `Qwen/Qwen3.8-27B-FP8` checkpoint. The checkpoint is pinned in the development image to revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` under Apache-2.0. The official [vLLM Qwen3.8-27B recipe](https://github.com/vllm-project/recipes/blob/main/models/Qwen/Qwen3.8-27B.yaml) lists H100 support and estimates 38 GB minimum VRAM; the [pinned Hugging Face revision](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a) exists and carries Apache-2.0. These are compatibility/model artifact facts, not Cloud.ru or project workload measurements. Actual image build, serving, VRAM headroom, and performance remain unverified.
+The first development and hackathon qualification profile uses the official `Qwen/Qwen3.8-27B` BF16 checkpoint at revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` under Apache-2.0. The official [Qwen model card](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0) marks the checkpoint BF16. The [vLLM recipe](https://github.com/vllm-project/recipes/blob/main/models/Qwen/Qwen3.8-27B.yaml) estimates 67 GB minimum VRAM for this checkpoint, but its model-specific verified GPU list does not include A100. This is a qualification target, not a claim that this exact model/profile has been verified on A100.
 
-FP8 is the initial profile because Hopper provides native FP8 acceleration and the FP8 checkpoint is smaller than the non-FP8 weights. Measure actual headroom for request context, batching, activations, and media/runtime allocations before accepting the profile.
+The Docker runtime's `A100_BF16` profile starts with `max-model-len=16384`, `max-num-seqs=2`, and `gpu-memory-utilization=0.90`. Keep this limit for the first run. Measure memory use, structured output, concurrency, and end-to-end performance before changing it. The BF16 profile's 55.6 GB weight files and the recipe's 67 GB VRAM estimate leave less operating margin than the FP8/H100 option; actual Cloud.ru allocation behavior and runtime buffers are still unknown.
 
-BF16/FP16 remains a benchmark candidate. It replaces FP8 only if end-to-end measurements show equal/better quality and total throughput while preserving serving memory headroom, media scheduling, safety margin, and the 300-second gate.
+Worker and Supervisor use the same vLLM process and model instance. `max-num-seqs=2` allows two active sequences; do not deploy two model processes or replicas on one A100. A runtime smoke test must confirm the two application calls work through one endpoint.
+
+### Performance option: one H100 with FP8
+
+The retained `H100_FP8` profile uses the official `Qwen/Qwen3.8-27B-FP8` checkpoint at revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` under Apache-2.0. The vLLM recipe lists H100 for this variant and estimates 38 GB minimum VRAM. The H100 profile uses `dtype=auto` so the engine follows the checkpoint's FP8 quantization configuration. [Pinned checkpoint](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a).
+
+The H100 remains a performance/fallback option; relative and absolute LCT latency are unknown until measured. Neither profile is confirmed against the 300-second product gate. For either profile, benchmark actual context, batching, activations, media/runtime allocations, peak VRAM, and cold/warm serving behavior before accepting it.
 
 Do not choose generic Q8/INT8 merely because it is 8-bit. Benchmark the actual checkpoint, kernels, engine, and workload.
 
@@ -49,7 +55,7 @@ Required invariants for the dual-GPU profile:
 - the presentation pipeline and product behavior are unchanged;
 - record device topology and parallelism settings in benchmark/release metadata.
 
-Before reducing required product behavior, test the dual-5090 profile if the primary H100 profile misses the time gate.
+Before reducing required product behavior, test the dual-5090 profile if the A100/H100 profiles miss the time gate.
 
 ## Two-agent topology
 

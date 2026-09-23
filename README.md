@@ -37,7 +37,7 @@ shared logical Qwen3.8-27B
 
 The model may run on one GPU or be sharded across several devices; Worker and Supervisor do not get separate model replicas. The serving target prewarms reusable role/stage instruction prefixes where supported; the current stateless adapter does not provide session or cache namespaces.
 
-Primary hardware target is a single H100-class GPU. If that profile cannot reliably meet the five-minute gate, the documented fallback is a dual RTX 5090-class sharded profile selected by benchmark rather than assumed linear scaling.
+The first development and hackathon qualification target is one A100 80GB using the BF16 Qwen checkpoint. H100 with the official FP8 checkpoint remains the performance/fallback option. Neither profile is claimed to meet the five-minute gate until an end-to-end workload is measured. See [`INFERENCE.md`](./INFERENCE.md) for profile limits and qualification status.
 
 Image/photo slots use the media adapter with `Qwen/Qwen-Image-2.1` as the preferred technical target, subject to the license/compliance gate in `INFERENCE.md`.
 
