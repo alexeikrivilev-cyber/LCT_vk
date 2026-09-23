@@ -33,6 +33,7 @@ const requiredRootDocs = [
   'CONTEXT.md',
   'ARCHITECTURE.md',
   'MODELS.md',
+  'INFERENCE.md',
   'AUDIT.md',
   'TESTING.md',
 ];

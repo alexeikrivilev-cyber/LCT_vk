@@ -1,6 +1,6 @@
 # Skills
 
-Skills contain reusable semantic workflows for the presentation compiler. They are versioned prompt/configuration assets, not a second implementation layer for geometry, persistence, rendering, or export.
+Skills contain reusable semantic workflows for the presentation compiler. They are versioned prompt/configuration assets, not a second implementation layer for geometry, persistence, rendering, scheduling, or export.
 
 ## Current inventory
 
@@ -13,7 +13,9 @@ They are starting material, not the final orchestrator architecture.
 
 ## Target skill shape
 
-The target runtime has one thin orchestration skill plus narrow specialized skills, for example:
+The runtime has one thin orchestration layer and two logical agent roles over the same Qwen3.8-27B model weights.
+
+Worker-oriented skills:
 
 ```text
 presentation-orchestrator
@@ -21,31 +23,50 @@ presentation-orchestrator
   -> deck-planner
   -> layout-ranker
   -> visual-planner
-  -> contextual-auditor
-  -> repair
+  -> local-repair/replan
 ```
 
-Exact names may change. The responsibility split in `MODELS.md` and `ARCHITECTURE.md` must not.
+Supervisor-oriented skills:
+
+```text
+supervisor-review
+  -> plan-review
+  -> slide/contextual-audit
+  -> visual-relevance-review
+  -> bounded-repair-proposal
+```
+
+These are skills/capabilities, not extra agents. The runtime still has exactly two semantic roles: worker and supervisor. Contextual audit runs under the supervisor rather than introducing a third model persona.
+
+Exact names may change. The responsibility split in `MODELS.md`, `ARCHITECTURE.md`, and `INFERENCE.md` must not.
 
 ## Authoring rules
 
 A skill should:
 
 - solve one repeatable semantic task;
-- state its inputs, constraints, and structured output clearly;
+- state its inputs, constraints, checkpoint/version expectations, and structured output clearly;
 - reference canonical repository docs instead of copying long product rules;
 - operate on stable ids supplied by the application;
-- leave exact geometry, OOXML, native object construction, locks, persistence, and deterministic audit to code;
+- leave exact geometry, OOXML, native object construction, locks, persistence, deadline scheduling, and deterministic audit to code;
 - avoid provider credentials and transport details;
 - be small enough to benchmark and version independently.
 
 The top-level orchestrator coordinates stages. Do not turn it into a giant presentation handbook.
 
-Prefer constrained choices over unconstrained design instructions. For example, rank a supplied set of compatible layouts instead of asking the model to invent a slide.
+Prefer constrained choices over unconstrained design instructions. Rank a supplied set of compatible layouts instead of asking the model to invent a slide.
+
+Supervisor skills should return targeted findings/patch operations, never a replacement full deck. They must treat locks, checkpoint versions, and deadline remaining as explicit constraints.
+
+## Context and cache discipline
+
+Skills must not assume that worker and supervisor share conversation history. Pass required facts explicitly through structured project/checkpoint state.
+
+Do not stuff the entire project into every skill call. Retrieve the smallest relevant content/design slice. Long-lived context growth hurts latency and KV-cache headroom and is constrained by `INFERENCE.md`.
 
 ## Versioning
 
-Prompt/skill changes can materially change output and must be traceable. Record a version for accepted runtime instructions and include that version in generation metadata.
+Prompt/skill changes can materially change output and must be traceable. Record versions for accepted worker and supervisor instructions and include them in generation metadata.
 
 Use the benchmark process in `TESTING.md` and `MODELS.md` before promoting a prompt/skill change.
 

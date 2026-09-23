@@ -22,6 +22,22 @@ PPTX template + content package + brief
 
 The default path requires no manual design work. The system selects a recommended slide and visual candidate at every choice point; the user only intervenes where they want a different option.
 
+## Runtime target
+
+Semantic inference is designed around one high-memory GPU serving unit with one loaded `Qwen/Qwen3.8-27B` weight set and two logical agents:
+
+```text
+shared Qwen3.8-27B weights
+  -> worker cache/session      # drives generation
+  -> supervisor cache/session  # reviews checkpoints and bounded repairs
+```
+
+The agents do not duplicate model weights and do not share mutable conversation/KV state. The initial H100 benchmark profile is the official FP8 checkpoint; BF16/FP16 is allowed only when end-to-end measurement shows a better profile without breaking VRAM headroom or the five-minute requirement.
+
+Image/photo slots use the media adapter with `Qwen/Qwen-Image-2.1` as the preferred technical target. `INFERENCE.md` documents the current license/compliance gate and the required fallback path if the final hackathon rules do not permit that model.
+
+A normal 10–15 slide generation has a hard 300-second budget; engineering should target approximately 270 seconds to retain export/demo headroom.
+
 ## Current repository state
 
 The repository already contains the minimal product shell:
@@ -33,7 +49,9 @@ The repository already contains the minimal product shell:
 - `craft/` — compact presentation craft guidance.
 - `templates/deck-framework.html` — neutral HTML deck preview shell.
 
-The presentation compiler pipeline described in `ARCHITECTURE.md` is the target for ongoing implementation. Documentation distinguishes implemented foundation from required target behavior.
+The presentation compiler and GPU-orchestration pipeline described in `ARCHITECTURE.md` / `INFERENCE.md` is the target for ongoing implementation. Documentation distinguishes implemented foundation from required target behavior.
+
+The current visual UI is temporary and is expected to be redesigned. Product/domain contracts are stable; existing screen styling/composition is not.
 
 ## Documentation
 
@@ -41,7 +59,8 @@ Start with `AGENTS.md` when working as a coding agent.
 
 - [`CONTEXT.md`](./CONTEXT.md) — canonical product specification.
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — system boundaries and pipeline.
-- [`MODELS.md`](./MODELS.md) — model, prompts, skills, and offline optimization.
+- [`MODELS.md`](./MODELS.md) — worker/supervisor model responsibilities, prompts, skills, and offline optimization.
+- [`INFERENCE.md`](./INFERENCE.md) — GPU runtime, precision, two caches, scheduling, media model, and the five-minute deadline.
 - [`AUDIT.md`](./AUDIT.md) — audit, repair, and preflight contract.
 - [`TESTING.md`](./TESTING.md) — test strategy and acceptance criteria.
 - [`skills/README.md`](./skills/README.md) — skill authoring policy.
@@ -75,7 +94,7 @@ LCT_PORT
 LCT_DATA_DIR
 ```
 
-Image generation is exposed through a deliberately small adapter:
+The current image-generation boundary remains deliberately small:
 
 ```text
 LCT_IMAGE_API_KEY
@@ -83,16 +102,16 @@ LCT_IMAGE_BASE_URL
 LCT_IMAGE_MODEL
 ```
 
-`OPENAI_API_KEY` may be used as the current compatibility fallback for the image adapter. Presentation domain code must not depend on that provider-specific detail.
+Do not let presentation-domain code depend on a specific inference-engine or media-provider request type. The future GPU inference host may be Python while the product daemon remains TypeScript.
 
 ## Scope
 
-The hackathon product is desktop-web only and optimized for roughly 10–15 slides or a user-selected count. Generation should fit the case time budget, with a target of no more than five minutes for a normal deck.
+The hackathon product is desktop-web only and optimized for roughly 10–15 slides or a user-selected count.
 
-In scope: unknown PPTX templates, template decomposition, content/outline planning, charts/tables/diagrams/icons/SmartArt-like structures, image generation, three controlled variants, selective repair, native export, skills/versioning, tests, and reproducibility.
+In scope: unknown PPTX templates, template decomposition, content/outline planning, charts/tables/diagrams/icons/SmartArt-like structures, image generation, three controlled variants, selective repair, native export, two-agent semantic inference, skills/versioning, tests, and reproducibility.
 
 Out of scope unless a concrete requirement appears: multiplayer collaboration, enterprise permissions, marketplace/community systems, video/audio generation, mobile apps, generic website/prototype generation, universal vector editing, and a large external research/fact-checking subsystem.
 
 ## Verification
 
-Before finishing a code change, run the checks applicable to it. `pnpm check:boundary` protects the presentation-only repository boundary. `TESTING.md` defines the expected coverage for parser, planner, variants, renderer, audit, locks, export, and end-to-end flows.
+Before finishing a code change, run the checks applicable to it. `pnpm check:boundary` protects the presentation-only repository boundary. `TESTING.md` defines expected coverage for parser, planner, variants, renderer, audit, locks, export, two-agent cache isolation, GPU profiles, media inference, and the five-minute end-to-end gate.
