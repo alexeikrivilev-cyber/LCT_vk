@@ -8,9 +8,9 @@ RUN uv pip install --system "transformers==5.8.0" "tiktoken==0.13.0" \
 
 ENV PORT=8080 \
     LCT_INFERENCE_PROFILE=A100_BF16 \
+    LCT_MODEL_STORAGE_ROOT=/tmp/lct-model-storage \
     HOME=/tmp/lct-home \
     XDG_CACHE_HOME=/tmp/lct-home/.cache \
-    HF_HOME=/tmp/lct-huggingface \
     VLLM_CACHE_ROOT=/tmp/lct-vllm-cache \
     VLLM_CONFIG_ROOT=/tmp/lct-vllm-config \
     TRITON_CACHE_DIR=/tmp/lct-triton-cache

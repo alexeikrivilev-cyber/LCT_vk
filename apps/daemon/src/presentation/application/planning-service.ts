@@ -85,6 +85,7 @@ interface TelemetrySummary {
   wallTimeMs: number;
   promptTokens: number | null;
   completionTokens: number | null;
+  finishReason: string | null;
 }
 
 export interface PlanningTelemetry {
@@ -451,11 +452,14 @@ function telemetrySummary(value: SemanticInferenceTelemetry): TelemetrySummary {
     wallTimeMs: value.wallTimeMs,
     promptTokens: value.promptTokens ?? null,
     completionTokens: value.completionTokens ?? null,
+    finishReason: value.finishReason ?? null,
   };
 }
 
 function validateTelemetrySummary(value: unknown): TelemetrySummary {
-  if (!isRecord(value) || !exactKeys(value, ['model', 'requestId', 'providerRequestId', 'startedAt', 'finishedAt', 'wallTimeMs', 'promptTokens', 'completionTokens'])
+  const legacyKeys = ['model', 'requestId', 'providerRequestId', 'startedAt', 'finishedAt', 'wallTimeMs', 'promptTokens', 'completionTokens'];
+  const currentKeys = [...legacyKeys, 'finishReason'];
+  if (!isRecord(value) || (!exactKeys(value, legacyKeys) && !exactKeys(value, currentKeys))
       || typeof value.model !== 'string' || value.model.length > 256
       || typeof value.requestId !== 'string' || value.requestId.length > 256
       || (value.providerRequestId !== null && (typeof value.providerRequestId !== 'string' || value.providerRequestId.length > 256))
@@ -463,10 +467,13 @@ function validateTelemetrySummary(value: unknown): TelemetrySummary {
       || typeof value.finishedAt !== 'string' || !Number.isFinite(Date.parse(value.finishedAt))
       || !Number.isSafeInteger(value.wallTimeMs) || Number(value.wallTimeMs) < 0
       || (value.promptTokens !== null && (!Number.isSafeInteger(value.promptTokens) || Number(value.promptTokens) < 0))
-      || (value.completionTokens !== null && (!Number.isSafeInteger(value.completionTokens) || Number(value.completionTokens) < 0))) {
+      || (value.completionTokens !== null && (!Number.isSafeInteger(value.completionTokens) || Number(value.completionTokens) < 0))
+      || (Object.hasOwn(value, 'finishReason') && value.finishReason !== null
+        && (typeof value.finishReason !== 'string' || value.finishReason.length === 0 || value.finishReason.length > 64
+          || !/^[A-Za-z0-9_.-]+$/.test(value.finishReason)))) {
     throw new TypeError('Saved planning telemetry is invalid');
   }
-  return value as unknown as TelemetrySummary;
+  return { ...value, finishReason: value.finishReason ?? null } as unknown as TelemetrySummary;
 }
 
 function validatePlanReviewState(value: unknown, plan: DeckPlan, contentIR: ContentIR): PlanReview {
@@ -772,7 +779,8 @@ export class PlanningService {
         ...state,
         inputs,
         status: stale ? 'stale' : state.status === 'needs_revision' ? 'needs_revision'
-          : state.lastSuccessful ? 'ready' : state.failure ? 'failed' : 'ready_for_planning',
+          : state.status === 'failed' ? 'failed'
+            : state.lastSuccessful ? 'ready' : state.failure ? 'failed' : 'ready_for_planning',
         updatedAt: this.now().toISOString(),
       };
       if (inputs.inputFingerprint !== currentFingerprint || state.status !== 'generating') {

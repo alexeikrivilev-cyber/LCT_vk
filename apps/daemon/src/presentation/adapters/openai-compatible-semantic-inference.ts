@@ -34,6 +34,7 @@ export interface SemanticInferenceConfig {
   model: string;
   apiKey?: string;
   requestTimeoutMs?: number;
+  enableThinking?: boolean;
 }
 
 export type SemanticFetch = typeof fetch;
@@ -79,10 +80,15 @@ export function semanticInferenceConfigFromEnvironment(
   }
   const apiKey = environment.LCT_SEMANTIC_API_KEY?.trim() || undefined;
   if (apiKey && apiKey.length > 4096) throw configError('LCT_SEMANTIC_API_KEY is too long');
+  const enableThinkingValue = environment.LCT_SEMANTIC_ENABLE_THINKING?.trim().toLowerCase();
+  if (enableThinkingValue && enableThinkingValue !== 'true' && enableThinkingValue !== 'false') {
+    throw configError('LCT_SEMANTIC_ENABLE_THINKING must be true or false');
+  }
   return {
     baseUrl: normalizeBaseUrl(baseUrl, apiKey),
     model,
     ...(apiKey ? { apiKey } : {}),
+    ...(enableThinkingValue ? { enableThinking: enableThinkingValue === 'true' } : {}),
     requestTimeoutMs: DEFAULT_TIMEOUT_MS,
   };
 }
@@ -311,6 +317,13 @@ function countUsage(usage: unknown): { promptTokens?: number; completionTokens?:
   };
 }
 
+function boundedFinishReason(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= 64
+    && /^[A-Za-z0-9_.-]+$/.test(value)
+    ? value
+    : undefined;
+}
+
 function makeTelemetryBase(
   request: SemanticInferenceRequest<unknown>,
   model: string,
@@ -364,7 +377,7 @@ function httpFailure(status: number): SemanticInferenceError {
   if (status === 429) {
     return new SemanticInferenceError('RATE_LIMITED', 'Inference endpoint is at capacity or rate limited', { httpStatus: status });
   }
-  if ([500, 502, 503, 504].includes(status)) {
+  if (status >= 500 && status <= 599) {
     return new SemanticInferenceError('SERVICE_UNAVAILABLE', 'Inference endpoint is temporarily unavailable', { httpStatus: status });
   }
   return new SemanticInferenceError('PROVIDER_ERROR', 'Inference endpoint returned HTTP ' + status, { httpStatus: status });
@@ -381,6 +394,9 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
     }
     const apiKey = config.apiKey?.trim() || undefined;
     if (apiKey && apiKey.length > 4096) throw configError('LCT_SEMANTIC_API_KEY is too long');
+    if (config.enableThinking !== undefined && typeof config.enableThinking !== 'boolean') {
+      throw configError('Semantic inference thinking configuration must be a boolean');
+    }
     this.config = {
       ...config,
       baseUrl: normalizeBaseUrl(config.baseUrl, apiKey),
@@ -400,6 +416,7 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
     const requestId = randomUUID();
     const startedMs = Date.now();
     const baseTelemetry = makeTelemetryBase(request, this.config.model, requestId, startedMs);
+    let finishReason: string | undefined;
     if (request.signal?.aborted) {
       const telemetry = finishTelemetry(baseTelemetry, 'cancelled', startedMs, { errorCode: 'CANCELLED' });
       throw new SemanticInferenceError('CANCELLED', 'Semantic inference was cancelled before dispatch', { telemetry });
@@ -424,6 +441,9 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       messages: request.messages.map(toProviderMessage),
       max_tokens: request.maxOutputTokens,
       temperature: request.temperature ?? 0,
+      ...(this.config.enableThinking === undefined ? {} : {
+        chat_template_kwargs: { enable_thinking: this.config.enableThinking },
+      }),
       stream: false,
       response_format: {
         type: 'json_schema',
@@ -509,6 +529,10 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
           || !isRecord(choices[0].message)) {
         throw new SemanticInferenceError('EMPTY_RESPONSE', 'Inference endpoint returned no assistant message');
       }
+      finishReason = boundedFinishReason(choices[0].finish_reason);
+      if (finishReason === 'length') {
+        throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'Inference endpoint truncated structured output at max_tokens');
+      }
       const content = choices[0].message.content;
       if (typeof content !== 'string' || content.length === 0) {
         throw new SemanticInferenceError('EMPTY_RESPONSE', 'Inference endpoint returned empty structured content');
@@ -537,6 +561,7 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
         value: parsed as T,
         telemetry: finishTelemetry(baseTelemetry, 'success', startedMs, {
           ...(providerRequestId ? { providerRequestId } : {}),
+          ...(finishReason ? { finishReason } : {}),
           ...usage,
         }),
       };
@@ -552,6 +577,7 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       const telemetry = finishTelemetry(baseTelemetry, normalizedError instanceof SemanticInferenceError && normalizedError.code === 'CANCELLED'
         ? 'cancelled' : 'error', startedMs, {
         ...(normalizedError instanceof SemanticInferenceError ? { errorCode: normalizedError.code } : { errorCode: 'PROVIDER_ERROR' }),
+        ...(finishReason ? { finishReason } : {}),
       });
       throw withTelemetry(normalizedError, telemetry);
     } finally {

@@ -20,7 +20,7 @@ function openAIResponse(content, options = {}) {
   return {
     id: 'chatcmpl-local-fixture',
     model: options.model ?? model,
-    choices: [{ index: 0, message: { role: 'assistant', ...options.message, content }, finish_reason: 'stop' }],
+    choices: [{ index: 0, message: { role: 'assistant', ...options.message, content }, finish_reason: options.finishReason ?? 'stop' }],
     usage: { prompt_tokens: 42, completion_tokens: 13 },
   };
 }
@@ -67,6 +67,14 @@ test('environment config requires an endpoint, pins a fixed model by default, an
   });
   assert.equal(config.baseUrl, 'https://inference.example.test/v1');
   assert.equal(config.model, model);
+  assert.equal(semanticInferenceConfigFromEnvironment({
+    LCT_SEMANTIC_BASE_URL: 'https://inference.example.test/v1',
+    LCT_SEMANTIC_ENABLE_THINKING: 'false',
+  }).enableThinking, false);
+  assert.throws(() => semanticInferenceConfigFromEnvironment({
+    LCT_SEMANTIC_BASE_URL: 'https://inference.example.test/v1',
+    LCT_SEMANTIC_ENABLE_THINKING: 'off',
+  }), errorCode('CONFIGURATION_ERROR'));
   assert.throws(() => semanticInferenceConfigFromEnvironment({
     LCT_SEMANTIC_BASE_URL: 'http://remote.example.test/v1',
     LCT_SEMANTIC_API_KEY: 'local-test-key',
@@ -113,14 +121,36 @@ test('validates structured output and keeps Worker and Supervisor evidence in se
   assert.deepEqual(received.map((item) => item.role), ['worker', 'supervisor']);
   assert.equal(received[0].body.response_format.type, 'json_schema');
   assert.equal(received[0].body.response_format.json_schema.strict, true);
+  assert.equal(Object.hasOwn(received[0].body, 'chat_template_kwargs'), false);
   assert.equal(worker.telemetry.role, 'worker');
   assert.equal(supervisor.telemetry.role, 'supervisor');
   assert.equal(worker.telemetry.promptTokens, 42);
   assert.equal(worker.telemetry.completionTokens, 13);
   assert.equal(worker.telemetry.providerRequestId, 'chatcmpl-local-fixture');
+  assert.equal(worker.telemetry.finishReason, 'stop');
   assert.equal(worker.telemetry.status, 'success');
   assert.doesNotMatch(JSON.stringify(worker.telemetry), /WORKER_SENTINEL|SUPERVISOR_SENTINEL/);
   assert.doesNotMatch(JSON.stringify(supervisor.telemetry), /WORKER_SENTINEL|SUPERVISOR_SENTINEL/);
+});
+
+test('maps the optional adapter thinking setting to request-level chat template kwargs', async (t) => {
+  let receivedBody;
+  const { baseUrl } = await startServer(t, async (request, reply) => {
+    receivedBody = await readJson(request);
+    reply.writeHead(200, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify(openAIResponse(JSON.stringify({
+      status: 'ok', summary: 'small schema accepted', nextAction: 'continue',
+    }))));
+  });
+  const config = semanticInferenceConfigFromEnvironment({
+    LCT_SEMANTIC_BASE_URL: baseUrl,
+    LCT_SEMANTIC_MODEL: model,
+    LCT_SEMANTIC_ENABLE_THINKING: 'false',
+  });
+  await new OpenAICompatibleSemanticInferenceAdapter({ ...config, requestTimeoutMs: 500 }).infer(workerSmokeRequest());
+  assert.deepEqual(receivedBody.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(receivedBody.response_format.type, 'json_schema');
+  assert.equal(receivedBody.response_format.json_schema.strict, true);
 });
 
 test('two semantic roles can be in flight at once through the stateless adapter', async (t) => {
@@ -154,8 +184,8 @@ test('two semantic roles can be in flight at once through the stateless adapter'
   assert.deepEqual(results.map((item) => item.telemetry.role).sort(), ['supervisor', 'worker']);
 });
 
-test('maps authentication, capacity, and service errors without returning provider bodies', async (t) => {
-  for (const [status, code] of [[401, 'AUTH_ERROR'], [429, 'RATE_LIMITED'], [503, 'SERVICE_UNAVAILABLE']]) {
+test('maps authentication, model, capacity, and service errors without returning provider bodies', async (t) => {
+  for (const [status, code] of [[401, 'AUTH_ERROR'], [404, 'PROVIDER_ERROR'], [429, 'RATE_LIMITED'], [503, 'SERVICE_UNAVAILABLE'], [524, 'SERVICE_UNAVAILABLE']]) {
     const { baseUrl } = await startServer(t, async (_request, reply) => {
       reply.writeHead(status, { 'content-type': 'text/plain' });
       reply.end('BODY_SECRET_MUST_NOT_APPEAR_IN_ERRORS');
@@ -173,6 +203,7 @@ test('maps authentication, capacity, and service errors without returning provid
 test('fails closed for malformed JSON, wrong schemas, empty answers, and wrong model ids', async (t) => {
   const cases = [
     ['not-json', {}, 'INVALID_JSON'],
+    [null, { message: { reasoning: 'reasoning without final content' } }, 'EMPTY_RESPONSE'],
     [JSON.stringify({ status: 'ok', summary: 'missing nextAction' }), {}, 'INVALID_STRUCTURED_OUTPUT'],
     ['', {}, 'EMPTY_RESPONSE'],
     [JSON.stringify({ status: 'ok', summary: 'ok', nextAction: 'continue' }), { model: 'some/other-model' }, 'CONFIGURATION_ERROR'],
@@ -184,6 +215,20 @@ test('fails closed for malformed JSON, wrong schemas, empty answers, and wrong m
     });
     await assert.rejects(adapter(baseUrl).infer(workerSmokeRequest()), errorCode(code));
   }
+});
+
+test('rejects max-token truncation even when the partial structured content is valid JSON', async (t) => {
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    reply.writeHead(200, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify(openAIResponse(JSON.stringify({
+      status: 'ok', summary: 'complete-looking result', nextAction: 'continue',
+    }), { finishReason: 'length' })));
+  });
+  await assert.rejects(adapter(baseUrl).infer(workerSmokeRequest()), (error) => {
+    assert.equal(error.code, 'INVALID_STRUCTURED_OUTPUT');
+    assert.equal(error.telemetry.finishReason, 'length');
+    return true;
+  });
 });
 
 test('keeps a separate reasoning field out of strict JSON content and rejects reasoning mixed into content', async (t) => {

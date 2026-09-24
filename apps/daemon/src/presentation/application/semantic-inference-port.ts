@@ -72,6 +72,7 @@ export interface SemanticInferenceTelemetry {
   wallTimeMs: number;
   promptTokens?: number;
   completionTokens?: number;
+  finishReason?: string;
   ttftMs?: number;
   cacheSignal?: string;
   status: 'success' | 'error' | 'cancelled';

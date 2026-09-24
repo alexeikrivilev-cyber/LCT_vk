@@ -11,6 +11,8 @@ The system keeps two classes separate:
 
 A finding must say which class produced it. Contextual audit is a Supervisor capability, not a third semantic agent.
 
+The current replaceable offline audit covers only the compile-time evidence it can measure: title/body bounds and mutual overlap, selected-layout references, blank text slides, broken ContentIR provenance, numeric tokens missing from cited units, common placeholder strings, exact duplicate slide text, explicit bullet count, and native-table row/column limits. It reports text overflow, visual fit, inherited style/contrast, and semantic entailment as unknown or leaves them to contextual review. A compile-time pass is not an export preflight pass.
+
 ## Finding contract
 
 A practical `AuditFinding` should carry:
@@ -101,6 +103,8 @@ Source consistency may be checked against supplied content where tractable. Do n
 
 Supervisor should not re-audit every slide with a long call. Deterministic findings, ambiguity, risk, and remaining deadline decide where contextual review is worth the latency.
 
+An internal, replaceable `ContextualSlideAuditPort` describes one bounded Supervisor capability over a rendered slide image, exact text, cited source evidence, and neighboring slide summaries. Its eight gates cover takeaway title, title support, one-sentence summary, factual grounding, visual relevance, prompt garbage, language consistency, and adjacent-slide narrative. Only the typed contract and local fake test exist; there is no model adapter, render-image pipeline, API, persisted finding state, or audit UI yet.
+
 ## Audit during progressive generation
 
 Audit must support continuous slide-pack generation rather than forcing a serial review workflow.
@@ -170,6 +174,8 @@ Safe, meaning-preserving deterministic fixes may run automatically when reversib
 A Supervisor-proposed semantic repair may be auto-applied only when product policy marks it safe, validation passes, locks are untouched, and the change remains visible/reversible. Otherwise surface it for selection or route through normal repair UX.
 
 Anything that changes meaning, chart semantics, layout family, visual type, or a locked item requires explicit action or visible re-plan.
+
+The offline compiler spike has a separate one-attempt repair helper. For the first slide with a measured out-of-bounds/overlapping text placement, it selects the next ranked layout once and audits the deck once more. This is not connected to saved project state or the runtime generation workflow. It never edits text or factual content.
 
 ## Preflight gates
 

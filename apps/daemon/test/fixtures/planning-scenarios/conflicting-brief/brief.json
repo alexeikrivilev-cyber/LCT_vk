@@ -1,0 +1,7 @@
+{
+  "audience": "Operations steering group",
+  "purpose": "Decide how to improve the service request handoff",
+  "expectedOutcome": "Choose a small process experiment",
+  "requestedSlideCount": 3,
+  "preferences": ["Use exactly five slides", "Do not exceed the requested three slides", "Use only supplied facts", "Give one concrete recommendation"]
+}

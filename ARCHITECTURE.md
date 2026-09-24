@@ -57,6 +57,10 @@ Implemented today:
 - bounded ContentIR v1 compilation for selected text, Markdown, JSON, CSV/TSV, image references, and inventory-only unsupported files;
 - validated Brief v1 and narrative-only DeckPlan v1 planning through the semantic adapter, with bounded Supervisor review/repair/re-plan;
 - project-local planning persistence, input-fingerprint staleness checks, planning API, and a compact workspace planning panel;
+- a replaceable offline slide-compilation spike that maps a persisted DeckPlan and ContentIR into three template-aware layout tracks, with explainable layout candidates;
+- a native OOXML PPTX writer that preserves the source package's master/theme/layout parts and emits editable text plus a native table when referenced CSV cells form a rectangular grid;
+- deterministic pre-render geometry/provenance/numeric checks, one bounded alternate-layout repair attempt, and an offline 3-template × 3-variant matrix runner;
+- a typed, replaceable contextual-audit port for the existing Supervisor capability, covered by a local fake test and no model invocation;
 - live HTML preview with relative resources;
 - built-in design-system and skill discovery;
 - image-generation adapter;
@@ -65,7 +69,26 @@ Implemented today:
 - presentation-oriented Node/TypeScript runtime;
 - PPTX/PDF primitives available to the daemon.
 
-The planning vertical slice is implemented through persisted DeckPlan and API/UI presentation. ContentIR v1 only deterministically compiles user-supplied `.txt`, `.md`, `.json`, `.csv`, and `.tsv` text; images become references and other binary files are inventory-only with warnings. It does not parse PDF/Office content, create semantic summaries, or perform research. SlidePack generation, progressive publication, native rendering, audit/export, and actual GPU serving/orchestration remain target architecture. The inference adapter carries caller-supplied stateless requests; it does not create persistent Worker/Supervisor sessions or KV namespaces. Template understanding v1 is a deterministic structural scan and does not establish universal arbitrary-template compatibility.
+The planning vertical slice is implemented through persisted DeckPlan and API/UI presentation. ContentIR v1 only deterministically compiles user-supplied `.txt`, `.md`, `.json`, `.csv`, and `.tsv` text; images become references and other binary files are inventory-only with warnings. It does not parse PDF/Office content, create semantic summaries, or perform research. Slide compilation, variant matching, one native table primitive, deterministic pre-render audit, and offline matrix generation now exist as replaceable application tooling. They are not connected to the application generation workflow: there is no SlidePack persistence, progressive publication, audit API/UI, general chart/image/diagram rendering, or PPTX/HTML/PDF export flow. The PPTX writer replaces the presentation's active slide list with compiled slides, keeps the source master/theme/layout package parts, and renders editable text plus rectangular CSV tables; it does not preserve the source deck's sample slides or fully reproduce inherited placeholder styling. No rendered overflow or visual-quality claim is made. The inference adapter carries caller-supplied stateless requests; it does not create persistent Worker/Supervisor sessions or KV namespaces. Template understanding v1 is a deterministic structural scan and does not establish universal arbitrary-template compatibility.
+
+### Offline slide compilation spike
+
+The replaceable internal slice has these boundaries:
+
+```text
+persisted ContentIR + Brief + DeckPlan
+TemplateIR/PDS
+        -> layout matcher + A/B/C variant policy
+        -> replaceable CompiledPresentation
+        -> native OOXML text / rectangular table objects
+        -> deterministic pre-render audit
+```
+
+The compiler copies DeckPlan takeaways and referenced ContentIR text/cells without rewriting claims. `DeckPlan` supplies narrative intent, `TemplateIR` supplies measured layout geometry and source parts, and `CompiledPresentation` records the selected layout, variant, exact text, visualization references, provenance, and placements. Layout matching uses placeholder roles and measured geometry; declared layout names are diagnostics only. The renderer performs no narrative or visualization selection.
+
+The three policies change layout ranking across the whole deck. The offline matrix runner validates and reuses one saved plan across three supplied PPTX templates and emits A/B/C PPTX files, audit reports, a replay manifest, and timing diagnostics without an inference adapter. It is a developer experiment command, not a production API or progressive SlidePack generator.
+
+Known rendering limits are deliberate: referenced CSV cell grids can become native tables; chart series, process semantics, image references, and general diagrams do not yet have sufficient compilation contracts for faithful rendering. Their requested visual type remains explicit and unresolved audit findings identify that gap. The compiler cannot route image units from current planning output because the DeckPlan contract disallows media-reference citations. Generated objects do not yet reproduce inherited placeholder text styles, chart/table styles, locks, or native picture relationships. The output package has not been opened in PowerPoint or LibreOffice.
 
 ## Canonical pipeline
 

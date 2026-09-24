@@ -7,6 +7,7 @@ const snapshotUrl = new URL('./model_snapshot.py', import.meta.url);
 const preflightUrl = new URL('./tokenizer_preflight.py', import.meta.url);
 const dockerfileUrl = new URL('./Dockerfile', import.meta.url);
 const readmeUrl = new URL('./README.md', import.meta.url);
+const inferenceUrl = new URL('../../INFERENCE.md', import.meta.url);
 
 async function source(url) {
   return readFile(url, 'utf8');
@@ -88,15 +89,74 @@ test('snapshot materialization pins the profile revision and preflight-only excl
   assert.match(snapshot, /snapshot_download\(/);
   assert.match(snapshot, /repo_id=model_id/);
   assert.match(snapshot, /revision=revision/);
-  assert.match(snapshot, /cache_dir=cache_dir/);
+  assert.match(snapshot, /cache_dir=hf_cache/);
   assert.match(snapshot, /allow_patterns=allow_patterns/);
   assert.match(snapshot, /PREFLIGHT_FILES = \(/);
   assert.match(snapshot, /REQUIRED_PREFLIGHT_FILES = \("config\.json", "tokenizer_config\.json", "tokenizer\.json"\)/);
   assert.doesNotMatch(snapshot, /safetensors|\.bin|model-\*|layers-\*/i);
   assert.match(script, /MODEL_REVISION.*\$PROFILE_MODEL_REVISION/);
-  assert.match(script, /env CUDA_VISIBLE_DEVICES= python3 \/opt\/lct-inference\/model_snapshot\.py "\$MODEL_ID" "\$MODEL_REVISION" "\$HF_HOME" "\$SNAPSHOT_MODE"/);
+  assert.match(script, /env CUDA_VISIBLE_DEVICES= python3 \/opt\/lct-inference\/model_snapshot\.py "\$MODEL_ID" "\$MODEL_REVISION" "\$LCT_MODEL_STORAGE_ROOT" "\$SNAPSHOT_MODE"/);
   assert.match(script, /--revision "\$MODEL_REVISION"/);
   assert.match(script, /--tokenizer-revision "\$MODEL_REVISION"/);
+});
+
+test('configured model storage is absolute, persistent by default, and owns the Hugging Face cache', async () => {
+  const [script, dockerfile, readme, snapshot] = await Promise.all([
+    source(entrypointUrl), source(dockerfileUrl), source(readmeUrl), source(snapshotUrl),
+  ]);
+
+  assert.match(script, /LCT_MODEL_STORAGE_ROOT="\$\{LCT_MODEL_STORAGE_ROOT:-\/tmp\/lct-model-storage\}"/);
+  assert.match(script, /LCT_MODEL_STORAGE_ROOT must be an absolute path/);
+  assert.match(script, /HF_HOME="\$LCT_MODEL_STORAGE_ROOT\/huggingface"/);
+  assert.match(script, /HF_HUB_CACHE="\$HF_HOME\/hub"/);
+  assert.match(script, /export LCT_MODEL_STORAGE_ROOT HF_HOME HF_HUB_CACHE/);
+  assert.match(script, /"\$LCT_MODEL_STORAGE_ROOT" "\$SNAPSHOT_MODE"/);
+  assert.match(dockerfile, /LCT_MODEL_STORAGE_ROOT=\/tmp\/lct-model-storage/);
+  assert.doesNotMatch(dockerfile, /HF_HOME=/);
+  assert.match(readme, /LCT_MODEL_STORAGE_ROOT=\/workspace\/lct-models/);
+  assert.match(readme, /persistent[ -]volume/i);
+  assert.match(readme, /default model root[\s\S]{0,120}disposable/i);
+  assert.match(readme, /HF_TOKEN/);
+
+  const rootValidation = script.indexOf('if [[ "$LCT_MODEL_STORAGE_ROOT" != /* ]]');
+  const snapshotInvocation = script.indexOf('/opt/lct-inference/model_snapshot.py');
+  const storagePreparation = snapshot.indexOf('if not prepare_storage(');
+  const downloadPlan = snapshot.indexOf('plan = get_download_plan(');
+  assert.ok(rootValidation >= 0 && rootValidation < snapshotInvocation);
+  assert.ok(storagePreparation >= 0 && storagePreparation < downloadPlan);
+});
+
+test('self-hosted storage stays behind the provider-neutral application inference boundary', async () => {
+  const [readme, inference] = await Promise.all([source(readmeUrl), source(inferenceUrl)]);
+
+  for (const document of [readme, inference]) {
+    assert.match(document, /RunPod is one self-hosted\s+(inference\s+)?runtime option/i);
+    assert.match(document, /LCT_MODEL_STORAGE_ROOT[\s\S]{0,100}self-hosted inference container/i);
+    assert.match(document, /\/workspace[\s\S]{0,180}(example|optional)/i);
+    assert.match(document, /not read or required by application or domain\s+code/i);
+    assert.match(document, /SemanticInferenceAdapter`?\s+remains provider-neutral/i);
+    assert.match(document, /top-10\s+hackathon deployment[\s\S]{0,400}organizer-provided VK inference[\s\S]{0,100}Qwen 3\.8 27B/i);
+    assert.match(document, /Worker, Supervisor, and application\/domain logic do not\s+change/i);
+    assert.match(document, /remote VK inference does not require local model storage/i);
+  }
+});
+
+test('full snapshot startup checks disk, reuses the pinned cache, and keeps tokenizer preflight weight-free', async () => {
+  const snapshot = await source(snapshotUrl);
+
+  assert.match(snapshot, /hf_home = storage_root \/ "huggingface"/);
+  assert.match(snapshot, /hf_cache = hf_home \/ "hub"/);
+  assert.match(snapshot, /snapshot_download\([\s\S]{0,180}dry_run=True/);
+  assert.match(snapshot, /shutil\.disk_usage\(storage_root\)\.free/);
+  assert.match(snapshot, /required_bytes > available_bytes/);
+  assert.match(snapshot, /reusing_cached_snapshot/);
+  assert.match(snapshot, /reusing_preflight_assets/);
+  assert.match(snapshot, /resuming_partial_snapshot/);
+  assert.match(snapshot, /force_download": False/);
+  assert.match(snapshot, /revision": revision/);
+  assert.match(snapshot, /cache_dir": hf_cache/);
+  assert.match(snapshot, /allow_patterns = list\(PREFLIGHT_FILES\) if mode == "preflight" else None/);
+  assert.doesNotMatch(snapshot, /safetensors|\.bin|model-\*|layers-\*/i);
 });
 
 test('preflight-only downloads a tokenizer snapshot, validates it locally, and exits before vLLM', async () => {
@@ -127,7 +187,8 @@ test('tokenizer diagnostics redact credential values and do not dump the environ
   assert.doesNotMatch(preflight, /printenv|env\s*\)/i);
   assert.match(snapshot, /SECRET_NAME_MARKERS/);
   assert.match(snapshot, /redact_secret_values/);
-  assert.match(snapshot, /Hub exceptions can contain signed download URLs/);
-  assert.match(snapshot, /download\.traceback=omitted/);
-  assert.doesNotMatch(snapshot, /print\([^\n]*os\.environ|traceback\.format_exc/);
+  assert.match(snapshot, /Hub exceptions may include signed download URLs/);
+  assert.match(snapshot, /type\(error\).__name__/);
+  assert.match(snapshot, /os\.environ\.get\("HF_TOKEN"\) or False/);
+  assert.doesNotMatch(snapshot, /print\([^\n]*HF_TOKEN|print\([^\n]*os\.environ|traceback\.format_exc/);
 });

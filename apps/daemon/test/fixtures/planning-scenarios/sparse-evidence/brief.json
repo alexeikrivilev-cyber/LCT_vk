@@ -1,0 +1,7 @@
+{
+  "audience": "Customer success leadership",
+  "purpose": "Decide whether the onboarding signal warrants a small follow-up study",
+  "expectedOutcome": "Select one question for the follow-up study",
+  "requestedSlideCount": 3,
+  "preferences": ["State what the survey cannot establish", "Do not invent customer outcomes"]
+}

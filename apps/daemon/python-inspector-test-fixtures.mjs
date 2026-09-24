@@ -51,8 +51,8 @@ function understateMemberSize(buffer, filename, declaredSize, declaredCrc) {
   throw new Error(`Synthetic ZIP has no ${filename} member`);
 }
 
-function shape({ id, name, text, x, y, width, height, idx = '7', colorKind = 'srgb', color = '336699', lastColor = '000000' }) {
-  const placeholder = idx === null ? '' : `<p:ph type="title" idx="${idx}"/>`;
+function shape({ id, name, text, x, y, width, height, idx = '7', placeholderType = 'title', colorKind = 'srgb', color = '336699', lastColor = '000000' }) {
+  const placeholder = idx === null ? '' : `<p:ph type="${placeholderType}" idx="${idx}"/>`;
   const colorElement = colorKind === 'scheme'
     ? `<a:schemeClr val="${color}"/>`
     : colorKind === 'system'
@@ -77,15 +77,19 @@ function slideXml(index, p, a, r, includeWarning, groupTransform = null, slideBa
   return `<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="${p}" xmlns:a="${a}" xmlns:r="${r}"><p:cSld>${background}<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${shape({ id: index + 1, name: `Takeaway ${index}`, text: `Synthetic takeaway ${index}`, x: 914400, y: index * 914400, width: 5486400, height: 914400 })}${picture({ id: index + 20, name: 'Embedded media', relationship: 'rIdImage' })}${picture({ id: index + 30, name: 'External media', relationship: 'rIdExternal', link: true })}${grouped}${warning}</p:spTree></p:cSld></p:sld>`;
 }
 
-function layoutXml(p, a, layoutIndex) {
-  return `<?xml version="1.0" encoding="UTF-8"?><p:sldLayout xmlns:p="${p}" xmlns:a="${a}" type="title"><p:cSld name="Synthetic layout ${layoutIndex}"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${shape({ id: 2, name: `Layout title ${layoutIndex}`, text: '', x: 457200, y: 228600, width: 6400800, height: 685800 })}${shape({ id: 3, name: `Layout mark ${layoutIndex}`, text: '', x: 100, y: 200, width: 300, height: 400, idx: null, colorKind: 'scheme', color: 'accent2' })}</p:spTree></p:cSld></p:sldLayout>`;
+function layoutXml(p, a, layoutIndex, profile = {}) {
+  const title = profile.title ?? { x: 457200, y: 228600, width: 6400800, height: 685800 };
+  const body = profile.body ? shape({ id: 4, name: `Layout body ${layoutIndex}`, text: '', ...profile.body, placeholderType: 'body', idx: '8' }) : '';
+  const visual = profile.visual ? shape({ id: 5, name: `Layout visual ${layoutIndex}`, text: '', ...profile.visual, placeholderType: profile.visual.type ?? 'chart', idx: '9' }) : '';
+  const layoutName = profile.name ?? `Synthetic layout ${layoutIndex}`;
+  return `<?xml version="1.0" encoding="UTF-8"?><p:sldLayout xmlns:p="${p}" xmlns:a="${a}" type="title"><p:cSld name="${layoutName}"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${shape({ id: 2, name: `Layout title ${layoutIndex}`, text: '', ...title })}${shape({ id: 3, name: `Layout mark ${layoutIndex}`, text: '', x: 100, y: 200, width: 300, height: 400, idx: null, colorKind: 'scheme', color: 'accent2' })}${body}${visual}</p:spTree></p:cSld></p:sldLayout>`;
 }
 
 function masterXml(p, a) {
   return `<?xml version="1.0" encoding="UTF-8"?><p:sldMaster xmlns:p="${p}" xmlns:a="${a}"><p:cSld name="Synthetic master"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${shape({ id: 4, name: 'Master mark', text: '', x: 1000, y: 2000, width: 3000, height: 4000, idx: null, colorKind: 'system', color: 'windowText', lastColor: '000000' })}</p:spTree></p:cSld></p:sldMaster>`;
 }
 
-export async function makeSyntheticPptx({ strict = false, slideCount = 1, layoutCount = 2, brokenLayout = false, unsafeRelationship = false, unsupported = false, parserWarning = false, themeLink = 'presentation', groupTransform = null, nestedTemplateGroups = false, slideBackground = false, unsupportedCompressionMethod, forgedDeflateExpansionBytes = 0 } = {}) {
+export async function makeSyntheticPptx({ strict = false, slideCount = 1, layoutCount = 2, layoutProfiles = [], brokenLayout = false, unsafeRelationship = false, unsupported = false, parserWarning = false, themeLink = 'presentation', groupTransform = null, nestedTemplateGroups = false, slideBackground = false, unsupportedCompressionMethod, forgedDeflateExpansionBytes = 0 } = {}) {
   const zip = new JSZip();
   const p = strict ? STRICT.presentation : NS.presentation;
   const a = strict ? STRICT.drawing : NS.drawing;
@@ -116,7 +120,7 @@ export async function makeSyntheticPptx({ strict = false, slideCount = 1, layout
       : '';
   zip.file('ppt/slideMasters/_rels/slideMaster1.xml.rels', `<?xml version="1.0"?><Relationships xmlns="${masterRelNs}">${Array.from({ length: layoutCount }, (_, i) => `<Relationship Id="rIdLayout${i + 1}" Type="${r}/slideLayout" Target="../slideLayouts/slideLayout${i + 1}.xml"/>`).join('')}${themeRelations}</Relationships>`, { date: fixedDate });
   for (let i = 1; i <= layoutCount; i += 1) {
-    const layoutContents = layoutXml(p, a, i)
+    const layoutContents = layoutXml(p, a, i, layoutProfiles[i - 1] ?? {})
       .replace(`<p:cSld name="Synthetic layout ${i}">`, `<p:cSld name="Synthetic layout ${i}"><p:bg><p:bgPr><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></p:bgPr></p:bg>`)
       .replace('</p:sldLayout>', '<p:clrMapOvr><a:overrideClrMapping accent1="accent2"/></p:clrMapOvr></p:sldLayout>');
     const layoutWithGroup = nestedTemplateGroups

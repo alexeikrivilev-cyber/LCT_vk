@@ -7,15 +7,30 @@ not inspect or filter evidence across roles. The calls are stateless requests
 with separate schemas and role metadata. The container does not include the
 LCT daemon.
 
+## Deployment boundary
+
+This vLLM image is one self-hosted inference option. RunPod is one self-hosted
+runtime option. `LCT_MODEL_STORAGE_ROOT` and persistent model volumes configure only the
+self-hosted inference container. `/workspace` below is an example provider
+mount path: it is optional and is not read or required by application or domain
+code. `SemanticInferenceAdapter` remains provider-neutral. For the top-10
+hackathon deployment, configure its remote inference endpoint to use the
+organizer-provided VK inference serving Qwen 3.8 27B. Moving from RunPod or
+another self-hosted runtime to that remote endpoint changes runtime
+configuration only; Worker, Supervisor, and application/domain logic do not
+change. Remote VK inference does not require local model storage.
+
 ## Pinned runtime
 
 - Engine image: the Qwen3.8-specific `vllm/vllm-openai:qwen38` image from the
   official vLLM recipe, pinned to its Linux/amd64 manifest digest in the
   Dockerfile. One image is used for both supported profiles. The pinned image
-  was built locally as `lct-qwen-inference:snapshot-local-v4`; its installed
+  is tagged locally as `lct-qwen-inference:persistent-storage-v5`; its installed
   vLLM package reports `0.1.dev19754+g3a0914114` from fork commit
-  `3a0914114705fa38d4c3171d0746c1a6b6f10209`. The tokenizer checks passed,
-  but neither serving profile has been started or qualified on a GPU here.
+  `3a0914114705fa38d4c3171d0746c1a6b6f10209`. A live A100 Qwen endpoint has
+  passed a small strict-schema request and one Worker/Supervisor planning run
+  (see `INFERENCE.md`); that evidence does not establish that this exact local
+  image tag was used or qualify the H100 profile or the 300-second gate.
   The official recipe reports tests on a fork build in the v0.27 range.
 - Transformers 5.8.0 and `tiktoken` 0.13.0 are pinned at image build. The
   build imports the selected Qwen tokenizer class and constructs its backend
@@ -32,7 +47,8 @@ LCT daemon.
 - The pinned base already supplies `huggingface_hub` 1.27.0. The Docker build
   verifies its version and `snapshot_download` API; no extra Hub package is
   installed. At startup the entrypoint resolves `MODEL_ID@MODEL_REVISION` with
-  `snapshot_download` into `$HF_HOME/hub`, then passes that returned local
+  `snapshot_download` into
+  `$LCT_MODEL_STORAGE_ROOT/huggingface/hub`, then passes that returned local
   snapshot directory as both vLLM's model and tokenizer path. The public API
   alias remains `Qwen/Qwen3.8-27B`. vLLM also receives the pinned revision for
   diagnostics, while all model and tokenizer files are read from the local
@@ -53,26 +69,27 @@ LCT daemon.
 - The entrypoint enables `--reasoning-parser qwen3`. The parser separates
   reasoning from final content; the daemon consumes only `message.content`
   and validates it against the requested strict JSON Schema. Fake-response
-  tests verify this boundary. The parser/structured-output interaction still
-  needs a real model smoke test.
+  tests verify this boundary. A live strict-schema planning smoke has passed
+  with request-level thinking disabled while the server reasoning parser stays
+  enabled; this is one endpoint/run result, not broad profile qualification.
 - Both profiles serve one model process under the stable API alias. vLLM
   continuous batching schedules concurrent requests; it does not promise
   equal GPU time per role.
 
 The official vLLM recipe estimates 67 GB minimum VRAM for the BF16 checkpoint
 and 38 GB for the FP8 checkpoint. It declares H100 for the FP8 variant but
-does not list A100 as a verified Qwen3.8-27B device. A100 BF16 is the first
-qualification target because the checkpoint is native BF16 and the card has
-80 GB; successful loading, headroom, and performance remain unverified until
-a GPU test. The recipe estimates do not account for Cloud.ru's allocation
-boundary or actual runtime buffers.
+does not list A100 as a verified Qwen3.8-27B device. One live A100 Qwen path
+has loaded and answered the planning requests described in `INFERENCE.md`;
+peak headroom, concurrency behavior, image provenance, and end-to-end 300
+second performance remain unverified. The recipe estimates do not account for
+Cloud.ru's allocation boundary or actual runtime buffers.
 
 ## Build
 
 From this directory:
 
     docker buildx build --check --platform linux/amd64 .
-    docker build --platform linux/amd64 -t lct-qwen-inference:snapshot-local-v4 .
+    docker build --platform linux/amd64 -t lct-qwen-inference:persistent-storage-v5 .
 
 The first command checks the Docker build definition without building the
 image or retrieving model weights. The second builds the serving image,
@@ -80,12 +97,19 @@ downloads the pinned base image and Python packages, and checks the tokenizer
 and snapshot dependencies, but never downloads Qwen files.
 
 `model_snapshot.py` uses the immutable profile revision as the source of truth.
-Normal startup calls `snapshot_download(repo_id=MODEL_ID,
-revision=MODEL_REVISION, cache_dir=$HF_HOME/hub)` without file filters, so it
-materializes the full checkpoint before vLLM starts. The returned path is the
-Hub cache's local snapshot for that commit; the base model and tokenizer share
-the same directory and downloaded blobs are not duplicated. Startup logs both
-`MODEL_ID@MODEL_REVISION` and the resolved local path.
+`LCT_MODEL_STORAGE_ROOT` selects one writable storage root and defaults to
+`/tmp/lct-model-storage` for container-local development. The entrypoint derives
+`HF_HOME=$LCT_MODEL_STORAGE_ROOT/huggingface` and
+`HF_HUB_CACHE=$HF_HOME/hub`, overriding other HF cache settings so the snapshot
+downloader and vLLM use the same location. Before a full download, a Hub dry
+run estimates uncached file bytes and startup fails early if the mounted
+filesystem lacks space. Hugging Face Hub downloads are resumable; retrying the
+same pinned commit reuses cached blobs and completes missing files. The
+returned path is the Hub cache's local snapshot for that commit; model and
+tokenizer files share that snapshot, and blobs are not duplicated. Startup logs
+`MODEL_ID@MODEL_REVISION`, the storage root, and the resolved snapshot path.
+Optional `HF_TOKEN` enables access to gated or rate-limited Hub content. It is
+passed to the Hub client and is not printed by this service.
 
 `LCT_INFERENCE_PREFLIGHT_ONLY=1` calls the same API and cache with an explicit
 allowlist of config, tokenizer, and template files. It excludes weight shards,
@@ -115,8 +139,11 @@ pinned revision and `main`, so the revision mismatch was a confirmed
 determinism defect but did not by itself explain the RunPod exception. The
 runtime now materializes the pinned commit and tests the tokenizer from that
 local path; the local CPU-only preflight has passed for both profile revisions.
-RunPod must still confirm that its cache path and runtime interpreter behave
-the same.
+The separate live RunPod A100 check later completed Worker and Supervisor
+planning requests, confirming tokenizer/runtime initialization on that
+endpoint. The available report does not identify whether it used this exact
+local `persistent-storage-v5` image or prove cache reuse across restart, so
+those image and persistence details remain unqualified.
 
 The `model_type` warning originates in vLLM `get_config`: it retries
 `HFConfigParser.parse`, which calls Transformers `AutoConfig`. Transformers
@@ -130,21 +157,46 @@ unconfirmed; no workaround was added.
 Run a deterministic CPU-only snapshot and tokenizer preflight without fetching
 weight shards or starting vLLM:
 
-    docker run --rm -e LCT_INFERENCE_PREFLIGHT_ONLY=1 lct-qwen-inference:snapshot-local-v4
+    docker run --rm -e LCT_INFERENCE_PREFLIGHT_ONLY=1 lct-qwen-inference:persistent-storage-v5
 
 It exits 0 only when the pinned config and tokenizer load from the local commit
 snapshot. The container retains its normal UID 1000 and image entrypoint; no
 GPU is attached.
 
 The build does not download model files, require a GPU, or contact Cloud.ru.
-The complete pinned model snapshot is fetched from Hugging Face when the
-container starts. Hugging Face, vLLM, Triton, config, and home caches use
-writable paths under `/tmp`; do not assume they survive scale-to-zero.
-The image has no Docker VOLUME, listens on 8080 by default, and runs as UID 1000.
+Preflight-only fetches the small allowlisted config and tokenizer files; normal
+startup fetches the full pinned snapshot if it is not already cached. The image
+has no Docker VOLUME, listens on 8080 by default, and runs as UID 1000. Its
+default model root is container-local `/tmp/lct-model-storage`, which is
+disposable when a container is replaced or scaled to zero. For self-hosted
+inference, set `LCT_MODEL_STORAGE_ROOT` to a directory on a persistent/network
+volume if snapshots should survive container replacement. The image stored in
+GHCR and model weights in the Hugging Face cache are separate; pulling the
+image does not include model weights.
+
+### RunPod persistent-volume environment
+
+RunPod is one self-hosted option. If its persistent/network volume is mounted
+at `/workspace`, configure:
+
+    LCT_INFERENCE_PROFILE=A100_BF16
+    LCT_MODEL_STORAGE_ROOT=/workspace/lct-models
+    PORT=8080
+
+If the selected checkpoint requires Hugging Face authentication, provide
+`HF_TOKEN` as a RunPod secret/environment variable. Do not bake it into the
+image. The path `/workspace/lct-models/huggingface/hub` holds the Hub cache,
+including commit-specific snapshots and shared blobs. The volume must be
+writable by container UID 1000 and have enough free space for the checkpoint
+and download overhead. `/workspace` is an example mount path, not an application
+requirement; another writable mount path can be set with
+`LCT_MODEL_STORAGE_ROOT`. Configure the provider's volume mount and retention
+so the selected volume survives pod replacement. The container's ephemeral
+disk remains temporary and is not used for model data with this setting.
 
 After an image build, a local hardware smoke run can check the API:
 
-    docker run --rm --gpus all -p 8080:8080 lct-qwen-inference:snapshot-local-v4
+    docker run --rm --gpus all -p 8080:8080 lct-qwen-inference:persistent-storage-v5
     curl http://localhost:8080/health
     curl http://localhost:8080/v1/models
 
@@ -158,8 +210,8 @@ reasoning.
 1. Create a container repository in the Cloud.ru Artifact Registry available
    to the target project. Authenticate Docker with the registry values and
    permissions supplied by that project, then tag and push
-   `lct-qwen-inference:snapshot-local-v4`. For the current repository, tag
-   and push it as `lct-inference.cr.cloud.ru/lct-qwen-inference:snapshot-local-v4`.
+   `lct-qwen-inference:persistent-storage-v5`. For the current repository, tag
+   and push it as `lct-inference.cr.cloud.ru/lct-qwen-inference:persistent-storage-v5`.
    A registry from another project must
    be public according to the Docker RUN image requirements.
 2. In AI Factory / ML Inference, create a Serverless inference service using

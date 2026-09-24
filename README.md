@@ -56,7 +56,7 @@ The repository contains the minimal product shell:
 - `craft/` — compact presentation craft guidance.
 - `templates/deck-framework.html` — neutral HTML preview shell.
 
-Deterministic PPTX structural understanding is implemented: upload a `.pptx` into a project, choose **Analyze as template**, and review the saved `TemplateIR`/structural design summary in the workspace. Recompiling the same source is deterministic; changing the source marks the saved result stale. This scan has partial OOXML/style coverage and does not claim universal arbitrary-template or native rendering compatibility. The workspace also supports planning from a brief and selected `.txt`, `.md`, `.json`, `.csv`, and `.tsv` sources: it compiles user-supplied evidence into `ContentIR`, asks the Worker for a narrative-only `DeckPlan`, runs a bounded Supervisor review, and persists the result across reloads. Local fake-adapter/API tests cover this planning slice. Without semantic inference configuration, template understanding remains available and plan generation returns an actionable configuration error. Actual Qwen serving and Cloud.ru deployment remain unverified; SlidePack generation, rendering, audit, and export remain future work. See [`services/inference/README.md`](./services/inference/README.md).
+Deterministic PPTX structural understanding is implemented: upload a `.pptx` into a project, choose **Analyze as template**, and review the saved `TemplateIR`/structural design summary in the workspace. Recompiling the same source is deterministic; changing the source marks the saved result stale. This scan has partial OOXML/style coverage and does not claim universal arbitrary-template compatibility. The workspace also supports planning from a brief and selected `.txt`, `.md`, `.json`, `.csv`, and `.tsv` sources: it compiles user-supplied evidence into `ContentIR`, asks the Worker for a narrative-only `DeckPlan`, runs a bounded Supervisor review, and persists the result across reloads. Local fake-adapter/API tests cover this planning slice. One live A100 Qwen3.8-27B path passed a small strict-schema request and a synthetic Worker → Supervisor → persisted-state/reload run with request-level thinking disabled. This does not qualify the 300-second gate or Cloud.ru/VK deployments. A replaceable offline compiler spike now ranks template layouts, compiles three whole-deck variants from one persisted plan, writes native editable text and rectangular CSV tables into the original template package, audits compiled geometry/provenance/numeric evidence, and generates a 3-template × 3-variant matrix without inference. It is not connected to application generation or the UI; charts, images, general diagrams, rendered overflow, and final PPTX quality remain unverified. See [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`AUDIT.md`](./AUDIT.md), [`TESTING.md`](./TESTING.md), [`INFERENCE.md`](./INFERENCE.md), and [`services/inference/README.md`](./services/inference/README.md).
 
 The current visual UI is temporary and expected to be redesigned. Product/domain contracts are stable; existing screen styling/composition is not.
 
@@ -99,6 +99,8 @@ mise exec -- pnpm dev
 
 If the pinned Node.js and pnpm versions are already active in your shell, run the `pnpm` commands directly; `mise` is only needed for selecting/installing those versions.
 
+If `mise` is unavailable but another `pnpm` is installed, run a script with the exact project-pinned pnpm using `pnpm dlx pnpm@10.33.2 <script>` (for example, `pnpm dlx pnpm@10.33.2 test`). This uses pnpm's package cache and does not change the repository's engine requirement.
+
 Runtime data defaults to `.lct/`. The current server/media adapter remains deliberately small and provider details must not leak into presentation-domain contracts.
 
 ## Scope
@@ -110,3 +112,13 @@ Out of scope unless a concrete requirement appears: multiplayer collaboration, e
 ## Verification
 
 Before finishing a change, run the checks applicable to it. `TESTING.md` defines coverage for parser/planner/variants, progressive publication, local edits during background generation, audit/locks/export, prompt-prefix warmup, independent two-agent request contexts, hardware profiles, media inference, and the five-minute end-to-end gate.
+
+## Offline presentation matrix
+
+To reuse one successful planning state for three local PPTX templates and generate A/B/C outputs without inference:
+
+```bash
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-offline-presentation-matrix.mjs --state ".lct/projects/<project-id>/.planning/state.json" --out ".lct/experiments/<run-name>" --templates "./templates/template-1.pptx" "./templates/template-2.pptx" "./templates/template-3.pptx" --run-metadata "./run-metadata.json"
+```
+
+`run-metadata.json` is optional and may contain only safe labels such as `{"providerKind":"runpod","profile":"A100_BF16","thinkingEnabled":false}`. Endpoint URLs and credentials are ignored. Output includes nine editable `.pptx` files, one audit JSON per variant, `matrix.json`, `replay.json`, and `diagnostics.json`. The compiler reuses the persisted DeckPlan and makes zero inference requests. The first slice renders text and rectangular CSV tables; it leaves unsupported visual types explicitly unresolved. See `TESTING.md` for verified limits.

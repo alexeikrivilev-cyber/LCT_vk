@@ -31,9 +31,31 @@ pnpm build
 
 `pnpm lint:craft` is required when skill/craft bindings change. Typecheck/build are required when the corresponding code paths change.
 
-`pnpm test` runs the Node built-in suite for project-file safeguards, ContentIR/Brief/DeckPlan contracts, planning API persistence and review bounds, the private Python inspector, the deterministic TemplateIR/PDS mapper, the template compile API, craft-reference tooling, the semantic inference adapter, and the inference benchmark harness. Inference and planning tests use fake adapters/local fake HTTP servers; they do not contact Cloud.ru, download model weights, or require a GPU. Planning API coverage includes reload, PASS/WARN/REPAIR/LOCAL-REPLAN, exactly one revision Worker call without recursive Supervisor review, duplicate slide-id rejection, invalid references/repair targets/checkpoints, image metadata exclusion from Worker evidence and factual citations, malformed review output, changed brief/source/template/prompt staleness, and lazy actionable inference-configuration failure. Synthetic Transitional and Strict OOXML fixtures exercise the implemented structural-inspection path, including linked versus ambiguous themes, nested master/layout groups, direct sRGB/scheme/system color observations, slide/master/layout backgrounds and color-map evidence, unresolved rotated group geometry, and notes inventory. These tests do not imply full arbitrary-template compatibility, inherited style resolution, automatic semantic entailment verification, native PowerPoint rendering, actual inference quality/serving, SlidePack generation, or export.
+`pnpm test` runs the Node built-in suite for project-file safeguards, ContentIR/Brief/DeckPlan contracts, planning API persistence and review bounds, the private Python inspector, the deterministic TemplateIR/PDS mapper, the template compile API, replaceable slide compilation/layout matching/native OOXML rendering/audit/matrix tooling, craft-reference tooling, the semantic inference adapter, and the inference benchmark harness. Inference and planning tests use fake adapters/local fake HTTP servers; they do not contact Cloud.ru, download model weights, or require a GPU. Planning API coverage includes reload, PASS/WARN/REPAIR/LOCAL-REPLAN, exactly one revision Worker call without recursive Supervisor review, duplicate slide-id rejection, invalid references/repair targets/checkpoints, image metadata exclusion from Worker evidence and factual citations, malformed review output, changed brief/source/template/prompt staleness, and lazy actionable inference-configuration failure. Synthetic Transitional and Strict OOXML fixtures exercise the implemented structural-inspection path, including linked versus ambiguous themes, nested master/layout groups, direct sRGB/scheme/system color observations, slide/master/layout backgrounds and color-map evidence, unresolved rotated group geometry, and notes inventory. These tests do not imply full arbitrary-template compatibility, inherited style resolution, automatic semantic entailment verification, rendered PowerPoint compatibility/visual quality, actual inference quality/serving, progressive SlidePack generation, or production export integration.
 
 The Template Compiler integration test uploads a synthetic PPTX through the project API, compiles and reloads its canonical state across a daemon restart, checks stable hashes and source-byte immutability, detects source changes as stale, and verifies controlled missing/invalid-file behavior, failed-path sanitization, and preservation of the last successful result. Mapper tests separately check deterministic IDs/hashes, exact relationships/placeholders/geometry/style/background facts, unsupported/warning retention, and PDS references to valid TemplateIR entities.
+
+## Planning quality runs
+
+Five small fictional cases for repeatable manual model checks live in `apps/daemon/test/fixtures/planning-scenarios/`. Upload a case's `source.md`, compile a template, and use its `brief.json` for one planning run. Save a copy of the resulting `.planning/state.json` outside the project data folder. Compare one or more saved states with:
+
+```bash
+node --import tsx scripts/evaluate-planning-runs.mjs run-1/state.json run-2/state.json
+```
+
+The evaluator calls the production ContentIR, Brief, DeckPlan, and Supervisor-review validators and reports slide count, references, persisted readiness, outcome, available request latencies, and Worker/Supervisor `finish_reason` values when present. It leaves unsupported-claim count and subjective content/narrative/visual review as `null`. Historical schemaVersion 1 states without finish reasons report `null`. The evaluator makes no inference requests and writes a result file only when `--out <path>` is supplied.
+
+## Offline compile and replay matrix
+
+The replaceable matrix runner reads one successful persisted planning state, validates its Brief/ContentIR/Worker checkpoint/final DeckPlan/Supervisor result, parses three local PPTX templates, and reuses the same plan for A/B/C compilation against each template. It has no inference adapter. It writes nine PPTX files, per-variant audit reports, `matrix.json`, a secret-filtered `replay.json`, and `diagnostics.json`.
+
+```bash
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-offline-presentation-matrix.mjs --state ".lct/projects/<project-id>/.planning/state.json" --out ".lct/experiments/<run-name>" --templates "./templates/template-1.pptx" "./templates/template-2.pptx" "./templates/template-3.pptx" --run-metadata "./run-metadata.json"
+```
+
+The optional metadata file accepts only `providerKind` (`runpod`, `cloudru`, `vk`, `local`, or `unknown`), a known `profile`, and boolean `thinkingEnabled`. It does not copy endpoint URLs or credentials. Worker/Supervisor temperature, token limits, prompt versions, persisted structured results, model alias, timestamps, latency, and `finishReason` are taken from known application settings and the saved state when available; historical states without finish reasons report `null`. `contentParsing`, repair, and separate PDF/HTML export timings remain unknown/not run; the runner records the stages it measures instead of inventing timings.
+
+The current writer keeps the source package's master/theme/layout parts and writes native editable text shapes and native tables from complete rectangular CSV references. The output slide list contains only generated slides; original sample slides are left as unreferenced package parts. Tests reopen generated OOXML with the local PPTX inspector and assert editable text, table rows, slide/layout relationships, and no full-slide picture object. They do not open the artifact in PowerPoint/LibreOffice or validate rendered overflow, inherited style fidelity, chart/image/diagram output, or production API/UI integration. Matrix tests generate their artifacts in a temporary directory and remove them after verification.
 
 ## Deterministic unit tests
 
@@ -50,6 +72,8 @@ Prioritize exact programmatic contracts:
 - event/state serialization;
 - export relationships/native object construction;
 - deadline accounting/scheduler priority rules.
+
+The current compiler tests additionally verify repeated compilation determinism, three whole-deck layout tracks from one plan, template-name independence, explicit source-backed CSV table cells, numeric/provenance findings, one bounded layout repair, generated PPTX reinspection, and exactly nine matrix outputs with zero inference calls.
 
 Use small fixtures and exact assertions.
 

@@ -1,0 +1,7 @@
+{
+  "audience": "Finance and product leads",
+  "purpose": "Explain the Q2 movement in the supplied subscription indicators",
+  "expectedOutcome": "Agree which metric needs investigation before the next review",
+  "requestedSlideCount": 4,
+  "preferences": ["Preserve exact figures and units", "Do not imply that ticket growth caused revenue growth"]
+}

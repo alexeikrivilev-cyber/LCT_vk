@@ -115,6 +115,7 @@ function makeFakeAdapter(control) {
           status: 'success',
           promptTokens: 120,
           completionTokens: 35,
+          finishReason: 'stop',
         },
       };
     },
@@ -194,6 +195,12 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     const saved = JSON.parse(await readFile(savedPath, 'utf8'));
     assert.equal(saved.lastSuccessful.deckPlan.hash, first.deckPlan.hash);
     assert.equal(saved.lastSuccessful.telemetry.worker.model, 'fake-planner-v1');
+    assert.equal(saved.lastSuccessful.telemetry.worker.finishReason, 'stop');
+    assert.equal(saved.lastSuccessful.telemetry.supervisor.finishReason, 'stop');
+    // Older schemaVersion=1 planning states did not store finishReason.
+    delete saved.lastSuccessful.telemetry.worker.finishReason;
+    delete saved.lastSuccessful.telemetry.supervisor.finishReason;
+    await writeFile(savedPath, JSON.stringify(saved));
     await closeStartedServer(started);
     started = await startServer(options);
     const reloaded = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
@@ -238,6 +245,10 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     control.reviewMode = 'malformed';
     const malformedReview = await generate(started, projectId);
     assert.equal(malformedReview.status, 422);
+    const failedReviewState = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
+    assert.equal(failedReviewState.status, 'failed', 'reload must preserve a failed same-input Supervisor attempt instead of presenting it as ready');
+    assert.ok(failedReviewState.deckPlan, 'the last successful plan remains available alongside the failed-attempt status');
+    assert.equal(failedReviewState.failure.code, 'PLANNING_FAILED');
 
     control.reviewMode = 'pass';
     control.badWorker = 'unknown-ref';

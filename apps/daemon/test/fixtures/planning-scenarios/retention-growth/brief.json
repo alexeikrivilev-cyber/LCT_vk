@@ -1,0 +1,7 @@
+{
+  "audience": "Board members",
+  "purpose": "Choose a focused retention investment",
+  "expectedOutcome": "Approve an onboarding pilot with a measurable success criterion",
+  "requestedSlideCount": 5,
+  "preferences": ["Separate observed evidence from the proposed pilot", "Show the relevant numbers and denominator"]
+}

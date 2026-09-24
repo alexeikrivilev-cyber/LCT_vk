@@ -1,0 +1,7 @@
+{
+  "audience": "Engineering leadership",
+  "purpose": "Review the prototype architecture and identify the next design decision",
+  "expectedOutcome": "Agree which unresolved deployment concern to investigate first",
+  "requestedSlideCount": 6,
+  "preferences": ["Keep current capabilities separate from undecided requirements", "Include one clear system-flow visual"]
+}
