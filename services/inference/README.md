@@ -11,12 +11,24 @@ LCT daemon.
 
 - Engine image: the Qwen3.8-specific `vllm/vllm-openai:qwen38` image from the
   official vLLM recipe, pinned to its Linux/amd64 manifest digest in the
-  Dockerfile. One image is used for both supported profiles. The official
-  recipe reports tests on a fork build in the v0.27 range; this repository
-  has not built or run the pinned image with these profiles.
-- Transformers: 5.8.0 is pinned at image build for the Qwen3-VL processor
-  classes required by the multimodal model. The image build has not yet
-  verified this installation against the exact base image.
+  Dockerfile. One image is used for both supported profiles. The pinned image
+  was built locally as `lct-qwen-inference:tokenizer-fix-v2`; its installed
+  vLLM package reports `0.1.dev19754+g3a0914114` from fork commit
+  `3a0914114705fa38d4c3171d0746c1a6b6f10209`. The tokenizer checks passed,
+  but neither serving profile has been started or qualified on a GPU here.
+  The official recipe reports tests on a fork build in the v0.27 range.
+- Transformers 5.8.0 and `tiktoken` 0.13.0 are pinned at image build. The
+  build imports the selected Qwen tokenizer class and constructs its backend
+  with a tiny in-memory vocabulary; it downloads no model files for this
+  check. `Qwen/Qwen3.8-27B` declares `Qwen2Tokenizer` and ships BPE
+  `tokenizer.json`, `vocab.json`, and `merges.txt` files. SentencePiece is not
+  required for this tokenizer family and is not added as a dependency. The
+  current pinned base image happens to contain both `tiktoken` and
+  SentencePiece, but the Dockerfile did not declare either. This differs from
+  the RunPod missing-dependency error, which cannot be reproduced with the
+  locally pulled base digest. The explicit `tiktoken` pin and build check make
+  the reported slow-to-fast fallback dependency reproducible; tokenizer-only
+  smoke tests pass against both pinned checkpoints without downloading weights.
 - Default profile `A100_BF16`: `Qwen/Qwen3.8-27B`, revision
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, dtype `bfloat16`,
   `max-model-len=16384`, `max-num-seqs=2`, and
@@ -52,12 +64,17 @@ boundary or actual runtime buffers.
 From this directory:
 
     docker buildx build --check --platform linux/amd64 .
-    docker build --platform linux/amd64 -t lct-qwen-inference:dev .
+    docker build --platform linux/amd64 -t lct-qwen-inference:tokenizer-fix-v2 .
 
 The first command checks the Docker build definition without building the
-image or retrieving model weights. The second builds the serving image and
-downloads the pinned base image and Transformers package, but never the Qwen
-weights.
+image or retrieving model weights. The second builds the serving image,
+downloads the pinned base image and Python packages, and runs the tokenizer
+dependency check, but never downloads Qwen weights.
+
+To repeat the dependency check inside the built image without starting vLLM or
+fetching model files:
+
+    docker run --rm --entrypoint python3 lct-qwen-inference:tokenizer-fix-v2 -c "import importlib.metadata as m, importlib.util, tiktoken; from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer; t=Qwen2Tokenizer(); print('transformers',m.version('transformers'),'tiktoken',m.version('tiktoken'),'sentencepiece available',importlib.util.find_spec('sentencepiece') is not None,'tokenizer',type(t).__name__)"
 
 The build does not download model weights, require a GPU, or contact
 Cloud.ru. The model is fetched from Hugging Face when the container starts.
@@ -67,7 +84,7 @@ The image has no Docker VOLUME, listens on 8080 by default, and runs as UID 1000
 
 After an image build, a local hardware smoke run can check the API:
 
-    docker run --rm --gpus all -p 8080:8080 lct-qwen-inference:dev
+    docker run --rm --gpus all -p 8080:8080 lct-qwen-inference:tokenizer-fix-v2
     curl http://localhost:8080/health
     curl http://localhost:8080/v1/models
 
@@ -81,8 +98,8 @@ reasoning.
 1. Create a container repository in the Cloud.ru Artifact Registry available
    to the target project. Authenticate Docker with the registry values and
    permissions supplied by that project, then tag and push
-   lct-qwen-inference:dev. A registry from another project must be public
-   according to the Docker RUN image requirements.
+   `lct-qwen-inference:tokenizer-fix-v2`. A registry from another project must
+   be public according to the Docker RUN image requirements.
 2. In AI Factory / ML Inference, create a Serverless inference service using
    Docker RUN and the pushed image. Choose Linux/amd64, port 8080, and A100
    NVLINK 80 GB. Set `LCT_INFERENCE_PROFILE=A100_BF16`, minimum instances to

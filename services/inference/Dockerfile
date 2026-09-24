@@ -3,7 +3,8 @@ FROM vllm/vllm-openai:qwen38@sha256:d392f621bb3e372ecc09f0b0cb88099afe9fa05d37a0
 LABEL org.opencontainers.image.title="LCT Qwen semantic inference"
 LABEL org.opencontainers.image.description="One vLLM server for concurrent LCT Worker and Supervisor requests"
 
-RUN uv pip install --system "transformers==5.8.0"
+RUN uv pip install --system "transformers==5.8.0" "tiktoken==0.13.0" \
+    && python3 -c 'import importlib.metadata as metadata; import tiktoken; from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer; assert metadata.version("transformers") == "5.8.0"; assert metadata.version("tiktoken") == "0.13.0"; tokenizer = Qwen2Tokenizer(); assert tokenizer._tokenizer.get_vocab(); print("Qwen tokenizer dependency check passed")'
 
 ENV PORT=8080 \
     LCT_INFERENCE_PROFILE=A100_BF16 \

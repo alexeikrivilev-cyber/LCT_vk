@@ -56,3 +56,16 @@ test('one server exposes the configured port, binds externally, selects Qwen rea
   assert.match(readme, /\/v1\/models/);
   assert.doesNotMatch(dockerfile, /^HEALTHCHECK\b/m);
 });
+
+test('Docker build pins and checks the Qwen tokenizer fallback without fetching model files', async () => {
+  const [dockerfile, readme] = await Promise.all([source(dockerfileUrl), source(readmeUrl)]);
+
+  assert.match(dockerfile, /transformers==5\.8\.0/);
+  assert.match(dockerfile, /tiktoken==0\.13\.0/);
+  assert.match(dockerfile, /python3 -c '[^\n]*import tiktoken/);
+  assert.match(dockerfile, /Qwen2Tokenizer\(\)/);
+  assert.match(dockerfile, /metadata\.version\("tiktoken"\) == "0\.13\.0"/);
+  assert.doesNotMatch(dockerfile, /sentencepiece|from_pretrained|snapshot_download|hf download|safetensors/i);
+  assert.match(readme, /sentencepiece is not[\s\S]{0,30}required/i);
+  assert.match(readme, /tiktoken[^\n]*pinned/i);
+});
