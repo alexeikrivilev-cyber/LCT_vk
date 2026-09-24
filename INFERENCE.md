@@ -8,7 +8,7 @@ The presentation application uses a provider-neutral semantic inference port. It
 
 The implemented adapter accepts `LCT_SEMANTIC_BASE_URL`, optional `LCT_SEMANTIC_API_KEY`, and `LCT_SEMANTIC_MODEL`. It sends a strict JSON Schema request and validates the returned value again with the caller's runtime validator. It bounds request/response sizes, supports deadlines and `AbortSignal`, returns typed failures and prompt-free telemetry, and carries role/operation labels. Caller-provided Worker and Supervisor messages are independent. The adapter does not depend on Cloud.ru, vLLM, or persistent conversation state.
 
-`services/inference/` contains a pinned vLLM Docker RUN development/benchmark artifact and an explicit remote benchmark harness. Normal tests use a local fake endpoint. No model weights were downloaded and no Cloud.ru deployment was performed for this integration.
+`services/inference/` contains a pinned vLLM Docker RUN development/benchmark artifact and an explicit remote benchmark harness. At startup it resolves the profile's immutable Hugging Face revision into the local Hub cache, validates config/tokenizer files from that snapshot, and passes local model/tokenizer paths to vLLM while retaining the public model alias. `LCT_INFERENCE_PREFLIGHT_ONLY=1` materializes only config/tokenizer assets and skips vLLM. Normal tests use a local fake endpoint. No model weights were downloaded and no Cloud.ru deployment was performed for this integration; the local CPU-only snapshot preflight has passed for both profiles.
 
 ## Semantic model
 

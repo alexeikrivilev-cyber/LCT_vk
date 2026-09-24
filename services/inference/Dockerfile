@@ -4,7 +4,7 @@ LABEL org.opencontainers.image.title="LCT Qwen semantic inference"
 LABEL org.opencontainers.image.description="One vLLM server for concurrent LCT Worker and Supervisor requests"
 
 RUN uv pip install --system "transformers==5.8.0" "tiktoken==0.13.0" \
-    && python3 -c 'import importlib.metadata as metadata; import tiktoken; from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer; assert metadata.version("transformers") == "5.8.0"; assert metadata.version("tiktoken") == "0.13.0"; tokenizer = Qwen2Tokenizer(); assert tokenizer._tokenizer.get_vocab(); print("Qwen tokenizer dependency check passed")'
+    && python3 -c 'import importlib.metadata as metadata; import tiktoken; from huggingface_hub import snapshot_download; from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer; assert metadata.version("transformers") == "5.8.0"; assert metadata.version("tiktoken") == "0.13.0"; assert metadata.version("huggingface-hub") == "1.27.0"; assert callable(snapshot_download); tokenizer = Qwen2Tokenizer(); assert tokenizer._tokenizer.get_vocab(); print("Qwen tokenizer and pinned snapshot dependency checks passed")'
 
 ENV PORT=8080 \
     LCT_INFERENCE_PROFILE=A100_BF16 \
@@ -15,7 +15,9 @@ ENV PORT=8080 \
     VLLM_CONFIG_ROOT=/tmp/lct-vllm-config \
     TRITON_CACHE_DIR=/tmp/lct-triton-cache
 
-COPY --chown=0:0 --chmod=0555 entrypoint.sh /opt/lct-inference/entrypoint.sh
+COPY --chown=0:0 --chmod=0555 entrypoint.sh model_snapshot.py tokenizer_preflight.py /opt/lct-inference/
+
+RUN python3 -m py_compile /opt/lct-inference/model_snapshot.py /opt/lct-inference/tokenizer_preflight.py
 
 RUN if ! grep -qE '^[^:]+:[^:]*:1000:' /etc/passwd; then \
       printf '%s\n' 'lct:x:1000:1000:LCT inference runtime:/tmp/lct-home:/bin/bash' >> /etc/passwd; \

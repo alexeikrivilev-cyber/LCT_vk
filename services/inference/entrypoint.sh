@@ -7,6 +7,7 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-27B}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+PREFLIGHT_ONLY="${LCT_INFERENCE_PREFLIGHT_ONLY:-0}"
 HOME="${HOME:-/tmp/lct-home}"
 HF_HOME="${HF_HOME:-/tmp/lct-huggingface}"
 VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/tmp/lct-vllm-cache}"
@@ -69,11 +70,33 @@ if ! [[ "$MODEL_REVISION" =~ ^[A-Fa-f0-9]{40}$ ]]; then
   echo "MODEL_REVISION must be a full 40-character commit SHA" >&2
   exit 64
 fi
+if [[ "$PREFLIGHT_ONLY" != "0" && "$PREFLIGHT_ONLY" != "1" ]]; then
+  echo "LCT_INFERENCE_PREFLIGHT_ONLY must be 0 or 1" >&2
+  exit 64
+fi
 
 mkdir -p "$HOME" "$HF_HOME" "$VLLM_CACHE_ROOT" "$VLLM_CONFIG_ROOT" "$TRITON_CACHE_DIR"
+if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
+  SNAPSHOT_MODE="preflight"
+else
+  SNAPSHOT_MODE="full"
+fi
+
+echo "Materializing model snapshot for $MODEL_ID@$MODEL_REVISION (mode=$SNAPSHOT_MODE)"
+MODEL_LOCAL_PATH="$(env CUDA_VISIBLE_DEVICES= python3 /opt/lct-inference/model_snapshot.py "$MODEL_ID" "$MODEL_REVISION" "$HF_HOME" "$SNAPSHOT_MODE")"
+echo "Resolved local model snapshot: $MODEL_LOCAL_PATH"
+echo "Running tokenizer/config preflight from the local snapshot"
+env CUDA_VISIBLE_DEVICES= python3 /opt/lct-inference/tokenizer_preflight.py "$MODEL_LOCAL_PATH" "$MODEL_ID" "$MODEL_REVISION"
+if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
+  echo "Local snapshot preflight passed; vLLM was not started"
+  exit 0
+fi
+
 args=(
-  serve "$MODEL_ID"
+  serve "$MODEL_LOCAL_PATH"
   --revision "$MODEL_REVISION"
+  --tokenizer "$MODEL_LOCAL_PATH"
+  --tokenizer-revision "$MODEL_REVISION"
   --dtype "$MODEL_DTYPE"
   --served-model-name "$SERVED_MODEL_NAME"
   --reasoning-parser qwen3

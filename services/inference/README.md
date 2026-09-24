@@ -12,7 +12,7 @@ LCT daemon.
 - Engine image: the Qwen3.8-specific `vllm/vllm-openai:qwen38` image from the
   official vLLM recipe, pinned to its Linux/amd64 manifest digest in the
   Dockerfile. One image is used for both supported profiles. The pinned image
-  was built locally as `lct-qwen-inference:tokenizer-fix-v2`; its installed
+  was built locally as `lct-qwen-inference:snapshot-local-v4`; its installed
   vLLM package reports `0.1.dev19754+g3a0914114` from fork commit
   `3a0914114705fa38d4c3171d0746c1a6b6f10209`. The tokenizer checks passed,
   but neither serving profile has been started or qualified on a GPU here.
@@ -29,6 +29,14 @@ LCT daemon.
   locally pulled base digest. The explicit `tiktoken` pin and build check make
   the reported slow-to-fast fallback dependency reproducible; tokenizer-only
   smoke tests pass against both pinned checkpoints without downloading weights.
+- The pinned base already supplies `huggingface_hub` 1.27.0. The Docker build
+  verifies its version and `snapshot_download` API; no extra Hub package is
+  installed. At startup the entrypoint resolves `MODEL_ID@MODEL_REVISION` with
+  `snapshot_download` into `$HF_HOME/hub`, then passes that returned local
+  snapshot directory as both vLLM's model and tokenizer path. The public API
+  alias remains `Qwen/Qwen3.8-27B`. vLLM also receives the pinned revision for
+  diagnostics, while all model and tokenizer files are read from the local
+  snapshot.
 - Default profile `A100_BF16`: `Qwen/Qwen3.8-27B`, revision
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, dtype `bfloat16`,
   `max-model-len=16384`, `max-num-seqs=2`, and
@@ -64,27 +72,79 @@ boundary or actual runtime buffers.
 From this directory:
 
     docker buildx build --check --platform linux/amd64 .
-    docker build --platform linux/amd64 -t lct-qwen-inference:tokenizer-fix-v2 .
+    docker build --platform linux/amd64 -t lct-qwen-inference:snapshot-local-v4 .
 
 The first command checks the Docker build definition without building the
 image or retrieving model weights. The second builds the serving image,
-downloads the pinned base image and Python packages, and runs the tokenizer
-dependency check, but never downloads Qwen weights.
+downloads the pinned base image and Python packages, and checks the tokenizer
+and snapshot dependencies, but never downloads Qwen files.
 
-To repeat the dependency check inside the built image without starting vLLM or
-fetching model files:
+`model_snapshot.py` uses the immutable profile revision as the source of truth.
+Normal startup calls `snapshot_download(repo_id=MODEL_ID,
+revision=MODEL_REVISION, cache_dir=$HF_HOME/hub)` without file filters, so it
+materializes the full checkpoint before vLLM starts. The returned path is the
+Hub cache's local snapshot for that commit; the base model and tokenizer share
+the same directory and downloaded blobs are not duplicated. Startup logs both
+`MODEL_ID@MODEL_REVISION` and the resolved local path.
 
-    docker run --rm --entrypoint python3 lct-qwen-inference:tokenizer-fix-v2 -c "import importlib.metadata as m, importlib.util, tiktoken; from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer; t=Qwen2Tokenizer(); print('transformers',m.version('transformers'),'tiktoken',m.version('tiktoken'),'sentencepiece available',importlib.util.find_spec('sentencepiece') is not None,'tokenizer',type(t).__name__)"
+`LCT_INFERENCE_PREFLIGHT_ONLY=1` calls the same API and cache with an explicit
+allowlist of config, tokenizer, and template files. It excludes weight shards,
+then checks `AutoConfig` and `AutoTokenizer` from that local snapshot with
+`local_files_only=True`. The preflight logs Python/package locations, import
+specs, config and tokenizer classes, and tokenizer backend; it hides CUDA from
+the short-lived Python process and never loads model weights. It does not
+print environment variables and redacts credential-like values from its own
+traceback output. vLLM is skipped in this mode.
 
-The build does not download model weights, require a GPU, or contact
-Cloud.ru. The model is fetched from Hugging Face when the container starts.
-Hugging Face, vLLM, Triton, config, and home caches use writable paths under
-/tmp; do not assume they survive scale-to-zero.
+For a full startup, the same local-only config/tokenizer check runs after all
+files have been materialized. vLLM receives the local snapshot path as both
+the positional model and `--tokenizer`, and retains `--served-model-name
+Qwen/Qwen3.8-27B` for the public API. The pinned revision flags are also passed
+to preserve the requested revision in engine configuration. In the pinned
+vLLM source, `resolve_revision` returns immediately when `Path(repo_id).exists()`;
+the materialized local directory therefore bypasses Hub revision resolution
+inside EngineCore while retaining the pinned SHA.
+
+In the pinned vLLM source, tokenizer creation follows
+`cached_tokenizer_from_config` → `cached_get_tokenizer` → `get_tokenizer` →
+`CachedHfTokenizer.from_pretrained` → Transformers `AutoTokenizer`. The pinned
+CLI registers `--tokenizer` and `--tokenizer-revision`; `ModelConfig` normally
+inherits tokenizer revision from model revision, but the RunPod log showed
+both as `main`. A local direct `AutoTokenizer` load succeeds for both the
+pinned revision and `main`, so the revision mismatch was a confirmed
+determinism defect but did not by itself explain the RunPod exception. The
+runtime now materializes the pinned commit and tests the tokenizer from that
+local path; the local CPU-only preflight has passed for both profile revisions.
+RunPod must still confirm that its cache path and runtime interpreter behave
+the same.
+
+The `model_type` warning originates in vLLM `get_config`: it retries
+`HFConfigParser.parse`, which calls Transformers `AutoConfig`. Transformers
+raises that warning text when the parsed config dictionary lacks `model_type`;
+vLLM's retry comment identifies a transient config-cache refresh as one
+possible condition. The pinned checkpoint config contains
+`model_type=qwen3_5`, and the observed run later resolved its architecture.
+The first parse input is unavailable, so the warning's trigger remains
+unconfirmed; no workaround was added.
+
+Run a deterministic CPU-only snapshot and tokenizer preflight without fetching
+weight shards or starting vLLM:
+
+    docker run --rm -e LCT_INFERENCE_PREFLIGHT_ONLY=1 lct-qwen-inference:snapshot-local-v4
+
+It exits 0 only when the pinned config and tokenizer load from the local commit
+snapshot. The container retains its normal UID 1000 and image entrypoint; no
+GPU is attached.
+
+The build does not download model files, require a GPU, or contact Cloud.ru.
+The complete pinned model snapshot is fetched from Hugging Face when the
+container starts. Hugging Face, vLLM, Triton, config, and home caches use
+writable paths under `/tmp`; do not assume they survive scale-to-zero.
 The image has no Docker VOLUME, listens on 8080 by default, and runs as UID 1000.
 
 After an image build, a local hardware smoke run can check the API:
 
-    docker run --rm --gpus all -p 8080:8080 lct-qwen-inference:tokenizer-fix-v2
+    docker run --rm --gpus all -p 8080:8080 lct-qwen-inference:snapshot-local-v4
     curl http://localhost:8080/health
     curl http://localhost:8080/v1/models
 
@@ -98,7 +158,9 @@ reasoning.
 1. Create a container repository in the Cloud.ru Artifact Registry available
    to the target project. Authenticate Docker with the registry values and
    permissions supplied by that project, then tag and push
-   `lct-qwen-inference:tokenizer-fix-v2`. A registry from another project must
+   `lct-qwen-inference:snapshot-local-v4`. For the current repository, tag
+   and push it as `lct-inference.cr.cloud.ru/lct-qwen-inference:snapshot-local-v4`.
+   A registry from another project must
    be public according to the Docker RUN image requirements.
 2. In AI Factory / ML Inference, create a Serverless inference service using
    Docker RUN and the pushed image. Choose Linux/amd64, port 8080, and A100
