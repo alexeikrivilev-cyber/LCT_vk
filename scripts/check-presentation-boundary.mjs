@@ -84,6 +84,26 @@ async function scanDirectory(relative) {
 
 await scanDirectory('apps');
 
+const officeKitImport = /(?:from\s+|import\s*\()\s*['"]@office-kit\/pptx(?:\/[^'"]*)?['"]/;
+async function scanOfficeKitBoundary(relative) {
+  const absolute = path.join(root, relative);
+  for (const entry of await readdir(absolute, { withFileTypes: true })) {
+    const childRelative = path.join(relative, entry.name);
+    if (entry.isDirectory()) {
+      await scanOfficeKitBoundary(childRelative);
+      continue;
+    }
+    if (!entry.isFile() || !sourceExtensions.has(path.extname(entry.name))) continue;
+    const source = await readFile(path.join(root, childRelative), 'utf8');
+    if (officeKitImport.test(source)) {
+      failures.push(`renderer dependency imported inside domain/application: ${childRelative}`);
+    }
+  }
+}
+
+await scanOfficeKitBoundary('apps/daemon/src/presentation/domain');
+await scanOfficeKitBoundary('apps/daemon/src/presentation/application');
+
 if (failures.length) {
   console.error('presentation boundary check failed:');
   for (const failure of failures) console.error(`- ${failure}`);

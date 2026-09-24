@@ -90,6 +90,8 @@ The three policies change layout ranking across the whole deck. The offline matr
 
 Known rendering limits are deliberate: referenced CSV cell grids can become native tables; chart series, process semantics, image references, and general diagrams do not yet have sufficient compilation contracts for faithful rendering. Their requested visual type remains explicit and unresolved audit findings identify that gap. The compiler cannot route image units from current planning output because the DeckPlan contract disallows media-reference citations. Generated objects do not yet reproduce inherited placeholder text styles, chart/table styles, locks, or native picture relationships. The output package has not been opened in PowerPoint or LibreOffice.
 
+The Office Kit package read/write adapter in `apps/daemon/src/presentation/spikes/` is a replaceable, test-only reuse spike. The current application flow does not import it. Its synthetic-template round-trip is evidence for a hybrid backend option, not proof of arbitrary-template fidelity or a production renderer decision; see [ADR-001](decisions/ADR-001-office-kit-renderer-spike.md).
+
 ## Canonical pipeline
 
 ```text
