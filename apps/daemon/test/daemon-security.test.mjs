@@ -40,11 +40,20 @@ test('server API returns bounded upload errors and hides parser stacks', async (
 
   const form = new FormData();
   for (let index = 0; index < 3; index += 1) form.append('files', new Blob([`part-${index}`]), `part-${index}.txt`);
-  const upload = await fetch(`${started.url}/api/projects/no-such-project/upload`, { method: 'POST', body: form });
+  const serverDiagnostics = [];
+  const previousConsoleError = console.error;
+  console.error = (...values) => serverDiagnostics.push(values);
+  let upload;
+  try {
+    upload = await fetch(`${started.url}/api/projects/no-such-project/upload`, { method: 'POST', body: form });
+  } finally {
+    console.error = previousConsoleError;
+  }
   assert.equal(upload.status, 413);
   const uploadBody = await upload.text();
   assert.match(uploadBody, /UPLOAD_LIMIT_EXCEEDED/);
   assert.doesNotMatch(uploadBody, /SyntaxError|node_modules|C:\\\\Projects|stack/i);
+  assert.match(JSON.stringify(serverDiagnostics), /Presentation API request failed/);
 });
 
 test('startServer also rejects direct non-loopback host configuration', async () => {

@@ -90,6 +90,19 @@ export function mimeForPresentationFile(name: string): string {
   } as Record<string, string>)[ext] ?? 'application/octet-stream';
 }
 
+/**
+ * Busboy decodes multipart filename parameters as Latin-1 by default, while
+ * browsers send raw UTF-8 bytes. Recover that UTF-8 filename only when the
+ * conversion is lossless; otherwise preserve the original value.
+ */
+export function normalizeMultipartFilename(name: string): string {
+  if (Array.from(name).some((character) => character.codePointAt(0)! > 0xff)) return name;
+  const sourceBytes = Buffer.from(name, 'latin1');
+  const decoded = sourceBytes.toString('utf8');
+  if (decoded.includes('\ufffd') || !Buffer.from(decoded, 'utf8').equals(sourceBytes)) return name;
+  return decoded;
+}
+
 function kindForPresentationFile(name: string): string {
   const mime = mimeForPresentationFile(name);
   if (mime.startsWith('image/')) return 'image';

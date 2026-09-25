@@ -143,12 +143,16 @@ function rawFileUrl(projectId: string, path: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}/raw/${encoded}`;
 }
 
-async function errorMessage(response: Response): Promise<string> {
-  const body = await response.json().catch(() => null) as ApiError | null;
+function messageFromApiError(body: ApiError | null, status: number): string {
   if (typeof body?.error === 'string') return body.error;
   if (body?.error && typeof body.error === 'object' && body.error.message) return body.error.message;
   if (body?.message) return body.message;
-  return `Request failed (${response.status})`;
+  return `Request failed (${status})`;
+}
+
+async function errorMessage(response: Response): Promise<string> {
+  const body = await response.json().catch(() => null) as ApiError | null;
+  return messageFromApiError(body, response.status);
 }
 
 function pickPreviewFile(files: ProjectFile[], selected?: string | null): string | null {
@@ -646,7 +650,9 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       if (!response.ok) {
         const failed = record(body);
         if (failed?.status === 'failed') setTemplateScan(parseTemplateCompileResponse(body));
-        throw new Error(failed?.failure ? templateFailureText(failed.failure) : `Request failed (${response.status})`);
+        throw new Error(failed?.failure
+          ? templateFailureText(failed.failure)
+          : messageFromApiError(record(body) as ApiError | null, response.status));
       }
       setTemplateScan(parseTemplateCompileResponse(body));
       await loadPlanning();

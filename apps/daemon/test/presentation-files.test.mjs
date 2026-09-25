@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   assertSafeProjectId,
   mimeForPresentationFile,
+  normalizeMultipartFilename,
   resolvePresentationFilePath,
 } from '../src/presentation-files.ts';
 
@@ -36,4 +37,12 @@ test('presentation MIME type lookup is case insensitive', () => {
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   );
   assert.equal(mimeForPresentationFile('preview.HTML'), 'text/html; charset=utf-8');
+});
+
+test('multipart filename normalization restores browser UTF-8 bytes without corrupting Latin-1 names', () => {
+  const cyrillicName = 'Шаблон презентации.pptx';
+  const busboyLatin1Value = Buffer.from(cyrillicName, 'utf8').toString('latin1');
+  assert.equal(normalizeMultipartFilename(busboyLatin1Value), cyrillicName);
+  assert.equal(normalizeMultipartFilename('Café.pptx'), 'Café.pptx');
+  assert.equal(normalizeMultipartFilename('template.pptx'), 'template.pptx');
 });

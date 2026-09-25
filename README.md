@@ -94,12 +94,39 @@ mise exec -- pnpm lint:craft
 mise exec -- pnpm test
 mise exec -- pnpm typecheck
 mise exec -- pnpm build
-mise exec -- pnpm dev
+corepack pnpm dev
 ```
+
+For an offline planning demo, start the fake OpenAI-compatible endpoint in one terminal:
+
+```bash
+corepack pnpm dev:fake-inference
+```
+
+Then configure the normal daemon in a second terminal:
+
+```powershell
+$env:LCT_SEMANTIC_BASE_URL = 'http://127.0.0.1:8787/v1'
+$env:LCT_SEMANTIC_MODEL = 'Qwen/Qwen3.8-27B'
+corepack pnpm dev
+```
+
+The fake binds to loopback and implements `/v1/chat/completions`. The daemon continues to use `OpenAICompatibleSemanticInferenceAdapter` and its normal strict runtime validation.
 
 `.node-version`, `mise.toml`, and the root `packageManager` field pin the project toolchain. Keep `pnpm-lock.yaml` in sync with package manifests and use `--frozen-lockfile` for clean installs.
 
+The root `dev` command builds and starts the daemon, waits for its health endpoint, then starts the web UI. It shuts both down when you press Ctrl+C. Set `LCT_PORT` and `PORT` to use non-default ports.
+
 If the pinned Node.js and pnpm versions are already active in your shell, run the `pnpm` commands directly; `mise` is only needed for selecting/installing those versions.
+
+On Windows with Node.js 24 installed but Corepack unavailable, use the pinned pnpm release through `pnpm dlx`:
+
+```powershell
+pnpm dlx pnpm@10.33.2 install --frozen-lockfile
+pnpm dlx pnpm@10.33.2 dev
+```
+
+For the offline semantic demo, start `pnpm dlx pnpm@10.33.2 dev:fake-inference` in one terminal and `pnpm dlx pnpm@10.33.2 dev` in the daemon/UI terminal after setting the semantic endpoint variables above.
 
 If `mise` is unavailable but another `pnpm` is installed, run a script with the exact project-pinned pnpm using `pnpm dlx pnpm@10.33.2 <script>` (for example, `pnpm dlx pnpm@10.33.2 test`). This uses pnpm's package cache and does not change the repository's engine requirement.
 

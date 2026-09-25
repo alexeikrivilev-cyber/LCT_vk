@@ -12,14 +12,19 @@ import {
   compactPackage,
   duplicateSlide,
   emu,
+  findSlidePlaceholder,
   findSlideLayoutByPartName,
+  findSlidePlaceholderByIdx,
   getShapeId,
   getShapeKind,
+  getShapePlaceholderIdx,
+  getShapePlaceholderType,
   getShapeParagraphCount,
   getShapeRunCount,
   getShapeText,
   getSlideCharts,
   getSlidePartName,
+  getSlideLayoutPlaceholders,
   getSlideShapes,
   getSlideTables,
   getSlides,
@@ -29,6 +34,7 @@ import {
   removeSlideNotes,
   savePresentation,
   setShapeText,
+  setShapeTextAutoFit,
   validatePresentation,
 } from '@office-kit/pptx/node';
 import JSZip from 'jszip';
@@ -170,6 +176,31 @@ function countExemplarObjects(slide: ReturnType<typeof getSlides>[number]) {
   return { textShapes, connectors, pictures, editableShapes, charts: getSlideCharts(slide).length, tables: getSlideTables(slide).length };
 }
 
+function matchingNativePlaceholder(
+  slide: ReturnType<typeof getSlides>[number],
+  layout: Parameters<typeof getSlideLayoutPlaceholders>[0],
+  placement: { x: number; y: number; width: number; height: number },
+  role: 'title' | 'body',
+) {
+  const allowedTypes = role === 'title'
+    ? new Set(['title', 'ctrTitle', 'subTitle'])
+    : new Set(['body', 'obj', 'subTitle']);
+  const matches = getSlideLayoutPlaceholders(layout).filter((placeholder) => {
+    if (!placeholder.bounds || !allowedTypes.has(placeholder.type ?? '')) return false;
+    return Math.abs(placeholder.bounds.x - placement.x) <= 1
+      && Math.abs(placeholder.bounds.y - placement.y) <= 1
+      && Math.abs(placeholder.bounds.w - placement.width) <= 1
+      && Math.abs(placeholder.bounds.h - placement.height) <= 1;
+  });
+  if (matches.length !== 1) return null;
+  const descriptor = matches[0]!;
+  const shape = typeof descriptor.idx === 'number'
+    ? findSlidePlaceholderByIdx(slide, descriptor.idx)
+    : findSlidePlaceholder(slide, descriptor.type as 'title' | 'ctrTitle' | 'subTitle' | 'body' | 'obj');
+  if (!shape || getShapePlaceholderIdx(shape) !== descriptor.idx || getShapePlaceholderType(shape) !== descriptor.type) return null;
+  return shape;
+}
+
 async function writeAtomically(filePath: string, bytes: Uint8Array): Promise<string> {
   const resolved = path.resolve(filePath);
   const temporary = `${resolved}.${process.pid}.tmp`;
@@ -258,13 +289,18 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       const layout = layoutsByPart.get(compiled.layoutSourcePart);
       if (!layout) throw new TypeError(`Office Kit cannot resolve selected layout part ${compiled.layoutSourcePart}`);
       slide = addSlide(presentation, { layout });
-      addSlideTextBox(slide, {
-        x: emu(compiled.placements.title.x),
-        y: emu(compiled.placements.title.y),
-        w: emu(compiled.placements.title.width),
-        h: emu(compiled.placements.title.height),
-        text: compiled.title,
-      });
+      const titlePlaceholder = matchingNativePlaceholder(slide, layout, compiled.placements.title, 'title');
+      if (titlePlaceholder) {
+        setShapeText(titlePlaceholder, compiled.title);
+        setShapeTextAutoFit(titlePlaceholder, 'normal');
+      }
+      else addSlideTextBox(slide, {
+          x: emu(compiled.placements.title.x),
+          y: emu(compiled.placements.title.y),
+          w: emu(compiled.placements.title.width),
+          h: emu(compiled.placements.title.height),
+          text: compiled.title,
+        });
       nativeTextShapeCount += 1;
       if (compiled.body.length) {
         const chartHasSlot = Boolean(compiled.placements.visual || compiled.body.length === 0);
@@ -274,13 +310,20 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         const specialVisualUsesBody = Boolean((compiled.visualization.chartData && chartHasSlot) || (compiled.visualization.kpi && kpiHasSlot)
           || (compiled.visualization.processSteps.length >= 2 && processHasSlot)
           || (compiled.imageRefs.length && imageHasSlot) || compiled.visualization.tableData);
-        if (!specialVisualUsesBody) addSlideTextBox(slide, {
-          x: emu(compiled.placements.body.x),
-          y: emu(compiled.placements.body.y),
-          w: emu(compiled.placements.body.width),
-          h: emu(compiled.placements.body.height),
-          text: compiled.body.join('\n'),
-        });
+        if (!specialVisualUsesBody) {
+          const bodyPlaceholder = matchingNativePlaceholder(slide, layout, compiled.placements.body, 'body');
+          if (bodyPlaceholder) {
+            setShapeText(bodyPlaceholder, compiled.body.join('\n'));
+            setShapeTextAutoFit(bodyPlaceholder, 'normal');
+          }
+          else addSlideTextBox(slide, {
+            x: emu(compiled.placements.body.x),
+            y: emu(compiled.placements.body.y),
+            w: emu(compiled.placements.body.width),
+            h: emu(compiled.placements.body.height),
+            text: compiled.body.join('\n'),
+          });
+        }
         if (!specialVisualUsesBody) nativeTextShapeCount += 1;
       }
       if (compiled.visualization.tableData) {

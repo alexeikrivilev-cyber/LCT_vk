@@ -10,7 +10,8 @@
     "lct": "./apps/daemon/bin/lct.mjs"
   },
   "scripts": {
-    "dev": "pnpm --parallel --filter @lct/web --filter @lct/daemon run dev",
+    "dev": "node ./scripts/dev.mjs",
+    "dev:fake-inference": "node ./scripts/dev-fake-semantic-endpoint.mjs",
     "dev:web": "pnpm --filter @lct/web run dev",
     "dev:daemon": "pnpm --filter @lct/daemon run dev",
     "build": "pnpm --filter @lct/web run build && pnpm --filter @lct/daemon run build",

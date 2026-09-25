@@ -25,6 +25,7 @@ import {
   ensurePresentationProjectDir,
   listPresentationFiles,
   mimeForPresentationFile,
+  normalizeMultipartFilename,
   removePresentationProjectDir,
   resolvePresentationFilePath,
   writePresentationFile,
@@ -90,8 +91,27 @@ function resolveDataDir(projectRoot: string, configured?: string): string {
 }
 
 function apiError(res: express.Response, status: number, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const errorCode = error && typeof error === 'object' && 'code' in error
+    ? (error as { code?: unknown }).code
+    : null;
+  const containsFilesystemPath = /(?:\b[A-Za-z]:[\\/]|\\\\|(?:^|[\s("'])\/(?:[^\s/]+\/)+|node_modules[\\/])/i.test(rawMessage);
+  const message = status >= 500 || typeof errorCode === 'string' || containsFilesystemPath
+    ? 'The request could not be completed.'
+    : rawMessage.slice(0, 240);
   res.status(status).json({ error: { code: status === 404 ? 'NOT_FOUND' : 'PRESENTATION_CORE_ERROR', message } });
+}
+
+function logRequestFailure(req: express.Request, error: unknown, status: number): void {
+  const diagnostic = error instanceof Error
+    ? { name: error.name, message: error.message, stack: error.stack }
+    : { name: 'UnknownError', message: String(error) };
+  console.error('Presentation API request failed', {
+    method: req.method,
+    path: req.path,
+    status,
+    ...diagnostic,
+  });
 }
 
 function projectNotFound(res: express.Response): void {
@@ -275,13 +295,18 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : [];
       const written = [];
       for (const file of files) {
-        const name = requestedDir ? `${requestedDir}/${file.originalname}` : file.originalname;
+        const originalName = normalizeMultipartFilename(file.originalname);
+        const name = requestedDir ? `${requestedDir}/${originalName}` : originalName;
         const saved = await writePresentationFile(projectsRoot, projectId, name, file.buffer);
-        written.push({ ...saved, originalName: file.originalname });
+        written.push({ ...saved, originalName });
       }
       res.json({ files: written });
     } catch (error) {
-      apiError(res, 400, error);
+      const message = error instanceof Error ? error.message : '';
+      const invalidInput = new Set(['invalid project id', 'invalid project file path', 'project file escapes project root']);
+      const status = invalidInput.has(message) ? 400 : 500;
+      if (status >= 500) logRequestFailure(req, error, status);
+      apiError(res, status, error);
     }
   });
 
@@ -582,11 +607,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     });
   });
 
-  app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  app.use((error: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
     if (res.headersSent) return;
     const status = typeof (error as { status?: unknown })?.status === 'number'
       ? Number((error as { status: number }).status)
       : error instanceof multer.MulterError ? 413 : 500;
+    logRequestFailure(req, error, status);
     res.status(status).json({
       error: {
         code: error instanceof multer.MulterError ? 'UPLOAD_LIMIT_EXCEEDED' : status === 400 ? 'INVALID_REQUEST' : 'REQUEST_FAILED',

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { link, mkdtemp, mkdir, readFile, rm, writeFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,6 +23,7 @@ import {
 } from '../src/presentation/application/exemplar-slide-selector.ts';
 import { OfficeKitPptxRenderer } from '../src/presentation/adapters/office-kit-pptx-renderer.ts';
 import { OfficeKitPreviewAdapter } from '../src/presentation/adapters/office-kit-preview-adapter.ts';
+import { getShapePlaceholderType, getShapeText, getSlideShapes, getSlides, hasShapeText, isShapePlaceholder, loadPresentation } from '@office-kit/pptx/node';
 import { briefHash } from '../src/presentation/domain/brief.ts';
 import { canonicalizeDeckPlan } from '../src/presentation/domain/deck-plan.ts';
 import { sha256Json, templateIRHashPayload } from '../src/presentation/domain/template-ir.ts';
@@ -38,6 +40,8 @@ import {
 
 register();
 
+const require = createRequire(import.meta.url);
+const PptxGenJS = require('pptxgenjs');
 const inch = (value) => Math.round(value * 914400);
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/Y6sAAAAASUVORK5CYII=', 'base64');
 const layoutProfiles = (prefix = 'Unknown') => [
@@ -108,6 +112,34 @@ async function familyExemplarFixture(root, fileName, options = {}) {
     compiledAt: '2026-09-25T00:00:00.000Z', compilerVersion: 'lct-template-compiler/1',
   });
   return { templatePath, templateIR, inspection };
+}
+
+async function nativePlaceholderFixture(root) {
+  const templatePath = path.join(root, 'native-placeholder-template.pptx');
+  const deck = new PptxGenJS();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({
+    title: 'Native placeholder layout',
+    background: { color: 'F8FAFC' },
+    objects: [
+      { placeholder: { options: { name: 'Native title', type: 'title', x: 0.55, y: 0.35, w: 11.9, h: 0.8, fontFace: 'Aptos Display', fontSize: 30, bold: true, color: '183B56', margin: 0 } } },
+      { placeholder: { options: { name: 'Native body', type: 'body', x: 0.65, y: 1.45, w: 8.2, h: 4.6, fontFace: 'Aptos', fontSize: 18, color: '243B53', margin: 0.05 } } },
+    ],
+  });
+  const slide = deck.addSlide({ masterName: 'Native placeholder layout' });
+  slide.addText('Template title sample', { placeholder: 'Native title' });
+  slide.addText('Template body sample', { placeholder: 'Native body' });
+  await deck.writeFile({ fileName: templatePath });
+  const bytes = await readFile(templatePath);
+  const inspection = await inspectPptx(templatePath);
+  const templateIR = createTemplateIR(inspection, {
+    filePath: path.basename(templatePath), originalName: path.basename(templatePath),
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    compiledAt: '2026-09-25T00:00:00.000Z', compilerVersion: 'lct-template-compiler/1',
+  });
+  templateIR.slides = [];
+  templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
+  return { templatePath, templateIR };
 }
 
 function inspectedCompositionSignature(inspectionEnvelope) {
@@ -636,6 +668,31 @@ test('Office Kit reports when replacing a mixed-run exemplar donor may collapse 
     && issue.message.includes('secondary mixed-run styling may be collapsed')));
 });
 
+test('Office Kit fallback fills native title and body placeholders without duplicate text boxes', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-native-placeholder-fallback-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await nativePlaceholderFixture(root);
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const slide = compiled.slides[0];
+  assert.ok(slide);
+  const outputPath = path.join(root, 'output', 'fallback.pptx');
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const result = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: { ...compiled, id: `${compiled.id}_placeholder_fallback`, slides: [slide] },
+    contentIR, templateIR: template.templateIR, templatePath: template.templatePath, outputPath,
+  });
+  assert.equal(result.reopenStatus, 'passed');
+  assert.equal(result.validationStatus, 'passed');
+  assert.equal(result.projectedCompositions[0].sourceSlideIndex, null, 'an empty TemplateIR slide index exercises the native-layout fallback');
+  const reopened = await loadPresentation(await readFile(outputPath));
+  const shapes = getSlideShapes(getSlides(reopened)[0]);
+  const textShapes = shapes.filter((shape) => hasShapeText(shape) && getShapeText(shape).trim());
+  assert.equal(textShapes.length, 2, 'filling the native slots must not overlay them with generic boxes');
+  assert.ok(textShapes.some((shape) => isShapePlaceholder(shape) && getShapePlaceholderType(shape) === 'title' && getShapeText(shape) === slide.title));
+  assert.ok(textShapes.some((shape) => isShapePlaceholder(shape) && getShapePlaceholderType(shape) === 'body' && getShapeText(shape) === slide.body.join('\n')));
+});
+
 test('hyperlinked exemplar slides fail closed and generated fallback drops source hyperlinks', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-hyperlink-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1045,7 +1102,9 @@ test('compatibility harness preserves source bytes, compares package parts, reop
   assert.equal(report.outputs.noOp.preservation.status, 'PASS');
   assert.equal(report.capabilities.generatedSlideProjection.status, 'PASS');
   assert.equal(report.capabilities.templatePartPreservation.status, 'PASS');
-  assert.equal(report.outputs.generatedMutation.preview.status, 'passed');
+  const generatedProbePath = path.join(root, 'reports', report.outputs.generatedMutation.path);
+  const generatedPreview = await new OfficeKitPreviewAdapter().preview(await readFile(generatedProbePath), 0);
+  assert.equal(report.outputs.generatedMutation.preview.status, 'passed', JSON.stringify({ report: report.outputs.generatedMutation, issues: generatedPreview.textLayoutIssues }));
   assert.equal(report.safeForOfficeKitBackend, 'no', 'external Office open/save and held-out real PPTX remain required');
   assert.equal(createHash('sha256').update(await readFile(source.path)).digest('hex'), originalHash);
   await stat(reportPath);

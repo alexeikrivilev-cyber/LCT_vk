@@ -51,16 +51,19 @@ test('Template Compiler API persists understanding, detects source changes, and 
 
     const pptx = await makeSyntheticPptx({ slideCount: 2, layoutCount: 2, unsupported: true, slideBackground: true, nestedTemplateGroups: true });
     const originalHash = createHash('sha256').update(pptx).digest('hex');
+    const templateName = 'Шаблон презентации.pptx';
     const upload = new FormData();
-    upload.append('files', new Blob([pptx]), 'template.pptx');
+    upload.append('files', new Blob([pptx]), templateName);
     const uploaded = await fetch(`${started.url}/api/projects/${projectId}/upload`, { method: 'POST', body: upload });
     assert.equal(uploaded.status, 200);
-    assert.equal((await json(uploaded)).files[0].path, 'template.pptx');
+    const uploadBody = await json(uploaded);
+    assert.equal(uploadBody.files[0].path, templateName);
+    assert.equal(uploadBody.files[0].originalName, templateName);
 
     const compiled = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ filePath: 'template.pptx' }),
+      body: JSON.stringify({ filePath: templateName }),
     });
     if (compiled.status === 503) {
       const response = await json(compiled);
@@ -72,7 +75,7 @@ test('Template Compiler API persists understanding, detects source changes, and 
     assert.equal(compiled.status, 200, await compiled.clone().text());
     const compiledBody = await json(compiled);
     assert.equal(compiledBody.status, 'ready');
-    assert.equal(compiledBody.source.filePath, 'template.pptx');
+    assert.equal(compiledBody.source.filePath, templateName);
     assert.equal(compiledBody.source.sha256, originalHash);
     assert.equal(compiledBody.templateIR.slides.length, 2);
     assert.equal(compiledBody.presentationDesignSystem.templateIRId, compiledBody.templateIR.id);
@@ -124,7 +127,7 @@ test('Template Compiler API persists understanding, detects source changes, and 
       && color.value === '336699' && color.uses > 0));
     assert.equal(compiledBody.presentationDesignSystem.layouts.length, 2);
     assert.equal(compiledBody.presentationDesignSystem.layouts[0].usageCount, 2);
-    assert.equal(createHash('sha256').update(await readFile(path.join(dataDir, 'projects', projectId, 'template.pptx'))).digest('hex'), originalHash,
+    assert.equal(createHash('sha256').update(await readFile(path.join(dataDir, 'projects', projectId, templateName))).digest('hex'), originalHash,
       'compilation must preserve the uploaded source bytes');
 
     await closeStartedServer(started);
@@ -169,13 +172,13 @@ test('Template Compiler API persists understanding, detects source changes, and 
     const recompilation = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ filePath: 'template.pptx' }),
+      body: JSON.stringify({ filePath: templateName }),
     });
     assert.equal(recompilation.status, 200);
     assert.equal((await json(recompilation)).templateIR.hash, compiledBody.templateIR.hash,
       'identical PPTX bytes map to the same TemplateIR hash across compilations');
     const modified = Buffer.concat([pptx, Buffer.from([0])]);
-    await writeFile(path.join(dataDir, 'projects', projectId, 'template.pptx'), modified);
+    await writeFile(path.join(dataDir, 'projects', projectId, templateName), modified);
     const stale = await json(await fetch(`${started.url}/api/projects/${projectId}/template`));
     assert.equal(stale.status, 'stale');
     assert.equal(stale.currentSourceSha256, createHash('sha256').update(modified).digest('hex'));

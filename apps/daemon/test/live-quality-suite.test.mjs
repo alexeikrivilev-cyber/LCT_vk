@@ -7,6 +7,7 @@ import { register } from 'tsx/esm/api';
 
 register();
 const { runLiveQualification } = await import('../../../scripts/run-live-quality-suite.mjs');
+const { startFakeSemanticEndpoint } = await import('../../../scripts/lib/fake-openai-compatible-endpoint.mjs');
 const repoRoot = path.resolve(import.meta.dirname, '../../..');
 const expectedModel = 'Qwen/Qwen3.8-27B';
 
@@ -55,67 +56,12 @@ async function listen(server) {
 }
 
 async function fakeEndpoint(options = {}) {
-  const state = { inference: [], authHeaders: [], healthCalls: 0, modelCalls: 0 };
-  const server = createServer(async (request, response) => {
-    if (request.method === 'GET' && request.url === '/health') {
-      state.healthCalls += 1;
-      response.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
-      return;
-    }
-    if (request.method === 'GET' && request.url === '/v1/models') {
-      state.modelCalls += 1;
-      const id = options.wrongModel ? 'different/model' : expectedModel;
-      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ data: [{ id }] }));
-      return;
-    }
-    if (request.method !== 'POST' || request.url !== '/v1/chat/completions') {
-      response.writeHead(404).end();
-      return;
-    }
-    const chunks = [];
-    for await (const chunk of request) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    const role = request.headers['x-lct-semantic-role'];
-    const operation = request.headers['x-lct-semantic-operation'];
-    state.inference.push({ role, operation, request: body });
-    state.authHeaders.push(request.headers.authorization ?? null);
-    if (options.failure && options.failure(role, operation, state.inference.length)) {
-      const failure = options.failure(role, operation, state.inference.length);
-      if (failure === 'http-524') {
-        response.writeHead(524, { 'content-type': 'application/json' }).end('{}');
-        return;
-      }
-      if (failure === 'content-null') {
-        response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
-          id: 'fake-null', model: expectedModel,
-          choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: null } }],
-        }));
-        return;
-      }
-      if (failure === 'length') {
-        response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(completion(expectedModel, '{}', 'length')));
-        return;
-      }
-      if (failure === 'malformed-json') {
-        response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(completion(expectedModel, '{')));
-        return;
-      }
-      if (failure === 'invalid-schema') {
-        response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(completion(expectedModel, { status: 'invalid', summary: 'bad', nextAction: 'bad' })));
-        return;
-      }
-    }
-    response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(planningResponse(body, options)));
+  return startFakeSemanticEndpoint({
+    model: expectedModel,
+    wrongModel: options.wrongModel,
+    failure: options.failure,
+    respond: (request) => planningResponse(request, options),
   });
-  const port = await listen(server);
-  return {
-    state,
-    baseUrl: `http://127.0.0.1:${port}/v1`,
-    async close() {
-      server.closeAllConnections?.();
-      await new Promise((resolve) => server.close(resolve));
-    },
-  };
 }
 
 async function runAgainst(endpoint, mode, runId, overrides = {}) {
