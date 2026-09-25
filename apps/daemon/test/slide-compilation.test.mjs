@@ -14,6 +14,7 @@ import { createTemplateIR } from '../src/presentation/application/template-mappe
 import { runOfflinePresentationMatrix } from '../src/presentation/application/offline-matrix-runner.ts';
 import { renderNativePptx } from '../src/presentation/application/native-pptx-renderer.ts';
 import { compilePresentation, extractCanonicalFactualPayload, VARIANT_POLICIES } from '../src/presentation/application/slide-compilation.ts';
+import { selectExemplarSlide } from '../src/presentation/application/exemplar-slide-selector.ts';
 import { OfficeKitPptxRenderer } from '../src/presentation/adapters/office-kit-pptx-renderer.ts';
 import { OfficeKitPreviewAdapter } from '../src/presentation/adapters/office-kit-preview-adapter.ts';
 import { briefHash } from '../src/presentation/domain/brief.ts';
@@ -23,7 +24,7 @@ import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 import { createHardTemplateCorpus } from './hard-template-corpus.mjs';
 import { createOfflineReplayManifest, runOfflineMatrixFromState } from '../../../scripts/run-offline-presentation-matrix.mjs';
 import { runPptxCompatibilityHarness } from '../../../scripts/compare-pptx-backends.mjs';
-import { createExemplarTemplate } from './exemplar-template-fixtures.mjs';
+import { createExemplarTemplate, createFamilyExemplarTemplate } from './exemplar-template-fixtures.mjs';
 
 register();
 
@@ -75,6 +76,19 @@ async function fixture(root, options = {}) {
 async function exemplarFixture(root, fileName, options = {}) {
   const templatePath = path.join(root, fileName);
   await createExemplarTemplate(templatePath, options);
+  const bytes = await readFile(templatePath);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const inspection = await inspectPptx(templatePath);
+  const templateIR = createTemplateIR(inspection, {
+    filePath: fileName, originalName: fileName, sha256,
+    compiledAt: '2026-09-25T00:00:00.000Z', compilerVersion: 'lct-template-compiler/1',
+  });
+  return { templatePath, templateIR, inspection };
+}
+
+async function familyExemplarFixture(root, fileName, options = {}) {
+  const templatePath = path.join(root, fileName);
+  await createFamilyExemplarTemplate(templatePath, options);
   const bytes = await readFile(templatePath);
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const inspection = await inspectPptx(templatePath);
@@ -316,6 +330,141 @@ test('exemplar slot inference is independent of donor/template names', async (t)
     geometry: value[role].geometry, provenance: value[role].provenance, confidence: value[role].confidence, sampleCount: value[role].sampleCount,
   }]));
   assert.deepEqual(comparable(evidence(first.templateIR)), comparable(evidence(second.templateIR)));
+});
+
+test('exemplar selection maps exact donor shapes, ranks three supported families, and ignores names', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-families-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const first = await familyExemplarFixture(root, 'first-family.pptx', { masterName: 'Alpha family' });
+  const second = await familyExemplarFixture(root, 'renamed-family.pptx', { masterName: 'Omega unrelated name' });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const selectTracks = (template) => VARIANT_POLICIES.map((policy) => {
+    const compiled = compilePresentation(deckPlan, contentIR, template, policy).slides[0];
+    return { compiled, selected: selectExemplarSlide(compiled, template) };
+  });
+  const tracks = selectTracks(first.templateIR);
+  const selections = tracks.map((track) => track.selected);
+  assert.ok(selections.every(Boolean), 'the source deck contains three compatible structural families');
+  assert.equal(new Set(selections.map((selection) => selection.familyKey)).size, 3);
+  assert.equal(new Set(selections.map((selection) => selection.sourceSlideIndex)).size, 3);
+  for (const selection of selections) {
+    const donor = first.templateIR.slides.find((slide) => slide.sourcePart === selection.sourcePart);
+    assert.ok(donor?.elements.some((element) => element.id === selection.slots.title.elementId && element.nativeId === selection.slots.title.nativeId));
+    assert.ok(donor?.elements.some((element) => element.id === selection.slots.body.elementId && element.nativeId === selection.slots.body.nativeId));
+    assert.ok(selection.confidence >= 0.72);
+    assert.ok(selection.evidence.some((item) => item.includes('source-specific shapes will be cleared')));
+    assert.ok(selection.preserveChromeNativeIds.length > 0);
+  }
+  const renamed = selectTracks(second.templateIR).map((track) => track.selected);
+  assert.deepEqual(renamed.map((selection) => selection?.sourceSlideIndex), selections.map((selection) => selection?.sourceSlideIndex));
+  const uncertain = structuredClone(tracks[0].compiled);
+  uncertain.layoutCandidates[0].slotEvidence.body.confidence = 0.71;
+  assert.equal(selectExemplarSlide(uncertain, first.templateIR), null, 'low-confidence donor geometry fails closed');
+});
+
+test('Office Kit duplicates an exemplar, preserves donor text style and decoration, and clears source content', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-render-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await familyExemplarFixture(root, 'family-template.pptx');
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const compiledSlide = compiled.slides.at(-1);
+  assert.ok(compiledSlide);
+  const selection = selectExemplarSlide(compiledSlide, template.templateIR);
+  assert.ok(selection);
+  const sourceHash = createHash('sha256').update(await readFile(template.templatePath)).digest('hex');
+  const outputPath = path.join(root, 'output', 'exemplar-probe.pptx');
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const oneSlide = { ...compiled, id: `${compiled.id}_single`, slides: [compiledSlide] };
+  const result = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: oneSlide, contentIR, templateIR: template.templateIR,
+    templatePath: template.templatePath, outputPath,
+  });
+  assert.equal(result.slideCount, 1);
+  assert.equal(result.reopenStatus, 'passed');
+  assert.equal(result.validationStatus, 'passed');
+  assert.equal(result.templatePreservationStatus, 'passed');
+  assert.ok(result.nativeShapeCount >= 1, 'the donor slide keeps its native vector decoration');
+  assert.ok(result.nativeTextShapeCount >= 3, 'mapped text and repeated brand text remain native/editable');
+  const reopened = await inspectPptx(outputPath);
+  const outputSlide = reopened.inspection.slides[0];
+  const title = outputSlide.elements.find((element) => element.text.trim() === compiledSlide.title);
+  const bodyText = compiledSlide.body.join('\n');
+  const body = outputSlide.elements.find((element) => element.text.trim() === bodyText.trim());
+  const donorSlide = template.templateIR.slides.find((slide) => slide.sourcePart === selection.sourcePart);
+  const titleDonor = donorSlide.elements.find((element) => element.id === selection.slots.title.elementId);
+  const bodyDonor = donorSlide.elements.find((element) => element.id === selection.slots.body.elementId);
+  assert.equal(title?.type, 'shape');
+  assert.equal(body?.type, 'shape');
+  assert.ok(result.validationIssues.filter((issue) => issue.message.includes('paragraph-end formatting may not be retained')).length >= 2,
+    'every replaced donor records the paragraph-end formatting limitation');
+  assert.deepEqual(title.style.font_sizes_pt, titleDonor.directStyles.fontSizesPt);
+  assert.equal(title.style.bold ?? null, titleDonor.directStyles.bold);
+  assert.deepEqual(body.style.font_sizes_pt, bodyDonor.directStyles.fontSizesPt);
+  assert.equal(body.style.bold ?? null, bodyDonor.directStyles.bold);
+  assert.deepEqual(title.resolvedGeometry, titleDonor.geometry.resolved);
+  assert.deepEqual(body.resolvedGeometry, bodyDonor.geometry.resolved);
+  assert.ok(outputSlide.elements.some((element) => element.text.trim() === 'SYNTHETIC BRAND'));
+  const packageZip = await (await import('jszip')).default.loadAsync(await readFile(outputPath));
+  const packageText = (await Promise.all(Object.values(packageZip.files)
+    .filter((entry) => !entry.dir).map((entry) => entry.async('string').catch(() => '')))).join('\n');
+  assert.ok(!packageText.includes('Original source headline'));
+  assert.ok(!packageText.includes('Original source body'));
+  assert.ok(!packageText.includes('Source only detail'));
+  assert.ok(!packageText.includes('Source only note'));
+  assert.equal(Object.keys(packageZip.files).some((name) => /^ppt\/notesSlides\/[^/]+\.xml$/i.test(name)), false);
+  assert.equal(createHash('sha256').update(await readFile(template.templatePath)).digest('hex'), sourceHash);
+  const preview = await new OfficeKitPreviewAdapter().preview(new Uint8Array(await readFile(outputPath)), 0, 960);
+  assert.equal(preview.slideCount, 1);
+  assert.ok(preview.png.length > 0);
+  assert.match(preview.svg, /Editable slides retain a source-backed visual/);
+});
+
+test('Office Kit reports when replacing a mixed-run exemplar donor may collapse secondary run styling', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-mixed-style-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await familyExemplarFixture(root, 'mixed-style-template.pptx', { mixedStyleBody: true });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const compiledSlide = compiled.slides.at(-1);
+  assert.ok(compiledSlide);
+  const selection = selectExemplarSlide(compiledSlide, template.templateIR);
+  assert.ok(selection);
+  const donor = template.templateIR.slides.find((slide) => slide.sourcePart === selection.sourcePart);
+  const bodyDonor = donor?.elements.find((element) => element.id === selection.slots.body.elementId);
+  assert.ok(bodyDonor?.directStyles.fontSizesPt && new Set(bodyDonor.directStyles.fontSizesPt).size > 0);
+  const outputPath = path.join(root, 'output', 'mixed-style-probe.pptx');
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const result = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: { ...compiled, id: `${compiled.id}_mixed`, slides: [compiledSlide] },
+    contentIR, templateIR: template.templateIR, templatePath: template.templatePath, outputPath,
+  });
+  assert.ok(result.validationIssues.some((issue) => issue.severity === 'warning'
+    && issue.message.includes('secondary mixed-run styling may be collapsed')));
+});
+
+test('hyperlinked exemplar slides fail closed and generated fallback drops source hyperlinks', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-hyperlink-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await familyExemplarFixture(root, 'hyperlinked-template.pptx', { hyperlinkBody: true });
+  assert.ok(template.templateIR.slides[0].relationships.some((relationship) => relationship.type.toLowerCase().endsWith('/hyperlink')));
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const compiledSlide = compiled.slides.at(-1);
+  assert.ok(compiledSlide);
+  assert.equal(selectExemplarSlide(compiledSlide, template.templateIR), null,
+    'the text donor must not carry a source hyperlink into generated content');
+  const outputPath = path.join(root, 'output', 'hyperlink-probe.pptx');
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const result = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: { ...compiled, id: `${compiled.id}_hyperlink`, slides: [compiledSlide] },
+    contentIR, templateIR: template.templateIR, templatePath: template.templatePath, outputPath,
+  });
+  assert.equal(result.reopenStatus, 'passed');
+  const packageZip = await (await import('jszip')).default.loadAsync(await readFile(outputPath));
+  const packageText = (await Promise.all(Object.values(packageZip.files)
+    .filter((entry) => !entry.dir).map((entry) => entry.async('string').catch(() => '')))).join('\n');
+  assert.ok(!packageText.includes('source-link.example.test'));
 });
 
 test('ambiguous exemplar geometry fails closed with typed evidence', async (t) => {

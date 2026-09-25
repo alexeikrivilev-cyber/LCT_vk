@@ -10,19 +10,33 @@ import {
   addSlideTable,
   addSlideTextBox,
   compactPackage,
+  duplicateSlide,
   emu,
   findSlideLayoutByPartName,
+  getShapeId,
+  getShapeKind,
+  getShapeParagraphCount,
+  getShapeRunCount,
+  getShapeText,
+  getSlideCharts,
+  getSlidePartName,
+  getSlideShapes,
+  getSlideTables,
   getSlides,
+  hasShapeText,
   loadPresentation,
   removeSlide,
   removeSlideNotes,
   savePresentation,
+  setShapeText,
   validatePresentation,
 } from '@office-kit/pptx/node';
 import JSZip from 'jszip';
 
 import { auditCompiledPresentation } from '../application/deterministic-audit.js';
+import { selectExemplarSlide, type ExemplarSlideSelection } from '../application/exemplar-slide-selector.js';
 import { collectSourceSlideVisualArtifacts, relationshipPartFor, removeUnreachableSourceVisualArtifacts } from '../application/pptx-source-artifacts.js';
+import type { CompiledSlide } from '../application/slide-compilation.js';
 import type { PptxRenderInput, PptxRenderResult, PptxRendererPort } from '../application/pptx-backend-port.js';
 
 const MAX_TEMPLATE_BYTES = 64 * 1024 * 1024;
@@ -97,6 +111,60 @@ function normalizeIssues(issues: ReturnType<typeof validatePresentation>) {
   return issues.map((issue) => ({ severity: issue.severity, message: issue.message, partName: issue.partName ?? null }));
 }
 
+function normalizePart(partName: string): string {
+  return partName.replace(/^\/+/, '');
+}
+
+function textSegmentation(shape: ReturnType<typeof getSlideShapes>[number]): { paragraphs: number; runs: number } {
+  const paragraphs = getShapeParagraphCount(shape);
+  let runs = 0;
+  for (let paragraph = 0; paragraph < paragraphs; paragraph += 1) runs += getShapeRunCount(shape, paragraph);
+  return { paragraphs, runs };
+}
+
+function requiredDonorShape(slide: ReturnType<typeof getSlides>[number], nativeId: string, role: string) {
+  const shape = getSlideShapes(slide).find((candidate) => String(getShapeId(candidate)) === nativeId);
+  if (!shape || !hasShapeText(shape)) throw new PptxBackendError('EXEMPLAR_DONOR_MISSING', `The selected exemplar ${role} donor could not be mapped to its Office Kit shape.`);
+  return shape;
+}
+
+function projectExemplarText(
+  slide: ReturnType<typeof getSlides>[number],
+  compiled: CompiledSlide,
+  selection: ExemplarSlideSelection,
+  textStyleWarnings: string[],
+): void {
+  const shapes = getSlideShapes(slide);
+  const byNativeId = new Map(shapes.map((shape) => [String(getShapeId(shape)), shape]));
+  const title = requiredDonorShape(slide, selection.slots.title.nativeId, 'title');
+  const body = requiredDonorShape(slide, selection.slots.body.nativeId, 'body');
+  for (const [role, shape] of [['title', title], ['body', body]] as const) {
+    const segmentation = textSegmentation(shape);
+    textStyleWarnings.push(`Exemplar slide ${selection.sourceSlideIndex} ${role} donor was replaced with Office Kit setShapeText; paragraph-end formatting may not be retained.`);
+    if (segmentation.paragraphs > 1 || segmentation.runs > 1) {
+      textStyleWarnings.push(`Exemplar slide ${selection.sourceSlideIndex} ${role} donor has ${segmentation.paragraphs} paragraph(s) and ${segmentation.runs} run(s); Office Kit setShapeText was used, so secondary mixed-run styling may be collapsed.`);
+    }
+  }
+  const replacementIds = new Set([selection.slots.title.nativeId, selection.slots.body.nativeId]);
+  for (const nativeId of selection.clearElementNativeIds) {
+    if (replacementIds.has(nativeId)) continue;
+    const shape = byNativeId.get(nativeId);
+    if (!shape || !hasShapeText(shape)) throw new PptxBackendError('EXEMPLAR_CLEANUP_MAPPING_FAILED', `A source-specific text shape on exemplar slide ${selection.sourceSlideIndex} could not be cleared safely.`);
+    setShapeText(shape, '');
+  }
+  setShapeText(title, compiled.title);
+  setShapeText(body, compiled.body.join('\n'));
+}
+
+function countExemplarObjects(slide: ReturnType<typeof getSlides>[number]) {
+  const shapes = getSlideShapes(slide);
+  const textShapes = shapes.filter((shape) => hasShapeText(shape) && getShapeText(shape).trim()).length;
+  const connectors = shapes.filter((shape) => getShapeKind(shape) === 'connector').length;
+  const pictures = shapes.filter((shape) => getShapeKind(shape) === 'picture').length;
+  const editableShapes = shapes.filter((shape) => getShapeKind(shape) === 'shape' && !hasShapeText(shape)).length;
+  return { textShapes, connectors, pictures, editableShapes, charts: getSlideCharts(slide).length, tables: getSlideTables(slide).length };
+}
+
 async function writeAtomically(filePath: string, bytes: Uint8Array): Promise<string> {
   const resolved = path.resolve(filePath);
   const temporary = `${resolved}.${process.pid}.tmp`;
@@ -137,6 +205,22 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       return [compiled.layoutSourcePart, layout] as const;
     }));
     const sourceSlides = [...getSlides(presentation)];
+    const sourceSlidesByPart = new Map(sourceSlides.map((slide) => [normalizePart(getSlidePartName(slide)), slide]));
+    const exemplarSelections = new Map(input.compiledPresentation.slides.flatMap((compiled) => {
+      const selection = selectExemplarSlide(compiled, input.templateIR);
+      if (!selection || !sourceSlidesByPart.has(selection.sourcePart)) return [];
+      return [[compiled.id, selection] as const];
+    }));
+    const duplicatedSlides = new Map<string, ReturnType<typeof duplicateSlide>>();
+    for (const compiled of input.compiledPresentation.slides) {
+      const selection = exemplarSelections.get(compiled.id);
+      if (!selection) continue;
+      const sourceSlide = sourceSlidesByPart.get(selection.sourcePart);
+      if (!sourceSlide) throw new PptxBackendError('EXEMPLAR_SOURCE_SLIDE_MISSING', `The selected source slide ${selection.sourceSlideIndex} is unavailable in the loaded package.`);
+      const duplicate = duplicateSlide(presentation, sourceSlide);
+      removeSlideNotes(duplicate);
+      duplicatedSlides.set(compiled.id, duplicate);
+    }
     for (const slide of sourceSlides) removeSlideNotes(slide);
     for (const slide of sourceSlides) removeSlide(presentation, slide);
     compactPackage(presentation);
@@ -148,10 +232,24 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
     let nativeShapeCount = 0;
     let nativeConnectorCount = 0;
     const unresolvedVisualTypes = new Set<string>();
+    const textStyleWarnings: string[] = [];
     for (const compiled of input.compiledPresentation.slides) {
+      const selection = exemplarSelections.get(compiled.id);
+      let slide = duplicatedSlides.get(compiled.id);
+      if (selection && slide) {
+        projectExemplarText(slide, compiled, selection, textStyleWarnings);
+        const counts = countExemplarObjects(slide);
+        nativeTextShapeCount += counts.textShapes;
+        nativeConnectorCount += counts.connectors;
+        nativeImageCount += counts.pictures;
+        nativeShapeCount += counts.editableShapes;
+        nativeChartCount += counts.charts;
+        nativeTableCount += counts.tables;
+        continue;
+      }
       const layout = layoutsByPart.get(compiled.layoutSourcePart);
       if (!layout) throw new TypeError(`Office Kit cannot resolve selected layout part ${compiled.layoutSourcePart}`);
-      const slide = addSlide(presentation, { layout });
+      slide = addSlide(presentation, { layout });
       addSlideTextBox(slide, {
         x: emu(compiled.placements.title.x),
         y: emu(compiled.placements.title.y),
@@ -274,6 +372,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
     for (const visualType of unresolvedVisualTypes) {
       validationIssues.push({ severity: 'warning', message: `No compatible template slot was available to render the requested ${visualType} visual; source-backed text is retained.`, partName: null });
     }
+    for (const message of textStyleWarnings) validationIssues.push({ severity: 'warning', message, partName: null });
     const outputPath = await writeAtomically(input.outputPath, outputBytes);
     return {
       backend: this.id,
@@ -288,7 +387,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       nativeConnectorCount,
       nativeNotesCount: 0,
       rasterSlideCount: 0,
-      auditFindingCount: audit.findings.length + unresolvedVisualTypes.size,
+      auditFindingCount: audit.findings.length + unresolvedVisualTypes.size + textStyleWarnings.length,
       artifactSha256: createHash('sha256').update(outputBytes).digest('hex'),
       reopenStatus: 'passed',
       validationStatus: validationIssues.some((issue) => issue.severity === 'error') ? 'failed' : 'passed',

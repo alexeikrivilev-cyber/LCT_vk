@@ -41,3 +41,44 @@ export async function createExemplarTemplate(filePath, { masterName = 'Unnamed d
   }
   await deck.writeFile({ fileName: filePath });
 }
+
+/** Three repeated but structurally distinct vector compositions for selector/render tests. */
+export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unlabelled composition families', mixedStyleBody = false, hyperlinkBody = false } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({ title: masterName, objects: [] });
+  for (let index = 0; index < 12; index += 1) {
+    const family = Math.floor(index / 4);
+    const slide = deck.addSlide({ masterName });
+    slide.addText(`Original source headline ${index + 1}`, {
+      x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
+    });
+    slide.addText(mixedStyleBody && index === 0
+      ? [
+        { text: 'Original source body ', options: { fontFace: 'Aptos', fontSize: 16 } },
+        { text: `${index + 1}`, options: { fontFace: 'Aptos', fontSize: 16, italic: true, color: '274C77' } },
+      ]
+      : `Original source body ${index + 1}`, {
+      x: 0.68, y: 1.35, w: 4.7, h: 5.45, fontFace: 'Aptos', fontSize: 16, margin: 0,
+      ...(hyperlinkBody ? { hyperlink: { url: 'https://source-link.example.test' } } : {}),
+    });
+    slide.addText(`Source only detail ${index + 1}`, {
+      x: 0.8, y: 6.5, w: 3.8, h: 0.3, fontFace: 'Aptos', fontSize: 10, margin: 0,
+    });
+    slide.addText('SYNTHETIC BRAND', {
+      x: 0.62, y: 7.08, w: 2.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+    });
+    for (let decoration = 0; decoration < 1 + family * 3; decoration += 1) {
+      slide.addShape('rect', {
+        x: 6.2 + (decoration % 3) * 0.42,
+        y: 1.45 + Math.floor(decoration / 3) * 0.32,
+        w: 0.24,
+        h: 0.18,
+        line: { color: '274C77', transparency: 100 },
+        fill: { color: family === 1 ? 'C6D7E8' : 'D9E3F0' },
+      });
+    }
+    slide.addNotes(`Source only note ${index + 1}`);
+  }
+  await deck.writeFile({ fileName: filePath });
+}

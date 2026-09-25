@@ -11,6 +11,7 @@ import {
   addSlideImage,
   addSlideLine,
   addSlideTable,
+  duplicateSlide,
   findSlidePlaceholder,
   getAllCharts,
   getAllImages,
@@ -31,6 +32,7 @@ import {
   getSlideLayoutName,
   getSlideLayoutPlaceholders,
   loadPresentation,
+  removeSlideNotes,
   savePresentation,
   setShapeImageCrop,
   setShapeText,
@@ -214,6 +216,14 @@ test('Office Kit round-trips a synthetic template and authors native objects', a
   });
   setSlideNotes(slide, 'Generated slide notes');
 
+  const duplicate = duplicateSlide(presentation, slide);
+  assert.equal(getSlideNotes(duplicate), 'Generated slide notes', 'duplicateSlide carries its owned notes dependency');
+  removeSlideNotes(duplicate);
+  assert.equal(getSlideNotes(duplicate), null);
+  assert.equal(getAllTables(presentation).length, 2, 'the copied slide has an independent native table');
+  assert.equal(getAllImages(presentation).length, 4, 'the copied slide retains its picture relationships');
+  assert.equal(getAllCharts(presentation).length, 2, 'the copied slide has an independent chart/workbook dependency');
+
   const svg = renderSlideToSvg(presentation, slide);
   assert.match(svg, /^<svg/);
   assert.ok(renderSlideToImage(presentation, slide, { width: 960 }).length > 0);
@@ -226,18 +236,21 @@ test('Office Kit round-trips a synthetic template and authors native objects', a
   assert.deepEqual(originalPartNames.filter((name) => !finalPartNames.has(name)), []);
   assert.equal(await finalZip.file('ppt/lctSpike/unknownPart.xml').async('string'), unknownXml);
   const slides = getSlides(reopened);
-  const reopenedSlide = slides.at(-1);
+  const reopenedSlide = slides[1];
+  const duplicatedSlide = slides[2];
   assert.ok(reopenedSlide);
-  assert.equal(getSlides(reopened).length, 2);
+  assert.ok(duplicatedSlide);
+  assert.equal(getSlides(reopened).length, 3);
   assert.deepEqual(getSlideMasterPartNames(reopened), sourceMasterParts);
   assert.deepEqual(getSlideLayouts(reopened).map(getSlideLayoutName), sourceLayoutNames);
   assert.deepEqual(getPresentationTheme(reopened), sourceTheme);
   assert.equal(getShapeText(findSlidePlaceholder(reopenedSlide, 'title')), 'Editable spike title');
   assert.equal(getSlideNotes(getSlides(reopened)[0]), 'Original speaker notes');
   assert.equal(getSlideNotes(reopenedSlide), 'Generated slide notes');
-  assert.equal(getAllTables(reopened).length, 1);
-  assert.equal(getAllImages(reopened).length, 2);
-  assert.equal(getAllCharts(reopened).length, 1);
+  assert.equal(getSlideNotes(duplicatedSlide), null);
+  assert.equal(getAllTables(reopened).length, 2);
+  assert.equal(getAllImages(reopened).length, 4);
+  assert.equal(getAllCharts(reopened).length, 2);
   assert.ok(getSlideShapes(reopenedSlide).some((shape) => getShapeKind(shape) === 'connector'));
   assert.ok(getSlideShapes(reopenedSlide).some((shape) => {
     const crop = getShapeImageCrop(shape);

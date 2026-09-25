@@ -60,6 +60,8 @@ Deterministic PPTX structural understanding is implemented: upload a `.pptx` int
 
 The current visual UI is temporary and expected to be redesigned. Product/domain contracts are stable; existing screen styling/composition is not.
 
+The held-out AIOS compatibility probe at `.lct/compatibility/aios-exemplar-run/` now exercises Office Kit exemplar projection on a real 16-slide PPTX: the generated slide duplicates an eligible AIOS source slide, replaces its title/body donors, retains native chrome/vector objects, reopens, validates, and previews without text-layout findings. The input SHA-256 remained `18198cc08df9fc3ea5aee5f509d89e70a4ade68bb539fed61a957581ee365ad1`. This is one preview-level compatibility result; native PowerPoint/LibreOffice open-save and broader held-out coverage remain unverified, so Office Kit is not qualified for production adoption.
+
 ## Documentation
 
 Start with `AGENTS.md` when working as a coding agent.
