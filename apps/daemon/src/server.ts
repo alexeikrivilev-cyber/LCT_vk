@@ -44,6 +44,7 @@ import {
 } from './presentation/adapters/openai-compatible-semantic-inference.js';
 import type { SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
 import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
+import { projectTemplateSemanticProfileCache, TemplateSemanticProfiler } from './presentation/application/template-semantic-profiler.js';
 import {
   PresentationGenerationError,
   PresentationGenerationService,
@@ -148,18 +149,34 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   await mkdir(projectsRoot, { recursive: true });
 
   const db = openPresentationStore(dataDir);
+  let semanticAdapter: SemanticInferenceAdapter | undefined;
+  const getSemanticAdapter = () => semanticAdapter ??= options.semanticInferenceAdapter
+    ?? options.semanticInferenceAdapterFactory?.()
+    ?? new OpenAICompatibleSemanticInferenceAdapter(semanticInferenceConfigFromEnvironment());
+  const semanticProfilingEnabled = Boolean(process.env.LCT_SEMANTIC_BASE_URL?.trim());
+  const templateProfilers = new Map<string, TemplateSemanticProfiler>();
+  const profileTemplate = semanticProfilingEnabled ? async (projectId: string, snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>) => {
+    if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
+      throw new TypeError('A ready TemplateIR and presentation design system are required for semantic profiling.');
+    }
+    let profiler = templateProfilers.get(projectId);
+    if (!profiler) {
+      profiler = new TemplateSemanticProfiler(getSemanticAdapter(), projectTemplateSemanticProfileCache(projectsRoot, projectId));
+      templateProfilers.set(projectId, profiler);
+    }
+    return profiler.profile(snapshot.templateIR, snapshot.presentationDesignSystem);
+  } : undefined;
   const planningService = new PlanningService({
     projectRoot,
     projectsRoot,
-    getInferenceAdapter: () => options.semanticInferenceAdapter
-      ?? options.semanticInferenceAdapterFactory?.()
-      ?? new OpenAICompatibleSemanticInferenceAdapter(semanticInferenceConfigFromEnvironment()),
+    getInferenceAdapter: getSemanticAdapter,
   });
   const generationService = new PresentationGenerationService({
     db,
     projectsRoot,
     planningService,
     backend: resolvePptxBackend(),
+    ...(profileTemplate ? { profileTemplate } : {}),
     ...(options.presentationRenderer ? { renderer: options.presentationRenderer } : {}),
     ...(options.presentationPreview ? { preview: options.presentationPreview } : {}),
   });
@@ -329,7 +346,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
     const filePath = typeof req.body?.filePath === 'string' ? req.body.filePath : '';
     try {
-      res.json(await compileTemplate(projectsRoot, req.params.id, filePath));
+      const compiled = await compileTemplate(projectsRoot, req.params.id, filePath);
+      if (profileTemplate) await profileTemplate(req.params.id, compiled);
+      res.json(compiled);
     } catch (error) {
       if (error instanceof TemplateCompilerError) {
         return res.status(error.status).json({ status: 'failed', failure: { code: error.code, message: error.message } });

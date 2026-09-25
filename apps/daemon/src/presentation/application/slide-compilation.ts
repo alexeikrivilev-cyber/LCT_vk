@@ -168,6 +168,15 @@ function asBox(geometry: TemplateGeometry | null | undefined): PlacementBox | nu
   return { x: geometry.x, y: geometry.y, width: geometry.width, height: geometry.height, unit: 'EMU' };
 }
 
+function fitVisualBoxToCanvas(box: PlacementBox, template: TemplateIR): PlacementBox | null {
+  const left = Math.max(0, box.x);
+  const top = Math.max(0, box.y);
+  const right = Math.min(template.slideSize.width, box.x + box.width);
+  const bottom = Math.min(template.slideSize.height, box.y + box.height);
+  if (right <= left || bottom <= top) return null;
+  return { x: left, y: top, width: right - left, height: bottom - top, unit: 'EMU' };
+}
+
 function intentFor(slide: DeckPlanSlide): SlideIntent {
   if (slide.narrativeRole === 'opening') return 'title';
   if (slide.narrativeRole === 'section-divider') return 'section';
@@ -686,6 +695,12 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
   const visualStatus = slide.semanticVisualType === 'none'
     ? 'none'
     : tableData || imageRefs.length || chartData || processSteps.length >= 2 || kpi ? 'referenced' : 'unresolved';
+  const visualPlacement = requiresVisualSlot && chosen.visualBox
+    ? fitVisualBoxToCanvas(chosen.visualBox, template)
+    : chosen.visualBox;
+  if (requiresVisualSlot && chosen.visualBox && !visualPlacement) {
+    throw new UnsupportedTemplateLayoutError(slide.id, allCandidates);
+  }
   return {
     id: `compiled_${slide.id}_${policy.id}`,
     sourceDeckPlanSlideId: slide.id,
@@ -698,7 +713,7 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
     visualization: { type: slide.semanticVisualType, sourceRefs: [...slide.contentRefs], status: visualStatus, tableData, tableCellRefs, chartData, processSteps, kpi },
     imageRefs,
     provenanceRefs: [...slide.contentRefs],
-    placements: { title: chosen.titleBox, body: chosen.bodyBox, visual: chosen.visualBox },
+    placements: { title: chosen.titleBox, body: chosen.bodyBox, visual: visualPlacement },
     layoutCandidates,
     selectedCandidateIndex: 0,
   };

@@ -114,6 +114,32 @@ export async function createRoleExemplarTemplate(filePath, { masterName = 'Struc
   await deck.writeFile({ fileName: filePath });
 }
 
+/** Two otherwise similar layouts with independent recurring footer chrome for cross-layout profile tests. */
+export async function createCrossLayoutFooterTemplate(filePath) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({ title: 'First composition layout', objects: [] });
+  deck.defineSlideMaster({ title: 'Second composition layout', objects: [] });
+  for (let index = 0; index < 8; index += 1) {
+    const masterName = index < 4 ? 'First composition layout' : 'Second composition layout';
+    const slide = deck.addSlide({ masterName });
+    slide.addText(`Source headline ${index + 1}`, {
+      x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
+    });
+    slide.addText(`Source body ${index + 1}. Supporting evidence remains in the body region.`, {
+      x: 0.68, y: 1.35, w: 4.7, h: 5.45, fontFace: 'Aptos', fontSize: 16, margin: 0,
+    });
+    slide.addText('REPEATED LAYOUT BRAND', {
+      x: 0.62, y: 7.08, w: 2.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+    });
+    if (index >= 4) slide.addShape('rect', {
+      x: 6.2, y: 1.45, w: 0.24, h: 0.18,
+      line: { color: '274C77', transparency: 100 }, fill: { color: 'D9E3F0' },
+    });
+  }
+  await deck.writeFile({ fileName: filePath });
+}
+
 /** Three old familyKey buckets collapse to one composition once the added source-only text is cleared. */
 export async function createDuplicateProjectionExemplarTemplate(filePath, { masterName = 'Duplicate projected families' } = {}) {
   const deck = new pptxgen();

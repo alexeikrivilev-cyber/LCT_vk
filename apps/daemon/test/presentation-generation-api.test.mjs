@@ -95,7 +95,7 @@ async function upload(server, projectId, name, bytes) {
   assert.equal(response.status, 200, await response.clone().text());
 }
 
-async function seedReadyPlanningState(server, dataDir, projectId, sourceText = 'Evidence points to a retention constraint for sustained growth.') {
+async function seedReadyPlanningState(server, dataDir, projectId, sourceText = 'Evidence points to a retention constraint for sustained growth.', includeChartSource = false) {
   const pptx = await makeValidSyntheticPptx(path.join(dataDir, 'fixture'));
   await upload(server, projectId, 'template.pptx', pptx);
   const compiled = await fetch(`${server.url}/api/projects/${projectId}/template/compile`, {
@@ -108,10 +108,14 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
   }
   assert.equal(compiled.status, 200, await compiled.clone().text());
   const template = await json(compiled);
-  await upload(server, projectId, 'source.md', Buffer.from(sourceText, 'utf8'));
+  const sourceFile = includeChartSource ? 'metrics.csv' : 'source.md';
+  const sourceBytes = includeChartSource
+    ? Buffer.from('Quarter,Retention\nQ1,10\nQ2,12\nQ3,13\n', 'utf8')
+    : Buffer.from(sourceText, 'utf8');
+  await upload(server, projectId, sourceFile, sourceBytes);
 
   const projectsRoot = path.join(dataDir, 'projects');
-  const contentIR = await compileContentIR(projectsRoot, projectId, ['source.md']);
+  const contentIR = await compileContentIR(projectsRoot, projectId, [sourceFile]);
   const [workerPrompt, supervisorPrompt] = await Promise.all([
     readFile(path.join(repoRoot, 'apps/daemon/prompts/worker-deck-plan.v2.md'), 'utf8'),
     readFile(path.join(repoRoot, 'apps/daemon/prompts/supervisor-plan-review.v1.md'), 'utf8'),
@@ -131,16 +135,18 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
     workerPromptSha256: createHash('sha256').update(workerPrompt).digest('hex'),
     supervisorPromptSha256: createHash('sha256').update(supervisorPrompt).digest('hex'),
   });
-  const contentId = contentIR.units.find((unit) => unit.kind !== 'media-reference')?.id;
-  assert.ok(contentId);
+  const contentIds = includeChartSource
+    ? contentIR.units.filter((unit) => unit.kind === 'table-cell').map((unit) => unit.id)
+    : [contentIR.units.find((unit) => unit.kind !== 'media-reference')?.id].filter((id) => id !== undefined);
+  assert.ok(contentIds.length);
   const now = new Date().toISOString();
   const plan = canonicalizeDeckPlan({
     workingTitle: 'Retention is the growth constraint',
     narrativeSummary: 'Show the supplied retention evidence and one decision.',
     slides: [
-      { narrativeRole: 'opening', purpose: 'Frame the decision.', takeaway: 'Growth requires a retention decision.', contentRefs: [], semanticVisualType: 'chart', targetDensity: 'compact' },
-      { narrativeRole: 'content', purpose: 'Show the evidence.', takeaway: 'The source identifies retention as a constraint.', contentRefs: [contentId], semanticVisualType: 'chart', targetDensity: 'balanced' },
-      { narrativeRole: 'closing', purpose: 'State the next step.', takeaway: 'Run a bounded retention pilot.', contentRefs: [contentId], semanticVisualType: 'chart', targetDensity: 'compact' },
+      { narrativeRole: 'opening', purpose: 'Frame the decision.', takeaway: 'Growth requires a retention decision.', contentRefs: includeChartSource ? contentIds : [], semanticVisualType: 'chart', targetDensity: 'compact' },
+      { narrativeRole: 'content', purpose: 'Show the evidence.', takeaway: 'The source identifies retention as a constraint.', contentRefs: contentIds, semanticVisualType: 'chart', targetDensity: 'balanced' },
+      { narrativeRole: 'closing', purpose: 'State the next step.', takeaway: 'Run a bounded retention pilot.', contentRefs: contentIds, semanticVisualType: 'chart', targetDensity: 'compact' },
     ],
   }, {
     id: 'offline-ready-plan',
@@ -162,9 +168,9 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
     schemaVersion: 1,
     updatedAt: now,
     status: 'ready',
-    inputs: { contentFiles: ['source.md'], brief, contentIR, inputFingerprint: fingerprint },
+    inputs: { contentFiles: [sourceFile], brief, contentIR, inputFingerprint: fingerprint },
     lastSuccessful: {
-      contentFiles: ['source.md'], brief, contentIR, inputFingerprint: fingerprint,
+      contentFiles: [sourceFile], brief, contentIR, inputFingerprint: fingerprint,
       checkpoint: plan, deckPlan: plan, review,
       telemetry: { worker: telemetrySummary, supervisor: { ...telemetrySummary, requestId: 'offline-supervisor' }, totalWallTimeMs: 0 },
       promptVersions: { worker: 'worker-deck-plan.v2', supervisor: 'supervisor-plan-review.v1' },
@@ -236,7 +242,7 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
   let started = await startServer(options);
   try {
     await createProject(started, projectId);
-    const seeded = await seedReadyPlanningState(started, dataDir, projectId);
+    const seeded = await seedReadyPlanningState(started, dataDir, projectId, undefined, true);
     if (!seeded) { t.skip('Python 3.12 unavailable: synthetic PPTX template cannot be compiled'); return; }
     const planView = await json(await fetch(`${started.url}/api/projects/${projectId}/planning`));
     assert.equal(planView.status, 'ready');

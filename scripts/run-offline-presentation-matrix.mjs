@@ -13,6 +13,11 @@ import { briefHash, validateBrief } from '../apps/daemon/src/presentation/domain
 import { validateContentIR } from '../apps/daemon/src/presentation/domain/content-ir.js';
 import { validateDeckPlan } from '../apps/daemon/src/presentation/domain/deck-plan.js';
 import { validatePlanReview } from '../apps/daemon/src/presentation/application/planning-service.js';
+import { OpenAICompatibleSemanticInferenceAdapter } from '../apps/daemon/src/presentation/adapters/openai-compatible-semantic-inference.js';
+import { derivePresentationDesignSystem } from '../apps/daemon/src/presentation/application/template-mapper.js';
+import { TemplateSemanticProfiler } from '../apps/daemon/src/presentation/application/template-semantic-profiler.js';
+import { OfficeKitPreviewAdapter } from '../apps/daemon/src/presentation/adapters/office-kit-preview-adapter.js';
+import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
 
 const WORKER_REQUEST_SCHEMA = 'deck_plan_draft_v1';
 const SUPERVISOR_REQUEST_SCHEMA = 'supervisor_plan_review_v1';
@@ -118,11 +123,11 @@ export function createOfflineReplayManifest(state, templates, matrix, runMetadat
 }
 
 function usage() {
-  return 'Usage: node --import tsx scripts/run-offline-presentation-matrix.mjs --state state.json --out output-dir --templates template-1.pptx [template-2.pptx ...] [--content-root project-content-dir] [--run-metadata metadata.json]';
+  return 'Usage: node --import tsx scripts/run-offline-presentation-matrix.mjs --state state.json --out output-dir --templates template-1.pptx [template-2.pptx ...] [--content-root project-content-dir] [--run-metadata metadata.json] [--local-semantic]';
 }
 
 function parseArgs(argv) {
-  const args = { templates: [] };
+  const args = { templates: [], localSemantic: false };
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
     if (key === '--state' || key === '--out' || key === '--run-metadata' || key === '--content-root') {
@@ -131,6 +136,8 @@ function parseArgs(argv) {
       args[key.slice(2).replaceAll('-', '')] = value;
     } else if (key === '--templates') {
       while (argv[index + 1] && !argv[index + 1].startsWith('--')) args.templates.push(argv[++index]);
+    } else if (key === '--local-semantic') {
+      args.localSemantic = true;
     } else {
       throw new Error(`Unknown option: ${key}`);
     }
@@ -185,18 +192,40 @@ export async function runOfflineMatrixFromState(args) {
     templates.push({ pptxPath, templateIR, ...(args.contentroot ? { contentRoot: path.resolve(args.contentroot) } : {}) });
     templateInspectionMs += performance.now() - parsingStarted;
   }
-  const matrix = await runOfflinePresentationMatrix({
-    deckPlan, contentIR, templates, outputRoot: args.out,
-    ...(args.backend ? { backend: args.backend } : {}),
-    ...(args.previewAdapter ? { previewAdapter: args.previewAdapter } : {}),
-    ...(args.previewAllSlides ? { previewAllSlides: true } : {}),
-  });
+  let fakeEndpoint = null;
+  let matrix;
+  try {
+    let profileTemplate;
+    if (args.localSemantic) {
+      fakeEndpoint = await startFakeSemanticEndpoint({ model: 'offline-fake-planner' });
+      const inference = new OpenAICompatibleSemanticInferenceAdapter({ baseUrl: fakeEndpoint.baseUrl, model: 'offline-fake-planner' });
+      const profiler = new TemplateSemanticProfiler(inference);
+      profileTemplate = (template) => profiler.profile(template.templateIR, derivePresentationDesignSystem(template.templateIR));
+    }
+    matrix = await runOfflinePresentationMatrix({
+      deckPlan, contentIR, templates, outputRoot: args.out,
+      ...(args.backend ? { backend: args.backend } : {}),
+      ...(args.previewAdapter ? { previewAdapter: args.previewAdapter } : {}),
+      ...(args.localSemantic ? { previewAdapter: new OfficeKitPreviewAdapter(), previewAllSlides: true, continueOnBlocked: true } : {}),
+      ...(profileTemplate ? { profileTemplate } : {}),
+    });
+  } finally {
+    await fakeEndpoint?.close();
+  }
   let runMetadata = null;
   if (args.runmetadata) runMetadata = JSON.parse(await readFile(args.runmetadata, 'utf8'));
   const manifest = createOfflineReplayManifest(state, templates, matrix, runMetadata);
   const diagnostics = {
     schemaVersion: 1,
-    inferenceRequests: 0,
+    qualificationMode: args.localSemantic ? 'local-semantic-fake' : 'offline-deterministic-replay',
+    inferenceRequests: fakeEndpoint?.state.inference.length ?? 0,
+    callCounts: fakeEndpoint ? {
+      planningWorker: fakeEndpoint.state.inference.filter((item) => item.operation === 'deck-plan' || item.operation === 'deck-plan-revision').length,
+      planningSupervisor: fakeEndpoint.state.inference.filter((item) => item.operation === 'plan-review').length,
+      templateProfiler: fakeEndpoint.state.inference.filter((item) => item.operation === 'template-semantic-profile').length,
+      generation: fakeEndpoint.state.inference.filter((item) => item.operation.startsWith('generation')).length,
+      total: fakeEndpoint.state.inference.length,
+    } : { planningWorker: 0, planningSupervisor: 0, templateProfiler: 0, generation: 0, total: 0 },
     stageMs: {
       templateInspection: Number(templateInspectionMs.toFixed(3)),
       contentParsing: null,
@@ -224,8 +253,10 @@ export async function runOfflineMatrixFromState(args) {
       deterministicAudit: 'measured during this run',
       repair: 'not run by this offline matrix command',
       export: 'not run separately; PPTX package assembly and reopen are included in render',
-      offlineTotal: 'measured for template inspection and offline matrix stages; excludes content parsing and inference reruns',
-      productEndToEndTotal: 'not measured; this replay makes no inference request and does not rerun content parsing',
+      offlineTotal: args.localSemantic ? 'measured for template inspection, one local fake profile call per unique template, and matrix rendering; excludes planning requests'
+        : 'measured for template inspection and offline matrix stages; excludes content parsing and inference reruns',
+      productEndToEndTotal: args.localSemantic ? 'not measured; Worker/Supervisor planning was loaded from persisted state'
+        : 'not measured; this replay makes no inference request and does not rerun content parsing',
     },
   };
   await Promise.all([

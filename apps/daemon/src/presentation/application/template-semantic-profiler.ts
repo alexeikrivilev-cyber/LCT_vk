@@ -10,6 +10,9 @@ import type {
   SemanticJsonSchema,
   SemanticOutputContract,
 } from './semantic-inference-port.js';
+import { randomBytes } from 'node:crypto';
+import { readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { resolvePresentationFilePath } from '../../presentation-files.js';
 
 export const TEMPLATE_SLIDE_ARCHETYPES = [
   'cover', 'section-divider', 'content', 'content-split', 'content-dense',
@@ -35,6 +38,52 @@ export interface TemplateSemanticSlideProfile {
 export interface TemplateSemanticProfile {
   templateIRHash: string;
   slides: TemplateSemanticSlideProfile[];
+}
+
+export interface TemplateSemanticProfileCache {
+  read(templateIRHash: string): Promise<unknown | null>;
+  write(profile: TemplateSemanticProfile): Promise<void>;
+  invalidate?(templateIRHash: string): Promise<void>;
+}
+
+/** Stores replaceable semantic evidence inside the owning project, keyed by the validated TemplateIR hash. */
+export function projectTemplateSemanticProfileCache(projectsRoot: string, projectId: string): TemplateSemanticProfileCache {
+  const profilePath = async (hash: string, createParent = false) => {
+    if (!/^[a-f0-9]{64}$/.test(hash)) throw new TypeError('Template semantic profile hash is invalid.');
+    return (await resolvePresentationFilePath(projectsRoot, projectId,
+      `.template-compiler/semantic-profiles/${hash}.json`, { createParent })).absolute;
+  };
+  return {
+    async read(hash) {
+      let raw: string;
+      const target = await profilePath(hash);
+      try { raw = await readFile(target, 'utf8'); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+      try { return JSON.parse(raw) as unknown; }
+      catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        await rm(target, { force: true });
+        return null;
+      }
+    },
+    async write(profile) {
+      const target = await profilePath(profile.templateIRHash, true);
+      const temporary = `${target}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+      try {
+        await writeFile(temporary, `${JSON.stringify(profile, null, 2)}\n`, { flag: 'wx' });
+        await rename(temporary, target);
+      } catch (error) {
+        await rm(temporary, { force: true }).catch(() => undefined);
+        throw error;
+      }
+    },
+    async invalidate(hash) {
+      await rm(await profilePath(hash), { force: true });
+    },
+  };
 }
 
 const PROFILE_MAX_SLIDES = 500;
@@ -154,6 +203,7 @@ function profileEvidence(templateIR: TemplateIR, presentationDesignSystem: Prese
       sourceSlideIndex: slide.index,
       elements: slide.elements.slice(0, PROFILE_MAX_ELEMENTS_PER_SLIDE).map((element) => ({
         id: element.id,
+        order: element.order,
         kind: element.kind,
         text: element.text?.slice(0, 320) ?? null,
         placeholderRole: element.placeholder?.role ?? null,
@@ -198,7 +248,7 @@ export class TemplateSemanticProfiler {
   private readonly cache = new Map<string, TemplateSemanticProfile>();
   private readonly inFlight = new Map<string, Promise<TemplateSemanticProfile>>();
 
-  constructor(private readonly inference: SemanticInferenceAdapter) {}
+  constructor(private readonly inference: SemanticInferenceAdapter, private readonly persistentCache?: TemplateSemanticProfileCache) {}
 
   async profile(templateIRInput: TemplateIR, designSystemInput: PresentationDesignSystem, signal?: AbortSignal): Promise<TemplateSemanticProfile> {
     const templateIR = validateTemplateIR(templateIRInput);
@@ -209,8 +259,19 @@ export class TemplateSemanticProfiler {
     if (pending) return structuredClone(await pending);
 
     const task = (async () => {
+      const persisted = await this.persistentCache?.read(templateIR.hash);
+      if (persisted !== null && persisted !== undefined) {
+        try {
+          const profile = validateTemplateSemanticProfile(persisted, templateIR);
+          this.cache.set(templateIR.hash, profile);
+          return profile;
+        } catch {
+          await this.persistentCache?.invalidate?.(templateIR.hash);
+        }
+      }
       const response = await this.inference.infer({ ...requestFor(templateIR, presentationDesignSystem), signal });
       const profile = validateTemplateSemanticProfile(response.value, templateIR);
+      await this.persistentCache?.write(profile);
       this.cache.set(templateIR.hash, profile);
       return profile;
     })();

@@ -148,15 +148,16 @@ function projectExemplarText(
   const shapes = getSlideShapes(slide);
   const byNativeId = new Map(shapes.map((shape) => [String(getShapeId(shape)), shape]));
   const title = requiredDonorShape(slide, selection.slots.title.nativeId, 'title');
-  const body = requiredDonorShape(slide, selection.slots.body.nativeId, 'body');
-  for (const [role, shape] of [['title', title], ['body', body]] as const) {
+  const bodySlots = selection.slots.bodySlots.length ? selection.slots.bodySlots : [selection.slots.body];
+  const bodyShapes = bodySlots.map((slot, index) => requiredDonorShape(slide, slot.nativeId, `body ${index + 1}`));
+  for (const [role, shape] of [['title', title] as const, ...bodyShapes.map((shape, index) => [`body ${index + 1}`, shape] as const)]) {
     const segmentation = textSegmentation(shape);
     textStyleWarnings.push(`Exemplar slide ${selection.sourceSlideIndex} ${role} donor was replaced with Office Kit setShapeText; paragraph-end formatting may not be retained.`);
     if (segmentation.paragraphs > 1 || segmentation.runs > 1) {
       textStyleWarnings.push(`Exemplar slide ${selection.sourceSlideIndex} ${role} donor has ${segmentation.paragraphs} paragraph(s) and ${segmentation.runs} run(s); Office Kit setShapeText was used, so secondary mixed-run styling may be collapsed.`);
     }
   }
-  const replacementIds = new Set([selection.slots.title.nativeId, selection.slots.body.nativeId]);
+  const replacementIds = new Set([selection.slots.title.nativeId, ...bodySlots.map((slot) => slot.nativeId)]);
   for (const nativeId of selection.clearElementNativeIds) {
     if (replacementIds.has(nativeId)) continue;
     const shape = byNativeId.get(nativeId);
@@ -164,7 +165,11 @@ function projectExemplarText(
     setShapeText(shape, '');
   }
   setShapeText(title, compiled.title);
-  setShapeText(body, compiled.body.join('\n'));
+  for (let index = 0; index < bodyShapes.length; index += 1) {
+    const start = Math.floor(index * compiled.body.length / bodyShapes.length);
+    const end = Math.floor((index + 1) * compiled.body.length / bodyShapes.length);
+    setShapeText(bodyShapes[index]!, compiled.body.slice(start, end).join('\n'));
+  }
 }
 
 function countExemplarObjects(slide: ReturnType<typeof getSlides>[number]) {
@@ -243,7 +248,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
     const sourceSlides = [...getSlides(presentation)];
     const sourceSlidesByPart = new Map(sourceSlides.map((slide) => [normalizePart(getSlidePartName(slide)), slide]));
     const exemplarAssessments = new Map(input.compiledPresentation.slides.map((compiled) => [
-      compiled.id, assessExemplarSelection(compiled, input.templateIR),
+      compiled.id, assessExemplarSelection(compiled, input.templateIR, input.semanticProfile),
     ] as const));
     const exemplarSelections = new Map(input.compiledPresentation.slides.flatMap((compiled) => {
       const selection = exemplarAssessments.get(compiled.id)?.selection;

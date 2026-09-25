@@ -66,10 +66,12 @@ export function auditCompiledPresentation(
   const seenContent = new Map<string, string>();
 
   for (const slide of presentation.slides) {
+    const hasRenderableVisual = slide.imageRefs.length > 0 || Boolean(slide.visualization.tableData || slide.visualization.chartData
+      || slide.visualization.kpi || slide.visualization.processSteps.length >= 2);
     const boxes: Array<[string, PlacementBox]> = [
       ['title', slide.placements.title],
       ['body', slide.placements.body],
-      ...(slide.placements.visual ? [['visual', slide.placements.visual] as [string, PlacementBox]] : []),
+      ...(hasRenderableVisual && slide.placements.visual ? [['visual', slide.placements.visual] as [string, PlacementBox]] : []),
     ];
     for (const [label, box] of boxes) {
       const right = box.x + box.width;
@@ -97,7 +99,7 @@ export function auditCompiledPresentation(
         suggestedRepair: 'Select the next ranked compatible layout.',
       });
     }
-    if (slide.placements.visual && (overlaps(slide.placements.title, slide.placements.visual)
+    if (hasRenderableVisual && slide.placements.visual && (overlaps(slide.placements.title, slide.placements.visual)
         || overlaps(slide.placements.body, slide.placements.visual))) {
       addFinding(findings, {
         slideId: slide.id,

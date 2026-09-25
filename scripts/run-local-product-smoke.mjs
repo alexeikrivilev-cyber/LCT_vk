@@ -167,7 +167,7 @@ async function main() {
       role: item.role, operation: item.operation,
       strictJsonSchema: item.request.response_format?.type === 'json_schema' && item.request.response_format.json_schema?.strict === true,
     }));
-    assert.deepEqual(report.fakeInferenceRequests.map((item) => item.role), ['worker', 'supervisor']);
+    assert.deepEqual(report.fakeInferenceRequests.map((item) => item.operation), ['template-semantic-profile', 'deck-plan', 'plan-review']);
     assert.ok(report.fakeInferenceRequests.every((item) => item.strictJsonSchema));
     await ensure(report);
 
@@ -283,7 +283,9 @@ async function main() {
 
     assert.equal(sha256(await readFile(templatePath)), sourceHashBefore, 'source template must remain byte-identical');
     report.gates.sourceImmutable = 'passed';
-    assert.equal(fake.state.inference.length, 2, 'generation, selection, repair, and export must not call semantic inference');
+    assert.equal(fake.state.inference.filter((item) => item.operation === 'template-semantic-profile').length, 1,
+      'template profiling happens once during compile and remains cached after daemon reload');
+    assert.equal(fake.state.inference.length, 3, 'generation, selection, repair, and export must not call semantic inference');
     report.fakeInferenceCallCount = fake.state.inference.length;
     report.status = 'passed';
   } catch (error) {

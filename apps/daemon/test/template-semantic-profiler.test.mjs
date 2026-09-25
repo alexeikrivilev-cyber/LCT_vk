@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 import { inspectPptx } from '../src/presentation/adapters/python-inspector.ts';
 import { OpenAICompatibleSemanticInferenceAdapter } from '../src/presentation/adapters/openai-compatible-semantic-inference.ts';
-import { TemplateSemanticProfiler } from '../src/presentation/application/template-semantic-profiler.ts';
+import { projectTemplateSemanticProfileCache, TemplateSemanticProfiler } from '../src/presentation/application/template-semantic-profiler.ts';
 import { createTemplateIR, derivePresentationDesignSystem } from '../src/presentation/application/template-mapper.ts';
 import { sha256Json, templateIRHashPayload } from '../src/presentation/domain/template-ir.ts';
 import { startFakeSemanticEndpoint, deterministicPlanningResponse } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
@@ -45,7 +45,8 @@ test('semantic template profile uses strict HTTP adapter output, validates all r
   const { templateIR, presentationDesignSystem } = await fixture(root);
   const endpoint = await startFakeSemanticEndpoint({ model });
   t.after(() => endpoint.close());
-  const profiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl));
+  const cache = projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile');
+  const profiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache);
 
   const first = await profiler.profile(templateIR, presentationDesignSystem);
   assert.equal(first.templateIRHash, templateIR.hash);
@@ -65,6 +66,14 @@ test('semantic template profile uses strict HTTP adapter output, validates all r
   const cached = await profiler.profile(templateIR, presentationDesignSystem);
   assert.ok(!cached.slides[0].reasonCodes.includes('caller_mutation'));
   assert.equal(endpoint.state.inference.length, 1, 'same TemplateIR hash uses the cached profile');
+
+  const persistedPath = path.join(root, 'projects', 'project-profile', '.template-compiler', 'semantic-profiles', `${templateIR.hash}.json`);
+  const persisted = JSON.parse(await readFile(persistedPath, 'utf8'));
+  assert.equal(persisted.templateIRHash, templateIR.hash);
+  const reloadedProfiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile'));
+  const afterReload = await reloadedProfiler.profile(templateIR, presentationDesignSystem);
+  assert.equal(afterReload.templateIRHash, templateIR.hash);
+  assert.equal(endpoint.state.inference.length, 1, 'a new profiler instance uses the project-owned cache after daemon reload');
 
   const changed = structuredClone(templateIR);
   changed.source.originalName = 'renamed-template.pptx';
@@ -96,4 +105,27 @@ test('semantic template profile rejects unknown slide indexes and element IDs th
       assert.equal(endpoint.state.inference.length, 1);
     });
   }
+});
+
+test('corrupt or invalid persisted semantic profiles are discarded and reprofiled through the strict adapter', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-corrupt-cache-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root);
+  const endpoint = await startFakeSemanticEndpoint({ model });
+  t.after(() => endpoint.close());
+  const cache = projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile');
+  const profiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache);
+  const profilePath = path.join(root, 'projects', 'project-profile', '.template-compiler', 'semantic-profiles', `${templateIR.hash}.json`);
+  await mkdir(path.dirname(profilePath), { recursive: true });
+
+  await writeFile(profilePath, '{broken-json', 'utf8');
+  await profiler.profile(templateIR, presentationDesignSystem);
+  assert.equal(endpoint.state.inference.length, 1, 'malformed JSON is removed and replaced by a validated strict response');
+  assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).templateIRHash, templateIR.hash);
+
+  profiler.clear();
+  await writeFile(profilePath, JSON.stringify({ templateIRHash: templateIR.hash, slides: [] }), 'utf8');
+  await profiler.profile(templateIR, presentationDesignSystem);
+  assert.equal(endpoint.state.inference.length, 2, 'a parsed cache with invalid slide coverage is also discarded');
+  assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).slides.length, templateIR.slides.length);
 });

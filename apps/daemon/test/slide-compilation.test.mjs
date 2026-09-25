@@ -33,6 +33,7 @@ import { createOfflineReplayManifest, runOfflineMatrixFromState } from '../../..
 import { runPptxCompatibilityHarness } from '../../../scripts/compare-pptx-backends.mjs';
 import {
   createDuplicateProjectionExemplarTemplate,
+  createCrossLayoutFooterTemplate,
   createExemplarTemplate,
   createFamilyExemplarTemplate,
   createRoleExemplarTemplate,
@@ -172,6 +173,34 @@ function inspectedCompositionSignature(inspectionEnvelope) {
       };
     });
   return createHash('sha256').update(JSON.stringify(composition)).digest('hex');
+}
+
+function semanticProfileFor(templateIR, archetypeFor = () => 'content', confidenceFor = () => 0.9) {
+  const canvasArea = templateIR.slideSize.width * templateIR.slideSize.height;
+  return {
+    templateIRHash: templateIR.hash,
+    slides: templateIR.slides.map((slide) => {
+      const text = slide.elements.filter((element) => element.parentId === null && element.kind.toLowerCase() === 'shape'
+        && element.nativeId && element.text?.trim() && (element.geometry.resolved ?? element.geometry.direct));
+      const title = [...text].sort((left, right) => Math.max(0, ...(right.directStyles.fontSizesPt ?? []))
+        - Math.max(0, ...(left.directStyles.fontSizesPt ?? [])))[0] ?? null;
+      const body = text.filter((element) => element.id !== title?.id).sort((left, right) => {
+        const leftBox = left.geometry.resolved ?? left.geometry.direct;
+        const rightBox = right.geometry.resolved ?? right.geometry.direct;
+        return rightBox.width * rightBox.height / canvasArea - leftBox.width * leftBox.height / canvasArea;
+      })[0] ?? null;
+      return {
+        sourceSlideIndex: slide.index,
+        archetype: archetypeFor(slide),
+        supportedContentModes: ['text'],
+        titleElementId: title?.id ?? null,
+        bodyElementIds: body ? [body.id] : [],
+        visualElementIds: [],
+        confidence: confidenceFor(slide),
+        reasonCodes: ['synthetic-test-evidence'],
+      };
+    }),
+  };
 }
 
 async function corpusTemplates(root, contentRoot) {
@@ -645,6 +674,147 @@ test('content intent prefers safe content donors over a text-fitting hero and ti
   assert.equal(classifyExemplarArchetype(splitSlide, template.templateIR, splitTitle.id, splitBody.id).archetype, 'content-split');
 });
 
+test('validated semantic archetypes change donor ranking and structural conflicts remain visible', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-semantic-ranking-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await familyExemplarFixture(root, 'semantic-ranking-template.pptx');
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[2]).slides[1];
+  assert.ok(compiled);
+  const structural = assessExemplarSelection(compiled, template.templateIR);
+  const semanticProfile = semanticProfileFor(template.templateIR,
+    (slide) => slide.index <= 4 ? 'content' : slide.index <= 8 ? 'content-dense' : 'table-data',
+    (slide) => slide.index <= 4 ? 0.72 : slide.index <= 8 ? 0.9 : 0.99);
+  const semantic = assessExemplarSelection(compiled, template.templateIR, semanticProfile);
+  assert.ok(structural.selection);
+  assert.ok(semantic.selection);
+  assert.equal(structural.selection.semanticArchetype, 'content');
+  assert.equal(semantic.selection.semanticArchetype, 'content-dense');
+  assert.ok(semantic.selection.sourceSlideIndex >= 5 && semantic.selection.sourceSlideIndex <= 8,
+    'the profile ranking selects its higher-confidence variant-preferred family');
+  assert.notEqual(semantic.selection.projectedCompositionSignature, structural.selection.projectedCompositionSignature,
+    'semantic archetypes change which safe projected composition is selected');
+  assert.ok(semantic.candidateDiagnostics.some((candidate) => candidate.structuralArchetype !== candidate.semanticArchetype
+    && candidate.evidence.some((item) => item.includes('semantic/structural conflict'))),
+  'conflicting semantic and structural classifications are retained as diagnostic evidence');
+});
+
+test('semantic role hints cannot bypass source-specific projection safety', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-semantic-safety-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'unsafe-semantic-template.pptx', { addLargeFooter: true, includePicture: false });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[1];
+  assert.ok(compiled);
+  const semanticProfile = semanticProfileFor(template.templateIR);
+  for (const profileSlide of semanticProfile.slides) {
+    const donor = template.templateIR.slides.find((slide) => slide.index === profileSlide.sourceSlideIndex);
+    const sourceHeading = donor.elements.find((element) => element.text?.startsWith('Large secondary heading'));
+    assert.ok(sourceHeading);
+    profileSlide.bodyElementIds.push(sourceHeading.id);
+  }
+  const assessment = assessExemplarSelection(compiled, template.templateIR, semanticProfile);
+  assert.equal(assessment.selection, null, 'narrative selection does not accept donors whose mapped projection would clear a major source region');
+  assert.ok(assessment.candidateDiagnostics.some((candidate) => candidate.projectionSafe === false && candidate.roleCompatible === false
+    && candidate.evidence.some((item) => item.includes('mapped but not projected'))),
+  'a semantic body hint cannot mark a large, unused source text region safe to erase');
+});
+
+test('cross-layout semantic donors preserve recurring chrome from the donor layout', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-cross-layout-chrome-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'cross-layout-footer-template.pptx', { create: createCrossLayoutFooterTemplate });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[1];
+  assert.ok(compiled);
+  const semanticProfile = semanticProfileFor(template.templateIR, () => 'content', (slide) => slide.layoutId === compiled.layoutId ? 0.7 : 0.99);
+  const assessment = assessExemplarSelection(compiled, template.templateIR, semanticProfile);
+  assert.ok(assessment.selection);
+  assert.notEqual(assessment.selection.layoutId, compiled.layoutId, 'high-confidence semantic evidence permits a safe donor from another native layout');
+  const donor = template.templateIR.slides.find((slide) => slide.index === assessment.selection.sourceSlideIndex);
+  const footer = donor.elements.find((element) => element.text === 'REPEATED LAYOUT BRAND');
+  assert.ok(footer?.nativeId);
+  assert.ok(assessment.selection.preserveChromeNativeIds.includes(footer.nativeId), 'recurring footer ids are classified in the donor layout scope');
+  assert.ok(!assessment.selection.clearElementNativeIds.includes(footer.nativeId), 'donor chrome is not cleared as source-specific text');
+});
+
+test('Office Kit preserves recurring chrome when projecting a cross-layout semantic donor', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-cross-layout-render-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'cross-layout-render-template.pptx', { create: createCrossLayoutFooterTemplate });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const slide = compiled.slides[1];
+  assert.ok(slide);
+  const semanticProfile = semanticProfileFor(template.templateIR, () => 'content',
+    (source) => source.layoutId === slide.layoutId ? 0.7 : 0.99);
+  const selection = selectExemplarSlide(slide, template.templateIR, semanticProfile);
+  assert.ok(selection);
+  assert.notEqual(selection.layoutId, slide.layoutId);
+  const sourceHash = createHash('sha256').update(await readFile(template.templatePath)).digest('hex');
+  const outputPath = path.join(root, 'rendered', 'cross-layout.pptx');
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const result = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: { ...compiled, id: `${compiled.id}_cross_layout`, slides: [slide] },
+    contentIR, templateIR: template.templateIR, semanticProfile,
+    templatePath: template.templatePath, outputPath,
+  });
+  assert.equal(result.validationStatus, 'passed');
+  assert.equal(result.reopenStatus, 'passed');
+  assert.equal(result.projectedCompositions[0].sourceSlideIndex, selection.sourceSlideIndex);
+  const reopened = await inspectPptx(outputPath);
+  assert.ok(reopened.inspection.slides[0].elements.some((element) => element.text.trim() === 'REPEATED LAYOUT BRAND'),
+    'the donor layout footer remains visible/editable after duplicate-slide projection');
+  assert.equal(createHash('sha256').update(await readFile(template.templatePath)).digest('hex'), sourceHash);
+});
+
+test('active visual requests retain per-source visual safety diagnostics while projection remains fail-closed', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-visual-diagnostics-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'visual-diagnostics-template.pptx');
+  const { contentIR, deckPlan } = await scenario(root, 1, ['none', 'none', 'none', 'none', 'image']);
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides.at(-1);
+  assert.ok(compiled);
+  const assessment = assessExemplarSelection(compiled, template.templateIR, semanticProfileFor(template.templateIR));
+  assert.equal(assessment.selection, null);
+  assert.equal(assessment.candidateDiagnostics.length, template.templateIR.slides.length);
+  assert.ok(assessment.candidateDiagnostics.every((candidate) => candidate.gate === 'compiled-visual-projection'));
+  assert.ok(assessment.candidateDiagnostics.some((candidate) => candidate.visualClassification.some((item) => item.endsWith(':source-specific-unsafe-visual'))));
+});
+
+test('recurring small template pictures are preservable while large source pictures stay unsafe', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-small-visual-safety-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'repeated-small-picture-template.pptx');
+  const commonPicturePart = 'ppt/media/repeated-template-mark.png';
+  for (const slide of template.templateIR.slides) for (const element of slide.elements.filter((candidate) => ['picture', 'image'].includes(candidate.kind.toLowerCase()))) {
+    const geometry = element.geometry.resolved ?? element.geometry.direct;
+    assert.ok(geometry);
+    element.geometry.direct = { ...geometry, x: 100_000, y: 100_000, width: 100_000, height: 100_000 };
+    element.geometry.resolved = { ...geometry, x: 100_000, y: 100_000, width: 100_000, height: 100_000 };
+    for (const relationship of slide.relationships.filter((candidate) => element.relationshipIds.includes(candidate.id))) {
+      relationship.target = '../media/repeated-template-mark.png';
+      relationship.targetPart = commonPicturePart;
+      for (const asset of template.templateIR.assets.filter((candidate) => candidate.relationshipIds.includes(relationship.id))) asset.part = commonPicturePart;
+    }
+  }
+  template.templateIR.hash = sha256Json(templateIRHashPayload(template.templateIR));
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[1];
+  assert.ok(compiled);
+  const assessment = assessExemplarSelection(compiled, template.templateIR);
+  assert.ok(assessment.selection, 'repeated, small decorative pictures do not automatically disqualify a text donor');
+  assert.ok(assessment.candidateDiagnostics.some((candidate) => candidate.visualClassification.some((item) => item.endsWith(':preservable-template-visual'))),
+    JSON.stringify(assessment.candidateDiagnostics.map(({ sourceSlideIndex, gate, rejectReason, visualClassification }) => ({ sourceSlideIndex, gate, rejectReason, visualClassification }))));
+
+  const largeTemplate = await exemplarFixture(root, 'large-source-picture-template.pptx');
+  const largeCompiled = compilePresentation(deckPlan, contentIR, largeTemplate.templateIR, VARIANT_POLICIES[0]).slides[1];
+  assert.ok(largeCompiled);
+  const largeAssessment = assessExemplarSelection(largeCompiled, largeTemplate.templateIR);
+  assert.equal(largeAssessment.selection, null, 'large source-specific photos remain fail-closed');
+  assert.ok(largeAssessment.candidateDiagnostics.some((candidate) => candidate.gate === 'visual-safety'));
+});
+
 test('Office Kit reports when replacing a mixed-run exemplar donor may collapse secondary run styling', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-mixed-style-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -672,7 +842,7 @@ test('Office Kit fallback fills native title and body placeholders without dupli
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-native-placeholder-fallback-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const template = await nativePlaceholderFixture(root);
-  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const { brief, contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
   const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
   const slide = compiled.slides[0];
   assert.ok(slide);
@@ -691,6 +861,21 @@ test('Office Kit fallback fills native title and body placeholders without dupli
   assert.equal(textShapes.length, 2, 'filling the native slots must not overlay them with generic boxes');
   assert.ok(textShapes.some((shape) => isShapePlaceholder(shape) && getShapePlaceholderType(shape) === 'title' && getShapeText(shape) === slide.title));
   assert.ok(textShapes.some((shape) => isShapePlaceholder(shape) && getShapePlaceholderType(shape) === 'body' && getShapeText(shape) === slide.body.join('\n')));
+
+  const single = singleSlidePlan(deckPlan, contentIR, brief);
+  const matrix = await runOfflinePresentationMatrix({
+    deckPlan: single.deckPlan,
+    contentIR,
+    templates: [{ ...template, pptxPath: template.templatePath }],
+    outputRoot: path.join(root, 'matrix'),
+    backend: 'office-kit',
+    continueOnBlocked: true,
+  });
+  const qualification = matrix.templateQualifications[0];
+  assert.equal(qualification?.status, 'blocked', 'one native layout must not qualify A/B/C merely because generated placeholder geometry differs');
+  assert.equal(new Set(qualification?.slides[0]?.signatures ?? []).size, 1, 'the fallback signature represents native layout structure');
+  assert.ok(qualification?.slides[0]?.variants.every((variant) => variant.compositionKind === 'layout-placeholder-backed'));
+  assert.equal(matrix.outputCount, 0);
 });
 
 test('hyperlinked exemplar slides fail closed and generated fallback drops source hyperlinks', async (t) => {
@@ -810,6 +995,33 @@ test('deterministic audit finds bad geometry, unsupported numbers, and broken pr
   assert.ok(report.findings.some((finding) => finding.ruleId === 'fidelity.unsupported-number' && finding.evidence.numericToken === 'currency-symbol:$999'));
   assert.ok(report.findings.some((finding) => finding.ruleId === 'integrity.broken-provenance'));
   assert.equal(report.checks.find((item) => item.ruleId === 'fidelity.semantic').status, 'unknown');
+});
+
+test('reserved visual geometry may bleed when unused, while generated visual placements remain strictly in bounds', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-audit-reserved-visual-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const unused = await scenario(root, 1, Array(5).fill('none'));
+  const unusedTemplate = unused.templates[0].templateIR;
+  const unusedCompiled = compilePresentation(unused.deckPlan, unused.contentIR, unusedTemplate, VARIANT_POLICIES[0]);
+  const withUnusedBleed = structuredClone(unusedCompiled.slides[0]);
+  withUnusedBleed.placements.visual = { x: -7800, y: 0, width: 1000, height: 1000, unit: 'EMU' };
+  const unusedAudit = auditCompiledPresentation({ ...unusedCompiled, slides: [withUnusedBleed] }, unused.contentIR, unusedTemplate);
+  assert.ok(!unusedAudit.findings.some((finding) => finding.ruleId === 'geometry.out-of-bounds'),
+    'an unused reserved image placeholder does not count as generated content');
+
+  const activeSlide = structuredClone(unusedCompiled.slides[0]);
+  const activeUnitId = unused.contentIR.units.find((unit) => unit.text)?.id;
+  assert.ok(activeUnitId);
+  activeSlide.visualization.type = 'process';
+  activeSlide.visualization.status = 'referenced';
+  activeSlide.visualization.processSteps = [
+    { text: 'Parse source', sourceRef: activeUnitId },
+    { text: 'Validate output', sourceRef: activeUnitId },
+  ];
+  activeSlide.placements.visual = { x: -1, y: 0, width: 1000, height: 1000, unit: 'EMU' };
+  const activeAudit = auditCompiledPresentation({ ...unusedCompiled, slides: [activeSlide] }, unused.contentIR, unusedTemplate);
+  assert.ok(activeAudit.findings.some((finding) => finding.ruleId === 'geometry.out-of-bounds' && finding.message.includes('visual')),
+    'a requested/generated visual remains subject to strict canvas bounds');
 });
 
 test('deterministic audit keeps currencies, percentages, and dates attached to their values', async (t) => {
@@ -1049,6 +1261,8 @@ test('offline matrix emits three validated distinct Office Kit tracks and previe
   assert.equal(result.outputCount, 3);
   assert.ok(result.timingsMs.preview > 0, 'preview duration is measured separately');
   const signatures = [];
+  const qualification = result.templateQualifications[0];
+  assert.ok(qualification);
   for (const output of result.outputs) {
     await stat(output.pptxPath);
     assert.equal(output.renderStatus, 'passed');
@@ -1062,7 +1276,11 @@ test('offline matrix emits three validated distinct Office Kit tracks and previe
     assert.equal(report.compiledPresentationId, output.compiledPresentationId);
     assert.equal(report.render.backend, 'office-kit');
     assert.equal(report.render.reopenStatus, 'passed');
-    signatures.push(report.render.projectedCompositions[0].projectedCompositionSignature);
+    const projected = report.render.projectedCompositions[0];
+    const qualifiedVariant = qualification.slides[0].variants.find((variant) => variant.variantId === output.variantId);
+    assert.equal(projected.projectedCompositionSignature, qualifiedVariant?.projectedCompositionSignature,
+      'the render must use the exact composition signature that passed qualification');
+    signatures.push(projected.projectedCompositionSignature);
     assert.equal(output.findingCount, report.render.auditFindingCount);
     assert.ok(Object.hasOwn(report, 'preview'));
   }
@@ -1086,6 +1304,73 @@ test('offline matrix withholds every output when fewer than three safe compositi
   }), /availableDistinctFamilies=1/);
   await assert.rejects(stat(path.join(outputRoot, 'template-1')), { code: 'ENOENT' },
     'the runner checks distinctness before it writes any A/B/C PPTX output');
+});
+
+test('local qualification continues across blocked templates and records selector candidate evidence without rendering them', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-matrix-diagnostics-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { brief, contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const single = singleSlidePlan(deckPlan, contentIR, brief);
+  const exemplar = await exemplarFixture(root, 'duplicate-projection-diagnostics-template.pptx', { create: createDuplicateProjectionExemplarTemplate });
+  const outputRoot = path.join(root, 'matrix');
+  let profileAttempts = 0;
+  const result = await runOfflinePresentationMatrix({
+    deckPlan: single.deckPlan,
+    contentIR,
+    templates: [
+      { ...exemplar, pptxPath: exemplar.templatePath },
+      { ...exemplar, pptxPath: exemplar.templatePath },
+    ],
+    outputRoot,
+    backend: 'office-kit',
+    continueOnBlocked: true,
+    profileTemplate: async () => {
+      profileAttempts += 1;
+      throw new Error('synthetic invalid profile');
+    },
+  });
+  assert.equal(profileAttempts, 2, 'one profile attempt is made per template hash when the profile is invalid');
+  assert.equal(result.templateQualifications.length, 2);
+  assert.ok(result.templateQualifications.every((item) => item.status === 'blocked'));
+  assert.ok(result.templateQualifications.every((item) => item.semanticProfileStatus === 'failed'));
+  assert.ok(result.templateQualifications.every((item) => item.profileFailure === 'synthetic invalid profile'));
+  assert.ok(result.templateQualifications.every((item) => item.slides[0].variants.every((variant) => Array.isArray(variant.candidateDiagnostics))));
+  assert.equal(result.outputCount, 0, 'blocked templates do not produce partial A/B/C artifacts');
+  await assert.rejects(stat(path.join(outputRoot, 'template-1')), { code: 'ENOENT' });
+  await assert.rejects(stat(path.join(outputRoot, 'template-2')), { code: 'ENOENT' });
+  assert.equal(JSON.parse(await readFile(path.join(outputRoot, 'matrix.json'), 'utf8')).templateQualifications.length, 2);
+});
+
+test('matrix keeps preview-failed artifacts diagnostic-only and reports the blocking preview stage', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-matrix-preview-blocked-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { brief, contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const single = singleSlidePlan(deckPlan, contentIR, brief);
+  const exemplar = await familyExemplarFixture(root, 'preview-blocked-template.pptx');
+  const outputRoot = path.join(root, 'matrix');
+  const result = await runOfflinePresentationMatrix({
+    deckPlan: single.deckPlan,
+    contentIR,
+    templates: [{ ...exemplar, pptxPath: exemplar.templatePath }],
+    outputRoot,
+    backend: 'office-kit',
+    continueOnBlocked: true,
+    previewAdapter: {
+      async preview() {
+        return { slideCount: 1, svg: '<svg/>', png: new Uint8Array([1]), textLayoutIssues: [{ code: 'synthetic-overflow' }], status: 'failed', limitations: [] };
+      },
+    },
+  });
+  const qualification = result.templateQualifications[0];
+  assert.equal(qualification.status, 'blocked');
+  assert.equal(qualification.renderStatus, 'passed');
+  assert.equal(qualification.previewStatus, 'failed');
+  assert.ok(qualification.previewIssueCounts.every((item) => item.issueCount === 1));
+  assert.deepEqual(qualification.previewIssueCounts[0]?.issues, [{ code: 'synthetic-overflow' }]);
+  assert.ok(qualification.diagnosticArtifactPath);
+  assert.equal(result.outputCount, 0, 'preview-failed A/B/C files are not listed as qualified outputs');
+  await stat(qualification.diagnosticArtifactPath);
+  await assert.rejects(stat(path.join(outputRoot, 'template-1')), { code: 'ENOENT' });
 });
 
 test('compatibility harness preserves source bytes, compares package parts, reopens mutation and writes previews', async (t) => {

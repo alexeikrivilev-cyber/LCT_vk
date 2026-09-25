@@ -59,18 +59,77 @@ function deterministicPlanningResponse(request) {
     return completion(request.model, { checkpointVersion: evidence.checkpointVersion, outcome: 'pass', findings: [], operations: [] });
   }
   if (schemaName === 'template_semantic_profile_v1') {
-    const slides = evidence.slides.map((slide, index) => {
+    const repeatedTextCounts = new Map();
+    for (const sourceSlide of evidence.slides) for (const element of sourceSlide.elements) {
+      if (typeof element.text !== 'string' || !element.text.trim()) continue;
+      const key = element.text.trim().replace(/\s+/gu, ' ').toLowerCase();
+      repeatedTextCounts.set(key, (repeatedTextCounts.get(key) ?? 0) + 1);
+    }
+    const slides = evidence.slides.map((slide) => {
       const textElements = slide.elements.filter((element) => typeof element.text === 'string' && element.text.trim());
-      const visualElements = slide.elements.filter((element) => !textElements.includes(element) && element.kind !== 'shape');
+      const numericFont = (element) => Math.max(0, ...(element.styles?.fontSizesPt ?? []));
+      const canvas = evidence.canvas ?? { width: 1, height: 1 };
+      const box = (element) => element.geometry ?? { x: 0, y: 0, width: 0, height: 0 };
+      const title = [...textElements].sort((left, right) => {
+        const role = (element) => /title|subtitle|ctrtitle/i.test(`${element.placeholderRole ?? ''}`) ? 100 : 0;
+        const leftBox = box(left);
+        const rightBox = box(right);
+        const leftScore = role(left) + numericFont(left) * 2 + Math.max(0, 1 - leftBox.y / Math.max(1, canvas.height)) * 8 + leftBox.width / Math.max(1, canvas.width);
+        const rightScore = role(right) + numericFont(right) * 2 + Math.max(0, 1 - rightBox.y / Math.max(1, canvas.height)) * 8 + rightBox.width / Math.max(1, canvas.width);
+        return rightScore - leftScore || (left.order ?? 0) - (right.order ?? 0);
+      })[0] ?? null;
+      const bodyCandidates = textElements.filter((element) => {
+        if (element === title || !element.geometry || element.kind !== 'shape') return false;
+        const geometry = box(element);
+        const edgeFurniture = geometry.y <= canvas.height * 0.12 || geometry.y + geometry.height >= canvas.height * 0.92;
+        const recurring = (repeatedTextCounts.get(element.text.trim().replace(/\s+/gu, ' ').toLowerCase()) ?? 0)
+          >= Math.max(2, Math.ceil(evidence.slides.length * 0.6));
+        const areaShare = geometry.width * geometry.height / Math.max(1, canvas.width * canvas.height);
+        return !(recurring && edgeFurniture && numericFont(element) <= 12 && geometry.height <= canvas.height * 0.06)
+          && (areaShare >= 0.015 || (numericFont(element) >= 16 && areaShare >= 0.006));
+      }).sort((left, right) => box(right).width * box(right).height - box(left).width * box(left).height
+        || (left.order ?? 0) - (right.order ?? 0));
+      const bodyElements = [];
+      for (const candidate of bodyCandidates) {
+        const candidateBox = box(candidate);
+        const overlapsSelected = bodyElements.some((selected) => {
+          const selectedBox = box(selected);
+          return candidateBox.x < selectedBox.x + selectedBox.width && candidateBox.x + candidateBox.width > selectedBox.x
+            && candidateBox.y < selectedBox.y + selectedBox.height && candidateBox.y + candidateBox.height > selectedBox.y;
+        });
+        if (overlapsSelected) continue;
+        bodyElements.push(candidate);
+        if (bodyElements.length >= 3) break;
+      }
+      const visualElements = slide.elements.filter((element) => !textElements.includes(element)
+        && /picture|image|table|chart|graphicframe|group|connector|shape/i.test(element.kind));
+      const titleBox = title ? box(title) : null;
+      const bodyBoxes = bodyElements.map(box);
+      const bodyCenters = bodyBoxes.map((geometry) => (geometry.x + geometry.width / 2) / Math.max(1, canvas.width));
+      const hasDataVisual = slide.elements.some((element) => /table|chart|graphicframe/i.test(element.kind));
+      const visualShare = visualElements.reduce((total, element) => {
+        const geometry = box(element);
+        return total + geometry.width * geometry.height / Math.max(1, canvas.width * canvas.height);
+      }, 0);
+      const separatedBodyColumns = bodyCenters.length > 1 && Math.max(...bodyCenters) - Math.min(...bodyCenters) > 0.28;
+      const titleFont = title ? numericFont(title) : 0;
+      const bodyFont = bodyElements.length ? Math.max(8, ...bodyElements.map(numericFont)) : 8;
+      const titleBodyRatio = titleFont / bodyFont;
+      let archetype = 'content';
+      if (hasDataVisual) archetype = 'table-data';
+      else if (visualShare >= 0.34) archetype = 'visual-led';
+      else if (separatedBodyColumns) archetype = 'content-split';
+      else if (bodyElements.length >= 5) archetype = 'content-dense';
+      else if (title && bodyElements.length <= 1 && titleBodyRatio >= 3) archetype = 'cover';
       return {
         sourceSlideIndex: slide.sourceSlideIndex,
-        archetype: index === 0 ? 'cover' : index === evidence.slides.length - 1 ? 'closing' : 'content',
-        supportedContentModes: ['text'],
-        titleElementId: textElements[0]?.id ?? null,
-        bodyElementIds: textElements.slice(1, 4).map((element) => element.id),
+        archetype,
+        supportedContentModes: [...new Set(['text', ...(hasDataVisual ? ['table', 'chart'] : []), ...(visualElements.length ? ['image', 'diagram', 'mixed'] : [])])],
+        titleElementId: title?.id ?? null,
+        bodyElementIds: bodyElements.slice(0, 32).map((element) => element.id),
         visualElementIds: visualElements.slice(0, 8).map((element) => element.id),
-        confidence: 0.25,
-        reasonCodes: ['offline_fake'],
+        confidence: title && bodyElements.length ? 0.82 : 0.32,
+        reasonCodes: ['offline_fake', title && bodyElements.length ? 'geometry_text_roles' : 'incomplete_role_evidence'],
       };
     });
     return completion(request.model, { templateIRHash: evidence.templateIRHash, slides });

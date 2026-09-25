@@ -44,3 +44,29 @@ test('local fake plans a contentful three-slide deck from source sections and pa
   const review = JSON.parse(supervisor.choices[0].message.content);
   assert.deepEqual(review, { checkpointVersion: 7, outcome: 'pass', findings: [], operations: [] });
 });
+
+test('local fake returns generic strict-schema template role mappings from supplied evidence', () => {
+  const hash = 'a'.repeat(64);
+  const evidence = {
+    templateIRHash: hash,
+    canvas: { width: 1000, height: 560 },
+    slides: [{
+      sourceSlideIndex: 17,
+      elements: [
+        { id: 'shape-title', kind: 'shape', text: 'Headline', order: 0, placeholderRole: null, geometry: { x: 40, y: 20, width: 900, height: 90 }, styles: { fontSizesPt: [32] } },
+        { id: 'shape-left', kind: 'shape', text: 'Evidence A', order: 1, placeholderRole: null, geometry: { x: 40, y: 150, width: 420, height: 280 }, styles: { fontSizesPt: [18] } },
+        { id: 'shape-right', kind: 'shape', text: 'Evidence B', order: 2, placeholderRole: null, geometry: { x: 520, y: 150, width: 420, height: 280 }, styles: { fontSizesPt: [18] } },
+        { id: 'visual-icon', kind: 'picture', text: null, order: 3, placeholderRole: null, geometry: { x: 5, y: 5, width: 20, height: 20 }, styles: { fontSizesPt: [] } },
+      ],
+    }],
+  };
+  const result = deterministicPlanningResponse(request('template_semantic_profile_v1', evidence));
+  const profile = JSON.parse(result.choices[0].message.content);
+  assert.equal(profile.templateIRHash, hash);
+  assert.equal(profile.slides[0].sourceSlideIndex, 17);
+  assert.equal(profile.slides[0].titleElementId, 'shape-title');
+  assert.deepEqual(profile.slides[0].bodyElementIds, ['shape-left', 'shape-right']);
+  assert.deepEqual(profile.slides[0].visualElementIds, ['visual-icon']);
+  assert.equal(profile.slides[0].archetype, 'content-split');
+  assert.ok(profile.slides[0].confidence >= 0.6);
+});

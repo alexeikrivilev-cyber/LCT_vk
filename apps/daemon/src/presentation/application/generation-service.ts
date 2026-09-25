@@ -24,6 +24,7 @@ import type { PptxPreviewPort } from './pptx-preview-port.js';
 import type { ContentIR } from '../domain/content-ir.js';
 import type { DeckPlan } from '../domain/deck-plan.js';
 import type { TemplateIR } from '../domain/template-ir.js';
+import type { TemplateSemanticProfile } from './template-semantic-profiler.js';
 
 export type GenerationStatus = 'preparing' | 'generating' | 'completed' | 'failed' | 'cancelled' | 'stale';
 export type SlideGenerationStatus = 'pending' | 'rendering' | 'ready' | 'failed';
@@ -111,6 +112,7 @@ export interface GenerationContext {
   contentIR: ContentIR;
   template: TemplateCompilationResponse;
   templateIR: TemplateIR;
+  semanticProfile?: TemplateSemanticProfile;
   templatePath: string;
   fingerprint: string;
 }
@@ -124,6 +126,7 @@ export interface PresentationGenerationServiceOptions {
   preview?: PptxPreviewPort;
   /** Replaceable dependency seams for offline API tests. */
   inspectPackage?: typeof inspectOfficeKitPackage;
+  profileTemplate?: (projectId: string, template: TemplateCompilationResponse) => Promise<TemplateSemanticProfile>;
   now?: () => Date;
 }
 
@@ -348,12 +351,16 @@ export class PresentationGenerationService {
       contentIRHash: planning.contentIR.hash,
       templateIRHash: template.templateIR.hash,
     });
+    const semanticProfile = this.options.profileTemplate
+      ? await this.options.profileTemplate(projectId, template)
+      : undefined;
     return {
       planning,
       deckPlan: planning.deckPlan,
       contentIR: planning.contentIR,
       template,
       templateIR: template.templateIR,
+      ...(semanticProfile ? { semanticProfile } : {}),
       templatePath,
       fingerprint,
     };
@@ -687,6 +694,7 @@ export class PresentationGenerationService {
         compiledPresentation: selectedPresentation,
         contentIR: context.contentIR,
         templateIR: context.templateIR,
+        ...(context.semanticProfile ? { semanticProfile: context.semanticProfile } : {}),
         templatePath: context.templatePath,
         outputPath: output.absolute,
         contentRoot: path.join(this.options.projectsRoot, projectId),
@@ -803,7 +811,7 @@ export class PresentationGenerationService {
           if (!slide) throw new PresentationGenerationError('PLAN_CHANGED', 'A planned slide is missing from the compiled output.', 409);
           return slide;
         });
-        const compositionDistinctness = assessVariantCompositionDistinctness(variantSlides, context.templateIR, this.options.backend);
+        const compositionDistinctness = assessVariantCompositionDistinctness(variantSlides, context.templateIR, this.options.backend, context.semanticProfile);
         if (!compositionDistinctness.distinct) {
           throw new PresentationGenerationError(
             'VARIANTS_NOT_DISTINCT',
@@ -911,6 +919,7 @@ export class PresentationGenerationService {
         compiledPresentation: oneSlide,
         contentIR: context.contentIR,
         templateIR: context.templateIR,
+        ...(context.semanticProfile ? { semanticProfile: context.semanticProfile } : {}),
         templatePath: context.templatePath,
         outputPath: temp.absolute,
         contentRoot: path.join(this.options.projectsRoot, projectId),

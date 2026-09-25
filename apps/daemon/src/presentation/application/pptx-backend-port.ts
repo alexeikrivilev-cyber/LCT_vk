@@ -1,5 +1,6 @@
 import type { ContentIR } from '../domain/content-ir.js';
 import type { TemplateIR } from '../domain/template-ir.js';
+import type { TemplateSemanticProfile } from './template-semantic-profiler.js';
 import type { CompiledPresentation } from './slide-compilation.js';
 
 /** Internal replaceable renderer boundary; not an external application API. */
@@ -9,6 +10,7 @@ export interface PptxRenderInput {
   compiledPresentation: CompiledPresentation;
   contentIR: ContentIR;
   templateIR: TemplateIR;
+  semanticProfile?: TemplateSemanticProfile;
   templatePath: string;
   outputPath: string;
   /** Absolute project content directory used only to resolve ContentIR media source paths. */
