@@ -228,6 +228,8 @@ It does not create a competing deck, bypass locks, write OOXML, invent unrestric
 
 For each planned slide, retrieve compatible layouts, reject invalid candidates deterministically, rank valid structures, and build A/B/C `SlideSpec` variants that preserve meaning while differing in controlled composition/density/grouping/visual treatment.
 
+The replaceable compiler profile uses explicit measured layout slots first. If those are absent, it may derive title/body/visual slots from repeated slide-level geometry and typography observed in `TemplateIR`, retaining confidence and source evidence without mutating `TemplateIR` or `PresentationDesignSystem`. Insufficient or ambiguous evidence makes the layout incompatible; there is no generic coordinate fallback.
+
 ### Visual engine
 
 Fix semantic visual type first, then produce/select up to three candidates inside that type. Image/photo slots may call the image model. Charts, tables, diagrams, icons, and SmartArt-like structures should remain native/deterministic where practical.

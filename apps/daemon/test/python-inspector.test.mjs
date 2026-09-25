@@ -257,3 +257,25 @@ test('private process boundary reports malformed JSON, invalid envelopes, nonzer
     errorCode('TIMEOUT'),
   );
 });
+
+test('Windows Python child transports Cyrillic and punctuation through UTF-8 without PYTHONUTF8', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'LCT utf8 child transport-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const filePath = path.join(temp, 'unicode evidence.pptx');
+  await writeFile(filePath, await makeSyntheticPptx({ unicodeText: true }));
+  const prior = process.env.PYTHONUTF8;
+  delete process.env.PYTHONUTF8;
+  try {
+    const inspection = await inspectPptx(filePath);
+    assert.equal(inspection.inspection.slides[0].elements[0].text, 'Сводка — этап → готов');
+  } catch (error) {
+    if (error instanceof InspectionAdapterError && error.code === 'PYTHON_NOT_AVAILABLE') {
+      t.skip('Python 3.12 unavailable: Unicode child-process integration is BLOCKED, not passed');
+      return;
+    }
+    throw error;
+  } finally {
+    if (prior === undefined) delete process.env.PYTHONUTF8;
+    else process.env.PYTHONUTF8 = prior;
+  }
+});

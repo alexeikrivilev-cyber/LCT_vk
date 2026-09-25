@@ -70,11 +70,12 @@ function picture({ id, name, relationship, link = false }) {
   return `<p:pic><p:nvPicPr><p:cNvPr id="${id}" name="${name}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:${reference}="${relationship}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr></p:pic>`;
 }
 
-function slideXml(index, p, a, r, includeWarning, groupTransform = null, slideBackground = false) {
+function slideXml(index, p, a, r, includeWarning, groupTransform = null, slideBackground = false, unicodeText = false) {
   const warning = includeWarning ? '<p:contentPart/>' : '';
   const background = slideBackground ? '<p:bg><p:bgPr><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></p:bgPr></p:bg>' : '';
   const grouped = groupTransform ? `<p:grpSp><p:nvGrpSpPr><p:cNvPr id="90" name="Transformed group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm${groupTransform.rotation ? ` rot="${groupTransform.rotation}"` : ''}${groupTransform.flipH ? ' flipH="1"' : ''}${groupTransform.flipV ? ' flipV="1"' : ''}><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/><a:chOff x="0" y="0"/><a:chExt cx="914400" cy="914400"/></a:xfrm></p:grpSpPr>${shape({ id: 91, name: 'Grouped child', text: 'Grouped geometry', x: 100, y: 200, width: 300, height: 400, idx: null })}</p:grpSp>` : '';
-  return `<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="${p}" xmlns:a="${a}" xmlns:r="${r}"><p:cSld>${background}<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${shape({ id: index + 1, name: `Takeaway ${index}`, text: `Synthetic takeaway ${index}`, x: 914400, y: index * 914400, width: 5486400, height: 914400 })}${picture({ id: index + 20, name: 'Embedded media', relationship: 'rIdImage' })}${picture({ id: index + 30, name: 'External media', relationship: 'rIdExternal', link: true })}${grouped}${warning}</p:spTree></p:cSld></p:sld>`;
+  const takeaway = unicodeText ? 'Сводка — этап → готов' : `Synthetic takeaway ${index}`;
+  return `<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="${p}" xmlns:a="${a}" xmlns:r="${r}"><p:cSld>${background}<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${shape({ id: index + 1, name: `Takeaway ${index}`, text: takeaway, x: 914400, y: index * 914400, width: 5486400, height: 914400 })}${picture({ id: index + 20, name: 'Embedded media', relationship: 'rIdImage' })}${picture({ id: index + 30, name: 'External media', relationship: 'rIdExternal', link: true })}${grouped}${warning}</p:spTree></p:cSld></p:sld>`;
 }
 
 function layoutXml(p, a, layoutIndex, profile = {}) {
@@ -89,7 +90,7 @@ function masterXml(p, a) {
   return `<?xml version="1.0" encoding="UTF-8"?><p:sldMaster xmlns:p="${p}" xmlns:a="${a}"><p:cSld name="Synthetic master"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${shape({ id: 4, name: 'Master mark', text: '', x: 1000, y: 2000, width: 3000, height: 4000, idx: null, colorKind: 'system', color: 'windowText', lastColor: '000000' })}</p:spTree></p:cSld></p:sldMaster>`;
 }
 
-export async function makeSyntheticPptx({ strict = false, slideCount = 1, layoutCount = 2, layoutProfiles = [], brokenLayout = false, unsafeRelationship = false, unsupported = false, parserWarning = false, themeLink = 'presentation', groupTransform = null, nestedTemplateGroups = false, slideBackground = false, unsupportedCompressionMethod, forgedDeflateExpansionBytes = 0 } = {}) {
+export async function makeSyntheticPptx({ strict = false, slideCount = 1, layoutCount = 2, layoutProfiles = [], brokenLayout = false, unsafeRelationship = false, unsupported = false, parserWarning = false, themeLink = 'presentation', groupTransform = null, nestedTemplateGroups = false, slideBackground = false, unicodeText = false, unsupportedCompressionMethod, forgedDeflateExpansionBytes = 0 } = {}) {
   const zip = new JSZip();
   const p = strict ? STRICT.presentation : NS.presentation;
   const a = strict ? STRICT.drawing : NS.drawing;
@@ -131,7 +132,7 @@ export async function makeSyntheticPptx({ strict = false, slideCount = 1, layout
   }
   for (let i = 1; i <= slideCount; i += 1) {
     const target = unsafeRelationship ? '../../../outside.xml' : brokenLayout ? '../slideLayouts/missing-layout.xml' : '../slideLayouts/slideLayout1.xml';
-    const xml = slideXml(i, p, a, r, parserWarning, groupTransform, slideBackground);
+    const xml = slideXml(i, p, a, r, parserWarning, groupTransform, slideBackground, unicodeText);
     const contents = i === 1 ? `${xml}${' '.repeat(forgedDeflateExpansionBytes)}` : xml;
     zip.file(`ppt/slides/slide${i}.xml`, contents, { date: fixedDate });
     const imageTarget = unsafeRelationship ? target : '../media/image1.png';

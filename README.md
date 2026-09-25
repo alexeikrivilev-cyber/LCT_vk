@@ -131,7 +131,7 @@ To qualify an individual template offline without overwriting it:
 pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/compare-pptx-backends.mjs "./templates/template.pptx" --out ".lct/compatibility/template-run"
 ```
 
-The report includes source/package hashes, LCT and Office Kit inventories, no-op roundtrip, a controlled generated slide, reopen/validation, preview, and part-preservation results. It conservatively reports `SAFE_FOR_OFFICE_KIT_BACKEND=no` until real held-out templates and a native PowerPoint/LibreOffice open-save check are available.
+The matcher uses explicit measured placeholders first. Where those are absent, it attempts conservative title/body/visual slot inference from repeated geometry and typography on slides sharing a layout; every inferred slot carries confidence and source evidence, and weak or ambiguous evidence fails with `UNSUPPORTED_TEMPLATE_LAYOUT` rather than a generic coordinate fallback. The harness records input safety, LCT/Office Kit inventory, no-op roundtrip, part preservation, source byte identity, generation compatibility, mutation, preview, and native Office status as independent stages. It writes `backend-compatibility-report.json` whenever the separate output directory is available, including when generation is incompatible. Preview remains approximate, and it reports `SAFE_FOR_OFFICE_KIT_BACKEND=no` until a native PowerPoint/LibreOffice open-save check passes.
 
 ## Bounded live Qwen qualification
 

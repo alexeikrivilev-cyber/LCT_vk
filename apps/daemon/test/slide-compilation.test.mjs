@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, rm, writeFile, stat } from 'node:fs/promises';
+import { link, mkdtemp, mkdir, readFile, rm, writeFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -23,6 +23,7 @@ import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 import { createHardTemplateCorpus } from './hard-template-corpus.mjs';
 import { createOfflineReplayManifest, runOfflineMatrixFromState } from '../../../scripts/run-offline-presentation-matrix.mjs';
 import { runPptxCompatibilityHarness } from '../../../scripts/compare-pptx-backends.mjs';
+import { createExemplarTemplate } from './exemplar-template-fixtures.mjs';
 
 register();
 
@@ -38,7 +39,7 @@ const layoutProfiles = (prefix = 'Unknown') => [
     name: `${prefix} / visual composition 4`,
     title: { x: inch(0.5), y: inch(0.4), width: inch(11.4), height: inch(0.7) },
     body: { x: inch(0.5), y: inch(1.4), width: inch(4.5), height: inch(2.5) },
-    visual: { x: inch(5.4), y: inch(1.4), width: inch(6.6), height: inch(4.4), type: 'chart' },
+    visual: { x: inch(5.4), y: inch(1.4), width: inch(6.6), height: inch(4.4), type: 'pic' },
   },
   {
     name: `${prefix} / text composition 92`,
@@ -69,6 +70,19 @@ async function fixture(root, options = {}) {
     compilerVersion: 'lct-template-compiler/1',
   });
   return { templatePath, templateIR };
+}
+
+async function exemplarFixture(root, fileName, options = {}) {
+  const templatePath = path.join(root, fileName);
+  await createExemplarTemplate(templatePath, options);
+  const bytes = await readFile(templatePath);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const inspection = await inspectPptx(templatePath);
+  const templateIR = createTemplateIR(inspection, {
+    filePath: fileName, originalName: fileName, sha256,
+    compiledAt: '2026-09-25T00:00:00.000Z', compilerVersion: 'lct-template-compiler/1',
+  });
+  return { templatePath, templateIR, inspection };
 }
 
 async function corpusTemplates(root, contentRoot) {
@@ -197,6 +211,166 @@ test('layout matching uses geometry and placeholder roles, not declared layout n
   assert.deepEqual(firstResult.slides[0].layoutCandidates.map(({ score, reasons, sourcePart }) => ({ score, reasons, sourcePart })),
     secondResult.slides[0].layoutCandidates.map(({ score, reasons, sourcePart }) => ({ score, reasons, sourcePart })));
   assert.ok(firstResult.slides[0].layoutCandidates[0].reasons.length > 0);
+});
+
+test('repeated ordinary text and picture exemplars infer title, body, and split visual slots', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-slots-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const exemplar = await exemplarFixture(root, 'ordinary-box-layout.pptx', { masterName: 'Donor name 17' });
+  assert.equal(exemplar.templateIR.layouts.reduce((count, layout) => count + layout.elements.filter((element) => element.placeholder !== null).length, 0), 0);
+  assert.equal(exemplar.templateIR.slides.length, 4);
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, exemplar.templateIR, VARIANT_POLICIES[0]);
+  const slots = compiled.slides[0].layoutCandidates[0].slotEvidence;
+  for (const role of ['title', 'body', 'visual']) {
+    assert.ok(slots[role], `missing inferred ${role} slot: ${JSON.stringify(slots)}`);
+    assert.equal(slots[role].provenance, 'inferred_exemplar');
+    assert.ok(slots[role].confidence >= 0.72);
+    assert.ok(slots[role].sampleCount >= 3);
+    assert.ok(new Set(slots[role].sourceEvidence.map((source) => source.slideIndex)).size >= 3);
+  }
+  assert.ok(slots.body.geometry.x < slots.visual.geometry.x, 'body and actual picture evidence form separate columns');
+  assert.deepEqual(compiled.slides[0].placements.title, slots.title.geometry);
+  assert.deepEqual(compiled.slides[0].placements.body, slots.body.geometry);
+  assert.deepEqual(compiled.slides[0].placements.visual, slots.visual.geometry);
+});
+
+test('body evidence uses slide-local title bounds, excludes headings and footer furniture, and samples across slides', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-body-evidence-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const exemplar = await exemplarFixture(root, 'body-evidence.pptx', {
+    masterName: 'Body evidence source', evidenceFragments: 20, addLargeFooter: true, addSmallFooter: true,
+  });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const slots = compilePresentation(deckPlan, contentIR, exemplar.templateIR, VARIANT_POLICIES[0]).slides[0].layoutCandidates[0].slotEvidence;
+  assert.ok(slots.body);
+  assert.ok(slots.body.sourceEvidence.every((source) => Math.max(0, ...(source.fontSizesPt ?? [])) <= 24));
+  assert.ok(new Set(slots.body.sourceEvidence.map((source) => source.slideIndex)).size >= 3);
+  assert.ok(slots.body.geometry.y + slots.body.geometry.height < inch(6.85), 'large headings and thin footer text are outside the inferred body region');
+});
+
+test('requested source images require a measured visual slot with or without body text', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-missing-visual-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const exemplar = await exemplarFixture(root, 'text-only-layout.pptx', { masterName: 'Text only', includePicture: false });
+  const { contentIR, deckPlan } = await scenario(root, 1, ['none', 'none', 'none', 'none', 'image']);
+  const imageUnit = contentIR.units.find((unit) => unit.kind === 'media-reference');
+  assert.ok(imageUnit);
+  const assertNoVisualSlot = (plan) => assert.throws(() => compilePresentation(plan, contentIR, exemplar.templateIR, VARIANT_POLICIES[0]), (error) => {
+    assert.equal(error.code, 'UNSUPPORTED_TEMPLATE_LAYOUT');
+    assert.ok(error.candidates.every((candidate) => candidate.slots.visual === null));
+    return true;
+  });
+  assertNoVisualSlot(deckPlan);
+  const imageOnlyDraft = {
+    workingTitle: deckPlan.workingTitle,
+    narrativeSummary: deckPlan.narrativeSummary,
+    slides: deckPlan.slides.map(({ id, order, ...slide }, index) => index === 4 ? { ...slide, contentRefs: [] } : slide),
+  };
+  const imageOnlyPlan = canonicalizeDeckPlan(imageOnlyDraft, {
+    id: deckPlan.id, version: deckPlan.version, createdAt: deckPlan.createdAt,
+    inputFingerprint: deckPlan.inputFingerprint, briefHash: deckPlan.briefHash,
+    allowedContentIds: new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => unit.id)),
+    allowedMediaIds: new Set(contentIR.units.filter((unit) => unit.kind === 'media-reference').map((unit) => unit.id)),
+    requestedSlideCount: deckPlan.slides.length,
+  });
+  assertNoVisualSlot(imageOnlyPlan);
+});
+
+test('multiple repeated visual regions remain ambiguous instead of selecting the last image', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-visual-ambiguity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const exemplar = await exemplarFixture(root, 'two-repeated-images.pptx', {
+    masterName: 'Two visual regions', pictureCopies: 2,
+  });
+  const { contentIR, deckPlan } = await scenario(root, 1, ['none', 'none', 'none', 'none', 'image']);
+  assert.throws(() => compilePresentation(deckPlan, contentIR, exemplar.templateIR, VARIANT_POLICIES[0]), (error) => {
+    assert.equal(error.code, 'UNSUPPORTED_TEMPLATE_LAYOUT');
+    assert.ok(error.candidates.every((candidate) => candidate.slots.visual === null));
+    return true;
+  });
+});
+
+test('visual exemplar search fails closed above its bounded geometry candidate budget', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-visual-budget-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const exemplar = await exemplarFixture(root, 'many-visuals.pptx', {
+    masterName: 'Dense visual source', pictureCopies: 33,
+  });
+  const { contentIR, deckPlan } = await scenario(root, 1, ['none', 'none', 'none', 'none', 'image']);
+  assert.throws(() => compilePresentation(deckPlan, contentIR, exemplar.templateIR, VARIANT_POLICIES[0]), (error) => {
+    assert.equal(error.code, 'UNSUPPORTED_TEMPLATE_LAYOUT');
+    assert.ok(error.candidates.every((candidate) => candidate.slots.visual === null));
+    return true;
+  });
+});
+
+test('exemplar slot inference is independent of donor/template names', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-name-independence-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const first = await exemplarFixture(root, 'first.pptx', { masterName: 'ALPHA title-zone package' });
+  const second = await exemplarFixture(root, 'second.pptx', { masterName: 'OMEGA closing-slide package' });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const evidence = (templateIR) => compilePresentation(deckPlan, contentIR, templateIR, VARIANT_POLICIES[0]).slides[0].layoutCandidates[0].slotEvidence;
+  const comparable = (value) => Object.fromEntries(['title', 'body', 'visual'].map((role) => [role, {
+    geometry: value[role].geometry, provenance: value[role].provenance, confidence: value[role].confidence, sampleCount: value[role].sampleCount,
+  }]));
+  assert.deepEqual(comparable(evidence(first.templateIR)), comparable(evidence(second.templateIR)));
+});
+
+test('ambiguous exemplar geometry fails closed with typed evidence', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-ambiguous-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const exemplar = await exemplarFixture(root, 'ambiguous.pptx', { masterName: 'Unrelated donor name', ambiguous: true });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  assert.throws(() => compilePresentation(deckPlan, contentIR, exemplar.templateIR, VARIANT_POLICIES[0]), (error) => {
+    assert.equal(error.code, 'UNSUPPORTED_TEMPLATE_LAYOUT');
+    assert.ok(Array.isArray(error.candidates));
+    assert.ok(error.candidates.every((candidate) => candidate.slots.title === null || candidate.slots.body === null));
+    return true;
+  });
+});
+
+test('compatibility harness writes partial staged evidence when exemplar generation fails', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-harness-partial-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = path.join(root, 'source');
+  const output = path.join(root, 'output');
+  await mkdir(source, { recursive: true });
+  const exemplar = await exemplarFixture(source, 'ambiguous-held-out.pptx', { masterName: 'No useful name', ambiguous: true });
+  await mkdir(output, { recursive: true });
+  const originalHash = createHash('sha256').update(await readFile(exemplar.templatePath)).digest('hex');
+  await link(exemplar.templatePath, path.join(output, 'backend-compatibility-report.json'));
+  const result = await runPptxCompatibilityHarness(exemplar.templatePath, output);
+  const saved = JSON.parse(await readFile(result.reportPath, 'utf8'));
+  assert.equal(createHash('sha256').update(await readFile(exemplar.templatePath)).digest('hex'), originalHash,
+    'replacing a pre-existing hard-linked report path must not modify the source presentation');
+  assert.equal(saved.capabilities.inputSafety.status, 'PASS');
+  assert.equal(saved.capabilities.lctInspection.status, 'PASS');
+  assert.equal(saved.capabilities.officeKitLoad.status, 'PASS');
+  assert.equal(saved.capabilities.noOpRoundTrip.status, 'PASS');
+  assert.equal(saved.capabilities.templatePartPreservation.status, 'PASS');
+  assert.equal(saved.capabilities.generationCompatibility.status, 'FAIL');
+  assert.equal(saved.capabilities.generationCompatibility.reason.code, 'UNSUPPORTED_TEMPLATE_LAYOUT');
+  assert.equal(saved.capabilities.generatedMutation.status, 'UNKNOWN');
+  assert.equal(saved.capabilities.sourceByteIdentity.status, 'PASS');
+  assert.equal(saved.source.immutable, 'PASS');
+  assert.ok(Array.isArray(saved.lctInventory.inferredSlotEvidence));
+  assert.equal(saved.outputs.generatedMutation, undefined);
+});
+
+test('compatibility harness reports unsafe or unavailable input when the report directory is available', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-harness-input-report-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = path.join(root, 'source');
+  const output = path.join(root, 'output');
+  await mkdir(source, { recursive: true });
+  const result = await runPptxCompatibilityHarness(path.join(source, 'missing.pptx'), output);
+  const saved = JSON.parse(await readFile(result.reportPath, 'utf8'));
+  assert.equal(saved.capabilities.inputSafety.status, 'FAIL');
+  assert.equal(saved.capabilities.lctInspection.status, 'UNKNOWN');
+  assert.equal(saved.capabilities.generationCompatibility.status, 'UNKNOWN');
+  assert.ok((await stat(result.reportPath)).isFile());
 });
 
 test('compiler rejects templates without measured title/content slots instead of publishing fallback geometry', async (t) => {
@@ -352,6 +526,12 @@ test('Office Kit reports missing and changed source images as typed failures wit
     new OfficeKitPptxRenderer().render({ compiledPresentation: compiled, contentIR, templateIR: template.templateIR, templatePath: template.templatePath, outputPath: path.join(root, 'changed-image.pptx'), contentRoot: template.contentRoot }),
     (error) => error.code === 'ASSET_HASH_MISMATCH' && error.finding.severity === 'error',
   );
+  await writeFile(imagePath, onePixelPng);
+  const rendered = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: compiled, contentIR, templateIR: template.templateIR,
+    templatePath: template.templatePath, outputPath: path.join(root, 'valid-image.pptx'), contentRoot: template.contentRoot,
+  });
+  assert.equal(rendered.nativeImageCount, 1, 'the measured picture slot receives the source-backed image');
 });
 
 test('repair switches at most one layout then audits once more', async (t) => {
@@ -423,7 +603,7 @@ test('native PPTX renderer preserves template masters/layouts and emits editable
 test('both backends remove inactive source slides and speaker notes from generated packages', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-source-content-purge-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const { contentIR, deckPlan } = await scenario(root, 1);
+  const { contentIR, deckPlan } = await scenario(root, 1, ['chart', 'table', 'kpi', 'process', 'none']);
   const templates = await corpusTemplates(root, path.join(root, 'projects', 'offline-fixture'));
   for (const template of [templates[0], templates[4]]) {
     const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
@@ -458,7 +638,7 @@ test('both backends remove inactive source slides and speaker notes from generat
 test('offline matrix produces fifteen validated Office Kit outputs and previews from one plan with zero inference', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-matrix-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const { contentIR, deckPlan, templates } = await scenario(root, 5);
+  const { contentIR, deckPlan, templates } = await scenario(root, 5, ['chart', 'table', 'kpi', 'process', 'none']);
   const outputRoot = path.join(root, 'matrix');
   const result = await runOfflinePresentationMatrix({ deckPlan, contentIR, templates, outputRoot, backend: 'office-kit', previewAdapter: new OfficeKitPreviewAdapter() });
   assert.equal(result.inferenceRequests, 0);
@@ -482,7 +662,6 @@ test('offline matrix produces fifteen validated Office Kit outputs and previews 
     assert.equal(output.findingCount, report.render.auditFindingCount);
     assert.ok(Object.hasOwn(report, 'preview'));
   }
-  assert.ok(result.outputs.some((output) => output.nativeObjectCounts.images > 0), 'source-backed images render as native images when the selected layout has a picture slot');
   assert.ok(result.outputs.some((output) => output.nativeObjectCounts.charts > 0), 'source-backed numeric data renders as native charts when a chart slot exists');
   assert.ok(result.outputs.some((output) => output.nativeObjectCounts.tables > 0), 'rectangular table cells render as native tables');
   assert.ok(result.outputs.some((output) => output.nativeObjectCounts.shapes >= 2 && output.nativeObjectCounts.connectors >= 1), 'KPI and process slides use native editable shapes/connectors');
@@ -515,7 +694,7 @@ test('compatibility harness preserves source bytes, compares package parts, reop
 test('persisted planning state replays offline and the manifest omits endpoint URLs and credentials', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-replay-matrix-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const { brief, contentIR, deckPlan, templates } = await scenario(root, 5);
+  const { brief, contentIR, deckPlan, templates } = await scenario(root, 5, ['chart', 'table', 'kpi', 'process', 'none']);
   const timestamp = '2026-09-25T00:00:00.000Z';
   const successful = {
     contentFiles: ['evidence.md', 'metrics.csv', 'kpi.csv', 'process.md', 'source-image.png'],

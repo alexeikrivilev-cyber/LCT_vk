@@ -172,6 +172,10 @@ def _inspection_observations(value: Any) -> dict[str, Any]:
 
 
 def main() -> int:
+    # Node reads this private protocol as UTF-8 bytes. Windows console/code-page
+    # defaults must not control the child's JSON or diagnostics transport.
+    sys.stdout.reconfigure(encoding="utf-8", errors="strict")
+    sys.stderr.reconfigure(encoding="utf-8", errors="strict")
     if len(sys.argv) != 2 or not os.path.isabs(sys.argv[1]):
         print("expected one absolute PPTX path argument", file=sys.stderr)
         return 2
