@@ -6,6 +6,7 @@ import type { ContentIR } from '../domain/content-ir.js';
 import type { DeckPlan } from '../domain/deck-plan.js';
 import type { TemplateIR } from '../domain/template-ir.js';
 import { auditCompiledPresentation } from './deterministic-audit.js';
+import { assessVariantCompositionDistinctness } from './exemplar-slide-selector.js';
 import { renderPresentation, resolvePptxBackend } from '../adapters/pptx-renderer-factory.js';
 import type { PptxBackendId, PptxRenderResult } from './pptx-backend-port.js';
 import type { PptxPreviewPort } from './pptx-preview-port.js';
@@ -72,17 +73,28 @@ export async function runOfflinePresentationMatrix(input: {
 
   for (let templateIndex = 0; templateIndex < input.templates.length; templateIndex += 1) {
     const template = input.templates[templateIndex]!;
+    const compileStarted = performance.now();
+    const compiledByVariant = new Map(policies.map((policy) => [
+      policy.id,
+      compilePresentation(input.deckPlan, input.contentIR, template.templateIR, policy),
+    ] as const));
+    timings.compile += performance.now() - compileStarted;
+    for (let slideIndex = 0; slideIndex < input.deckPlan.slides.length; slideIndex += 1) {
+      const variantSlides = policies.map((policy) => compiledByVariant.get(policy.id)!.slides[slideIndex]!);
+      const distinctness = assessVariantCompositionDistinctness(variantSlides, template.templateIR, backend);
+      if (!distinctness.distinct) {
+        throw new TypeError(`Template ${templateIndex + 1}, slide ${slideIndex + 1} has only ${distinctness.availableDistinctFamilies} distinct safe projected composition(s); A/B/C outputs were withheld. ${distinctness.evidence.join('; ')}`);
+      }
+    }
     const templateDirectory = path.join(outputRoot, `template-${templateIndex + 1}`);
     await mkdir(templateDirectory, { recursive: true });
     for (const policy of policies) {
       const variantDirectory = path.join(templateDirectory, `variant-${policy.id.toLowerCase()}`);
       await mkdir(variantDirectory, { recursive: true });
-      const compileStarted = performance.now();
-      const compiled = compilePresentation(input.deckPlan, input.contentIR, template.templateIR, policy);
+      const compiled = compiledByVariant.get(policy.id)!;
       const factualPayload = JSON.stringify(extractCanonicalFactualPayload(compiled));
       canonicalFacts ??= factualPayload;
       const factualEquivalenceStatus = factualPayload === canonicalFacts ? 'passed' as const : 'failed' as const;
-      timings.compile += performance.now() - compileStarted;
       const auditStarted = performance.now();
       const audit = auditCompiledPresentation(compiled, input.contentIR, template.templateIR);
       timings.audit += performance.now() - auditStarted;

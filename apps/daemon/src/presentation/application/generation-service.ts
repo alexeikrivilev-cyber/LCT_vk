@@ -15,6 +15,7 @@ import type { PlanningResponse, PlanningService } from './planning-service.js';
 import { getTemplateCompilation, type TemplateCompilationResponse } from './template-compiler.js';
 import { compilePresentation, UnsupportedTemplateLayoutError, VARIANT_POLICIES, type CompiledPresentation, type CompiledSlide, type PresentationVariantId } from './slide-compilation.js';
 import { auditCompiledPresentation, type DeterministicAuditReport } from './deterministic-audit.js';
+import { assessVariantCompositionDistinctness } from './exemplar-slide-selector.js';
 import { renderPresentation } from '../adapters/pptx-renderer-factory.js';
 import { OfficeKitPreviewAdapter } from '../adapters/office-kit-preview-adapter.js';
 import { inspectOfficeKitPackage } from '../adapters/office-kit-package-inspector.js';
@@ -796,6 +797,20 @@ export class PresentationGenerationService {
           updatedAt: this.now().toISOString(),
         }));
         if (!startUpdate) return;
+        const variantSlides = VARIANT_IDS.map((variant) => {
+          const presentation = variantsById(tracks, variant);
+          const slide = presentation.slides.find((candidate) => candidate.sourceDeckPlanSlideId === currentSlideId);
+          if (!slide) throw new PresentationGenerationError('PLAN_CHANGED', 'A planned slide is missing from the compiled output.', 409);
+          return slide;
+        });
+        const compositionDistinctness = assessVariantCompositionDistinctness(variantSlides, context.templateIR, this.options.backend);
+        if (!compositionDistinctness.distinct) {
+          throw new PresentationGenerationError(
+            'VARIANTS_NOT_DISTINCT',
+            `Slide ${pack.index} has only ${compositionDistinctness.availableDistinctFamilies} distinct safe projected composition(s); A/B/C were withheld. ${compositionDistinctness.evidence.join('; ')}`,
+            422,
+          );
+        }
         const pendingResults = {} as Record<PresentationVariantId, Omit<GeneratedVariantState, 'status' | 'version'>>;
         for (const variant of VARIANT_IDS) {
           if (signal.aborted || this.current(projectId).status === 'cancelled') return;

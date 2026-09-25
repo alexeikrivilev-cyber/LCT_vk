@@ -43,7 +43,7 @@ export async function createExemplarTemplate(filePath, { masterName = 'Unnamed d
 }
 
 /** Three repeated but structurally distinct vector compositions for selector/render tests. */
-export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unlabelled composition families', mixedStyleBody = false, hyperlinkBody = false } = {}) {
+export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unlabelled composition families', mixedStyleBody = false, hyperlinkBody = false, varyingFooter = false } = {}) {
   const deck = new pptxgen();
   deck.layout = 'LAYOUT_WIDE';
   deck.defineSlideMaster({ title: masterName, objects: [] });
@@ -53,7 +53,7 @@ export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unl
     slide.addText(`Original source headline ${index + 1}`, {
       x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
     });
-    slide.addText(mixedStyleBody && index === 0
+    slide.addText(mixedStyleBody
       ? [
         { text: 'Original source body ', options: { fontFace: 'Aptos', fontSize: 16 } },
         { text: `${index + 1}`, options: { fontFace: 'Aptos', fontSize: 16, italic: true, color: '274C77' } },
@@ -68,6 +68,9 @@ export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unl
     slide.addText('SYNTHETIC BRAND', {
       x: 0.62, y: 7.08, w: 2.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
     });
+    if (varyingFooter) slide.addText(`Source page ${index + 1}`, {
+      x: 11.25, y: 7.08, w: 1.45, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+    });
     for (let decoration = 0; decoration < 1 + family * 3; decoration += 1) {
       slide.addShape('rect', {
         x: 6.2 + (decoration % 3) * 0.42,
@@ -79,6 +82,62 @@ export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unl
       });
     }
     slide.addNotes(`Source only note ${index + 1}`);
+  }
+  await deck.writeFile({ fileName: filePath });
+}
+
+/** Structural role fixtures; titles and bodies share geometry so only measured typography/topology distinguishes them. */
+export async function createRoleExemplarTemplate(filePath, { masterName = 'Structural role fixtures' } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({ title: masterName, objects: [] });
+  const layouts = [
+    ...Array.from({ length: 9 }, () => ({ role: 'content', titleSize: 30, bodySize: 18 })),
+    ...Array.from({ length: 3 }, () => ({ role: 'hero', titleSize: 58, bodySize: 8 })),
+    ...Array.from({ length: 3 }, () => ({ role: 'split', titleSize: 30, bodySize: 16 })),
+  ];
+  for (const [index, item] of layouts.entries()) {
+    const slide = deck.addSlide({ masterName });
+    slide.addText(`Source headline ${index + 1}`, {
+      x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: item.titleSize, bold: true, margin: 0,
+    });
+    slide.addText(`Source body ${index + 1}. Supporting evidence remains available in the larger body region.`, {
+      x: 0.68, y: 1.35, w: 4.7, h: 5.45, fontFace: 'Aptos', fontSize: item.bodySize, margin: 0,
+    });
+    if (item.role === 'split') slide.addText(`Second source column ${index + 1}. Additional evidence occupies a parallel region.`, {
+      x: 6.0, y: 1.35, w: 5.8, h: 5.45, fontFace: 'Aptos', fontSize: item.bodySize, margin: 0,
+    });
+    slide.addText('REPEATED BRAND', {
+      x: 0.62, y: 7.08, w: 2.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+    });
+  }
+  await deck.writeFile({ fileName: filePath });
+}
+
+/** Three old familyKey buckets collapse to one composition once the added source-only text is cleared. */
+export async function createDuplicateProjectionExemplarTemplate(filePath, { masterName = 'Duplicate projected families' } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({ title: masterName, objects: [] });
+  const sourceOnlyTextCounts = [0, 2, 7];
+  for (let index = 0; index < 12; index += 1) {
+    const family = Math.floor(index / 4);
+    const slide = deck.addSlide({ masterName });
+    slide.addText(`Source headline ${index + 1}`, {
+      x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
+    });
+    slide.addText(`Source body ${index + 1}. Supporting evidence remains in the same mapped text region.`, {
+      x: 0.68, y: 1.35, w: 4.7, h: 5.45, fontFace: 'Aptos', fontSize: 16, margin: 0,
+    });
+    slide.addText('REPEATED BRAND', {
+      x: 0.62, y: 7.08, w: 2.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+    });
+    for (let detail = 0; detail < sourceOnlyTextCounts[family]; detail += 1) {
+      slide.addText(`Unique removable note ${index + 1} ${detail + 1}`, {
+        x: 6.0 + (detail % 3) * 1.3, y: 6.55 + Math.floor(detail / 3) * 0.22, w: 1.1, h: 0.16,
+        fontFace: 'Aptos', fontSize: 7, margin: 0,
+      });
+    }
   }
   await deck.writeFile({ fileName: filePath });
 }

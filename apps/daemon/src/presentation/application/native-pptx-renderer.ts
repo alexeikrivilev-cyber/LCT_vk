@@ -7,6 +7,7 @@ import JSZip from 'jszip';
 import type { ContentIR } from '../domain/content-ir.js';
 import { validateTemplateIR, type TemplateIR } from '../domain/template-ir.js';
 import { auditCompiledPresentation } from './deterministic-audit.js';
+import { generatedFallbackCompositionSignature } from './exemplar-slide-selector.js';
 import { collectSourceSlideVisualArtifacts, removeUnreachableSourceVisualArtifacts } from './pptx-source-artifacts.js';
 import type { CompiledPresentation, CompiledSlide, PlacementBox } from './slide-compilation.js';
 import type { PptxRenderResult } from './pptx-backend-port.js';
@@ -284,5 +285,18 @@ export async function renderNativePptx(input: {
     templatePreservationStatus: 'unknown',
     validationIssues: unsupportedVisualIssues,
     unresolvedVisualTypes,
+    projectedCompositions: input.compiledPresentation.slides.map((slide) => ({
+      slideId: slide.id,
+      variantId: slide.variantId,
+      sourceSlideIndex: null,
+      semanticArchetype: null,
+      confidence: null,
+      projectedCompositionSignature: generatedFallbackCompositionSignature(slide, input.templateIR),
+      availableDistinctFamilies: null,
+      titleGeometryNormalized: null,
+      bodyGeometryNormalized: null,
+      titleBodyFontHierarchy: null,
+      selectionReason: 'custom renderer used deterministic generated placements',
+    })),
   };
 }

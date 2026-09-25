@@ -14,7 +14,12 @@ import { createTemplateIR } from '../src/presentation/application/template-mappe
 import { runOfflinePresentationMatrix } from '../src/presentation/application/offline-matrix-runner.ts';
 import { renderNativePptx } from '../src/presentation/application/native-pptx-renderer.ts';
 import { compilePresentation, extractCanonicalFactualPayload, VARIANT_POLICIES } from '../src/presentation/application/slide-compilation.ts';
-import { selectExemplarSlide } from '../src/presentation/application/exemplar-slide-selector.ts';
+import {
+  assessVariantCompositionDistinctness,
+  assessExemplarSelection,
+  classifyExemplarArchetype,
+  selectExemplarSlide,
+} from '../src/presentation/application/exemplar-slide-selector.ts';
 import { OfficeKitPptxRenderer } from '../src/presentation/adapters/office-kit-pptx-renderer.ts';
 import { OfficeKitPreviewAdapter } from '../src/presentation/adapters/office-kit-preview-adapter.ts';
 import { briefHash } from '../src/presentation/domain/brief.ts';
@@ -24,7 +29,12 @@ import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 import { createHardTemplateCorpus } from './hard-template-corpus.mjs';
 import { createOfflineReplayManifest, runOfflineMatrixFromState } from '../../../scripts/run-offline-presentation-matrix.mjs';
 import { runPptxCompatibilityHarness } from '../../../scripts/compare-pptx-backends.mjs';
-import { createExemplarTemplate, createFamilyExemplarTemplate } from './exemplar-template-fixtures.mjs';
+import {
+  createDuplicateProjectionExemplarTemplate,
+  createExemplarTemplate,
+  createFamilyExemplarTemplate,
+  createRoleExemplarTemplate,
+} from './exemplar-template-fixtures.mjs';
 
 register();
 
@@ -75,7 +85,8 @@ async function fixture(root, options = {}) {
 
 async function exemplarFixture(root, fileName, options = {}) {
   const templatePath = path.join(root, fileName);
-  await createExemplarTemplate(templatePath, options);
+  const { create = createExemplarTemplate, ...fixtureOptions } = options;
+  await create(templatePath, fixtureOptions);
   const bytes = await readFile(templatePath);
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const inspection = await inspectPptx(templatePath);
@@ -97,6 +108,38 @@ async function familyExemplarFixture(root, fileName, options = {}) {
     compiledAt: '2026-09-25T00:00:00.000Z', compilerVersion: 'lct-template-compiler/1',
   });
   return { templatePath, templateIR, inspection };
+}
+
+function inspectedCompositionSignature(inspectionEnvelope) {
+  const { slideSize } = inspectionEnvelope.inspection;
+  const q = (value, extent) => Number((value / extent).toFixed(4));
+  const slide = inspectionEnvelope.inspection.slides[0];
+  const composition = slide.elements
+    .filter((element) => element.parentId === null)
+    .sort((left, right) => left.sourceOrder - right.sourceOrder)
+    .map((element, order) => {
+      const box = element.resolvedGeometry ?? element.rawGeometry;
+      return {
+        order,
+        type: element.type,
+        geometry: box ? {
+          x: q(box.x, slideSize.width), y: q(box.y, slideSize.height),
+          width: q(box.width, slideSize.width), height: q(box.height, slideSize.height),
+          rotation: q(box.rotation, 360),
+        } : null,
+        style: {
+          fonts: [...(element.style.fonts ?? [])].sort(),
+          fontSizesPt: [...(element.style.font_sizes_pt ?? [])].map((value) => Math.round(value)).sort((a, b) => a - b),
+          bold: element.style.bold ?? null,
+          italic: element.style.italic ?? null,
+          fillColor: element.style.fill_color ?? null,
+          lineColor: element.style.line_color ?? null,
+        },
+        hasText: Boolean(element.text.trim()),
+        relationshipType: element.relationship?.type ?? null,
+      };
+    });
+  return createHash('sha256').update(JSON.stringify(composition)).digest('hex');
 }
 
 async function corpusTemplates(root, contentRoot) {
@@ -178,6 +221,26 @@ async function scenario(root, templateCount = 1, visualTypes = ['chart', 'table'
     templates.push({ ...created, pptxPath: created.templatePath, contentRoot: projectDir });
   }
   return { brief, contentIR, deckPlan, templates };
+}
+
+function singleSlidePlan(deckPlan, contentIR, brief, slideIndex = 4) {
+  const { id: _id, order: _order, ...sourceSlide } = deckPlan.slides[slideIndex];
+  const singleBrief = { ...brief, requestedSlideCount: 1 };
+  const singlePlan = canonicalizeDeckPlan({
+    workingTitle: deckPlan.workingTitle,
+    narrativeSummary: deckPlan.narrativeSummary,
+    slides: [sourceSlide],
+  }, {
+    id: `${deckPlan.id}_single_slide`,
+    version: 1,
+    createdAt: deckPlan.createdAt,
+    inputFingerprint: deckPlan.inputFingerprint,
+    briefHash: briefHash(singleBrief),
+    allowedContentIds: new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => unit.id)),
+    allowedMediaIds: new Set(contentIR.units.filter((unit) => unit.kind === 'media-reference').map((unit) => unit.id)),
+    requestedSlideCount: 1,
+  });
+  return { brief: singleBrief, deckPlan: singlePlan };
 }
 
 test('one plan compiles deterministically into three layout variants without changing text or provenance', async (t) => {
@@ -346,7 +409,12 @@ test('exemplar selection maps exact donor shapes, ranks three supported families
   const selections = tracks.map((track) => track.selected);
   assert.ok(selections.every(Boolean), 'the source deck contains three compatible structural families');
   assert.equal(new Set(selections.map((selection) => selection.familyKey)).size, 3);
+  assert.equal(new Set(selections.map((selection) => selection.projectedCompositionSignature)).size, 3,
+    'A/B/C choices have distinct post-projection compositions');
   assert.equal(new Set(selections.map((selection) => selection.sourceSlideIndex)).size, 3);
+  const distinctness = assessVariantCompositionDistinctness(tracks.map((track) => track.compiled), first.templateIR, 'office-kit');
+  assert.equal(distinctness.distinct, true);
+  assert.equal(distinctness.availableDistinctFamilies, 3);
   for (const selection of selections) {
     const donor = first.templateIR.slides.find((slide) => slide.sourcePart === selection.sourcePart);
     assert.ok(donor?.elements.some((element) => element.id === selection.slots.title.elementId && element.nativeId === selection.slots.title.nativeId));
@@ -362,10 +430,42 @@ test('exemplar selection maps exact donor shapes, ranks three supported families
   assert.equal(selectExemplarSlide(uncertain, first.templateIR), null, 'low-confidence donor geometry fails closed');
 });
 
+test('Office Kit renderer preserves distinct projected A/B/C composition signatures', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-rendered-variant-signatures-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await familyExemplarFixture(root, 'rendered-variants-template.pptx');
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const renderedSignatures = [];
+  const inspectedSignatures = [];
+  for (const policy of VARIANT_POLICIES) {
+    const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, policy);
+    const slide = compiled.slides[0];
+    assert.ok(slide);
+    const selection = selectExemplarSlide(slide, template.templateIR);
+    assert.ok(selection);
+    const outputPath = path.join(root, 'rendered', `${policy.id}.pptx`);
+    await mkdir(path.dirname(outputPath), { recursive: true });
+    const result = await new OfficeKitPptxRenderer().render({
+      compiledPresentation: { ...compiled, id: `${compiled.id}_rendered_${policy.id}`, slides: [slide] },
+      contentIR, templateIR: template.templateIR, templatePath: template.templatePath, outputPath,
+    });
+    assert.equal(result.validationStatus, 'passed');
+    assert.equal(result.reopenStatus, 'passed');
+    assert.equal(result.projectedCompositions[0].projectedCompositionSignature, selection.projectedCompositionSignature);
+    assert.equal(result.projectedCompositions[0].sourceSlideIndex, selection.sourceSlideIndex);
+    renderedSignatures.push(result.projectedCompositions[0].projectedCompositionSignature);
+    inspectedSignatures.push(inspectedCompositionSignature(await inspectPptx(outputPath)));
+  }
+  assert.equal(new Set(renderedSignatures).size, 3,
+    'the renderer emits three materially distinct composition signatures instead of trusting source family labels');
+  assert.equal(new Set(inspectedSignatures).size, 3,
+    'the reopened rendered PPTX files also retain three distinct native compositions');
+});
+
 test('Office Kit duplicates an exemplar, preserves donor text style and decoration, and clears source content', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-render-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const template = await familyExemplarFixture(root, 'family-template.pptx');
+  const template = await familyExemplarFixture(root, 'family-template.pptx', { varyingFooter: true });
   const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
   const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
   const compiledSlide = compiled.slides.at(-1);
@@ -384,6 +484,8 @@ test('Office Kit duplicates an exemplar, preserves donor text style and decorati
   assert.equal(result.reopenStatus, 'passed');
   assert.equal(result.validationStatus, 'passed');
   assert.equal(result.templatePreservationStatus, 'passed');
+  assert.equal(result.projectedCompositions.length, 1);
+  assert.equal(result.projectedCompositions[0].projectedCompositionSignature, selection.projectedCompositionSignature);
   assert.ok(result.nativeShapeCount >= 1, 'the donor slide keeps its native vector decoration');
   assert.ok(result.nativeTextShapeCount >= 3, 'mapped text and repeated brand text remain native/editable');
   const reopened = await inspectPptx(outputPath);
@@ -412,12 +514,103 @@ test('Office Kit duplicates an exemplar, preserves donor text style and decorati
   assert.ok(!packageText.includes('Original source body'));
   assert.ok(!packageText.includes('Source only detail'));
   assert.ok(!packageText.includes('Source only note'));
+  assert.ok(!packageText.includes('Source page'), 'a repeated-position footer with changing source text is cleared');
   assert.equal(Object.keys(packageZip.files).some((name) => /^ppt\/notesSlides\/[^/]+\.xml$/i.test(name)), false);
   assert.equal(createHash('sha256').update(await readFile(template.templatePath)).digest('hex'), sourceHash);
   const preview = await new OfficeKitPreviewAdapter().preview(new Uint8Array(await readFile(outputPath)), 0, 960);
   assert.equal(preview.slideCount, 1);
   assert.ok(preview.png.length > 0);
   assert.match(preview.svg, /Editable slides retain a source-backed visual/);
+});
+
+test('A/B/C selection deduplicates donor families after source text cleanup', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-post-projection-dedup-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'duplicate-projection-template.pptx', { create: createDuplicateProjectionExemplarTemplate });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const assessments = VARIANT_POLICIES.map((policy) => {
+    const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, policy).slides[1];
+    assert.ok(compiled);
+    return assessExemplarSelection(compiled, template.templateIR);
+  });
+  assert.equal(assessments[0].availableDistinctFamilies, 1,
+    'source slides that differ only by removable source text collapse to one distinct family');
+  assert.equal(assessments[0].distinctSourceFamilyKeys.length, 3,
+    'the original source families were technically different before cleanup');
+  assert.ok(assessments[0].selection);
+  assert.equal(assessments[1].selection, null);
+  assert.equal(assessments[2].selection, null);
+  const compiledTracks = VARIANT_POLICIES.map((policy) => compilePresentation(deckPlan, contentIR, template.templateIR, policy).slides[1]);
+  assert.ok(compiledTracks.every(Boolean));
+  const distinctness = assessVariantCompositionDistinctness(compiledTracks, template.templateIR, 'office-kit');
+  assert.equal(distinctness.distinct, false);
+  assert.equal(distinctness.availableDistinctFamilies, 1);
+  assert.ok(distinctness.evidence.some((item) => item.includes('duplicate projected compositions'))
+    || distinctness.evidence.some((item) => item.includes('cannot be established')));
+  const visibleClearedBox = structuredClone(template.templateIR);
+  const styledText = visibleClearedBox.slides.find((slide) => slide.index === 9)?.elements.find((element) => element.text?.startsWith('Unique removable note'));
+  assert.ok(styledText);
+  styledText.directStyles.fillColor = 'D9E3F0';
+  const visibleBoxAssessment = assessExemplarSelection(compiledTracks[0], visibleClearedBox);
+  const ordinaryFamily = visibleBoxAssessment.candidateDiagnostics.find((item) => item.sourceSlideIndex === 1);
+  const styledFamily = visibleBoxAssessment.candidateDiagnostics.find((item) => item.sourceSlideIndex === 9);
+  assert.ok(ordinaryFamily && styledFamily);
+  assert.notEqual(ordinaryFamily.projectedCompositionSignature, styledFamily.projectedCompositionSignature,
+    'cleared source text values stay excluded while a directly visible text-box fill remains in the projected signature');
+  assert.equal(assessments[0].evidence[0], `availableDistinctFamilies=${assessments[0].availableDistinctFamilies}`,
+    'unavailable variant ranks expose an explicit distinct-family count');
+  assert.ok(assessments[0].selection.projectedCompositionSignature.startsWith('sha256:'));
+  assert.equal(assessments[0].selection.availableDistinctFamilies, 1,
+    'the selected A track carries the explicit post-projection family count');
+});
+
+test('content intent prefers safe content donors over a text-fitting hero and titles can still use a hero', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-semantic-role-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'role-template.pptx', { create: createRoleExemplarTemplate });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const contentSlide = compiled.slides[1];
+  const titleSlide = compiled.slides[0];
+  assert.ok(contentSlide && titleSlide);
+  const contentAssessment = assessExemplarSelection(contentSlide, template.templateIR);
+  assert.ok(contentAssessment.selection);
+  assert.equal(contentAssessment.selection.semanticArchetype, 'content');
+  assert.ok(!['cover', 'section-divider', 'hero'].includes(contentAssessment.selection.semanticArchetype),
+    'a content slide does not select the structurally obvious hero while safe content donors exist');
+  const selectedContentDonor = template.templateIR.slides.find((slide) => slide.index === contentAssessment.selection.sourceSlideIndex);
+  assert.ok(selectedContentDonor);
+  const titleElement = selectedContentDonor.elements.find((element) => element.id === contentAssessment.selection.slots.title.elementId);
+  const bodyElement = selectedContentDonor.elements.find((element) => element.id === contentAssessment.selection.slots.body.elementId);
+  assert.ok(titleElement && bodyElement);
+  assert.ok(classifyExemplarArchetype(selectedContentDonor, template.templateIR, titleElement.id, bodyElement.id).evidence.length >= 3);
+  const titleSelection = selectExemplarSlide({ ...titleSlide, title: 'Annual Review' }, template.templateIR);
+  assert.ok(titleSelection);
+  assert.equal(titleSelection.semanticArchetype, 'hero', 'title intent keeps the high-typography hero eligible');
+
+  const sourceUnits = contentIR.units.filter((unit) => unit.text).map((unit) => unit.id);
+  const sectionBrief = { audience: 'Reviewers', purpose: 'Introduce one section', expectedOutcome: 'Start a new section', preferences: [], requestedSlideCount: 1 };
+  const sectionPlan = canonicalizeDeckPlan({
+    workingTitle: 'Section plan', narrativeSummary: 'One synthetic section divider.',
+    slides: [{ narrativeRole: 'section-divider', purpose: 'Introduce this section', takeaway: 'New section', contentRefs: [sourceUnits[0]], semanticVisualType: 'none', targetDensity: 'balanced' }],
+  }, {
+    id: 'synthetic_section_plan', version: 1, createdAt: '2026-09-25T00:00:00.000Z', inputFingerprint: contentIR.hash,
+    briefHash: briefHash(sectionBrief), allowedContentIds: new Set(contentIR.units.map((unit) => unit.id)), requestedSlideCount: 1,
+  });
+  const sectionSlide = compilePresentation(sectionPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[0];
+  assert.ok(sectionSlide);
+  const sectionSelection = selectExemplarSlide(sectionSlide, template.templateIR);
+  assert.ok(sectionSelection);
+  assert.equal(sectionSelection.semanticArchetype, 'hero', 'section intent keeps the high-typography hero eligible');
+
+  const splitSlide = template.templateIR.slides.find((slide) => slide.elements.filter((element) =>
+    element.kind.toLowerCase() === 'shape' && (element.text ?? '').includes('Second source column')).length === 1);
+  assert.ok(splitSlide);
+  const splitText = splitSlide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && (element.text ?? '').trim());
+  const splitTitle = splitText.find((element) => (element.text ?? '').startsWith('Source headline'));
+  const splitBody = splitText.find((element) => (element.text ?? '').startsWith('Source body'));
+  assert.ok(splitTitle && splitBody);
+  assert.equal(classifyExemplarArchetype(splitSlide, template.templateIR, splitTitle.id, splitBody.id).archetype, 'content-split');
 });
 
 test('Office Kit reports when replacing a mixed-run exemplar donor may collapse secondary run styling', async (t) => {
@@ -784,17 +977,21 @@ test('both backends remove inactive source slides and speaker notes from generat
   }
 });
 
-test('offline matrix produces fifteen validated Office Kit outputs and previews from one plan with zero inference', async (t) => {
+test('offline matrix emits three validated distinct Office Kit tracks and previews from one plan with zero inference', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-matrix-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const { contentIR, deckPlan, templates } = await scenario(root, 5, ['chart', 'table', 'kpi', 'process', 'none']);
+  const { brief, contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const single = singleSlidePlan(deckPlan, contentIR, brief);
+  const exemplar = await familyExemplarFixture(root, 'matrix-family-template.pptx');
+  const templates = [{ ...exemplar, pptxPath: exemplar.templatePath }];
   const outputRoot = path.join(root, 'matrix');
-  const result = await runOfflinePresentationMatrix({ deckPlan, contentIR, templates, outputRoot, backend: 'office-kit', previewAdapter: new OfficeKitPreviewAdapter() });
+  const result = await runOfflinePresentationMatrix({ deckPlan: single.deckPlan, contentIR, templates, outputRoot, backend: 'office-kit', previewAdapter: new OfficeKitPreviewAdapter() });
   assert.equal(result.inferenceRequests, 0);
-  assert.equal(result.templateCount, 5);
+  assert.equal(result.templateCount, 1);
   assert.equal(result.variantCount, 3);
-  assert.equal(result.outputCount, 15);
+  assert.equal(result.outputCount, 3);
   assert.ok(result.timingsMs.preview > 0, 'preview duration is measured separately');
+  const signatures = [];
   for (const output of result.outputs) {
     await stat(output.pptxPath);
     assert.equal(output.renderStatus, 'passed');
@@ -804,17 +1001,34 @@ test('offline matrix produces fifteen validated Office Kit outputs and previews 
     assert.equal(output.validationStatus, 'passed');
     assert.equal(output.previewStatus, 'passed');
     const report = JSON.parse(await readFile(output.auditPath, 'utf8'));
-    assert.equal(report.planHash, deckPlan.hash);
+    assert.equal(report.planHash, single.deckPlan.hash);
     assert.equal(report.compiledPresentationId, output.compiledPresentationId);
     assert.equal(report.render.backend, 'office-kit');
     assert.equal(report.render.reopenStatus, 'passed');
+    signatures.push(report.render.projectedCompositions[0].projectedCompositionSignature);
     assert.equal(output.findingCount, report.render.auditFindingCount);
     assert.ok(Object.hasOwn(report, 'preview'));
   }
-  assert.ok(result.outputs.some((output) => output.nativeObjectCounts.charts > 0), 'source-backed numeric data renders as native charts when a chart slot exists');
-  assert.ok(result.outputs.some((output) => output.nativeObjectCounts.tables > 0), 'rectangular table cells render as native tables');
-  assert.ok(result.outputs.some((output) => output.nativeObjectCounts.shapes >= 2 && output.nativeObjectCounts.connectors >= 1), 'KPI and process slides use native editable shapes/connectors');
-  assert.equal(JSON.parse(await readFile(path.join(outputRoot, 'matrix.json'), 'utf8')).outputs.length, 15);
+  assert.equal(new Set(signatures).size, 3, 'matrix artifacts only include distinct projected A/B/C compositions');
+  assert.equal(JSON.parse(await readFile(path.join(outputRoot, 'matrix.json'), 'utf8')).outputs.length, 3);
+});
+
+test('offline matrix withholds every output when fewer than three safe compositions are available', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-matrix-withheld-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { brief, contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const single = singleSlidePlan(deckPlan, contentIR, brief);
+  const exemplar = await exemplarFixture(root, 'duplicate-projection-matrix-template.pptx', { create: createDuplicateProjectionExemplarTemplate });
+  const outputRoot = path.join(root, 'matrix');
+  await assert.rejects(runOfflinePresentationMatrix({
+    deckPlan: single.deckPlan,
+    contentIR,
+    templates: [{ ...exemplar, pptxPath: exemplar.templatePath }],
+    outputRoot,
+    backend: 'office-kit',
+  }), /availableDistinctFamilies=1/);
+  await assert.rejects(stat(path.join(outputRoot, 'template-1')), { code: 'ENOENT' },
+    'the runner checks distinctness before it writes any A/B/C PPTX output');
 });
 
 test('compatibility harness preserves source bytes, compares package parts, reopens mutation and writes previews', async (t) => {
@@ -843,16 +1057,18 @@ test('compatibility harness preserves source bytes, compares package parts, reop
 test('persisted planning state replays offline and the manifest omits endpoint URLs and credentials', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-replay-matrix-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const { brief, contentIR, deckPlan, templates } = await scenario(root, 5, ['chart', 'table', 'kpi', 'process', 'none']);
+  const { brief, contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const single = singleSlidePlan(deckPlan, contentIR, brief);
+  const exemplar = await familyExemplarFixture(root, 'replay-family-template.pptx');
   const timestamp = '2026-09-25T00:00:00.000Z';
   const successful = {
     contentFiles: ['evidence.md', 'metrics.csv', 'kpi.csv', 'process.md', 'source-image.png'],
-    brief,
+    brief: single.brief,
     contentIR,
-    inputFingerprint: deckPlan.inputFingerprint,
-    checkpoint: deckPlan,
-    deckPlan,
-    review: { checkpointVersion: deckPlan.version, outcome: 'pass', findings: [], operations: [] },
+    inputFingerprint: single.deckPlan.inputFingerprint,
+    checkpoint: single.deckPlan,
+    deckPlan: single.deckPlan,
+    review: { checkpointVersion: single.deckPlan.version, outcome: 'pass', findings: [], operations: [] },
     telemetry: {
       worker: { model: 'Qwen/Qwen3.8-27B', requestId: 'worker-1', providerRequestId: null, startedAt: timestamp, finishedAt: timestamp, wallTimeMs: 18000, promptTokens: 1000, completionTokens: 400, finishReason: 'stop' },
       supervisor: { model: 'Qwen/Qwen3.8-27B', requestId: 'supervisor-1', providerRequestId: null, startedAt: timestamp, finishedAt: timestamp, wallTimeMs: 4000, promptTokens: 800, completionTokens: 100, finishReason: 'stop' },
@@ -865,8 +1081,8 @@ test('persisted planning state replays offline and the manifest omits endpoint U
   const state = {
     schemaVersion: 1,
     status: 'ready',
-    currentCheckpoint: deckPlan,
-    inputs: { contentFiles: successful.contentFiles, brief, contentIR, inputFingerprint: deckPlan.inputFingerprint },
+    currentCheckpoint: single.deckPlan,
+    inputs: { contentFiles: successful.contentFiles, brief: single.brief, contentIR, inputFingerprint: single.deckPlan.inputFingerprint },
     failure: null,
     lastSuccessful: successful,
   };
@@ -878,11 +1094,12 @@ test('persisted planning state replays offline and the manifest omits endpoint U
   const result = await runOfflineMatrixFromState({
     state: statePath,
     out: outputRoot,
-    templates: templates.map((item) => item.templatePath),
+    templates: [exemplar.templatePath],
     runmetadata: metadataPath,
     contentroot: path.join(root, 'projects', 'offline-fixture'),
+    backend: 'office-kit',
   });
-  assert.equal(result.matrix.outputCount, 15);
+  assert.equal(result.matrix.outputCount, 3);
   assert.equal(result.manifest.requestSchema.worker, 'deck_plan_draft_v1');
   assert.equal(result.manifest.worker.temperature, 0.2);
   assert.equal(result.manifest.worker.maxOutputTokens, 4096);

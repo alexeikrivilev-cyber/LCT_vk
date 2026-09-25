@@ -130,7 +130,7 @@ async function runAgainst(endpoint, mode, runId, overrides = {}) {
     runId,
     outputRoot: path.join(repoRoot, '.lct', 'experiments'),
     env,
-    backend: 'custom',
+    backend: 'office-kit',
     providerKind: 'local',
     profile: 'OFFLINE_FAKE',
     previewAdapter: {

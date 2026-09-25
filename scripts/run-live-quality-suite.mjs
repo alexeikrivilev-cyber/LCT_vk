@@ -20,7 +20,7 @@ import { evaluatePlanningState } from './evaluate-planning-runs.mjs';
 import { runOfflineMatrixFromState } from './run-offline-presentation-matrix.mjs';
 import { runPptxCompatibilityHarness } from './compare-pptx-backends.mjs';
 import { workerSmokeRequest } from '../apps/daemon/test/semantic-smoke-contracts.mjs';
-import { createHardTemplateCorpus } from '../apps/daemon/test/hard-template-corpus.mjs';
+import { createFamilyExemplarTemplate } from '../apps/daemon/test/exemplar-template-fixtures.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SCENARIO_ROOT = path.join(REPO_ROOT, 'apps', 'daemon', 'test', 'fixtures', 'planning-scenarios');
@@ -297,12 +297,12 @@ async function createOutputTemplate(outDir, suppliedTemplate) {
     await writeFile(target, bytes, { flag: 'wx' });
     return { path: target, sourcePath: source, sha256: sha256(bytes), sourceKind: 'user-supplied' };
   }
-  const generated = await createHardTemplateCorpus(path.join(inputDir, 'synthetic-corpus'));
-  const selected = generated.find((item) => item.id === 'T1_CORPORATE');
-  if (!selected) throw Object.assign(new Error('Synthetic template fixture was not created'), { code: 'SYNTHETIC_TEMPLATE_UNAVAILABLE' });
+  const source = path.join(inputDir, 'synthetic-exemplar-family.pptx');
+  await createFamilyExemplarTemplate(source);
+  const bytes = await readFile(source);
   const target = path.join(inputDir, 'template.pptx');
-  await writeFile(target, selected.bytes, { flag: 'wx' });
-  return { path: target, sourcePath: null, sha256: sha256(selected.bytes), sourceKind: 'synthetic-T1_CORPORATE' };
+  await writeFile(target, bytes, { flag: 'wx' });
+  return { path: target, sourcePath: null, sha256: sha256(bytes), sourceKind: 'synthetic-3-family-exemplar' };
 }
 
 function safeScenarioResult(id) {

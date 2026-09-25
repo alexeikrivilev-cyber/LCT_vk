@@ -34,7 +34,12 @@ import {
 import JSZip from 'jszip';
 
 import { auditCompiledPresentation } from '../application/deterministic-audit.js';
-import { selectExemplarSlide, type ExemplarSlideSelection } from '../application/exemplar-slide-selector.js';
+import {
+  assessExemplarSelection,
+  generatedFallbackCompositionSignature,
+  type ExemplarSelectionAssessment,
+  type ExemplarSlideSelection,
+} from '../application/exemplar-slide-selector.js';
 import { collectSourceSlideVisualArtifacts, relationshipPartFor, removeUnreachableSourceVisualArtifacts } from '../application/pptx-source-artifacts.js';
 import type { CompiledSlide } from '../application/slide-compilation.js';
 import type { PptxRenderInput, PptxRenderResult, PptxRendererPort } from '../application/pptx-backend-port.js';
@@ -206,8 +211,11 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
     }));
     const sourceSlides = [...getSlides(presentation)];
     const sourceSlidesByPart = new Map(sourceSlides.map((slide) => [normalizePart(getSlidePartName(slide)), slide]));
+    const exemplarAssessments = new Map(input.compiledPresentation.slides.map((compiled) => [
+      compiled.id, assessExemplarSelection(compiled, input.templateIR),
+    ] as const));
     const exemplarSelections = new Map(input.compiledPresentation.slides.flatMap((compiled) => {
-      const selection = selectExemplarSlide(compiled, input.templateIR);
+      const selection = exemplarAssessments.get(compiled.id)?.selection;
       if (!selection || !sourceSlidesByPart.has(selection.sourcePart)) return [];
       return [[compiled.id, selection] as const];
     }));
@@ -394,6 +402,35 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       templatePreservationStatus,
       validationIssues,
       unresolvedVisualTypes: [...unresolvedVisualTypes],
+      projectedCompositions: input.compiledPresentation.slides.map((compiled) => {
+        const assessment: ExemplarSelectionAssessment = exemplarAssessments.get(compiled.id)!;
+        const selection = exemplarSelections.get(compiled.id) ?? null;
+        return selection ? {
+          slideId: compiled.id,
+          variantId: compiled.variantId,
+          sourceSlideIndex: selection.sourceSlideIndex,
+          semanticArchetype: selection.semanticArchetype,
+          confidence: selection.confidence,
+          projectedCompositionSignature: selection.projectedCompositionSignature,
+          availableDistinctFamilies: assessment.availableDistinctFamilies,
+          titleGeometryNormalized: selection.titleGeometryNormalized,
+          bodyGeometryNormalized: selection.bodyGeometryNormalized,
+          titleBodyFontHierarchy: selection.titleBodyFontHierarchy,
+          selectionReason: selection.selectionReason,
+        } : {
+          slideId: compiled.id,
+          variantId: compiled.variantId,
+          sourceSlideIndex: null,
+          semanticArchetype: null,
+          confidence: null,
+          projectedCompositionSignature: generatedFallbackCompositionSignature(compiled, input.templateIR),
+          availableDistinctFamilies: assessment.availableDistinctFamilies,
+          titleGeometryNormalized: null,
+          bodyGeometryNormalized: null,
+          titleBodyFontHierarchy: null,
+          selectionReason: `generated fallback used because no safe exemplar rank was selected: ${assessment.evidence.join('; ')}`,
+        };
+      }),
     };
   }
 }

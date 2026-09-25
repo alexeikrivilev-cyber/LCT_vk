@@ -31,23 +31,28 @@ async function makeValidSyntheticPptx(directory) {
   deck.layout = 'LAYOUT_WIDE';
   deck.author = 'LCT offline generation integration test';
   const title = { x: 0.55, y: 0.3, w: 12.1, h: 0.7, fontFace: 'Aptos Display', fontSize: 25, bold: true };
-  const body = { x: 0.65, y: 1.3, w: 4.9, h: 5.3, fontFace: 'Aptos', fontSize: 17 };
-  const visual = { y: 1.3, w: 5.2, h: 5.3 };
-  const master = (name, visualX) => deck.defineSlideMaster({
+  const master = (name, bodyBox, visualBox) => deck.defineSlideMaster({
     title: name,
     background: { color: 'FFFFFF' },
     objects: [
       { placeholder: { options: { name: `${name}_TITLE`, type: 'title', ...title } } },
-      { placeholder: { options: { name: `${name}_BODY`, type: 'body', ...body } } },
-      { placeholder: { options: { name: `${name}_VISUAL`, type: 'chart', x: visualX, ...visual } } },
+      { placeholder: { options: { name: `${name}_BODY`, type: 'body', ...bodyBox, fontFace: 'Aptos', fontSize: 17 } } },
+      { placeholder: { options: { name: `${name}_VISUAL`, type: 'chart', ...visualBox } } },
     ],
   });
-  const overlapName = 'LCT_OVERLAP';
-  master(overlapName, body.x);
-  master('LCT_SEPARATED', 6.1);
-  const slide = deck.addSlide({ masterName: overlapName });
-  slide.addText('Source sample title', { placeholder: `${overlapName}_TITLE` });
-  slide.addText('Source sample body', { placeholder: `${overlapName}_BODY` });
+  const textHeavy = 'LCT_TEXT_HEAVY';
+  master(textHeavy,
+    { x: 0.65, y: 1.3, w: 6.15, h: 3.3 },
+    { x: 7.25, y: 1.3, w: 4.0, h: 2.75 });
+  master('LCT_VISUAL_HEAVY',
+    { x: 0.65, y: 1.3, w: 4.3, h: 2.95 },
+    { x: 0.65, y: 1.3, w: 6.25, h: 4.15 });
+  master('LCT_BALANCED',
+    { x: 0.65, y: 1.3, w: 5.35, h: 3.0 },
+    { x: 6.4, y: 1.3, w: 5.65, h: 3.65 });
+  const slide = deck.addSlide({ masterName: textHeavy });
+  slide.addText('Source sample title', { placeholder: `${textHeavy}_TITLE` });
+  slide.addText('Source sample body', { placeholder: `${textHeavy}_BODY` });
   const filePath = path.join(directory, 'synthetic-template.pptx');
   await deck.writeFile({ fileName: filePath });
   return readFile(filePath);
@@ -307,7 +312,8 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     assert.equal(repaired.slides[1].lockedVariant, 'C');
 
     gate.release();
-    const completed = await waitFor(() => getGeneration(started, projectId), (state) => state.status === 'completed', 'generation completion');
+    const completed = await waitFor(() => getGeneration(started, projectId), (state) => ['completed', 'failed'].includes(state.status), 'generation terminal state', 90_000);
+    assert.equal(completed.status, 'completed', JSON.stringify({ status: completed.status, failure: completed.failure }));
     assert.equal(completed.readySlides, 3);
     assert.equal(completed.slides[0].selectedVariant, 'B');
     assert.equal(completed.slides[1].lockedVariant, 'C');

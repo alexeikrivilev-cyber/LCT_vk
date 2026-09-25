@@ -35,6 +35,20 @@ export interface PptxRenderResult {
   templatePreservationStatus: 'passed' | 'failed' | 'unknown';
   validationIssues: readonly { severity: 'error' | 'warning'; message: string; partName: string | null }[];
   unresolvedVisualTypes: readonly string[];
+  /** Replaceable internal evidence describing the post-cleanup native composition selected for each slide. */
+  projectedCompositions: readonly {
+    slideId: string;
+    variantId: string;
+    sourceSlideIndex: number | null;
+    semanticArchetype: string | null;
+    confidence: number | null;
+    projectedCompositionSignature: string;
+    availableDistinctFamilies: number | null;
+    titleGeometryNormalized: { x: number; y: number; width: number; height: number; rotation: number } | null;
+    bodyGeometryNormalized: { x: number; y: number; width: number; height: number; rotation: number } | null;
+    titleBodyFontHierarchy: { titlePt: number; bodyPt: number; ratio: number } | null;
+    selectionReason: string;
+  }[];
 }
 
 /** A backend materializes one already-compiled deck without narrative decisions. */
