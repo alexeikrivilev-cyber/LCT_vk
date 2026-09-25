@@ -1,6 +1,9 @@
 import { spawn } from 'node:child_process';
 import type { Server } from 'node:http';
 import type { StartServerOptions } from './server.js';
+import { assertLoopbackDaemonBindHost, DEFAULT_DAEMON_BIND_HOST, normalizeDaemonBindHost } from './daemon-bind-host.js';
+
+export { DEFAULT_DAEMON_BIND_HOST, normalizeDaemonBindHost } from './daemon-bind-host.js';
 
 export type StartedDaemonRuntime = {
   server: Server;
@@ -14,8 +17,6 @@ type DaemonRuntimeOptions = Omit<StartServerOptions, 'returnServer'> & {
   logListening?: boolean;
 };
 
-export const DEFAULT_DAEMON_BIND_HOST = '127.0.0.1';
-
 function openUrl(url: string): void {
   const command = process.platform === 'darwin'
     ? { bin: 'open', args: [url] }
@@ -28,11 +29,6 @@ function openUrl(url: string): void {
   } catch {
     // Browser opening is convenience only.
   }
-}
-
-export function normalizeDaemonBindHost(input: unknown): string {
-  const host = String(input ?? '').trim();
-  return host || DEFAULT_DAEMON_BIND_HOST;
 }
 
 export function parseDaemonCliStartupArgs(argv: string[]):
@@ -61,6 +57,8 @@ export function parseDaemonCliStartupArgs(argv: string[]):
       return { ok: false, kind: 'error', message: `unknown option or command: ${arg}` };
     }
   }
+  try { host = assertLoopbackDaemonBindHost(host); }
+  catch (error) { return { ok: false, kind: 'error', message: error instanceof Error ? error.message : 'invalid bind host' }; }
   return { ok: true, config: { host, port, open } };
 }
 

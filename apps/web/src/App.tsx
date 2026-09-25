@@ -42,6 +42,7 @@ type TemplateCompileResponse = {
 type PlanningResponse = {
   status?: string;
   templateStatus?: string;
+  inputFingerprint?: string | null;
   contentFiles?: string[];
   brief?: unknown;
   contentIR?: unknown;
@@ -53,6 +54,47 @@ type PlanningResponse = {
   failure?: unknown;
   warnings?: unknown;
   updatedAt?: string | null;
+};
+
+type GenerationVariantId = 'A' | 'B' | 'C';
+type GenerationVariant = {
+  status: string;
+  version: number;
+  previewUrl: string | null;
+  layoutIssueCount: number;
+  visualSlotStatus: string;
+  audit: { findings?: unknown[] } | null;
+};
+type GenerationPack = {
+  slideId: string;
+  index: number;
+  title: string;
+  recommendedVariant: GenerationVariantId;
+  selectedVariant: GenerationVariantId;
+  status: string;
+  version: number;
+  lockedVariant: GenerationVariantId | null;
+  auditSummary: { errors: number; warnings: number; infos: number };
+  failure: { code: string; message: string } | null;
+  variants: Record<GenerationVariantId, GenerationVariant>;
+};
+type GenerationState = {
+  generationId: string;
+  idempotencyKey: string;
+  inputFingerprint: string;
+  planHash: string;
+  contentIRHash: string;
+  templateIRHash: string;
+  revision: number;
+  status: string;
+  readySlides: number;
+  totalSlides: number;
+  currentSlideId: string | null;
+  defaultTrack: GenerationVariantId;
+  selectionVersion: number;
+  slides: GenerationPack[];
+  failure: { code: string; message: string } | null;
+  exports: Array<{ id: string; mode: 'selected' | GenerationVariantId; downloadUrl: string; validationStatus: string; nativeOfficeStatus: string }>;
 };
 
 type DataRecord = Record<string, unknown>;
@@ -716,16 +758,20 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const upload = async (incoming: FileList | null) => {
     if (!incoming?.length) return;
     const incomingFiles = Array.from(incoming);
+    const uploadedFiles: ProjectFile[] = [];
     setBusy(true);
     setError(null);
     try {
-      const form = new FormData();
-      for (const file of incomingFiles) form.append('files', file);
-      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/upload`, { method: 'POST', body: form });
-      if (!response.ok) throw new Error(await errorMessage(response));
-      const body = await response.json().catch(() => null) as { files?: ProjectFile[] } | null;
+      for (let offset = 0; offset < incomingFiles.length; offset += 2) {
+        const form = new FormData();
+        for (const file of incomingFiles.slice(offset, offset + 2)) form.append('files', file);
+        const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/upload`, { method: 'POST', body: form });
+        if (!response.ok) throw new Error(await errorMessage(response));
+        const body = await response.json().catch(() => null) as { files?: ProjectFile[] } | null;
+        uploadedFiles.push(...(body?.files ?? []));
+      }
       await loadFiles();
-      const uploadedTemplate = body?.files?.find((file) => /\.pptx$/i.test(filePath(file) || file.originalName || ''));
+      const uploadedTemplate = uploadedFiles.find((file) => /\.pptx$/i.test(filePath(file) || file.originalName || ''));
       const incomingTemplate = incomingFiles.find((file) => /\.pptx$/i.test(file.name));
       const uploadedPath = uploadedTemplate
         ? filePath(uploadedTemplate)
@@ -734,6 +780,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       await loadTemplateScan();
       await loadPlanning();
     } catch (err) {
+      if (uploadedFiles.length) await loadFiles();
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       if (uploadRef.current) uploadRef.current.value = '';
@@ -779,7 +826,15 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
 
       {error ? <div className="error-banner workspace-error">{error}</div> : null}
 
-      <section className="template-panel" aria-labelledby="template-panel-title">
+      <nav className="workspace-stages" aria-label="Presentation stages">
+        <a href="#template-panel" data-complete={templateScan?.status === 'ready'}>Template</a>
+        <a href="#planning-panel" data-complete={planningSourceFiles.length > 0}>Content / brief</a>
+        <a href="#planning-panel" data-complete={planning?.status === 'ready'}>Plan</a>
+        <a href="#generation-panel" data-complete={planning?.status === 'ready'}>Generate</a>
+        <a href="#generation-review" data-complete={false}>Review / export</a>
+      </nav>
+
+      <section className="template-panel" id="template-panel" aria-labelledby="template-panel-title">
         <div className="template-panel-head">
           <div>
             <span className="eyebrow">TEMPLATE UNDERSTANDING</span>
@@ -950,7 +1005,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         ) : null}
       </section>
 
-      <section className="planning-panel" aria-labelledby="planning-panel-title">
+      <section className="planning-panel" id="planning-panel" aria-labelledby="planning-panel-title">
         <div className="planning-panel-head">
           <div>
             <span className="eyebrow">CONTENT PLANNING</span>
@@ -1093,6 +1148,15 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         ) : null}
       </section>
 
+      <PresentationGenerationPanel
+        projectId={projectId}
+        planningReady={planning?.status === 'ready'}
+        inputFingerprint={planning?.inputFingerprint ?? null}
+        planHash={stringValue(firstValue(planningDeckPlan, ['hash']))}
+        contentIRHash={stringValue(firstValue(contentIR, ['hash']))}
+        templateIRHash={stringValue(firstValue(templateIR, ['hash']))}
+      />
+
       <div className="workspace-grid">
         <aside className="workspace-sidebar">
           <section className="sidebar-section">
@@ -1170,5 +1234,266 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         </section>
       </div>
     </main>
+  );
+}
+
+function PresentationGenerationPanel({ projectId, planningReady, inputFingerprint, planHash, contentIRHash, templateIRHash }: {
+  projectId: string;
+  planningReady: boolean;
+  inputFingerprint: string | null;
+  planHash: string;
+  contentIRHash: string;
+  templateIRHash: string;
+}) {
+  const [generation, setGeneration] = useState<GenerationState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const generationRef = useRef<GenerationState | null>(null);
+  const idempotencyRef = useRef<string | null>(null);
+  const activeRef = useRef(false);
+  const matchesCurrentInputs = (state: GenerationState | null) => Boolean(state && inputFingerprint && planHash && contentIRHash && templateIRHash
+    && state.inputFingerprint && state.planHash === planHash && state.contentIRHash === contentIRHash
+    && state.templateIRHash === templateIRHash);
+
+  useEffect(() => {
+    if (generation && !matchesCurrentInputs(generation)) idempotencyRef.current = null;
+  }, [generation?.generationId, generation?.status, inputFingerprint, planHash, contentIRHash, templateIRHash]);
+
+  const apply = useCallback((next: GenerationState | null) => {
+    const current = generationRef.current;
+    if (next && current && next.generationId === current.generationId && next.revision < current.revision) return;
+    generationRef.current = next;
+    activeRef.current = Boolean(next && (next.status === 'preparing' || next.status === 'generating'));
+    if (next?.idempotencyKey) idempotencyRef.current = next.idempotencyKey;
+    setGeneration(next);
+  }, []);
+
+  const load = useCallback(async () => {
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/generation`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      const body = await response.json() as { generation?: GenerationState | null };
+      apply(body.generation ?? null);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [apply, projectId]);
+
+  useEffect(() => {
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      await load();
+      if (!disposed && activeRef.current) timer = window.setTimeout(() => void poll(), 850);
+    };
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [load, projectId]);
+
+  const request = async (url: string, init: RequestInit = {}) => {
+    const response = await fetch(url, init);
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    if (!response.ok) {
+      const message = await errorMessage(new Response(JSON.stringify(body), { status: response.status }));
+      throw new Error(message);
+    }
+    return body ?? {};
+  };
+
+  const withBusy = async (key: string, operation: () => Promise<void>) => {
+    setBusy(key);
+    setError(null);
+    try { await operation(); }
+    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setBusy(null); }
+  };
+
+  const start = () => withBusy('start', async () => {
+    const key = matchesCurrentInputs(generationRef.current) ? idempotencyRef.current ?? id() : id();
+    idempotencyRef.current = key;
+    const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key }, body: '{}',
+    }) as { generation?: GenerationState };
+    if (body.generation) apply(body.generation);
+    await load();
+  });
+
+  const cancel = () => withBusy('cancel', async () => {
+    const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/cancel`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    }) as { generation?: GenerationState };
+    if (body.generation) apply(body.generation);
+  });
+
+  const chooseTrack = (variant: GenerationVariantId) => {
+    if (!generation) return;
+    void withBusy(`track-${variant}`, async () => {
+      const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/selection`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: 'deck', variant, expectedVersion: generation.selectionVersion }),
+      }) as { generation?: GenerationState };
+      if (body.generation) apply(body.generation);
+    });
+  };
+
+  const chooseSlide = (pack: GenerationPack, variant: GenerationVariantId) => {
+    void withBusy(`slide-${pack.slideId}-${variant}`, async () => {
+      const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/selection`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: 'slide', slideId: pack.slideId, variant, expectedVersion: pack.version }),
+      }) as { generation?: GenerationState };
+      if (body.generation) apply(body.generation);
+    });
+  };
+
+  const toggleLock = (pack: GenerationPack) => {
+    void withBusy(`lock-${pack.slideId}`, async () => {
+      const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/slides/${encodeURIComponent(pack.slideId)}/lock`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ locked: !pack.lockedVariant, variant: pack.selectedVariant, expectedVersion: pack.version }),
+      }) as { generation?: GenerationState };
+      if (body.generation) apply(body.generation);
+    });
+  };
+
+  const repair = (pack: GenerationPack, variant: GenerationVariantId, findingId: string) => {
+    void withBusy(`repair-${pack.slideId}-${findingId}`, async () => {
+      const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/repair`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slideId: pack.slideId, variant, findingId, expectedVersion: pack.version }),
+      }) as { generation?: GenerationState };
+      if (body.generation) apply(body.generation);
+    });
+  };
+
+  const exportDeck = (mode: 'selected' | GenerationVariantId) => {
+    void withBusy(`export-${mode}`, async () => {
+      const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/export`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }),
+      }) as { state?: GenerationState };
+      if (body.state) apply(body.state);
+    });
+  };
+
+  const isActive = generation?.status === 'preparing' || generation?.status === 'generating';
+  const currentGeneration = matchesCurrentInputs(generation);
+  const canExport = currentGeneration && generation?.status === 'completed' && generation.readySlides === generation.totalSlides;
+
+  return (
+    <section className="generation-panel" id="generation-panel" aria-labelledby="generation-panel-title">
+      <div className="generation-panel-head">
+        <div>
+          <span className="eyebrow">PROGRESSIVE SLIDE GENERATION</span>
+          <h2 id="generation-panel-title">Generate and review slide packs</h2>
+          <p>The saved outline is compiled into A/B/C alternatives once. Changing a selection does not run planning again.</p>
+        </div>
+        <div className="generation-actions">
+          {isActive ? <button className="quiet" onClick={() => void cancel()} disabled={Boolean(busy)}>Cancel generation</button>
+            : <button className="primary" onClick={() => void start()} disabled={!planningReady || loading || Boolean(busy) || currentGeneration && (generation?.status === 'completed' || generation?.status === 'cancelled')}>
+              {currentGeneration && generation?.status === 'failed' ? 'Resume generation' : currentGeneration && generation?.status === 'completed' ? 'Generated' : 'Generate slide packs'}
+            </button>}
+          <span className={`generation-status generation-status-${generation?.status ?? 'idle'}`} role="status">
+            {loading ? 'Loading saved generation' : generation?.status === 'completed' && !currentGeneration ? 'Plan changed · ready to regenerate' : generation ? generation.status.replaceAll('_', ' ') : planningReady ? 'Ready to generate' : 'Waiting for a ready plan'}
+          </span>
+        </div>
+      </div>
+
+      {!planningReady ? <p className="generation-notice">Finish and save a valid plan before starting slide generation.</p> : null}
+      {error ? <p className="generation-error" role="alert">{error}</p> : null}
+      {generation?.failure ? <p className="generation-notice" role="status">{generation.failure.message}</p> : null}
+
+      {generation ? <>
+        <div className="generation-progress-row" role="status" aria-live="polite">
+          <strong>{generation.readySlides} / {generation.totalSlides} slides ready</strong>
+          <span>{generation.currentSlideId ? `Working on slide ${generation.slides.find((pack) => pack.slideId === generation.currentSlideId)?.index ?? ''}` : generation.status}</span>
+        </div>
+        <div className="generation-track-picker" role="group" aria-label="Default deck track">
+          <span>Default track</span>
+          {(['A', 'B', 'C'] as const).map((variant) => <button key={variant} className={generation.defaultTrack === variant ? 'active' : ''}
+            aria-pressed={generation.defaultTrack === variant} disabled={Boolean(busy)} onClick={() => chooseTrack(variant)}>
+            All {variant}{variant === 'A' ? ' · recommended' : ''}
+          </button>)}
+        </div>
+        <div className="generation-slide-list">
+          {generation.slides.map((pack) => <article className="generation-slide-card" key={pack.slideId} aria-labelledby={`generation-slide-${pack.index}`}>
+            <div className="generation-slide-heading">
+              <div><span>SLIDE {String(pack.index).padStart(2, '0')}</span><h3 id={`generation-slide-${pack.index}`}>{pack.title}</h3></div>
+              <div className={`generation-pack-status pack-status-${pack.status}`} role="status">{pack.status}</div>
+            </div>
+            <div className="generation-variants">
+              {(['A', 'B', 'C'] as const).map((variant) => {
+                const item = pack.variants[variant];
+                const audit = item.audit?.findings ?? [];
+                return <section className={`generation-variant ${pack.selectedVariant === variant ? 'selected' : ''}`} key={variant} aria-label={`Slide ${pack.index}, variant ${variant}`}>
+                  <div className="generation-variant-heading">
+                    <strong>Variant {variant}</strong>
+                    {pack.recommendedVariant === variant ? <span className="recommended-mark">Recommended</span> : null}
+                  </div>
+                  {item.previewUrl ? <img className="generation-preview" src={`${item.previewUrl}?v=${item.version}`} alt={`Slide ${pack.index}, variant ${variant} preview`} />
+                    : <div className="generation-preview-empty" role="status">{pack.status === 'rendering' ? 'Preparing preview…' : item.status}</div>}
+                  <div className="generation-variant-meta">
+                    <span>{item.visualSlotStatus === 'not-applicable' ? 'Text slide' : `Visual ${item.visualSlotStatus}`}</span>
+                    {item.layoutIssueCount ? <span>{item.layoutIssueCount} preview layout note(s)</span> : null}
+                    <span>{audit.length} audit finding(s)</span>
+                  </div>
+                  <button className={pack.selectedVariant === variant ? 'primary generation-select' : 'quiet generation-select'}
+                    aria-pressed={pack.selectedVariant === variant} disabled={pack.status !== 'ready' || Boolean(busy)}
+                    onClick={() => chooseSlide(pack, variant)}>
+                    {pack.selectedVariant === variant ? `Selected ${variant}` : `Choose ${variant}`}
+                  </button>
+                </section>;
+              })}
+            </div>
+            <div className="generation-slide-footer">
+              <span className="generation-audit-badge" data-errors={pack.auditSummary.errors > 0}>
+                A/B/C: {pack.auditSummary.errors} errors · {pack.auditSummary.warnings} warnings
+              </span>
+              <button className="quiet" disabled={pack.status !== 'ready' || Boolean(busy)} onClick={() => toggleLock(pack)}>
+                {pack.lockedVariant ? `Unlock ${pack.lockedVariant}` : `Lock ${pack.selectedVariant}`}
+              </button>
+              <details className="generation-audit" id={pack.index === 1 ? 'generation-review' : undefined}>
+                <summary>Audit findings</summary>
+                {pack.variants[pack.selectedVariant].audit?.findings?.length ? <ul>
+                  {pack.variants[pack.selectedVariant].audit?.findings?.map((findingValue, index) => {
+                    const finding = record(findingValue);
+                    const findingId = stringValue(firstValue(finding, ['id']));
+                    const rule = stringValue(firstValue(finding, ['ruleId']), 'audit');
+                    const message = stringValue(firstValue(finding, ['message']), 'Finding details are unavailable.');
+                    const safeFix = firstValue(finding, ['autofixAvailable']) === true;
+                    return <li key={`${findingId}-${index}`}>
+                      <span><strong>{rule}</strong> · {message}</span>
+                      {safeFix ? <button className="quiet compact" disabled={Boolean(busy)} onClick={() => repair(pack, pack.selectedVariant, findingId)}>Apply safe fix</button> : <small>Replan required</small>}
+                    </li>;
+                  })}
+                </ul> : <p>No deterministic findings for the selected variant.</p>}
+              </details>
+            </div>
+            {pack.failure ? <p className="generation-notice" role="alert">{pack.failure.message}</p> : null}
+          </article>)}
+        </div>
+
+        <section className="generation-export" aria-labelledby="generation-export-title">
+          <div><span className="eyebrow">REVIEW / EXPORT</span><h3 id="generation-export-title">Download editable PowerPoint</h3>
+            <p>Exports become available after package reopen validation. PowerPoint desktop rendering has not been reviewed.</p></div>
+          <div className="generation-export-actions">
+            {(['selected', 'A', 'B', 'C'] as const).map((mode) => <button key={mode} className={mode === 'selected' ? 'primary' : 'quiet'}
+              disabled={!canExport || Boolean(busy)} onClick={() => exportDeck(mode)}>
+              {busy === `export-${mode}` ? 'Assembling…' : mode === 'selected' ? 'Download selected PPTX' : `Download ${mode}`}
+            </button>)}
+          </div>
+          {generation.exports.length ? <ul className="generation-export-list">{generation.exports.map((artifact) => <li key={artifact.id}>
+            <a href={artifact.downloadUrl}>Download {artifact.mode === 'selected' ? 'selected deck' : `track ${artifact.mode}`}</a>
+            <span>package validation passed · native Office review unknown</span>
+          </li>)}</ul> : null}
+        </section>
+      </> : <p className="generation-notice">A/B/C slide alternatives and previews will appear here as each pack is ready.</p>}
+    </section>
   );
 }

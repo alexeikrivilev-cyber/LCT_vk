@@ -6,11 +6,11 @@ import {
 import type {
   PptxDocumentAdapter,
   PptxRoundTripResult,
-} from './pptx-document-adapter.js';
+} from '../application/pptx-document-port.js';
 
 /**
- * Replaceable Office Kit implementation used only by the isolated renderer
- * spike. Production application flow does not import or construct this class.
+ * Replaceable Office Kit document implementation. Office Kit types stay
+ * behind this adapter and the application-owned document port.
  */
 export class OfficeKitPptxDocumentAdapter implements PptxDocumentAdapter {
   async roundTrip(source: Uint8Array): Promise<PptxRoundTripResult> {

@@ -11,7 +11,7 @@ The system keeps two classes separate:
 
 A finding must say which class produced it. Contextual audit is a Supervisor capability, not a third semantic agent.
 
-The current replaceable offline audit covers only the compile-time evidence it can measure: title/body bounds and mutual overlap, selected-layout references, blank text slides, broken ContentIR provenance, numeric tokens missing from cited units, common placeholder strings, exact duplicate slide text, explicit bullet count, and native-table row/column limits. It reports text overflow, visual fit, inherited style/contrast, and semantic entailment as unknown or leaves them to contextual review. A compile-time pass is not an export preflight pass.
+The replaceable offline audit checks measured title/body/visual bounds and overlaps, selected-layout references, blank text slides, broken ContentIR/media references, numeric values plus explicit currencies/percentages/dates against cited units, table-cell provenance, chart categories/series labels/values and slide provenance, KPI numeric source cells, process step refs, common placeholder strings, duplicate slide text, more-than-six explicit bullets, bullets of at least twenty words, chart-series count, and table row/column limits. The long-bullet rule is a lexical warning, not a fit calculation. The compiler explicitly rejects a plan when no measured title/content slots can carry its text instead of publishing fallback geometry. Invalid image source paths, missing files, hash mismatches, and unsupported image formats produce typed Office Kit backend failures with an attached deterministic finding. Both render paths remove inactive source slides and speaker notes; source-only image, chart, and workbook parts are pruned only when unreachable from the generated package root. Office Kit render results include reopen, package validation, retained-source-part preservation, native object counts, and unresolved visual types; the custom renderer reports its unsupported visual types and leaves reopen/preservation status unknown. Numeric checking is lexical and does not infer conversions, derived-value validity, or semantic equivalence. Text overflow, crop/aspect distortion for unsupported image formats, inherited style/contrast, PowerPoint rendering, and semantic entailment remain unknown or belong to preview/contextual review. Preview overflow results are recorded but do not turn an approximate renderer into an export oracle. A compile-time or Office Kit package-validation pass is not a PowerPoint/LibreOffice export preflight pass.
 
 ## Finding contract
 
@@ -103,11 +103,11 @@ Source consistency may be checked against supplied content where tractable. Do n
 
 Supervisor should not re-audit every slide with a long call. Deterministic findings, ambiguity, risk, and remaining deadline decide where contextual review is worth the latency.
 
-An internal, replaceable `ContextualSlideAuditPort` describes one bounded Supervisor capability over a rendered slide image, exact text, cited source evidence, and neighboring slide summaries. Its eight gates cover takeaway title, title support, one-sentence summary, factual grounding, visual relevance, prompt garbage, language consistency, and adjacent-slide narrative. Only the typed contract and local fake test exist; there is no model adapter, render-image pipeline, API, persisted finding state, or audit UI yet.
+An internal, replaceable `ContextualSlideAuditPort` describes one bounded Supervisor capability over a rendered slide image, exact text, cited source evidence, and neighboring slide summaries. Its eight gates cover takeaway title, title support, one-sentence summary, factual grounding, visual relevance, prompt garbage, language consistency, and adjacent-slide narrative. Only the typed contract and local fake test exist: contextual findings are not wired to a model adapter, rendered-image pipeline, persistence, API, or UI. The current generation API/UI instead exposes deterministic findings persisted with each rendered variant.
 
 ## Audit during progressive generation
 
-Audit must support continuous slide-pack generation rather than forcing a serial review workflow.
+Audit must support continuous slide-pack generation rather than forcing a serial review workflow. In the implemented application slice, each variant receives deterministic audit before the complete A/B/C pack is published, and the findings are stored with the variant. The client reads changes through persisted REST snapshots; no push event transport is implemented.
 
 For each slide pack:
 
@@ -115,8 +115,8 @@ For each slide pack:
 2. run blocking deterministic render/integrity checks required for a usable pack;
 3. publish the valid A/B/C pack;
 4. continue generation of later slides immediately;
-5. run non-blocking deterministic/contextual review and safe repair asynchronously where appropriate;
-6. emit `audit.updated` / `slide.updated` when later findings or repairs change an already-ready slide.
+5. run contextual review and any follow-up review asynchronously where appropriate;
+6. make later findings or repairs visible in the persisted snapshot. A future streaming client may notify the user with `audit.updated` / `slide.updated` events.
 
 A severe deterministic problem may prevent publication of the affected pack until repaired. Ordinary warnings and contextual Supervisor review must not hold the entire generation queue.
 
@@ -128,7 +128,7 @@ Audit must also be runnable on demand.
 
 The presentation view should overlay findings on affected regions where coordinates/object ids are known.
 
-The issue panel should support:
+The current generation panel shows stored deterministic findings and exposes the available safe local layout repair. The broader audit UX should support:
 
 - filter by severity/category;
 - distinguish deterministic/contextual checks;
@@ -175,7 +175,7 @@ A Supervisor-proposed semantic repair may be auto-applied only when product poli
 
 Anything that changes meaning, chart semantics, layout family, visual type, or a locked item requires explicit action or visible re-plan.
 
-The offline compiler spike has a separate one-attempt repair helper. For the first slide with a measured out-of-bounds/overlapping text placement, it selects the next ranked layout once and audits the deck once more. This is not connected to saved project state or the runtime generation workflow. It never edits text or factual content.
+The offline compiler has a one-attempt alternate-layout helper. Phase 2 connects a slide-local deterministic layout change to persisted generation state: it checks the finding, lock and expected slide version, renders/audits only the affected variant, and rejects the repair if the blocking issue remains. It never edits text or factual content. Contextual semantic repair and multi-finding repair selection are not implemented.
 
 ## Preflight gates
 

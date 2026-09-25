@@ -11,7 +11,7 @@ Implementation details may evolve. The boundaries and state semantics below are 
 ```text
 Browser / Next.js
       |
-      | HTTP + incremental generation events
+      | REST + persisted-state polling (current generation UI)
       v
 Presentation daemon / Express
       |
@@ -57,9 +57,9 @@ Implemented today:
 - bounded ContentIR v1 compilation for selected text, Markdown, JSON, CSV/TSV, image references, and inventory-only unsupported files;
 - validated Brief v1 and narrative-only DeckPlan v1 planning through the semantic adapter, with bounded Supervisor review/repair/re-plan;
 - project-local planning persistence, input-fingerprint staleness checks, planning API, and a compact workspace planning panel;
-- a replaceable offline slide-compilation spike that maps a persisted DeckPlan and ContentIR into three template-aware layout tracks, with explainable layout candidates;
+- a replaceable offline presentation-engine experiment that maps a persisted DeckPlan and ContentIR into three template-aware layout tracks, with explainable layout candidates;
 - a native OOXML PPTX writer that preserves the source package's master/theme/layout parts and emits editable text plus a native table when referenced CSV cells form a rectangular grid;
-- deterministic pre-render geometry/provenance/numeric checks, one bounded alternate-layout repair attempt, and an offline 3-template × 3-variant matrix runner;
+- deterministic pre-render geometry/provenance/numeric checks, one bounded alternate-layout repair attempt, and an offline matrix runner for supplied PPTX templates;
 - a typed, replaceable contextual-audit port for the existing Supervisor capability, covered by a local fake test and no model invocation;
 - live HTML preview with relative resources;
 - built-in design-system and skill discovery;
@@ -69,28 +69,28 @@ Implemented today:
 - presentation-oriented Node/TypeScript runtime;
 - PPTX/PDF primitives available to the daemon.
 
-The planning vertical slice is implemented through persisted DeckPlan and API/UI presentation. ContentIR v1 only deterministically compiles user-supplied `.txt`, `.md`, `.json`, `.csv`, and `.tsv` text; images become references and other binary files are inventory-only with warnings. It does not parse PDF/Office content, create semantic summaries, or perform research. Slide compilation, variant matching, one native table primitive, deterministic pre-render audit, and offline matrix generation now exist as replaceable application tooling. They are not connected to the application generation workflow: there is no SlidePack persistence, progressive publication, audit API/UI, general chart/image/diagram rendering, or PPTX/HTML/PDF export flow. The PPTX writer replaces the presentation's active slide list with compiled slides, keeps the source master/theme/layout package parts, and renders editable text plus rectangular CSV tables; it does not preserve the source deck's sample slides or fully reproduce inherited placeholder styling. No rendered overflow or visual-quality claim is made. The inference adapter carries caller-supplied stateless requests; it does not create persistent Worker/Supervisor sessions or KV namespaces. Template understanding v1 is a deterministic structural scan and does not establish universal arbitrary-template compatibility.
+The planning vertical slice is implemented through persisted DeckPlan and API/UI presentation. ContentIR v1 deterministically compiles user-supplied `.txt`, `.md`, `.json`, `.csv`, and `.tsv` text; images become references and other binary files are inventory-only with warnings. It does not parse PDF/Office content, create semantic summaries, or perform research. The offline compiler supports source-backed text, rectangular tables, limited numeric charts, KPI/process objects, and PNG/JPEG images through the selectable Office Kit renderer; its custom fallback writes editable text and rectangular tables. Phase 2 connects a ready persisted planning result to application generation: one shared DeckPlan and ContentIR are compiled as ordered A/B/C slide packs, rendered and deterministically audited, then exposed through persisted REST snapshots to the UI. The application can select a default track or per-slide variants, lock ready slides, apply a bounded local layout repair, and export selected/mixed or whole-track PPTX files. This path makes no inference calls after planning. Image generation, PDF/HTML export, semantic slide audit, and native Office visual qualification are not implemented by this slice. Inherited style fidelity, rendered overflow, and final visual quality remain unverified. The inference adapter carries caller-supplied stateless requests; it does not create persistent Worker/Supervisor sessions or KV namespaces. Template understanding v1 is a deterministic structural scan and does not establish universal arbitrary-template compatibility.
 
 ### Offline slide compilation spike
 
-The replaceable internal slice has these boundaries:
+The replaceable presentation-engine slice has these boundaries:
 
 ```text
 persisted ContentIR + Brief + DeckPlan
 TemplateIR/PDS
-        -> layout matcher + A/B/C variant policy
+        -> evidence-based layout matcher + A/B/C variant policy
         -> replaceable CompiledPresentation
-        -> native OOXML text / rectangular table objects
-        -> deterministic pre-render audit
+        -> custom or Office Kit PPTX renderer
+        -> deterministic audit + optional Office Kit preview
 ```
 
-The compiler copies DeckPlan takeaways and referenced ContentIR text/cells without rewriting claims. `DeckPlan` supplies narrative intent, `TemplateIR` supplies measured layout geometry and source parts, and `CompiledPresentation` records the selected layout, variant, exact text, visualization references, provenance, and placements. Layout matching uses placeholder roles and measured geometry; declared layout names are diagnostics only. The renderer performs no narrative or visualization selection.
+The compiler copies DeckPlan takeaways and referenced ContentIR text/cells without rewriting claims. `DeckPlan` supplies narrative intent and factual references; optional `mediaRefs` point only to image media units and stay separate from factual `contentRefs`. `TemplateIR` supplies measured layout geometry and source parts. `CompiledPresentation` records layout evidence, exact text, source-backed table/chart/KPI/process/image payloads, provenance, and placements. Layout matching uses placeholder types and measured geometry; declared layout names are diagnostics only. The renderer performs no narrative or data selection.
 
-The three policies change layout ranking across the whole deck. The offline matrix runner validates and reuses one saved plan across three supplied PPTX templates and emits A/B/C PPTX files, audit reports, a replay manifest, and timing diagnostics without an inference adapter. It is a developer experiment command, not a production API or progressive SlidePack generator.
+The three policies change layout ranking while a canonical factual payload test proves that claims and provenance remain equal. The offline matrix runner validates and reuses one saved plan across supplied PPTX templates, renders A/B/C through a selected backend, and records native object counts, validation/reopen/preview/preservation status, audit reports, replay metadata, and timings without an inference adapter. Five valid synthetic template families exercise 15 outputs. This remains a developer command, not a production API or progressive SlidePack generator.
 
-Known rendering limits are deliberate: referenced CSV cell grids can become native tables; chart series, process semantics, image references, and general diagrams do not yet have sufficient compilation contracts for faithful rendering. Their requested visual type remains explicit and unresolved audit findings identify that gap. The compiler cannot route image units from current planning output because the DeckPlan contract disallows media-reference citations. Generated objects do not yet reproduce inherited placeholder text styles, chart/table styles, locks, or native picture relationships. The output package has not been opened in PowerPoint or LibreOffice.
+The default remains the custom OOXML renderer until the reuse gate is met. The pinned Office Kit backend is selectable behind the same replaceable renderer port and uses its document/layout/shape/table/chart/image/connector APIs. It materializes generated slides only, retains and byte-checks masters/layouts/theme/media/opaque package parts, reopens and validates the output, and reports unsupported visuals explicitly. The backend supports source-backed PNG/JPEG images with contain fit; crop authoring exists in the donor API but the current DeckPlan/CompiledPresentation does not carry crop intent. WebP is rejected. Native notes are not generated because the semantic plan has no notes contract.
 
-The Office Kit package read/write adapter in `apps/daemon/src/presentation/spikes/` is a replaceable, test-only reuse spike. The current application flow does not import it. Its synthetic-template round-trip is evidence for a hybrid backend option, not proof of arbitrary-template fidelity or a production renderer decision; see [ADR-001](decisions/ADR-001-office-kit-renderer-spike.md).
+`OfficeKitPreviewAdapter` provides SVG/PNG and text-layout checks for diagnostics. It is not a PowerPoint visual oracle, and table-cell text overflow remains unaudited. The production-useful offline harness `scripts/compare-pptx-backends.mjs` verifies an immutable template with a no-op save/reopen and a controlled generated slide, then reports preservation and preview evidence. Its current decision is `SAFE_FOR_OFFICE_KIT_BACKEND=no`: no held-out user/organizer template or PowerPoint/LibreOffice open-save has been qualified. See [ADR-001](decisions/ADR-001-office-kit-renderer-spike.md) for exact adoption gates.
 
 ## Canonical pipeline
 
@@ -102,17 +102,16 @@ TemplateIR + PresentationDesignSystem + ContentIR + Brief
   -> Worker -> canonical DeckPlan -> bounded Supervisor plan review
   -> persisted planning state / API / UI
 
-  -> SlidePack generation (target)
-  -> continuous slide-pack pipeline
+  -> persisted PresentationGenerationState
+  -> continuous slide-pack pipeline (implemented)
        slide 1: A/B/C -> validate/render/audit -> publish
        slide 2: A/B/C -> validate/render/audit -> publish
        ...
        slide N: A/B/C -> validate/render/audit -> publish
-  -> visual candidates arrive/update slots asynchronously
-  -> targeted supervisor review/repair of completed checkpoints
+  -> image candidates (target; not implemented)
+  -> targeted semantic review/repair (target; current repair is deterministic layout-only)
   -> SelectedDeck
-  -> preflight
-  -> PPTX / PDF / HTML
+  -> PPTX assembly, reopen and package validation (implemented)
 ```
 
 Do not implement this as one giant agent call or as three unrelated full-deck generations.
@@ -144,7 +143,9 @@ Switching a candidate, locking a ready object, or editing a completed slide loca
 
 ## Incremental state and events
 
-Generation state is durable application state, not model-chat state. The daemon should expose incremental events; transport may be SSE, WebSocket, streaming HTTP, or another suitable mechanism.
+Generation state is durable SQLite application state, not model-chat state. The current daemon exposes it through REST snapshots, and the web client polls while generation is active. The persisted snapshot is authoritative after reconnect or restart. No SSE/WebSocket event bus is used in this slice.
+
+The current daemon has no authentication boundary and rejects non-loopback bind addresses. Exposing its project, upload, inference, media, or export API to another machine requires authentication before the bind policy can change.
 
 Canonical event meanings include:
 
@@ -159,7 +160,7 @@ generation.completed
 generation.failed
 ```
 
-Event payloads carry project/generation/checkpoint ids and stable slide/object ids. The client treats events as state notifications and can always recover current state from persisted project data after reconnect.
+The snapshot carries project/generation ids, revision and monotonic ready-slide progress, plus stable slide ids. A future streaming transport may notify the client of these state changes, but it must not replace persisted state as the source of truth.
 
 Do not make the browser connection the source of truth for a running generation.
 

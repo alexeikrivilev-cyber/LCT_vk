@@ -31,9 +31,9 @@ pnpm build
 
 `pnpm lint:craft` is required when skill/craft bindings change. Typecheck/build are required when the corresponding code paths change.
 
-`pnpm test` runs the Node built-in suite for project-file safeguards, ContentIR/Brief/DeckPlan contracts, planning API persistence and review bounds, the private Python inspector, the deterministic TemplateIR/PDS mapper, the template compile API, replaceable slide compilation/layout matching/native OOXML rendering/audit/matrix tooling, craft-reference tooling, the semantic inference adapter, and the inference benchmark harness. Inference and planning tests use fake adapters/local fake HTTP servers; they do not contact Cloud.ru, download model weights, or require a GPU. Planning API coverage includes reload, PASS/WARN/REPAIR/LOCAL-REPLAN, exactly one revision Worker call without recursive Supervisor review, duplicate slide-id rejection, invalid references/repair targets/checkpoints, image metadata exclusion from Worker evidence and factual citations, malformed review output, changed brief/source/template/prompt staleness, and lazy actionable inference-configuration failure. Synthetic Transitional and Strict OOXML fixtures exercise the implemented structural-inspection path, including linked versus ambiguous themes, nested master/layout groups, direct sRGB/scheme/system color observations, slide/master/layout backgrounds and color-map evidence, unresolved rotated group geometry, and notes inventory. These tests do not imply full arbitrary-template compatibility, inherited style resolution, automatic semantic entailment verification, rendered PowerPoint compatibility/visual quality, actual inference quality/serving, progressive SlidePack generation, or production export integration.
+`pnpm test` runs the Node built-in suite for project-file safeguards, ContentIR/Brief/DeckPlan contracts, planning API persistence and review bounds, the private Python inspector, the deterministic TemplateIR/PDS mapper, the template compile API, replaceable slide compilation/layout matching, custom and Office Kit renderers, preview/audit/matrix tooling, craft-reference tooling, the semantic inference adapter, and the inference benchmark harness. Inference and planning tests use fake adapters/local fake HTTP servers; they do not contact Cloud.ru, download model weights, or require a GPU. Planning API coverage includes reload, PASS/WARN/REPAIR/LOCAL-REPLAN, exactly one revision Worker call without recursive Supervisor review, duplicate slide-id rejection, invalid references/repair targets/checkpoints, image metadata exclusion from Worker factual evidence, separately typed image `mediaRefs`, malformed review output, changed brief/source/template/prompt staleness, and lazy actionable inference-configuration failure. Synthetic Transitional and Strict OOXML fixtures exercise the implemented structural-inspection path, including linked versus ambiguous themes, nested master/layout groups, direct sRGB/scheme/system color observations, slide/master/layout backgrounds and color-map evidence, unresolved rotated group geometry, and notes inventory. A separate valid PptxGenJS corpus exercises five distinct template families, multi-master/notes/media/chart/table/connector content, opaque XML preservation, 15 Office Kit generated outputs, preview status, source immutability, and no-op/generated-slide reopen. `apps/daemon/test/presentation-generation-api.test.mjs` adds an offline API flow over synthetic templates: it verifies ordered incremental A/B/C packs, persisted monotonic progress, concurrent selection/lock/repair, preview and selected mixed-deck export, output reopen, failure/cancel behavior, restart recovery and zero inference calls. These tests do not imply real held-out template compatibility, inherited style resolution, automatic semantic entailment verification, native PowerPoint/LibreOffice fidelity, actual inference quality/serving, or browser-automated UI behavior.
 
-The Template Compiler integration test uploads a synthetic PPTX through the project API, compiles and reloads its canonical state across a daemon restart, checks stable hashes and source-byte immutability, detects source changes as stale, and verifies controlled missing/invalid-file behavior, failed-path sanitization, and preservation of the last successful result. Mapper tests separately check deterministic IDs/hashes, exact relationships/placeholders/geometry/style/background facts, unsupported/warning retention, and PDS references to valid TemplateIR entities.
+The Template Compiler integration test uploads a synthetic PPTX through the project API, compiles and reloads its canonical state across a daemon restart, checks stable hashes and source-byte immutability, detects source changes as stale, and verifies controlled missing/invalid-file behavior, failed-path sanitization, and preservation of the last successful result. Renderer package tests check inactive source-slide text, speaker-note text, and unreachable source-only image/chart/workbook data are absent after projection, while generated outputs reopen and the Office Kit backend validates active native objects. Mapper tests separately check deterministic IDs/hashes, exact relationships/placeholders/geometry/style/background facts, unsupported/warning retention, and PDS references to valid TemplateIR entities.
 
 ## Planning quality runs
 
@@ -45,17 +45,29 @@ node --import tsx scripts/evaluate-planning-runs.mjs run-1/state.json run-2/stat
 
 The evaluator calls the production ContentIR, Brief, DeckPlan, and Supervisor-review validators and reports slide count, references, persisted readiness, outcome, available request latencies, and Worker/Supervisor `finish_reason` values when present. It leaves unsupported-claim count and subjective content/narrative/visual review as `null`. Historical schemaVersion 1 states without finish reasons report `null`. The evaluator makes no inference requests and writes a result file only when `--out <path>` is supplied.
 
-## Offline compile and replay matrix
-
-The replaceable matrix runner reads one successful persisted planning state, validates its Brief/ContentIR/Worker checkpoint/final DeckPlan/Supervisor result, parses three local PPTX templates, and reuses the same plan for A/B/C compilation against each template. It has no inference adapter. It writes nine PPTX files, per-variant audit reports, `matrix.json`, a secret-filtered `replay.json`, and `diagnostics.json`.
+`apps/daemon/test/live-quality-suite.test.mjs` runs the live qualification orchestration against a local fake OpenAI-compatible HTTP server. It covers health/model discovery, one strict JSON request, a real PlanningService Worker/Supervisor/persist/replay flow, five sequential scenarios with exactly two calls each, offline A/B/C compilation with zero extra inference, secret-free reports, unavailable/wrong-model endpoints, 524, null content, `finish_reason=length`, malformed JSON, and no retry. Run it with:
 
 ```bash
-pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-offline-presentation-matrix.mjs --state ".lct/projects/<project-id>/.planning/state.json" --out ".lct/experiments/<run-name>" --templates "./templates/template-1.pptx" "./templates/template-2.pptx" "./templates/template-3.pptx" --run-metadata "./run-metadata.json"
+pnpm dlx pnpm@10.33.2 exec node --import tsx --test apps/daemon/test/live-quality-suite.test.mjs
 ```
 
-The optional metadata file accepts only `providerKind` (`runpod`, `cloudru`, `vk`, `local`, or `unknown`), a known `profile`, and boolean `thinkingEnabled`. It does not copy endpoint URLs or credentials. Worker/Supervisor temperature, token limits, prompt versions, persisted structured results, model alias, timestamps, latency, and `finishReason` are taken from known application settings and the saved state when available; historical states without finish reasons report `null`. `contentParsing`, repair, and separate PDF/HTML export timings remain unknown/not run; the runner records the stages it measures instead of inventing timings.
+The user-facing PowerShell setup and output review steps are in [`LIVE_QUALIFICATION.md`](./LIVE_QUALIFICATION.md).
 
-The current writer keeps the source package's master/theme/layout parts and writes native editable text shapes and native tables from complete rectangular CSV references. The output slide list contains only generated slides; original sample slides are left as unreferenced package parts. Tests reopen generated OOXML with the local PPTX inspector and assert editable text, table rows, slide/layout relationships, and no full-slide picture object. They do not open the artifact in PowerPoint/LibreOffice or validate rendered overflow, inherited style fidelity, chart/image/diagram output, or production API/UI integration. Matrix tests generate their artifacts in a temporary directory and remove them after verification.
+## Offline compile and replay matrix
+
+The replaceable matrix runner reads one successful persisted planning state, validates its Brief/ContentIR/Worker checkpoint/final DeckPlan/Supervisor result, parses one through ten local PPTX templates, and reuses the same plan for A/B/C compilation against each template. The acceptance corpus is five templates × three variants = 15 outputs. It has no inference adapter. It writes PPTX files, per-variant audit reports, `matrix.json`, a secret-filtered `replay.json`, and `diagnostics.json`.
+
+```bash
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-offline-presentation-matrix.mjs --state ".lct/projects/<project-id>/.planning/state.json" --out ".lct/experiments/<run-name>" --templates "./templates/template-1.pptx" "./templates/template-2.pptx" "./templates/template-3.pptx" "./templates/template-4.pptx" "./templates/template-5.pptx" --content-root ".lct/projects/<project-id>" --run-metadata "./run-metadata.json"
+```
+
+The optional metadata file accepts only `providerKind` (`runpod`, `cloudru`, `vk`, `local`, or `unknown`), a known `profile`, and boolean `thinkingEnabled`. It does not copy endpoint URLs or credentials. Worker/Supervisor temperature, token limits, prompt versions, persisted structured results, model alias, timestamps, latency, and `finishReason` are taken from known application settings and the saved state when available; historical states without finish reasons report `null`. Diagnostics represent template inspection, content parsing, Worker, Supervisor, slide compilation, render, preview, audit, repair, export, offline total, and product end-to-end total. Stages not run are `null` with an explicit status; no elapsed-time zero is used as a stand-in for a skipped stage.
+
+Both renderers use the same compiled representation. The default custom backend emits editable text and rectangular tables; unsupported visual types are listed in its result and template preservation remains `unknown`. The selectable Office Kit backend removes source sample slides from the active slide list, then authors native text, table, chart, image, KPI, and process objects through the pinned library. Both backends remove inactive source slide parts and speaker-note parts from generated packages; package-level regression tests exercise synthetic T1 and T5 through both paths. Office Kit reopens and validates output, compares retained template package parts byte-for-byte, and exposes unresolved visual slots. Image source paths are resolved below the supplied content root, checked for symlink escape and SHA-256 mismatch, and inserted with contain fit. PNG/JPEG are supported; WebP is explicitly rejected until the chosen backend proves image fidelity. The current plan does not provide image crop semantics, so the compiler does not infer a crop. Generated notes remain unsupported because DeckPlan/CompiledPresentation has no notes contract.
+
+The `OfficeKitPreviewAdapter` wraps the pinned SVG/PNG renderer and `auditTextLayout`; previews are approximate and do not verify native PowerPoint rendering or table-cell text overflow. `scripts/compare-pptx-backends.mjs <template.pptx> --out <separate-dir>` safely hashes an immutable input, inventories the LCT/Office Kit views, runs no-op and generated-slide roundtrips, compares source package parts, checks source-byte identity, and writes preview artifacts plus a JSON report. It reports `SAFE_FOR_OFFICE_KIT_BACKEND=no` until a real held-out corpus and native PowerPoint/LibreOffice open-save validation pass.
+
+Matrix tests reopen Office Kit outputs and assert the active slide count equals the generated count, sample slide text is absent, masters/layouts/themes/media/opaque parts are unchanged, and native object counts cover image/table/chart/KPI/process paths. The fixture crop tests library capability only; generated source images currently use contain fit. Matrix artifacts are created in a temporary directory and removed after verification. These checks still do not prove rendered overflow, inherited style fidelity, real-template compatibility, or browser-level interaction. Application API/export integration is covered only by the synthetic generation API test described above.
 
 ## Deterministic unit tests
 
@@ -73,7 +85,7 @@ Prioritize exact programmatic contracts:
 - export relationships/native object construction;
 - deadline accounting/scheduler priority rules.
 
-The current compiler tests additionally verify repeated compilation determinism, three whole-deck layout tracks from one plan, template-name independence, explicit source-backed CSV table cells, numeric/provenance findings, one bounded layout repair, generated PPTX reinspection, and exactly nine matrix outputs with zero inference calls.
+The current compiler tests additionally verify repeated compilation determinism, three distinct A/B/C layout tracks with an identical canonical factual payload, template-name independence, source-backed CSV table and chart values, image-media references separate from factual citations, typed missing/hash-mismatch image errors, KPI/process source refs, chart/table provenance blockers, one bounded layout repair, generated PPTX reinspection, Office Kit source-slide projection and package preservation, SVG/PNG preview, and exactly 15 matrix outputs with zero inference calls.
 
 Use small fixtures and exact assertions.
 
@@ -85,7 +97,7 @@ Compare normalized `TemplateIR`/design-system state, not unstable ZIP timestamps
 
 ## Progressive-generation integration tests
 
-This is a first-class product contract.
+This is a first-class product contract. The current synthetic API integration test covers the implemented application slice; the remaining behaviors below stay acceptance requirements until explicitly covered.
 
 Test a multi-slide `DeckPlan` and verify:
 
@@ -94,13 +106,13 @@ Test a multi-slide `DeckPlan` and verify:
 - each published pack contains all three A/B/C structural candidates and one recommended default;
 - visible pack order follows deck order even if internal work is pipelined;
 - progress is monotonic and reconnect can recover current persisted state;
-- Worker begins/continues future slide work after publishing the previous pack;
+- generation continues future slide work after publishing the previous pack; deterministic A/B/C compilation does not make another Worker/Supervisor request;
 - local selection/lock/edit on a ready slide does not pause or reset unrelated pending slides;
 - a scoped future-plan change invalidates only the affected pending scope;
 - explicit pause/cancel stops forward generation cleanly;
 - a blocking failure preserves already-ready slide packs/project state.
 
-Test incremental events such as `generation.progress`, `slide-pack.ready`, `visual-candidates.ready`, `audit.updated`, and terminal completion/failure. The exact transport may vary; event meanings/state recovery may not.
+The current web client polls the persisted generation snapshot over REST while work is active. The snapshot, not a push event, is authoritative. A future streaming transport may use notifications comparable to `generation.progress`, `slide-pack.ready`, `audit.updated`, and terminal completion/failure, provided reload still recovers from persisted state. Image-candidate events are not implemented because image generation is outside this slice.
 
 ## Variant invariants
 

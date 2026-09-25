@@ -6,6 +6,7 @@ import express from 'express';
 import multer from 'multer';
 import fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
+import { assertLoopbackDaemonBindHost } from './daemon-bind-host.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Server } from 'node:http';
@@ -20,6 +21,7 @@ import {
 } from './presentation-store.js';
 import {
   deletePresentationFile,
+  assertSafeProjectId,
   ensurePresentationProjectDir,
   listPresentationFiles,
   mimeForPresentationFile,
@@ -42,6 +44,13 @@ import {
 import type { SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
 import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
 import {
+  PresentationGenerationError,
+  PresentationGenerationService,
+} from './presentation/application/generation-service.js';
+import type { PptxRendererPort } from './presentation/application/pptx-backend-port.js';
+import type { PptxPreviewPort } from './presentation/application/pptx-preview-port.js';
+import { resolvePptxBackend } from './presentation/adapters/pptx-renderer-factory.js';
+import {
   compileTemplate,
   getTemplateCompilation,
   TemplateCompilerError,
@@ -56,6 +65,10 @@ export interface StartServerOptions {
   returnServer?: boolean;
   semanticInferenceAdapter?: SemanticInferenceAdapter;
   semanticInferenceAdapterFactory?: () => SemanticInferenceAdapter;
+  /** Replaceable renderer seam used by offline application tests. */
+  presentationRenderer?: PptxRendererPort;
+  /** Replaceable preview seam used by offline application tests. */
+  presentationPreview?: PptxPreviewPort;
 }
 
 export interface StartedPresentationServer {
@@ -85,12 +98,30 @@ function projectNotFound(res: express.Response): void {
   res.status(404).json({ error: { code: 'PROJECT_NOT_FOUND', message: 'Presentation project not found.' } });
 }
 
+function generationError(res: express.Response, error: unknown): void {
+  if (error instanceof PresentationGenerationError) {
+    res.status(error.status).json({ error: { code: error.code, message: error.message } });
+    return;
+  }
+  if (error instanceof Error && error.message === 'invalid project id') {
+    res.status(400).json({ error: { code: 'INVALID_PROJECT_ID', message: 'Project id is invalid.' } });
+    return;
+  }
+  res.status(500).json({ error: { code: 'GENERATION_FAILED', message: 'The slide generation request failed.' } });
+}
+
+function smallGenerationBody(req: express.Request): boolean {
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return false;
+  return Buffer.byteLength(JSON.stringify(req.body), 'utf8') <= 16 * 1024;
+}
+
 function encodedRawUrl(projectId: string, name: string): string {
   const encoded = name.split('/').filter(Boolean).map(encodeURIComponent).join('/');
   return `/api/projects/${encodeURIComponent(projectId)}/raw/${encoded}`;
 }
 
 export async function startServer(options: StartServerOptions = {}): Promise<string | StartedPresentationServer> {
+  const host = assertLoopbackDaemonBindHost(options.host?.trim() || process.env.LCT_BIND_HOST || '127.0.0.1');
   const projectRoot = path.resolve(options.projectRoot ?? repoRootFromModule());
   const dataDir = resolveDataDir(projectRoot, options.dataDir);
   const projectsRoot = path.join(dataDir, 'projects');
@@ -104,14 +135,39 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       ?? options.semanticInferenceAdapterFactory?.()
       ?? new OpenAICompatibleSemanticInferenceAdapter(semanticInferenceConfigFromEnvironment()),
   });
+  const generationService = new PresentationGenerationService({
+    db,
+    projectsRoot,
+    planningService,
+    backend: resolvePptxBackend(),
+    ...(options.presentationRenderer ? { renderer: options.presentationRenderer } : {}),
+    ...(options.presentationPreview ? { preview: options.presentationPreview } : {}),
+  });
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '32mb' }));
 
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 64 * 1024 * 1024, files: 64 },
+    limits: { fileSize: 64 * 1024 * 1024, files: 2, fields: 2, parts: 4 },
   });
+  let activeUploadRequests = 0;
+  const reserveUploadSlot: express.RequestHandler = (_req, res, next) => {
+    if (activeUploadRequests >= 2) {
+      res.status(429).json({ error: { code: 'UPLOAD_BUSY', message: 'Too many uploads are already in progress.' } });
+      return;
+    }
+    activeUploadRequests += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      activeUploadRequests -= 1;
+    };
+    res.once('close', release);
+    res.once('finish', release);
+    next();
+  };
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, product: 'lct-presentation-core', runtime: 'presentation-only' });
@@ -147,7 +203,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   app.get('/api/projects/:id', (req, res) => {
     const project = getPresentationProject(db, req.params.id);
     if (!project) return projectNotFound(res);
-    res.json({ project, resolvedDir: path.join(projectsRoot, project.id) });
+    res.json({ project });
   });
 
   app.patch('/api/projects/:id', (req, res) => {
@@ -177,6 +233,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   app.delete('/api/projects/:id', async (req, res) => {
     try {
       if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+      const generation = await generationService.getSnapshot(req.params.id);
+      if (generation && ['preparing', 'generating'].includes(generation.status)) await generationService.cancel(req.params.id);
       deletePresentationProject(db, req.params.id);
       await removePresentationProjectDir(projectsRoot, req.params.id);
       res.json({ ok: true });
@@ -209,7 +267,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     }
   });
 
-  app.post('/api/projects/:id/upload', upload.array('files', 64), async (req, res) => {
+  app.post('/api/projects/:id/upload', reserveUploadSlot, upload.array('files', 2), async (req, res) => {
     try {
       const projectId = req.params.id as string;
       if (!getPresentationProject(db, projectId)) return projectNotFound(res);
@@ -284,6 +342,136 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
         error: { code: 'PLANNING_FAILED', message: 'Planning failed. Check the project sources and retry.' },
       });
     }
+  });
+
+  app.get('/api/projects/:id/generation', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      res.json({ generation: await generationService.getSnapshot(projectId) });
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.get('/api/projects/:id/generation/packs', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      const generation = await generationService.getSnapshot(projectId);
+      res.json({ packs: generation?.slides ?? [], progress: generation ? {
+        ready: generation.readySlides, total: generation.totalSlides, revision: generation.revision,
+      } : null });
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.post('/api/projects/:id/generation', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      if (!smallGenerationBody(req)) return apiError(res, 413, new Error('generation request must be a small JSON object'));
+      const bodyKeys = Object.keys(req.body as Record<string, unknown>);
+      if (bodyKeys.some((key) => key !== 'idempotencyKey')) return apiError(res, 400, new Error('unexpected generation request field'));
+      const headerKey = req.get('Idempotency-Key');
+      const bodyKey = typeof req.body.idempotencyKey === 'string' ? req.body.idempotencyKey : undefined;
+      if (headerKey && bodyKey && headerKey !== bodyKey) return apiError(res, 400, new Error('Idempotency-Key header and body value differ'));
+      const result = await generationService.start(projectId, headerKey ?? bodyKey);
+      res.status(result.created ? 202 : 200).json({ generation: result.state, created: result.created });
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.post('/api/projects/:id/generation/cancel', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      if (!smallGenerationBody(req) || Object.keys(req.body as Record<string, unknown>).length) {
+        return apiError(res, 400, new Error('cancel request must have an empty JSON object'));
+      }
+      res.json({ generation: await generationService.cancel(projectId) });
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.put('/api/projects/:id/generation/selection', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      if (!smallGenerationBody(req)) return apiError(res, 413, new Error('selection request is too large'));
+      const body = req.body as Record<string, unknown>;
+      if (body.scope === 'deck' && Object.keys(body).sort().join(',') === 'expectedVersion,scope,variant') {
+        return res.json({ generation: await generationService.setDefaultTrack(projectId, body.variant, body.expectedVersion) });
+      }
+      if (body.scope === 'slide' && Object.keys(body).sort().join(',') === 'expectedVersion,scope,slideId,variant') {
+        return res.json({ generation: await generationService.selectVariant(projectId, body.slideId, body.variant, body.expectedVersion) });
+      }
+      return apiError(res, 400, new Error('selection request fields are invalid'));
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.put('/api/projects/:id/generation/slides/:slideId/lock', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      if (!smallGenerationBody(req)) return apiError(res, 413, new Error('lock request is too large'));
+      const body = req.body as Record<string, unknown>;
+      if (Object.keys(body).some((key) => !['locked', 'variant', 'expectedVersion'].includes(key))
+          || !Object.hasOwn(body, 'locked') || !Object.hasOwn(body, 'expectedVersion')) {
+        return apiError(res, 400, new Error('lock request fields are invalid'));
+      }
+      res.json({ generation: await generationService.lockSlide(projectId, req.params.slideId, body.locked, body.variant, body.expectedVersion) });
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.get('/api/projects/:id/generation/slides/:slideId/audit', (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      res.json({ audit: generationService.audit(projectId, req.params.slideId, req.query.variant) });
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.post('/api/projects/:id/generation/repair', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      if (!smallGenerationBody(req)) return apiError(res, 413, new Error('repair request is too large'));
+      const body = req.body as Record<string, unknown>;
+      if (Object.keys(body).sort().join(',') !== 'expectedVersion,findingId,slideId,variant') {
+        return apiError(res, 400, new Error('repair request fields are invalid'));
+      }
+      res.json({ generation: await generationService.repair(projectId, body as { slideId: unknown; variant: unknown; findingId: unknown; expectedVersion: unknown }) });
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.get('/api/projects/:id/generation/previews/:slideId/:variant', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      const preview = await generationService.readPreview(projectId, req.params.slideId, req.params.variant);
+      res.type('png').setHeader('Cache-Control', 'private, max-age=60').send(preview);
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.post('/api/projects/:id/generation/export', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      if (!smallGenerationBody(req) || Object.keys(req.body as Record<string, unknown>).join(',') !== 'mode') {
+        return apiError(res, 400, new Error('export request must contain only mode'));
+      }
+      res.status(201).json(await generationService.export(projectId, req.body.mode));
+    } catch (error) { generationError(res, error); }
+  });
+
+  app.get('/api/projects/:id/generation/exports/:exportId', async (req, res) => {
+    try {
+      const projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      const { bytes, artifact } = await generationService.readExport(projectId, req.params.exportId);
+      const name = `LCT-${artifact.mode}-${artifact.id.slice(0, 8)}.pptx`;
+      res.status(200)
+        .type('application/vnd.openxmlformats-officedocument.presentationml.presentation')
+        .setHeader('Content-Disposition', `attachment; filename="${name}"`)
+        .setHeader('Cache-Control', 'no-store')
+        .send(bytes);
+    } catch (error) { generationError(res, error); }
   });
 
   app.get('/api/projects/:id/preview-url', async (req, res) => {
@@ -394,8 +582,23 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     });
   });
 
-  const host = options.host?.trim() || process.env.LCT_BIND_HOST?.trim() || '127.0.0.1';
+  app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (res.headersSent) return;
+    const status = typeof (error as { status?: unknown })?.status === 'number'
+      ? Number((error as { status: number }).status)
+      : error instanceof multer.MulterError ? 413 : 500;
+    res.status(status).json({
+      error: {
+        code: error instanceof multer.MulterError ? 'UPLOAD_LIMIT_EXCEEDED' : status === 400 ? 'INVALID_REQUEST' : 'REQUEST_FAILED',
+        message: error instanceof multer.MulterError
+          ? 'Upload limits were exceeded. Upload at most two files per request, each no larger than 64 MiB.'
+          : status === 400 ? 'The request body could not be parsed.' : 'The request could not be completed.',
+      },
+    });
+  });
+
   const port = Number.isInteger(options.port) ? Number(options.port) : (Number(process.env.LCT_PORT) || 7456);
+  await generationService.recover();
   const server = await new Promise<Server>((resolve, reject) => {
     const listening = app.listen(port, host, () => resolve(listening));
     listening.once('error', reject);
@@ -406,6 +609,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   const url = `http://${urlHost}:${boundPort}`;
 
   const shutdown = async () => {
+    try { await generationService.shutdown(); } catch { /* persisted generation can recover on next start */ }
     try { db.close(); } catch { /* already closed */ }
   };
 

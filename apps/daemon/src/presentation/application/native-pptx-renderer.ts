@@ -7,22 +7,15 @@ import JSZip from 'jszip';
 import type { ContentIR } from '../domain/content-ir.js';
 import { validateTemplateIR, type TemplateIR } from '../domain/template-ir.js';
 import { auditCompiledPresentation } from './deterministic-audit.js';
+import { collectSourceSlideVisualArtifacts, removeUnreachableSourceVisualArtifacts } from './pptx-source-artifacts.js';
 import type { CompiledPresentation, CompiledSlide, PlacementBox } from './slide-compilation.js';
+import type { PptxRenderResult } from './pptx-backend-port.js';
 
 const FIXED_ZIP_DATE = new Date('1980-01-01T00:00:00.000Z');
 const PACKAGE_REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
 const MAX_TEMPLATE_BYTES = 64 * 1024 * 1024;
 
-export interface NativePptxRenderResult {
-  outputPath: string;
-  presentationId: string;
-  slideCount: number;
-  nativeTextShapeCount: number;
-  nativeTableCount: number;
-  rasterSlideCount: 0;
-  auditFindingCount: number;
-  artifactSha256: string;
-}
+export type NativePptxRenderResult = PptxRenderResult;
 
 function escapeXml(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
@@ -41,6 +34,23 @@ function appendBeforeClose(xml: string, closeTag: string, addition: string): str
   const index = xml.lastIndexOf(closeTag);
   if (index < 0) throw new TypeError(`PPTX package is missing ${closeTag}`);
   return `${xml.slice(0, index)}${addition}${xml.slice(index)}`;
+}
+
+function removeInactiveSourceSlidesAndNotes(zip: JSZip, contentTypesXml: string): string {
+  const removedParts = new Set<string>();
+  for (const [name, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    const sourceSlide = /^ppt\/slides\/[^/]+\.xml$/i.test(name);
+    const sourceSlideRels = /^ppt\/slides\/_rels\/[^/]+\.rels$/i.test(name);
+    const sourceNotes = /^ppt\/notesSlides\/[^/]+\.xml$/i.test(name);
+    const sourceNotesRels = /^ppt\/notesSlides\/_rels\/[^/]+\.rels$/i.test(name);
+    if (sourceSlide || sourceSlideRels || sourceNotes || sourceNotesRels) {
+      if (sourceSlide || sourceNotes) removedParts.add(name);
+      zip.remove(name);
+    }
+  }
+  return contentTypesXml.replace(/<Override\b[^>]*\bPartName\s*=\s*(["'])\/(ppt\/(?:slides|notesSlides)\/[^"']+\.xml)\1[^>]*\/>/giu,
+    (tag, _quote: string, partName: string) => removedParts.has(partName) ? '' : tag);
 }
 
 function safePart(part: string): string {
@@ -189,6 +199,7 @@ export async function renderNativePptx(input: {
   const inputHash = createHash('sha256').update(inputBytes).digest('hex');
   if (inputHash !== templateIR.source.sha256) throw new TypeError('Template PPTX bytes do not match the compiled TemplateIR source hash');
   const zip = await JSZip.loadAsync(inputBytes, { checkCRC32: true, createFolders: false });
+  const sourceVisualArtifacts = await collectSourceSlideVisualArtifacts(zip);
   const presentationFile = zip.file('ppt/presentation.xml');
   const relsFile = zip.file('ppt/_rels/presentation.xml.rels');
   const contentTypesFile = zip.file('[Content_Types].xml');
@@ -215,7 +226,8 @@ export async function renderNativePptx(input: {
     prefix = `lct_${input.compiledPresentation.id.slice(-12)}_${input.compiledPresentation.variantId.toLowerCase()}_${suffix++}`;
   }
   const parts = presentationParts(presentationXml, relsXml, input.compiledPresentation.slides, templateIR, pNs, aNs, rNs, officeRelNs, prefix);
-  const nextContentTypes = appendBeforeClose(contentTypesXml, '</Types>', parts.slideEntries.map((_entry, index) =>
+  const cleanedContentTypesXml = removeInactiveSourceSlidesAndNotes(zip, contentTypesXml);
+  const nextContentTypes = appendBeforeClose(cleanedContentTypesXml, '</Types>', parts.slideEntries.map((_entry, index) =>
     `<Override PartName="/ppt/slides/${prefix}_slide_${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`).join(''));
   // Some generated fixtures declare only a generic XML default; keep all original declarations intact.
   zip.file('ppt/presentation.xml', parts.presentation, { date: FIXED_ZIP_DATE });
@@ -226,6 +238,7 @@ export async function renderNativePptx(input: {
     zip.file(part.name, part.xml, { date: FIXED_ZIP_DATE });
     zip.file(part.relsName, part.relsXml, { date: FIXED_ZIP_DATE });
   }
+  await removeUnreachableSourceVisualArtifacts(zip, sourceVisualArtifacts);
 
   const outputBytes = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
   const resolvedOutput = path.resolve(input.outputPath);
@@ -237,14 +250,39 @@ export async function renderNativePptx(input: {
     await rm(temporary, { force: true }).catch(() => undefined);
     throw error;
   }
+  const unresolvedVisualTypes = [...new Set(input.compiledPresentation.slides.flatMap((slide) => {
+    const unresolved: string[] = [];
+    if (slide.imageRefs.length > 0) unresolved.push('image');
+    if (slide.visualization.type !== 'none'
+        && (slide.visualization.type !== 'table' || slide.visualization.tableData === null)) {
+      unresolved.push(slide.visualization.type);
+    }
+    return unresolved;
+  }))];
+  const unsupportedVisualIssues = unresolvedVisualTypes.map((visualType) => ({
+    severity: 'warning' as const,
+    message: `The custom backend does not materialize ${visualType} visuals; source-backed text is retained.`,
+    partName: null,
+  }));
   return {
+    backend: 'custom',
     outputPath: resolvedOutput,
     presentationId: input.compiledPresentation.id,
     slideCount: input.compiledPresentation.slides.length,
     nativeTextShapeCount: input.compiledPresentation.slides.length * 2,
     nativeTableCount: input.compiledPresentation.slides.filter((slide) => slide.visualization.tableData !== null).length,
+    nativeChartCount: 0,
+    nativeImageCount: 0,
+    nativeShapeCount: 0,
+    nativeConnectorCount: 0,
+    nativeNotesCount: 0,
     rasterSlideCount: 0,
-    auditFindingCount: audit.findings.length,
+    auditFindingCount: audit.findings.length + unsupportedVisualIssues.length,
     artifactSha256: createHash('sha256').update(outputBytes).digest('hex'),
+    reopenStatus: 'not-run',
+    validationStatus: 'not-run',
+    templatePreservationStatus: 'unknown',
+    validationIssues: unsupportedVisualIssues,
+    unresolvedVisualTypes,
   };
 }

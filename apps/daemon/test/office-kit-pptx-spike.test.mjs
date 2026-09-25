@@ -39,7 +39,7 @@ import {
 } from '@office-kit/pptx/node';
 import { auditTextLayout, renderSlideToSvg } from '@office-kit/pptx-preview';
 import { renderSlideToImage } from '@office-kit/pptx-preview/node';
-import { OfficeKitPptxDocumentAdapter } from '../src/presentation/spikes/office-kit-pptx-document-adapter.ts';
+import { OfficeKitPptxDocumentAdapter } from '../src/presentation/adapters/office-kit-pptx-document-adapter.ts';
 
 const require = createRequire(import.meta.url);
 const pptxgen = require('pptxgenjs');

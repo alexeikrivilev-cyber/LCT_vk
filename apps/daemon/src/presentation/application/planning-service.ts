@@ -29,7 +29,7 @@ import {
   type SemanticInferenceTelemetry,
 } from './semantic-inference-port.js';
 
-export const WORKER_PLAN_PROMPT_VERSION = 'worker-deck-plan.v1';
+export const WORKER_PLAN_PROMPT_VERSION = 'worker-deck-plan.v2';
 export const SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION = 'supervisor-plan-review.v1';
 const MAX_SELECTED_FILES = 12;
 const MAX_EVIDENCE_CHARS = 256 * 1024;
@@ -219,7 +219,7 @@ async function readPlanningPromptAssets(projectRoot: string): Promise<PlanningPr
   const promptRoot = path.join(projectRoot, 'apps', 'daemon', 'prompts');
   try {
     const [worker, supervisor] = await Promise.all([
-      readFile(path.join(promptRoot, 'worker-deck-plan.v1.md'), 'utf8'),
+      readFile(path.join(promptRoot, 'worker-deck-plan.v2.md'), 'utf8'),
       readFile(path.join(promptRoot, 'supervisor-plan-review.v1.md'), 'utf8'),
     ]);
     return {
@@ -264,9 +264,12 @@ function validateFailure(value: unknown): PlanningFailure | null {
 }
 
 function allowedContentIds(contentIR: ContentIR): Set<string> {
-  // Image references identify supplied assets, but do not expose their pixels
-  // or embedded text as evidence for a factual narrative takeaway.
+  // Factual citations must be text/data units. Media uses a separate field.
   return new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => unit.id));
+}
+
+function allowedMediaIds(contentIR: ContentIR): Set<string> {
+  return new Set(contentIR.units.filter((unit) => unit.kind === 'media-reference').map((unit) => unit.id));
 }
 
 function validateFinding(value: unknown, plan: DeckPlan, contentIds: ReadonlySet<string>): PlanningFinding {
@@ -377,12 +380,15 @@ export function applyPlanRepair(
   const draft: DeckPlanDraft = {
     workingTitle: checkpoint.workingTitle,
     narrativeSummary: checkpoint.narrativeSummary,
-    slides: slides.map(({ narrativeRole, purpose, takeaway, contentRefs, semanticVisualType, targetDensity }) => ({
-      narrativeRole, purpose, takeaway, contentRefs, semanticVisualType, targetDensity,
+    slides: slides.map(({ narrativeRole, purpose, takeaway, contentRefs, mediaRefs, semanticVisualType, targetDensity }) => ({
+      narrativeRole, purpose, takeaway, contentRefs,
+      ...(mediaRefs === undefined ? {} : { mediaRefs }),
+      semanticVisualType, targetDensity,
     })),
   };
   const contentIds = allowedContentIds(contentIR);
-  const validDraft = validateDeckPlanDraft(draft, contentIds, brief.requestedSlideCount);
+  const mediaIds = allowedMediaIds(contentIR);
+  const validDraft = validateDeckPlanDraft(draft, contentIds, brief.requestedSlideCount, mediaIds);
   return canonicalizeDeckPlan(validDraft, {
     id: checkpoint.id,
     version: checkpoint.version + 1,
@@ -390,6 +396,7 @@ export function applyPlanRepair(
     inputFingerprint,
     briefHash: briefHash(brief),
     allowedContentIds: contentIds,
+    allowedMediaIds: mediaIds,
     requestedSlideCount: brief.requestedSlideCount,
   });
 }
@@ -501,7 +508,7 @@ function validateStoredState(value: unknown): StoredPlanningState {
   let currentCheckpoint: DeckPlan | null = null;
   if (value.currentCheckpoint !== null) {
     if (!inputs) throw new TypeError('Saved checkpoint has no planning inputs');
-    currentCheckpoint = validateDeckPlan(value.currentCheckpoint, allowedContentIds(inputs.contentIR), inputs.brief.requestedSlideCount);
+    currentCheckpoint = validateDeckPlan(value.currentCheckpoint, allowedContentIds(inputs.contentIR), inputs.brief.requestedSlideCount, allowedMediaIds(inputs.contentIR));
   }
   let lastSuccessful: SuccessfulPlanSnapshot | null = null;
   if (value.lastSuccessful !== null) {
@@ -511,7 +518,7 @@ function validateStoredState(value: unknown): StoredPlanningState {
     ]) || !Array.isArray(saved.contentFiles) || saved.contentFiles.length > MAX_SELECTED_FILES
         || saved.contentFiles.some((item) => typeof item !== 'string') || !isHexHash(saved.inputFingerprint)
         || !isRecord(saved.promptVersions) || !exactKeys(saved.promptVersions, ['worker', 'supervisor'])
-        || saved.promptVersions.worker !== WORKER_PLAN_PROMPT_VERSION
+        || !['worker-deck-plan.v1', WORKER_PLAN_PROMPT_VERSION].includes(String(saved.promptVersions.worker))
         || saved.promptVersions.supervisor !== SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION
         || typeof saved.model !== 'string' || saved.model.length > 256
         || typeof saved.createdAt !== 'string' || !Number.isFinite(Date.parse(saved.createdAt))
@@ -524,8 +531,9 @@ function validateStoredState(value: unknown): StoredPlanningState {
     const brief = validateBrief(saved.brief);
     const contentIR = validateContentIR(saved.contentIR);
     const contentIds = allowedContentIds(contentIR);
-    const checkpoint = validateDeckPlan(saved.checkpoint, contentIds, brief.requestedSlideCount);
-    const deckPlan = validateDeckPlan(saved.deckPlan, contentIds, brief.requestedSlideCount);
+    const mediaIds = allowedMediaIds(contentIR);
+    const checkpoint = validateDeckPlan(saved.checkpoint, contentIds, brief.requestedSlideCount, mediaIds);
+    const deckPlan = validateDeckPlan(saved.deckPlan, contentIds, brief.requestedSlideCount, mediaIds);
     const expectedBriefHash = briefHash(brief);
     if (deckPlan.id !== checkpoint.id || deckPlan.version < checkpoint.version
         || deckPlan.inputFingerprint !== saved.inputFingerprint || checkpoint.inputFingerprint !== saved.inputFingerprint
@@ -547,7 +555,7 @@ function validateStoredState(value: unknown): StoredPlanningState {
       deckPlan,
       review: validatePlanReviewState(saved.review, checkpoint, contentIR),
       telemetry,
-      promptVersions: { worker: WORKER_PLAN_PROMPT_VERSION, supervisor: SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION },
+      promptVersions: { worker: String(saved.promptVersions.worker), supervisor: String(saved.promptVersions.supervisor) },
       model: saved.model,
       createdAt: saved.createdAt,
     };
@@ -637,19 +645,23 @@ function compactContentIR(contentIR: ContentIR): unknown {
     schemaVersion: contentIR.schemaVersion,
     id: contentIR.id,
     hash: contentIR.hash,
-    // Planning currently has no image understanding. Do not let filenames or
-    // inventory metadata bias semantic claims; retain those refs in canonical
-    // ContentIR for the UI and future visual-asset work.
     sources: contentIR.sources.filter((source) => source.kind === 'text').map(({ id, sourcePath, originalName, mediaType, sha256, order, byteLength, warnings }) => ({
       id, sourcePath, originalName, mediaType, sha256, order, byteLength, kind: 'text', warnings,
     })),
     units: contentIR.units.filter((unit) => unit.kind !== 'media-reference'),
+    // Visual references are selectors only. The text model sees no image pixels
+    // and must not use asset metadata as evidence for factual claims.
+    mediaAssets: contentIR.sources.filter((source) => source.kind === 'image').map(({ id, originalName, mediaType, sha256, order }) => ({
+      id: contentIR.units.find((unit) => unit.kind === 'media-reference' && unit.sourceId === id)?.id ?? null,
+      originalName, mediaType, sha256, order,
+    })).filter((asset) => asset.id !== null),
     warnings: contentIR.warnings.map(({ code, message }) => ({ code, message })),
   };
 }
 
 function contentForReview(contentIR: ContentIR, plan: DeckPlan): unknown {
   const wanted = new Set(plan.slides.flatMap((slide) => slide.contentRefs));
+  const mediaWanted = new Set(plan.slides.flatMap((slide) => slide.mediaRefs ?? []));
   const sources = new Map(contentIR.sources.map((source) => [source.id, source]));
   return {
     sources: contentIR.sources.filter((source) => plan.slides.some((slide) => slide.contentRefs.some((ref) => {
@@ -657,6 +669,11 @@ function contentForReview(contentIR: ContentIR, plan: DeckPlan): unknown {
       return unit?.sourceId === source.id;
     }))).map(({ id, sourcePath, originalName, mediaType, sha256 }) => ({ id, sourcePath, originalName, mediaType, sha256 })),
     units: contentIR.units.filter((unit) => wanted.has(unit.id)),
+    visualMedia: contentIR.units.filter((unit) => mediaWanted.has(unit.id)).map((unit) => ({
+      mediaRef: unit.id,
+      mediaType: sources.get(unit.sourceId)?.mediaType ?? null,
+      sourceHash: sources.get(unit.sourceId)?.sha256 ?? null,
+    })),
     warnings: contentIR.warnings.filter((warning) => warning.sourceId === null || sources.has(warning.sourceId)).slice(0, 24),
   };
 }
@@ -667,7 +684,7 @@ function telemetryModel(response: { telemetry: SemanticInferenceTelemetry }): st
 
 function isDraft(value: unknown, contentIR: ContentIR, brief: Brief): value is DeckPlanDraft {
   try {
-    validateDeckPlanDraft(value, allowedContentIds(contentIR), brief.requestedSlideCount);
+    validateDeckPlanDraft(value, allowedContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR));
     return true;
   } catch {
     return false;
@@ -689,10 +706,11 @@ function workerDraftSchema(): SemanticJsonSchema {
             purpose: { type: 'string', minLength: 1, maxLength: 1000 },
             takeaway: { type: 'string', minLength: 1, maxLength: 1000 },
             contentRefs: { type: 'array', maxItems: 20, items: { type: 'string' } },
+            mediaRefs: { type: 'array', maxItems: 20, items: { type: 'string' } },
             semanticVisualType: { type: 'string', enum: [...VISUAL_VALUES] },
             targetDensity: { type: 'string', enum: [...DENSITY_VALUES] },
           },
-          required: ['narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'semanticVisualType', 'targetDensity'],
+          required: ['narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'mediaRefs', 'semanticVisualType', 'targetDensity'],
         },
       },
     },
@@ -701,7 +719,7 @@ function workerDraftSchema(): SemanticJsonSchema {
 }
 
 function asDraft(value: unknown, contentIR: ContentIR, brief: Brief): DeckPlanDraft {
-  return validateDeckPlanDraft(value, allowedContentIds(contentIR), brief.requestedSlideCount);
+  return validateDeckPlanDraft(value, allowedContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR));
 }
 
 function outcomeMessage(error: unknown): PlanningFailure {
@@ -884,6 +902,7 @@ export class PlanningService {
         inputFingerprint: fingerprint,
         briefHash: briefHash(brief),
         allowedContentIds: allowedContentIds(contentIR),
+        allowedMediaIds: allowedMediaIds(contentIR),
         requestedSlideCount: brief.requestedSlideCount,
       });
       state = { ...state, currentCheckpoint: checkpoint, updatedAt: this.now().toISOString() };
@@ -955,11 +974,12 @@ export class PlanningService {
           inputFingerprint: fingerprint,
           briefHash: briefHash(brief),
           allowedContentIds: allowedContentIds(contentIR),
+          allowedMediaIds: allowedMediaIds(contentIR),
           requestedSlideCount: brief.requestedSlideCount,
         });
         revisionWorkerSummary = telemetrySummary(revisionResponse.telemetry);
       }
-      validateDeckPlan(deckPlan, allowedContentIds(contentIR), brief.requestedSlideCount);
+      validateDeckPlan(deckPlan, allowedContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR));
 
       const finalTemplate = await getTemplateCompilation(this.options.projectsRoot, projectId);
       const finalContentIR = await compileContentIR(this.options.projectsRoot, projectId, input.contentFiles);

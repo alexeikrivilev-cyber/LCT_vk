@@ -62,6 +62,7 @@ export function openPresentationStore(dataDir: string): Db {
   fs.mkdirSync(dataDir, { recursive: true });
   const db = new Database(path.join(dataDir, 'app.sqlite'));
   db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
   db.exec(`
     CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY,
@@ -71,6 +72,15 @@ export function openPresentationStore(dataDir: string): Db {
       pending_prompt TEXT,
       metadata_json TEXT,
       created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS presentation_generations (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+      generation_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      input_fingerprint TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      state_json TEXT NOT NULL,
       updated_at INTEGER NOT NULL
     );
   `);

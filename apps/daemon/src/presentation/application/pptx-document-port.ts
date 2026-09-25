@@ -1,7 +1,4 @@
-/**
- * Replaceable byte-in/byte-out document adapter boundary for renderer reuse
- * experiments. This is not an application or domain contract.
- */
+/** Replaceable package-level document capability used by presentation backends. */
 export interface PptxDocumentAdapter {
   roundTrip(source: Uint8Array): Promise<PptxRoundTripResult>;
 }

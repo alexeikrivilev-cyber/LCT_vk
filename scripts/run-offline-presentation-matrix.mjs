@@ -118,14 +118,14 @@ export function createOfflineReplayManifest(state, templates, matrix, runMetadat
 }
 
 function usage() {
-  return 'Usage: node --import tsx scripts/run-offline-presentation-matrix.mjs --state state.json --out output-dir --templates template-1.pptx template-2.pptx template-3.pptx [--run-metadata metadata.json]';
+  return 'Usage: node --import tsx scripts/run-offline-presentation-matrix.mjs --state state.json --out output-dir --templates template-1.pptx [template-2.pptx ...] [--content-root project-content-dir] [--run-metadata metadata.json]';
 }
 
 function parseArgs(argv) {
   const args = { templates: [] };
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
-    if (key === '--state' || key === '--out' || key === '--run-metadata') {
+    if (key === '--state' || key === '--out' || key === '--run-metadata' || key === '--content-root') {
       const value = argv[++index];
       if (!value) throw new Error(`${key} requires a path`);
       args[key.slice(2).replaceAll('-', '')] = value;
@@ -135,7 +135,7 @@ function parseArgs(argv) {
       throw new Error(`Unknown option: ${key}`);
     }
   }
-  if (!args.state || !args.out || args.templates.length !== 3) throw new Error(usage());
+  if (!args.state || !args.out || args.templates.length < 1 || args.templates.length > 10) throw new Error(usage());
   return args;
 }
 
@@ -152,8 +152,11 @@ export async function runOfflineMatrixFromState(args) {
   const currentBrief = validateBrief(currentInputs.brief);
   const currentContentIR = validateContentIR(currentInputs.contentIR);
   const ids = new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => unit.id));
-  const checkpoint = validateDeckPlan(saved.checkpoint, ids, brief.requestedSlideCount);
-  const deckPlan = validateDeckPlan(saved.deckPlan, ids, brief.requestedSlideCount);
+  const mediaIds = new Set(contentIR.units.filter((unit) => unit.kind === 'media-reference').map((unit) => unit.id));
+  const checkpoint = validateDeckPlan(saved.checkpoint, ids, brief.requestedSlideCount, mediaIds);
+  const deckPlan = validateDeckPlan(saved.deckPlan, ids, brief.requestedSlideCount, mediaIds);
+  const usesMedia = deckPlan.slides.some((slide) => (slide.mediaRefs?.length ?? 0) > 0);
+  if (usesMedia && !args.contentroot) throw new TypeError('The saved DeckPlan references images; --content-root is required for safe source-backed image resolution');
   const review = validatePlanReview(saved.review, checkpoint, contentIR);
   if (state.failure !== null || !Array.isArray(currentInputs.contentFiles) || !currentInputs.contentFiles.every((item) => typeof item === 'string')
       || currentInputs.inputFingerprint !== saved.inputFingerprint || briefHash(currentBrief) !== briefHash(brief)
@@ -166,7 +169,7 @@ export async function runOfflineMatrixFromState(args) {
   }
 
   const templates = [];
-  let templateParsingMs = 0;
+  let templateInspectionMs = 0;
   for (let index = 0; index < args.templates.length; index += 1) {
     const parsingStarted = performance.now();
     const pptxPath = path.resolve(args.templates[index]);
@@ -179,10 +182,15 @@ export async function runOfflineMatrixFromState(args) {
       compiledAt: new Date().toISOString(),
       compilerVersion: 'lct-template-compiler/1',
     });
-    templates.push({ pptxPath, templateIR });
-    templateParsingMs += performance.now() - parsingStarted;
+    templates.push({ pptxPath, templateIR, ...(args.contentroot ? { contentRoot: path.resolve(args.contentroot) } : {}) });
+    templateInspectionMs += performance.now() - parsingStarted;
   }
-  const matrix = await runOfflinePresentationMatrix({ deckPlan, contentIR, templates, outputRoot: args.out });
+  const matrix = await runOfflinePresentationMatrix({
+    deckPlan, contentIR, templates, outputRoot: args.out,
+    ...(args.backend ? { backend: args.backend } : {}),
+    ...(args.previewAdapter ? { previewAdapter: args.previewAdapter } : {}),
+    ...(args.previewAllSlides ? { previewAllSlides: true } : {}),
+  });
   let runMetadata = null;
   if (args.runmetadata) runMetadata = JSON.parse(await readFile(args.runmetadata, 'utf8'));
   const manifest = createOfflineReplayManifest(state, templates, matrix, runMetadata);
@@ -190,25 +198,34 @@ export async function runOfflineMatrixFromState(args) {
     schemaVersion: 1,
     inferenceRequests: 0,
     stageMs: {
-      templateParsing: Number(templateParsingMs.toFixed(3)),
+      templateInspection: Number(templateInspectionMs.toFixed(3)),
       contentParsing: null,
+      worker: safeLatency(saved.telemetry?.worker?.wallTimeMs),
+      supervisor: safeLatency(saved.telemetry?.supervisor?.wallTimeMs),
       planning: safeLatency(saved.telemetry?.totalWallTimeMs),
       slideCompilation: matrix.timingsMs.compile,
       render: matrix.timingsMs.render,
+      preview: matrix.timingsMs.preview,
       deterministicAudit: matrix.timingsMs.audit,
       repair: null,
       export: null,
-      offlineTotal: Number((templateParsingMs + matrix.timingsMs.total).toFixed(3)),
+      offlineTotal: Number((templateInspectionMs + matrix.timingsMs.total).toFixed(3)),
+      productEndToEndTotal: null,
     },
     stageStatus: {
-      templateParsing: 'measured during this run',
+      templateInspection: 'measured during this run',
       contentParsing: 'not rerun; ContentIR was loaded from the persisted planning snapshot',
+      worker: 'loaded from persisted inference telemetry; no inference request was made during this replay',
+      supervisor: 'loaded from persisted inference telemetry; no inference request was made during this replay',
       planning: 'loaded from persisted Worker/Supervisor telemetry; no inference request was made',
       slideCompilation: 'measured during this run',
       render: 'measured during this run',
+      preview: matrix.timingsMs.preview === null ? 'not run; no preview adapter was supplied' : 'measured during this run',
       deterministicAudit: 'measured during this run',
       repair: 'not run by this offline matrix command',
-      export: 'PPTX package assembly is included in render; no separate PDF/HTML export stage exists',
+      export: 'not run separately; PPTX package assembly and reopen are included in render',
+      offlineTotal: 'measured for template inspection and offline matrix stages; excludes content parsing and inference reruns',
+      productEndToEndTotal: 'not measured; this replay makes no inference request and does not rerun content parsing',
     },
   };
   await Promise.all([

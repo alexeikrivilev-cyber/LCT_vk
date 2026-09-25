@@ -1,10 +1,10 @@
 # LCT Presentation Compiler
 
-LCT converts an arbitrary corporate PPTX template, source materials, and a brief into a complete editable presentation that follows the template's design logic.
+The product target is to convert a corporate PPTX template, source materials, and a brief into an editable presentation that follows the template's design logic. Current qualification limits are listed below; arbitrary-template support is not claimed.
 
 The product is intentionally narrow: understand the template, plan the story once, continuously publish A/B/C slide packs, fill same-type visual slots, audit/repair locally, and export native PPTX/PDF/HTML.
 
-## Product flow
+## Target product flow
 
 ```text
 PPTX template + content + brief
@@ -21,7 +21,7 @@ PPTX template + content + brief
   -> editable PPTX / PDF / HTML
 ```
 
-Generation does not stop after each slide pack. The UI progressively exposes ready slides and a non-blocking progress indicator while later slides continue in the background. Users can inspect, switch, or lock ready slides without restarting unrelated pending work.
+The intended flow does not stop after each slide pack. The current synthetic application slice progressively exposes ready slides and a non-blocking progress indicator while later slides continue in the background. Users can inspect, switch, or lock ready slides without restarting unrelated pending work.
 
 `CONTEXT.md` is the canonical product contract.
 
@@ -56,7 +56,7 @@ The repository contains the minimal product shell:
 - `craft/` — compact presentation craft guidance.
 - `templates/deck-framework.html` — neutral HTML preview shell.
 
-Deterministic PPTX structural understanding is implemented: upload a `.pptx` into a project, choose **Analyze as template**, and review the saved `TemplateIR`/structural design summary in the workspace. Recompiling the same source is deterministic; changing the source marks the saved result stale. This scan has partial OOXML/style coverage and does not claim universal arbitrary-template compatibility. The workspace also supports planning from a brief and selected `.txt`, `.md`, `.json`, `.csv`, and `.tsv` sources: it compiles user-supplied evidence into `ContentIR`, asks the Worker for a narrative-only `DeckPlan`, runs a bounded Supervisor review, and persists the result across reloads. Local fake-adapter/API tests cover this planning slice. One live A100 Qwen3.8-27B path passed a small strict-schema request and a synthetic Worker → Supervisor → persisted-state/reload run with request-level thinking disabled. This does not qualify the 300-second gate or Cloud.ru/VK deployments. A replaceable offline compiler spike now ranks template layouts, compiles three whole-deck variants from one persisted plan, writes native editable text and rectangular CSV tables into the original template package, audits compiled geometry/provenance/numeric evidence, and generates a 3-template × 3-variant matrix without inference. It is not connected to application generation or the UI; charts, images, general diagrams, rendered overflow, and final PPTX quality remain unverified. See [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`AUDIT.md`](./AUDIT.md), [`TESTING.md`](./TESTING.md), [`INFERENCE.md`](./INFERENCE.md), and [`services/inference/README.md`](./services/inference/README.md).
+Deterministic PPTX structural understanding is implemented: upload a `.pptx` into a project, choose **Analyze as template**, and review the saved `TemplateIR`/structural design summary in the workspace. Recompiling the same source is deterministic; changing the source marks the saved result stale. This scan has partial OOXML/style coverage and does not claim universal arbitrary-template compatibility. The workspace also supports planning from a brief and selected `.txt`, `.md`, `.json`, `.csv`, and `.tsv` sources: it compiles user-supplied evidence into `ContentIR`, asks the Worker for a narrative-only `DeckPlan`, runs a bounded Supervisor review, and persists the result across reloads. One live A100 Qwen3.8-27B path passed a small strict-schema request and a synthetic Worker → Supervisor → persisted-state/reload run with request-level thinking disabled. This does not qualify the 300-second gate or Cloud.ru/VK deployments. From a ready plan, the application now compiles and renders ordered A/B/C slide packs without further inference, persists progress, selections and locks in SQLite, supports deterministic layout-only repair, and exports selected/mixed or whole-track editable PPTX files after reopen and package validation. The web workspace exposes Template, Content/Brief, Plan, Generate and Review/Export stages with incremental persisted-state polling. Offline API end-to-end tests use synthetic PPTX fixtures and zero inference; they do not establish held-out template compatibility or native Office visual fidelity. The presentation engine has a replaceable document/render boundary with the existing custom backend and a selectable Office Kit backend. Production Office Kit adoption remains unqualified until real held-out PPTX and a native Office open/save gate pass. Image generation and PDF/HTML export are not included in this application slice. See [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`AUDIT.md`](./AUDIT.md), [`TESTING.md`](./TESTING.md), [`INFERENCE.md`](./INFERENCE.md), and [`services/inference/README.md`](./services/inference/README.md).
 
 The current visual UI is temporary and expected to be redesigned. Product/domain contracts are stable; existing screen styling/composition is not.
 
@@ -103,6 +103,8 @@ If `mise` is unavailable but another `pnpm` is installed, run a script with the 
 
 Runtime data defaults to `.lct/`. The current server/media adapter remains deliberately small and provider details must not leak into presentation-domain contracts.
 
+The daemon API has no authentication and binds only to `localhost` or a loopback IP. Network-facing deployment is unsupported until an authentication boundary is implemented. Uploads accept at most two files per request, each up to 64 MiB; the workspace splits larger selections into bounded requests.
+
 ## Scope
 
 In scope: unseen PPTX templates, template decomposition, content/outline planning, continuous A/B/C slide generation, same-type visual alternatives, charts/tables/diagrams/icons/SmartArt-like structures, image generation, locks/local regeneration, selective repair, native export, two-agent semantic inference, versioned skills, tests, and reproducibility.
@@ -115,10 +117,22 @@ Before finishing a change, run the checks applicable to it. `TESTING.md` defines
 
 ## Offline presentation matrix
 
-To reuse one successful planning state for three local PPTX templates and generate A/B/C outputs without inference:
+To reuse one successful planning state for five local PPTX templates and generate 15 A/B/C outputs without inference:
 
 ```bash
-pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-offline-presentation-matrix.mjs --state ".lct/projects/<project-id>/.planning/state.json" --out ".lct/experiments/<run-name>" --templates "./templates/template-1.pptx" "./templates/template-2.pptx" "./templates/template-3.pptx" --run-metadata "./run-metadata.json"
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-offline-presentation-matrix.mjs --state ".lct/projects/<project-id>/.planning/state.json" --out ".lct/experiments/<run-name>" --templates "./templates/template-1.pptx" "./templates/template-2.pptx" "./templates/template-3.pptx" "./templates/template-4.pptx" "./templates/template-5.pptx" --content-root "./projects/<project-id>" --run-metadata "./run-metadata.json"
 ```
 
-`run-metadata.json` is optional and may contain only safe labels such as `{"providerKind":"runpod","profile":"A100_BF16","thinkingEnabled":false}`. Endpoint URLs and credentials are ignored. Output includes nine editable `.pptx` files, one audit JSON per variant, `matrix.json`, `replay.json`, and `diagnostics.json`. The compiler reuses the persisted DeckPlan and makes zero inference requests. The first slice renders text and rectangular CSV tables; it leaves unsupported visual types explicitly unresolved. See `TESTING.md` for verified limits.
+`--content-root` is required when the saved plan references images; it is the project directory used to resolve and hash-check those source files. `run-metadata.json` is optional and may contain only safe labels such as `{"providerKind":"runpod","profile":"A100_BF16","thinkingEnabled":false}`. Endpoint URLs and credentials are ignored. Output includes 15 editable `.pptx` files, one audit JSON per variant, `matrix.json`, `replay.json`, and `diagnostics.json`. The compiler reuses the persisted DeckPlan and makes zero inference requests. Set `LCT_PPTX_BACKEND=office-kit` for the Office Kit renderer; the default remains the custom backend until the adoption gate passes.
+
+To qualify an individual template offline without overwriting it:
+
+```bash
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/compare-pptx-backends.mjs "./templates/template.pptx" --out ".lct/compatibility/template-run"
+```
+
+The report includes source/package hashes, LCT and Office Kit inventories, no-op roundtrip, a controlled generated slide, reopen/validation, preview, and part-preservation results. It conservatively reports `SAFE_FOR_OFFICE_KIT_BACKEND=no` until real held-out templates and a native PowerPoint/LibreOffice open-save check are available.
+
+## Bounded live Qwen qualification
+
+Use the reproducible PowerShell smoke and sequential quality suite in [`LIVE_QUALIFICATION.md`](./LIVE_QUALIFICATION.md). The runner reads the existing `LCT_SEMANTIC_*` adapter settings, caps model calls, persists a replayable planning state, generates local A/B/C outputs without further inference, and keeps endpoint/key values out of its reports. It does not control cloud resources.

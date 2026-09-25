@@ -17,8 +17,8 @@ export interface VariantPolicy {
 }
 
 export const VARIANT_POLICIES: readonly VariantPolicy[] = [
-  { id: 'A', version: 'variant-policy.v1', label: 'BALANCED', visualAreaWeight: 0.1, textCapacityWeight: 0.4 },
-  { id: 'B', version: 'variant-policy.v1', label: 'VISUAL_FIRST', visualAreaWeight: 4, textCapacityWeight: 0.5 },
+  { id: 'A', version: 'variant-policy.v1', label: 'BALANCED', visualAreaWeight: 0.2, textCapacityWeight: 2 },
+  { id: 'B', version: 'variant-policy.v1', label: 'VISUAL_FIRST', visualAreaWeight: 8, textCapacityWeight: 0.05 },
   { id: 'C', version: 'variant-policy.v1', label: 'DATA_FIRST', visualAreaWeight: 1.5, textCapacityWeight: 3 },
 ];
 
@@ -35,8 +35,20 @@ export interface LayoutMatchCandidate {
   sourcePart: string;
   score: number;
   reasons: string[];
+  evidence: {
+    titleElementId: string | null;
+    bodyElementId: string | null;
+    visualElementId: string | null;
+    measuredPlaceholderCount: number;
+    unknownGeometryCount: number;
+    textAreaRatio: number;
+    visualAreaRatio: number;
+  };
+  scoreContributions: Array<{ feature: string; points: number }>;
+  unknownReasons: string[];
   titleBox: PlacementBox;
   bodyBox: PlacementBox;
+  visualBox: PlacementBox | null;
 }
 
 export interface CompiledSlide {
@@ -48,12 +60,31 @@ export interface CompiledSlide {
   variantId: PresentationVariantId;
   title: string;
   body: string[];
-  visualization: { type: SemanticVisualType; sourceRefs: string[]; status: 'none' | 'referenced' | 'unresolved'; tableData: string[][] | null };
-  imageRefs: Array<{ contentUnitId: string; sourceId: string; sourcePath: string; sha256: string }>;
+  visualization: {
+    type: SemanticVisualType;
+    sourceRefs: string[];
+    status: 'none' | 'referenced' | 'unresolved';
+    tableData: string[][] | null;
+    tableCellRefs: string[][] | null;
+    chartData: CompiledChartData | null;
+    processSteps: Array<{ text: string; sourceRef: string }>;
+    kpi: { label: string; value: string; sourceRefs: string[] } | null;
+  };
+  imageRefs: Array<{ contentUnitId: string; sourceId: string; sourcePath: string; mediaType: string; sha256: string }>;
   provenanceRefs: string[];
-  placements: { title: PlacementBox; body: PlacementBox };
+  placements: { title: PlacementBox; body: PlacementBox; visual: PlacementBox | null };
   layoutCandidates: LayoutMatchCandidate[];
   selectedCandidateIndex: number;
+}
+
+export interface CompiledChartData {
+  kind: 'column' | 'line';
+  categories: string[];
+  series: Array<{ name: string; nameSourceRef: string; values: number[]; sourceRefs: string[] }>;
+  categorySourceRefs: string[];
+  unit: string | null;
+  title: string;
+  provenanceRefs: string[];
 }
 
 export interface CompiledPresentation {
@@ -67,6 +98,20 @@ export interface CompiledPresentation {
   templateIRId: string;
   templateIRHash: string;
   slides: CompiledSlide[];
+}
+
+/** Facts and their evidence without variant-specific layout or rendering choices. */
+export interface CanonicalFactualPayload {
+  sourceSlideId: string;
+  intent: SlideIntent;
+  title: string;
+  body: string[];
+  provenanceRefs: string[];
+  table: { values: string[][]; sourceRefs: string[][] } | null;
+  chart: CompiledChartData | null;
+  kpi: { label: string; value: string; sourceRefs: string[] } | null;
+  process: Array<{ text: string; sourceRef: string }>;
+  images: Array<{ sourceId: string; sha256: string }>;
 }
 
 const TEMPLATE_INSET = 457200;
@@ -101,25 +146,65 @@ function intentFor(slide: DeckPlanSlide): SlideIntent {
   return 'narrative';
 }
 
-function roleOf(element: TemplateLayout['elements'][number]): string {
-  return `${element.placeholder?.role ?? ''} ${element.placeholder?.type ?? ''} ${element.kind}`.toLowerCase();
+function placeholderType(element: TemplateLayout['elements'][number]): string {
+  return element.placeholder?.type?.toLowerCase().replaceAll('_', '').replaceAll('-', '') ?? '';
 }
 
-function profile(layout: TemplateLayout, template: TemplateIR): {
+function isTitleSlot(element: TemplateLayout['elements'][number]): boolean {
+  const type = placeholderType(element);
+  const role = element.placeholder?.role?.toLowerCase() ?? '';
+  return ['title', 'ctrtitle', 'subtitle'].includes(type) || ['title', 'subtitle'].includes(role);
+}
+
+function isBodySlot(element: TemplateLayout['elements'][number]): boolean {
+  const type = placeholderType(element);
+  const role = element.placeholder?.role?.toLowerCase() ?? '';
+  return ['body', 'obj', 'content'].includes(type) || ['body', 'content'].includes(role);
+}
+
+function visualSlotType(element: TemplateLayout['elements'][number]): string | null {
+  const type = placeholderType(element);
+  if (['pic', 'chart', 'table', 'tbl', 'graphicframe'].includes(type)) return type === 'tbl' ? 'table' : type;
+  const kind = element.kind.toLowerCase().replaceAll('_', '').replaceAll('-', '');
+  if (['picture', 'chart', 'table', 'graphicframe'].includes(kind)) return kind === 'picture' ? 'pic' : kind;
+  return null;
+}
+
+function requestedVisualSlot(slide: DeckPlanSlide): string | null {
+  return slide.semanticVisualType === 'image' ? 'pic'
+    : slide.semanticVisualType === 'chart' ? 'chart'
+      : slide.semanticVisualType === 'table' ? 'table'
+        : ['kpi', 'process', 'diagram', 'timeline', 'comparison'].includes(slide.semanticVisualType) ? 'any' : null;
+}
+
+function profile(layout: TemplateLayout, template: TemplateIR, slide: DeckPlanSlide): {
   titleBox: PlacementBox;
   bodyBox: PlacementBox;
+  visualBox: PlacementBox | null;
+  titleElementId: string | null;
+  bodyElementId: string | null;
+  visualElementId: string | null;
   titleArea: number;
   textArea: number;
   visualArea: number;
   slotCount: number;
+  measuredPlaceholderCount: number;
+  unknownGeometryCount: number;
 } {
   const geometries = layout.elements.map((element) => ({ element, box: asBox(element.geometry.resolved ?? element.geometry.direct) }))
     .filter((item): item is { element: TemplateLayout['elements'][number]; box: PlacementBox } => item.box !== null);
-  const title = geometries.filter(({ element }) => /title|ctrtitle|subtitle/.test(roleOf(element)))
-    .sort((left, right) => area(right.box) - area(left.box))[0]?.box;
-  const body = geometries.filter(({ element }) => /body|obj|content|text/.test(roleOf(element))
-      && !/title|subtitle/.test(roleOf(element)))
-    .sort((left, right) => area(right.box) - area(left.box))[0]?.box;
+  const titleSlot = geometries.filter(({ element }) => isTitleSlot(element))
+    .sort((left, right) => area(right.box) - area(left.box))[0];
+  const bodySlot = geometries.filter(({ element }) => isBodySlot(element))
+    .sort((left, right) => area(right.box) - area(left.box))[0];
+  const requestedSlot = requestedVisualSlot(slide);
+  const visualSlot = geometries.filter(({ element }) => {
+    const type = visualSlotType(element);
+    return type !== null && (requestedSlot === 'any' || type === requestedSlot || type === 'graphicframe');
+  })
+    .sort((left, right) => area(right.box) - area(left.box))[0];
+  const title = titleSlot?.box;
+  const body = bodySlot?.box;
   const fallbackTitle: PlacementBox = {
     x: TEMPLATE_INSET,
     y: TEMPLATE_INSET,
@@ -137,12 +222,20 @@ function profile(layout: TemplateLayout, template: TemplateIR): {
     unit: 'EMU',
   };
   const bodyBox = body ?? fallbackBody;
-  const visualArea = geometries.filter(({ element }) => /pic|chart|table|graphic|media|image/.test(roleOf(element)))
-    .reduce((sum, item) => sum + area(item.box), 0);
-  const textArea = geometries.filter(({ element }) => /body|obj|content|text/.test(roleOf(element)) && !/title|subtitle/.test(roleOf(element)))
+  const visualArea = visualSlot ? area(visualSlot.box) : 0;
+  const textArea = geometries.filter(({ element }) => isBodySlot(element))
     .reduce((sum, item) => sum + area(item.box), 0);
   const slotCount = geometries.filter(({ element }) => element.placeholder !== null).length;
-  return { titleBox, bodyBox, titleArea: area(title), textArea, visualArea, slotCount };
+  const measuredPlaceholderCount = geometries.filter(({ element }) => element.placeholder !== null).length;
+  const unknownGeometryCount = layout.elements.filter((element) => element.placeholder !== null
+    && asBox(element.geometry.resolved ?? element.geometry.direct) === null).length;
+  return {
+    titleBox, bodyBox, visualBox: visualSlot?.box ?? null,
+    titleElementId: titleSlot?.element.id ?? null,
+    bodyElementId: bodySlot?.element.id ?? null,
+    visualElementId: visualSlot?.element.id ?? null,
+    titleArea: area(title), textArea, visualArea, slotCount, measuredPlaceholderCount, unknownGeometryCount,
+  };
 }
 
 function matchLayouts(slide: DeckPlanSlide, template: TemplateIR, policy: VariantPolicy): LayoutMatchCandidate[] {
@@ -150,34 +243,61 @@ function matchLayouts(slide: DeckPlanSlide, template: TemplateIR, policy: Varian
   const intent = intentFor(slide);
   const totalArea = template.slideSize.width * template.slideSize.height;
   const ranked = template.layouts.map((layout) => {
-    const features = profile(layout, template);
+    const features = profile(layout, template, slide);
     const reasons: string[] = [];
+    const unknownReasons: string[] = [];
+    const scoreContributions: Array<{ feature: string; points: number }> = [];
     const titleRatio = features.titleArea / totalArea;
     const textRatio = features.textArea / totalArea;
     const visualRatio = features.visualArea / totalArea;
     let score = 0;
-    if (features.titleArea > 0) { score += 25; reasons.push('has a measured title zone'); }
-    else reasons.push('uses a generic title zone because no title placeholder geometry was observed');
-    score += Math.min(24, titleRatio * 120);
-    score += policy.textCapacityWeight * Math.min(30, textRatio * 90);
-    score += policy.visualAreaWeight * Math.min(28, visualRatio * 100);
-    score += Math.min(8, features.slotCount);
-    if (intent === 'data' && visualRatio > 0) { score += 12; reasons.push('provides measured chart/table/media area for data intent'); }
-    if (intent === 'visual' && visualRatio > 0) { score += 12; reasons.push('provides measured visual area for visual intent'); }
-    if (intent === 'narrative' && textRatio > 0) { score += 8; reasons.push('provides measured text capacity for narrative intent'); }
+    const contribute = (feature: string, points: number, reason?: string) => {
+      score += points;
+      scoreContributions.push({ feature, points: Number(points.toFixed(6)) });
+      if (reason) reasons.push(reason);
+    };
+    if (features.titleArea > 0) contribute('measured-title-slot', 25 + Math.min(24, titleRatio * 120), 'has a measured title placeholder and bounds');
+    else unknownReasons.push('no measured title placeholder geometry; fallback title placement is not evidence of template fit');
+    if (textRatio > 0) contribute('text-capacity', policy.textCapacityWeight * Math.min(30, textRatio * 90), 'body capacity is measured from body/content placeholders');
+    else unknownReasons.push('no measured body/content placeholder geometry');
+    if (visualRatio > 0) contribute('visual-capacity', policy.visualAreaWeight * Math.min(28, visualRatio * 100), 'visual capacity is measured from an explicit picture/chart/table slot');
+    else if (slide.semanticVisualType !== 'none') unknownReasons.push('no explicit visual placeholder geometry for this visual intent');
+    contribute('placeholder-count', Math.min(8, features.slotCount), 'placeholder count is measured from layout elements');
+    const requestedSlot = requestedVisualSlot(slide);
+    const matchingVisual = layout.elements.some((element) => visualSlotType(element) === requestedSlot
+      || requestedSlot !== null && (visualSlotType(element) === 'graphicframe' || requestedSlot === 'any' && visualSlotType(element) !== null));
+    if (requestedSlot && matchingVisual) contribute('visual-type-match', 12 * Math.min(1, policy.visualAreaWeight / 4), requestedSlot === 'any'
+      ? 'contains a measured visual placeholder compatible with editable shapes'
+      : `contains an explicit ${requestedSlot} placeholder`);
+    else if (requestedSlot) unknownReasons.push(`no explicit ${requestedSlot} placeholder observed`);
+    if (slide.targetDensity === 'detailed' && textRatio > 0) contribute('density-detail', Math.min(5, textRatio * 20), 'detailed density has measured body area');
+    if (slide.targetDensity === 'compact' && textRatio > 0) contribute('density-compact', Math.max(0, 5 - textRatio * 20), 'compact density uses measured body area');
+    if (intent === 'data' && visualRatio > 0) contribute('data-visual-fit', 6, 'provides measured visual area for data intent');
+    if (intent === 'visual' && visualRatio > 0) contribute('visual-intent-fit', 6, 'provides measured visual area for visual intent');
+    if (intent === 'narrative' && textRatio > 0) contribute('narrative-text-fit', 6, 'provides measured text capacity for narrative intent');
     if (intent === 'title' || intent === 'section' || intent === 'summary') reasons.push(`supports ${intent} intent through its title zone`);
-    if (textRatio > 0) reasons.push('text capacity is measured from placeholder geometry');
-    if (visualRatio > 0) reasons.push('visual capacity is measured from template element geometry');
     return {
       layoutId: layout.id,
       sourcePart: layout.sourcePart,
       score: Number(score.toFixed(6)),
       reasons,
+      evidence: {
+        titleElementId: features.titleElementId,
+        bodyElementId: features.bodyElementId,
+        visualElementId: features.visualElementId,
+        measuredPlaceholderCount: features.measuredPlaceholderCount,
+        unknownGeometryCount: features.unknownGeometryCount,
+        textAreaRatio: Number(textRatio.toFixed(6)),
+        visualAreaRatio: Number(visualRatio.toFixed(6)),
+      },
+      scoreContributions,
+      unknownReasons,
       titleBox: features.titleBox,
       bodyBox: features.bodyBox,
+      visualBox: features.visualBox,
     };
   });
-  return ranked.sort((left, right) => right.score - left.score || left.sourcePart.localeCompare(right.sourcePart));
+  return ranked.sort((left, right) => right.score - left.score || (left.sourcePart < right.sourcePart ? -1 : left.sourcePart > right.sourcePart ? 1 : 0));
 }
 
 function textForUnit(unit: ContentUnit): string | null {
@@ -211,6 +331,92 @@ function tableDataFor(units: ContentUnit[]): string[][] | null {
   return grid.map((row) => row.map((cell) => cell ?? ''));
 }
 
+function tableCellRefsFor(units: ContentUnit[]): string[][] | null {
+  const cells = units.filter((unit) => unit.kind === 'table-cell');
+  if (!cells.length || cells.length !== units.length || new Set(cells.map((unit) => unit.sourceId)).size !== 1) return null;
+  const positions = cells.map((unit) => ({ row: unit.locator.rowIndex, column: unit.locator.columnIndex, id: unit.id }));
+  if (positions.some((item) => !Number.isSafeInteger(item.row) || !Number.isSafeInteger(item.column))) return null;
+  const minRow = Math.min(...positions.map((item) => item.row!));
+  const maxRow = Math.max(...positions.map((item) => item.row!));
+  const minColumn = Math.min(...positions.map((item) => item.column!));
+  const maxColumn = Math.max(...positions.map((item) => item.column!));
+  if (positions.length !== (maxRow - minRow + 1) * (maxColumn - minColumn + 1)) return null;
+  const grid = Array.from({ length: maxRow - minRow + 1 }, () => Array.from({ length: maxColumn - minColumn + 1 }, () => null as string | null));
+  for (const item of positions) {
+    const row = item.row! - minRow;
+    const column = item.column! - minColumn;
+    if (grid[row]![column] !== null) return null;
+    grid[row]![column] = item.id;
+  }
+  if (grid.some((row) => row.some((cell) => cell === null))) return null;
+  return grid as string[][];
+}
+
+function chartDataFor(units: ContentUnit[], title: string): CompiledChartData | null {
+  const cells = units.filter((unit) => unit.kind === 'table-cell');
+  if (cells.length !== units.length || cells.length < 4 || new Set(cells.map((unit) => unit.sourceId)).size !== 1) return null;
+  const grid = tableDataFor(cells);
+  if (!grid || grid.length < 2 || (grid[0]?.length ?? 0) < 2 || grid.some((row) => row.length !== grid[0]!.length)) return null;
+  const minRow = Math.min(...cells.map((unit) => unit.locator.rowIndex!));
+  const minColumn = Math.min(...cells.map((unit) => unit.locator.columnIndex!));
+  const sourceCells = new Map(cells.map((unit) => [`${unit.locator.rowIndex! - minRow}:${unit.locator.columnIndex! - minColumn}`, unit]));
+  const categories = grid.slice(1).map((row) => row[0]!);
+  if (!categories.length || categories.some((item) => !item.trim())) return null;
+  const series = grid[0]!.slice(1).map((name, seriesIndex) => {
+    const column = seriesIndex + 1;
+    const cellUnits = grid.slice(1).map((_row, rowIndex) => sourceCells.get(`${rowIndex + 1}:${column}`));
+    if (!name.trim() || cellUnits.some((unit) => !unit || typeof unit.numericLexeme !== 'string')) return null;
+    const values = cellUnits.map((unit) => Number(unit!.numericLexeme));
+    if (values.some((value) => !Number.isFinite(value))) return null;
+    return { name, nameSourceRef: sourceCells.get(`0:${column}`)!.id, values, sourceRefs: cellUnits.map((unit) => unit!.id) };
+  });
+  if (series.some((item) => item === null)) return null;
+  const categorySourceRefs = grid.slice(1).map((_row, rowIndex) => sourceCells.get(`${rowIndex + 1}:0`)!.id);
+  const headerRefs = grid[0]!.map((_cell, column) => sourceCells.get(`0:${column}`)!.id);
+  const provenanceRefs = [...new Set([...categorySourceRefs, ...headerRefs, ...series.flatMap((item) => item!.sourceRefs)])];
+  const periodCategories = categories.every((category) => /^(?:\d{4}(?:[-/]\d{1,2})?|Q[1-4](?:\s+\d{4})?)$/i.test(category.trim()));
+  return {
+    kind: periodCategories ? 'line' : 'column',
+    categories,
+    series: series as Array<{ name: string; nameSourceRef: string; values: number[]; sourceRefs: string[] }>,
+    categorySourceRefs,
+    unit: null,
+    title,
+    provenanceRefs,
+  };
+}
+
+function processStepsFor(units: ContentUnit[]): Array<{ text: string; sourceRef: string }> {
+  const textUnits = units.filter((unit) => unit.text && unit.kind !== 'json-value');
+  if (textUnits.length < 2 || textUnits.some((unit) => !/^\s*(?:\d+[.)]|[-*•])\s+/.test(unit.text!))) return [];
+  return textUnits.map((unit) => ({
+    text: unit.text!.replace(/^\s*(?:\d+[.)]|[-*•])\s+/, '').trim(),
+    sourceRef: unit.id,
+  }));
+}
+
+function kpiFor(units: ContentUnit[]): { label: string; value: string; sourceRefs: string[] } | null {
+  const cells = units.filter((unit) => unit.kind === 'table-cell');
+  const grid = cells.length === units.length ? tableDataFor(cells) : null;
+  if (!grid || grid.length !== 2 || grid[0]?.length !== 2 || grid[1]?.length !== 2) return null;
+  const minRow = Math.min(...cells.map((unit) => unit.locator.rowIndex!));
+  const minColumn = Math.min(...cells.map((unit) => unit.locator.columnIndex!));
+  const at = (row: number, column: number) => cells.find((unit) => unit.locator.rowIndex === minRow + row && unit.locator.columnIndex === minColumn + column);
+  const labelCell = at(1, 0);
+  const valueCell = at(1, 1);
+  if (!labelCell?.cellValue?.trim() || !valueCell?.numericLexeme) return null;
+  return { label: labelCell.cellValue, value: valueCell.cellValue!, sourceRefs: [labelCell.id, valueCell.id] };
+}
+
+export class UnsupportedTemplateLayoutError extends Error {
+  readonly code = 'UNSUPPORTED_TEMPLATE_LAYOUT';
+
+  constructor(slideId: string) {
+    super(`Template has no measured title and content slots compatible with DeckPlan slide ${slideId}.`);
+    this.name = 'UnsupportedTemplateLayoutError';
+  }
+}
+
 function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: TemplateIR, policy: VariantPolicy): CompiledSlide {
   const byId = new Map(contentIR.units.map((unit) => [unit.id, unit]));
   const sourceById = new Map(contentIR.sources.map((source) => [source.id, source]));
@@ -219,21 +425,36 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
     if (!unit) throw new TypeError(`DeckPlan slide ${slide.id} refers to missing ContentIR unit ${id}`);
     return unit;
   });
-  const layoutCandidates = matchLayouts(slide, template, policy);
-  const chosen = layoutCandidates[0]!;
   const tableData = slide.semanticVisualType === 'table' ? tableDataFor(referenced) : null;
+  const tableCellRefs = tableData ? tableCellRefsFor(referenced) : null;
   const body = referenced.flatMap((unit) => {
     if (tableData && unit.kind === 'table-cell') return [];
     const value = textForUnit(unit);
     return value === null || !value.trim() ? [] : [value];
   });
-  const imageRefs = referenced.filter((unit) => unit.kind === 'media-reference').flatMap((unit) => {
+  const mediaRefs = (slide.mediaRefs ?? []).map((id) => byId.get(id)).filter((unit): unit is ContentUnit => unit?.kind === 'media-reference');
+  const imageRefs = mediaRefs.flatMap((unit) => {
     const source = sourceById.get(unit.sourceId);
-    return source?.kind === 'image' ? [{ contentUnitId: unit.id, sourceId: source.id, sourcePath: source.sourcePath, sha256: source.sha256 }] : [];
+    return source?.kind === 'image' ? [{ contentUnitId: unit.id, sourceId: source.id, sourcePath: source.sourcePath, mediaType: source.mediaType, sha256: source.sha256 }] : [];
   });
+  const chartData = slide.semanticVisualType === 'chart' ? chartDataFor(referenced, slide.takeaway) : null;
+  const processSteps = slide.semanticVisualType === 'process' ? processStepsFor(referenced) : [];
+  const kpi = slide.semanticVisualType === 'kpi' ? kpiFor(referenced) : null;
+  const hasNativeVisual = Boolean(tableData || chartData || processSteps.length >= 2 || kpi);
+  const layoutCandidates = matchLayouts(slide, template, policy).filter((candidate) => {
+    const hasTitle = candidate.evidence.titleElementId !== null;
+    const hasBody = candidate.evidence.bodyElementId !== null;
+    const hasVisual = candidate.evidence.visualElementId !== null;
+    const contentHasSlot = body.length === 0
+      ? !hasNativeVisual || hasVisual || hasBody
+      : hasBody;
+    return hasTitle && contentHasSlot;
+  });
+  if (layoutCandidates.length === 0) throw new UnsupportedTemplateLayoutError(slide.id);
+  const chosen = layoutCandidates[0]!;
   const visualStatus = slide.semanticVisualType === 'none'
     ? 'none'
-    : tableData || imageRefs.length ? 'referenced' : 'unresolved';
+    : tableData || imageRefs.length || chartData || processSteps.length >= 2 || kpi ? 'referenced' : 'unresolved';
   return {
     id: `compiled_${slide.id}_${policy.id}`,
     sourceDeckPlanSlideId: slide.id,
@@ -243,10 +464,10 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
     variantId: policy.id,
     title: slide.takeaway,
     body,
-    visualization: { type: slide.semanticVisualType, sourceRefs: [...slide.contentRefs], status: visualStatus, tableData },
+    visualization: { type: slide.semanticVisualType, sourceRefs: [...slide.contentRefs], status: visualStatus, tableData, tableCellRefs, chartData, processSteps, kpi },
     imageRefs,
     provenanceRefs: [...slide.contentRefs],
-    placements: { title: chosen.titleBox, body: chosen.bodyBox },
+    placements: { title: chosen.titleBox, body: chosen.bodyBox, visual: chosen.visualBox },
     layoutCandidates,
     selectedCandidateIndex: 0,
   };
@@ -261,7 +482,10 @@ export function compilePresentation(
 ): CompiledPresentation {
   const contentIR = validateContentIR(contentIRValue);
   const templateIR = validateTemplateIR(templateIRValue);
-  const deckPlan = validateDeckPlan(deckPlanValue, new Set(contentIR.units.map((unit) => unit.id)));
+  const deckPlan = validateDeckPlan(deckPlanValue,
+    new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => unit.id)),
+    undefined,
+    new Set(contentIR.units.filter((unit) => unit.kind === 'media-reference').map((unit) => unit.id)));
   if (!['A', 'B', 'C'].includes(policy.id) || !policy.version || !Number.isFinite(policy.visualAreaWeight)
       || !Number.isFinite(policy.textCapacityWeight) || policy.visualAreaWeight < 0 || policy.textCapacityWeight < 0) {
     throw new TypeError('Variant policy is invalid');
@@ -278,4 +502,22 @@ export function compilePresentation(
     slides: deckPlan.slides.map((slide) => makeSlide(slide, contentIR, templateIR, policy)),
   };
   return { ...payload, id: `compiled_${digest(payload).slice(0, 24)}` };
+}
+
+/** Canonical, variant-independent factual projection used to verify A/B/C equivalence. */
+export function extractCanonicalFactualPayload(presentation: CompiledPresentation): CanonicalFactualPayload[] {
+  return presentation.slides.map((slide) => ({
+    sourceSlideId: slide.sourceDeckPlanSlideId,
+    intent: slide.intent,
+    title: slide.title,
+    body: [...slide.body],
+    provenanceRefs: [...slide.provenanceRefs],
+    table: slide.visualization.tableData && slide.visualization.tableCellRefs
+      ? { values: slide.visualization.tableData.map((row) => [...row]), sourceRefs: slide.visualization.tableCellRefs.map((row) => [...row]) }
+      : null,
+    chart: slide.visualization.chartData ? structuredClone(slide.visualization.chartData) : null,
+    kpi: slide.visualization.kpi ? { ...slide.visualization.kpi, sourceRefs: [...slide.visualization.kpi.sourceRefs] } : null,
+    process: slide.visualization.processSteps.map((step) => ({ ...step })),
+    images: slide.imageRefs.map((image) => ({ sourceId: image.sourceId, sha256: image.sha256 })),
+  }));
 }

@@ -1,6 +1,6 @@
-# ADR-001: Office Kit renderer reuse spike
+# ADR-001: Office Kit renderer reuse and qualification
 
-- **Status:** accepted for an isolated spike; production adoption deferred
+- **Status:** accepted for selectable offline qualification; application/export adoption deferred
 - **Date:** 2026-09-25
 
 ## Context
@@ -11,30 +11,33 @@ No real user PPTX template is present in this checkout. A synthetic template gen
 
 ## Decision
 
-Choose **Option C: hybrid**. Pin `@office-kit/pptx@0.21.0` and `@office-kit/pptx-preview@0.11.0` as exact daemon development dependencies and exercise them through the replaceable `PptxDocumentAdapter` spike boundary. Do not connect the adapter to the application flow yet.
+Keep **Option C: hybrid** for this replaceable offline experiment. The existing `@office-kit/pptx@0.21.0` package is an exact runtime dependency behind internal renderer/document adapters; `@office-kit/pptx-preview@0.11.0` remains an exact development-only diagnostic dependency. The Office Kit backend is selectable by the offline matrix/harness through `LCT_PPTX_BACKEND=office-kit`. The custom backend remains the default until adoption gates pass. Neither backend is connected to the application generation/export path.
 
-If adoption proceeds, Office Kit is a candidate for OPC package loading/saving, template-layout slide creation, and native text, table, image, chart, shape, and connector authoring. LCT keeps TemplateIR/PDS, content-to-slide mapping, semantic provenance, layout policy, policy audit, persistence, and application/API behavior. `@office-kit/pptx-preview` is a diagnostic aid; its output is not a PowerPoint visual-fidelity oracle.
+The offline backend uses Office Kit for OPC package loading/saving, template-layout slide creation, and native text, table, image, chart, shape, and connector authoring. LCT keeps TemplateIR/PDS, content-to-slide mapping, semantic provenance, layout policy, policy audit, persistence, and application/API behavior. This does not set a final product process boundary or export contract. `@office-kit/pptx-preview` is a diagnostic aid; its output is not a PowerPoint visual-fidelity oracle.
 
-The existing renderer remains available until a held-out template corpus demonstrates acceptable preservation, editability, and native application rendering. The choice between retaining source sample slides and replacing the active slide list is an unresolved output-policy decision for that migration.
+For this offline experiment, uploaded PPTX is treated as a design/template source: output contains generated slides in the active slide list and retains masters, layouts, theme, static/media and opaque package parts that the backend can preserve. Source sample slides and their speaker notes are not active output slides. This remains a provisional replaceable projection choice, not a final product contract. The Office Kit renderer checks preserved non-slide package parts byte-for-byte and refuses to claim a safe production backend while real held-out templates and a native Office open/save pass are unavailable.
 
 ## Evidence from the local spike
 
-The test generated a valid synthetic template with PptxGenJS, added an opaque package XML part, opened and saved it with Office Kit, then reopened and edited it. The run verified:
+The initial spike generated a valid PptxGenJS template, added an opaque package XML part, opened and saved it with Office Kit, then reopened and edited it. The expanded synthetic corpus has five materially different PptxGenJS families: corporate, split visual, data/dashboard, editorial, and stress. T5 adds mixed runs, image crop, chart, table, connector, notes, a second master, and opaque XML. It exercises:
 
-- all original file parts and the injected opaque part survived round-trip;
-- the master, layouts, theme, and original speaker notes survived;
+- all retained template file parts and the injected opaque part survived no-op round-trip and generated-slide projection;
+- masters, layouts, themes, media, and opaque package parts retained byte identity;
+- generated outputs contain only requested active slides and do not expose source sample slide text;
 - a new slide was created from an existing layout and its title placeholder remained editable;
 - native table, image with contain fit, image crop, chart, connector, and speaker notes survived save/reopen;
 - `validatePresentation` returned no issues;
 - the preview emitted SVG and PNG, and `auditTextLayout` returned no findings for the fixture.
+- a five-template × three-variant zero-inference matrix produced 15 reopened and audited outputs;
+- source-backed image/table/chart/KPI/process compilation, factual equivalence, and bounded layout repair have focused regressions.
 
-No real template was available. The ignored inspector fixtures in `.lct/` are deliberately minimal structural test inputs, not valid Office Kit compatibility fixtures. The package-level validator is lightweight and does not replace ECMA-376/Open XML validation. The preview is approximate and does not audit table cell text. Text mutation may collapse mixed run formatting and drops paragraph-end formatting.
+No real user/organizer template has been qualified. The package-level validator is lightweight and does not replace ECMA-376/Open XML validation. The preview is approximate and does not audit table-cell text. Text mutation may collapse mixed-run formatting and drops paragraph-end formatting. The current report deliberately keeps `SAFE_FOR_OFFICE_KIT_BACKEND=no` until real templates and a PowerPoint/LibreOffice open-save gate pass.
 
 ## Compatibility and licensing
 
 The registry reported these exact versions on 2026-09-25:
 
-- `@office-kit/pptx@0.21.0` — MIT, ESM, Node `>=22.18`, one runtime dependency (`fflate`);
+- `@office-kit/pptx@0.21.0` — MIT, ESM, Node `>=22.18`, one runtime dependency (`fflate`), exact runtime pin;
 - `@office-kit/pptx-preview@0.11.0` — MIT, ESM, Node `>=22.18`, peer range `@office-kit/pptx@^0.21.0`.
 
 The repository uses Node `~24`, TypeScript `5.9.3`, and ESM. Office Kit is pre-1.0: exact pins are required, and its public API may change between minor versions.
@@ -50,7 +53,7 @@ All reviewed donor repositories use MIT or Apache-2.0 licenses. Retain upstream 
 
 ## Follow-up gates
 
-1. Run the adapter against held-out real templates, including multiple masters, layouts, inherited styles, rich text, charts, media, and unsupported OOXML parts.
-2. Validate output with an ECMA-376/Open XML validator and open/render it in PowerPoint or LibreOffice.
-3. Decide the generated-slide versus source-slide preservation policy.
-4. Only then compare renderer fidelity and migration effort against the current renderer and consider connecting the adapter to compilation.
+1. Run the compatibility harness against held-out organizer/user templates, including multiple masters/layouts, inherited styles, rich text, charts/media, and unsupported OOXML parts.
+2. Validate output with an ECMA-376/Open XML validator and open/save/render it in PowerPoint or LibreOffice.
+3. Inspect generated and source-backed visual slides for slot fit, inherited styles, notes behavior, and table-cell overflow.
+4. Only then compare renderer fidelity and migration effort against the custom backend and consider application/export integration.
