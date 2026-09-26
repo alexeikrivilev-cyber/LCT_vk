@@ -8,6 +8,7 @@ import {
   friendlyErrorMessage,
   generationStatusLabel,
   planningStatusLabel,
+  productWorkflowStageLabel,
   ru,
   slidePackStatusLabel,
   templateStatusLabel,
@@ -116,6 +117,31 @@ type GenerationState = {
   slides: GenerationPack[];
   failure: { code: string; message: string } | null;
   exports: Array<{ id: string; mode: 'selected' | GenerationVariantId; format?: 'pptx' | 'pdf' | 'html'; downloadUrl: string; validationStatus: string; nativeOfficeStatus: string }>;
+};
+
+type ProductWorkflowOperation = {
+  operationId: string;
+  inputFingerprint: string;
+  status: 'running' | 'ready' | 'failed';
+  stage: 'analyzing_template' | 'understanding_template' | 'planning' | 'generating' | 'contextual_audit' | 'ready' | 'failed';
+  readySlides: number;
+  totalSlides: number | null;
+  generationId: string | null;
+  contextualAudit: {
+    status: 'ready' | 'failed';
+    stale: boolean;
+    findings: Array<{
+      ruleId: string;
+      slideId: string | null;
+      severity: 'info' | 'warning' | 'error';
+      messageCode: keyof typeof ru.workflow.messages;
+      evidenceRefs: string[];
+      repairable: boolean;
+      suggestedActionCode: string | null;
+    }> | null;
+    failureCode: string | null;
+  } | null;
+  failure: { code: string; stage: string; retryable: boolean } | null;
 };
 
 type DataRecord = Record<string, unknown>;
@@ -446,6 +472,9 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const [planningLoading, setPlanningLoading] = useState(false);
   const [planningGenerating, setPlanningGenerating] = useState(false);
   const [planningError, setPlanningError] = useState<UiFailure | null>(null);
+  const [productOperation, setProductOperation] = useState<ProductWorkflowOperation | null>(null);
+  const [productWorkflowBusy, setProductWorkflowBusy] = useState(false);
+  const [productWorkflowError, setProductWorkflowError] = useState<UiFailure | null>(null);
   const [selectedContentFiles, setSelectedContentFiles] = useState<string[]>([]);
   const [briefAudience, setBriefAudience] = useState('');
   const [briefPurpose, setBriefPurpose] = useState('');
@@ -560,11 +589,19 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     }
   }, [projectId, restoreDraft]);
 
+  const loadProductOperation = useCallback(async () => {
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/workflow`, { cache: 'no-store' });
+    if (!response.ok) throw await errorMessage(response, 'generation');
+    const body = await response.json() as { operation?: ProductWorkflowOperation | null };
+    setProductOperation(body.operation ?? null);
+    return body.operation ?? null;
+  }, [projectId]);
+
   const reload = useCallback(async () => {
     setError(null);
     try {
       const [, loadedFiles, , loadedScan, savedPlanning] = await Promise.all([
-        loadProject(), loadFiles(), loadDesignSystems(), loadTemplateScan(), loadPlanning(),
+        loadProject(), loadFiles(), loadDesignSystems(), loadTemplateScan(), loadPlanning(), loadProductOperation(),
       ]);
       restoreDraft(savedPlanning, loadedFiles, loadedScan);
       draftHydratedRef.current = true;
@@ -572,7 +609,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     } catch (err) {
       setError(uiFailure(err));
     }
-  }, [loadDesignSystems, loadFiles, loadPlanning, loadProject, loadTemplateScan, restoreDraft]);
+  }, [loadDesignSystems, loadFiles, loadPlanning, loadProductOperation, loadProject, loadTemplateScan, restoreDraft]);
 
   useEffect(() => { void reload(); }, [reload]);
 
@@ -602,6 +639,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const templateBadgeLabel = templateAnalyzing ? ru.template.analyzing
     : templateFetching ? ru.template.fetching
       : templateStatusLabel(visibleTemplateStatus ?? (templateError ? 'unavailable' : 'uncompiled'));
+  const productWorkflowRunning = productWorkflowBusy || productOperation?.status === 'running';
   const templateIR = record(templateScan?.templateIR);
   const presentationDesignSystem = record(templateScan?.presentationDesignSystem);
   const canvas = record(firstValue(presentationDesignSystem, ['canvas']))
@@ -792,6 +830,98 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       setTemplateAnalyzing(false);
     }
   };
+
+  const generatePresentation = async () => {
+    setProductWorkflowError(null);
+    if (!templateFile) {
+      setProductWorkflowError({ message: ru.template.uploadFirst });
+      return;
+    }
+    if (!briefPurpose.trim()) {
+      setProductWorkflowError({ message: ru.validation.briefRequired });
+      return;
+    }
+    const count = requestedSlideCount.trim() ? Number(requestedSlideCount) : undefined;
+    if (count !== undefined && (!Number.isInteger(count) || count < 1 || count > 30)) {
+      setProductWorkflowError({ message: ru.validation.slideCount });
+      return;
+    }
+    const preferences = normalizePreferenceLines(briefPreferences).split('\n').filter(Boolean);
+    if (preferences.length > 12 || preferences.some((item) => item.length > 200)) {
+      setProductWorkflowError({ message: ru.validation.preferences });
+      return;
+    }
+    setProductWorkflowBusy(true);
+    try {
+      const brief = {
+        audience: briefAudience.trim(),
+        purpose: briefPurpose.trim(),
+        expectedOutcome: briefExpectedOutcome.trim(),
+        context: briefContext.trim(),
+        preferences,
+        ...(count === undefined ? {} : { requestedSlideCount: count }),
+      };
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/workflow/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ templateFilePath: templateFile, contentFiles: planningSelectedPaths, brief }),
+      });
+      if (!response.ok) throw await errorMessage(response, 'generation');
+      const body = await response.json() as { operation?: ProductWorkflowOperation };
+      if (body.operation) setProductOperation(body.operation);
+      if (body.operation?.status === 'ready') {
+        await Promise.all([loadTemplateScan(), loadPlanning()]);
+        document.getElementById('generation-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+      try { if (typeof window !== 'undefined') clearWorkspaceDraft(window.sessionStorage, projectId); }
+      catch { /* Server-owned operation and plan remain available after reload. */ }
+    } catch (err) {
+      setProductWorkflowError(uiFailure(err, ru.workflow.error));
+    } finally {
+      setProductWorkflowBusy(false);
+    }
+  };
+
+  const repeatContextualAudit = async () => {
+    setProductWorkflowError(null);
+    setProductWorkflowBusy(true);
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/workflow/contextual-audit`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      if (!response.ok) throw await errorMessage(response, 'generation');
+      const body = await response.json() as { operation?: ProductWorkflowOperation };
+      if (body.operation) setProductOperation(body.operation);
+    } catch (err) {
+      setProductWorkflowError(uiFailure(err, ru.workflow.error));
+    } finally {
+      setProductWorkflowBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!productOperation || productOperation.status !== 'running') return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      let next: ProductWorkflowOperation | null = null;
+      try {
+        next = await loadProductOperation();
+        if (!cancelled && next?.status === 'ready') {
+          await Promise.all([loadTemplateScan(), loadPlanning()]);
+          document.getElementById('generation-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      } catch (err) {
+        if (!cancelled) setProductWorkflowError(uiFailure(err, ru.workflow.error));
+      }
+      if (!cancelled && (!next || next.status === 'running')) timer = window.setTimeout(() => void poll(), 900);
+    };
+    timer = window.setTimeout(() => void poll(), 900);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [loadPlanning, loadProductOperation, loadTemplateScan, productOperation?.operationId, productOperation?.status]);
 
   useEffect(() => {
     const paths = templateFiles.map(filePath);
@@ -995,7 +1125,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             id="template-source"
             value={templateFile ?? ''}
             onChange={(event) => setTemplateFile(event.target.value || null)}
-            disabled={templateFiles.length === 0 || templateFetching || templateAnalyzing}
+            disabled={templateFiles.length === 0 || templateFetching || templateAnalyzing || productWorkflowRunning}
           >
             {templateFiles.length === 0 ? <option value="">{ru.template.uploadFirst}</option> : null}
             {templateFiles.map((file) => {
@@ -1003,7 +1133,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
               return <option key={path} value={path}>{path}</option>;
             })}
           </select>
-          <button className="primary" onClick={() => void analyzeTemplate()} disabled={!templateFile || busy || templateFetching || templateAnalyzing}>
+          <button className="primary" onClick={() => void analyzeTemplate()} disabled={!templateFile || busy || templateFetching || templateAnalyzing || productWorkflowRunning}>
             {templateAnalyzing ? ru.template.analyzing : ru.template.analyze}
           </button>
           {templateScan?.compiledAt ? <span className="template-compiled-at">{ru.template.lastScan(formatUiDateTime(new Date(templateScan.compiledAt)))}</span> : null}
@@ -1173,6 +1303,41 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         ) : null}
         {planningLoading && !planning ? <div className="planning-notice" role="status">{ru.planning.loading}</div> : null}
         <ErrorNotice failure={planningError} className="error-banner planning-error" />
+        <section className="product-workflow-card" aria-label={ru.workflow.action}>
+          <div className="product-workflow-copy">
+            <strong>{ru.workflow.action}</strong>
+            <p>{ru.workflow.requireTemplateAndTask}</p>
+          </div>
+          <div className="product-workflow-controls">
+            <button className="primary" onClick={() => void generatePresentation()} disabled={!templateFile || !briefPurpose.trim() || productWorkflowRunning}>
+              {productWorkflowRunning ? ru.workflow.working : ru.workflow.action}
+            </button>
+            {productOperation ? <span className={`product-workflow-status status-${productOperation.status}`} role="status" aria-live="polite">
+              {productOperation.status === 'running' ? productWorkflowStageLabel(productOperation.stage, productOperation.readySlides, productOperation.totalSlides)
+                : productWorkflowBusy ? ru.workflow.working
+                  : productOperation.status === 'ready' ? ru.workflow.stages.ready : ru.workflow.stages.failed}
+            </span> : null}
+          </div>
+          <ErrorNotice failure={productWorkflowError} className="error-banner product-workflow-error" />
+          {productOperation?.failure ? <ErrorNotice role="status" className="product-workflow-failure" failure={{
+            message: friendlyErrorMessage(productOperation.failure.code, 500, 'generation'),
+            code: productOperation.failure.code,
+          }} /> : null}
+          {productOperation?.contextualAudit ? <div className="product-contextual-audit" role="status">
+            <strong>{ru.workflow.audit}: {ru.workflow.auditFindings(productOperation.contextualAudit.findings?.filter((finding) => finding.severity !== 'info').length ?? 0)}</strong>
+            {productOperation.contextualAudit.stale ? <p>{ru.workflow.auditStale}</p> : null}
+            {productOperation.contextualAudit.status === 'failed' ? <p>{ru.workflow.error}</p> : null}
+            <p>{ru.workflow.suggestionsOnly}</p>
+            {productOperation.contextualAudit.findings?.length ? <details>
+              <summary>{ru.planning.reviewLabel}</summary>
+              <ul>{productOperation.contextualAudit.findings.filter((finding) => finding.severity !== 'info').map((finding) => <li key={`${finding.ruleId}-${finding.slideId ?? 'deck'}`}>
+                <span>{ru.workflow.messages[finding.messageCode]}</span>
+                <small>{finding.slideId ? ru.workflow.slideLabel(planningSlides.findIndex((slide) => stringValue(record(slide)?.id) === finding.slideId) + 1) : ru.workflow.deckLabel}</small>
+              </li>)}</ul>
+            </details> : <p>{ru.workflow.auditClean}</p>}
+            {productOperation.contextualAudit.stale ? <button className="quiet" onClick={() => void repeatContextualAudit()} disabled={productWorkflowRunning}>{ru.workflow.auditRerun}</button> : null}
+          </div> : null}
+        </section>
         {planning?.status === 'stale' ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.stale}</div> : null}
         {planningDraftDirty ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.draftChanged}</div> : null}
         {planningFailure?.message ? <ErrorNotice role="status" className="planning-notice planning-notice-warning" failure={{
@@ -1194,7 +1359,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                         type="checkbox"
                         checked={planningSelectedPaths.includes(path)}
                         onChange={(event) => togglePlanningFile(path, event.target.checked)}
-                        disabled={planningGenerating || (!planningSelectedPaths.includes(path) && planningSelectedPaths.length >= 12)}
+                        disabled={planningGenerating || productWorkflowRunning || (!planningSelectedPaths.includes(path) && planningSelectedPaths.length >= 12)}
                       />
                       <span>{path}</span>
                       <small className="content-source-status" data-status={sourceStatus} aria-label={`${contentSourceStatusLabel(sourceStatus)}: ${path}`}>
@@ -1210,22 +1375,22 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
 
           <div className="planning-brief">
             <label>{ru.planning.audience}
-              <input maxLength={500} value={briefAudience} onChange={(event) => setBriefAudience(event.target.value)} disabled={planningGenerating} placeholder={ru.planning.audiencePlaceholder} />
+              <input maxLength={500} value={briefAudience} onChange={(event) => setBriefAudience(event.target.value)} disabled={planningGenerating || productWorkflowRunning} placeholder={ru.planning.audiencePlaceholder} />
             </label>
             <label>{ru.planning.purpose}
-              <textarea maxLength={1000} value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)} disabled={planningGenerating} rows={2} placeholder={ru.planning.purposePlaceholder} />
+              <textarea maxLength={1000} value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={2} placeholder={ru.planning.purposePlaceholder} />
             </label>
             <label>{ru.planning.outcome}
-              <textarea maxLength={1000} value={briefExpectedOutcome} onChange={(event) => setBriefExpectedOutcome(event.target.value)} disabled={planningGenerating} rows={2} placeholder={ru.planning.outcomePlaceholder} />
+              <textarea maxLength={1000} value={briefExpectedOutcome} onChange={(event) => setBriefExpectedOutcome(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={2} placeholder={ru.planning.outcomePlaceholder} />
             </label>
             <label>{ru.planning.context}
-              <textarea maxLength={16_000} value={briefContext} onChange={(event) => setBriefContext(event.target.value)} disabled={planningGenerating} rows={3} placeholder={ru.planning.contextPlaceholder} />
+              <textarea maxLength={16_000} value={briefContext} onChange={(event) => setBriefContext(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={3} placeholder={ru.planning.contextPlaceholder} />
             </label>
             <label>{ru.planning.preferences} <span className="planning-label-note">{ru.planning.perLine}</span>
-              <textarea value={briefPreferences} onChange={(event) => setBriefPreferences(event.target.value)} disabled={planningGenerating} rows={2} placeholder={ru.planning.preferencesPlaceholder} />
+              <textarea value={briefPreferences} onChange={(event) => setBriefPreferences(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={2} placeholder={ru.planning.preferencesPlaceholder} />
             </label>
             <label className="planning-slide-count">{ru.planning.slideCount} <span className="planning-label-note">{ru.planning.optionalRange}</span>
-              <input type="number" min="1" max="30" step="1" value={requestedSlideCount} onChange={(event) => setRequestedSlideCount(event.target.value)} disabled={planningGenerating} placeholder={ru.planning.automatic} />
+              <input type="number" min="1" max="30" step="1" value={requestedSlideCount} onChange={(event) => setRequestedSlideCount(event.target.value)} disabled={planningGenerating || productWorkflowRunning} placeholder={ru.planning.automatic} />
             </label>
             <div className="planning-submit-row">
               <span className="planning-muted">{ru.planning.requires}</span>
@@ -1302,6 +1467,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       </section>
 
       <PresentationGenerationPanel
+        key={productOperation?.status === 'ready' ? productOperation.operationId : 'workflow-initial'}
         projectId={projectId}
         planningReady={savedPlanReady}
         inputFingerprint={planning?.inputFingerprint ?? null}

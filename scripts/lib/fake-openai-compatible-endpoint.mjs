@@ -20,15 +20,23 @@ function deterministicPlanningResponse(request) {
       && typeof unit.text === 'string' && unit.text.trim());
     const taskSourceIds = new Set((evidence.contentIR.sources ?? [])
       .filter((source) => source.kind === 'brief-task').map((source) => source.id));
+    const contextSourceIds = new Set((evidence.contentIR.sources ?? [])
+      .filter((source) => source.kind === 'brief-context').map((source) => source.id));
     const contextUnits = allTextUnits.filter((unit) => !taskSourceIds.has(unit.sourceId));
     // A brief-task is instruction, not slide evidence. Use it as a grounded
     // fallback only when no context/source material exists.
     const textUnits = contextUnits.length ? contextUnits : allTextUnits;
     const hasHeadings = textUnits.some((unit) => unit.kind === 'heading');
     // Task/context-only planning has no uploaded Markdown heading structure.
-    // Keep each bounded ContentIR unit as its own evidence section so the local
-    // fake exercises the real no-file workflow without repeating one claim.
-    const sections = !hasHeadings ? textUnits.map((unit) => ({ heading: null, contentUnits: [unit] })) : [];
+    // Preserve user-authored task lines as separate evidence sections so the
+    // local fake can exercise task-only decks without repeating one claim.
+    const sections = !hasHeadings ? textUnits.flatMap((unit) => {
+      if (!contextSourceIds.has(unit.sourceId) && !(taskSourceIds.has(unit.sourceId) && unit.text.includes('\n'))) {
+        return [{ heading: null, contentUnits: [unit] }];
+      }
+      const paragraphs = unit.text.split(/\r?\n+/u).map((text) => text.trim()).filter(Boolean);
+      return (paragraphs.length ? paragraphs : [unit.text]).map((text) => ({ heading: null, contentUnits: [{ ...unit, text }] }));
+    }) : [];
     let section = null;
     for (const unit of hasHeadings ? textUnits : []) {
       if (unit.kind === 'media-reference' || typeof unit.text !== 'string' || !unit.text.trim()) continue;
@@ -70,6 +78,33 @@ function deterministicPlanningResponse(request) {
   }
   if (schemaName === 'supervisor_plan_review_v1') {
     return completion(request.model, { checkpointVersion: evidence.checkpointVersion, outcome: 'pass', findings: [], operations: [] });
+  }
+  if (schemaName === 'contextual_deck_audit_v1') {
+    const rules = [
+      ['titleTakeaway', 'TITLE_TAKEAWAY_CLEAR'],
+      ['titleContentAlignment', 'TITLE_CONTENT_ALIGNED'],
+      ['factGrounding', 'FACTS_GROUNDED'],
+      ['visualSemanticFit', 'VISUAL_SEMANTIC_FIT'],
+      ['languageConsistency', 'LANGUAGE_CONSISTENT'],
+      ['narrativeContinuity', 'NARRATIVE_CONTINUOUS'],
+      ['redundancy', 'NO_REDUNDANCY'],
+      ['garbage', 'NO_PROMPT_GARBAGE'],
+      ['oneSentenceSummary', 'SUMMARY_CLEAR'],
+    ];
+    const firstSlide = evidence.slides?.[0];
+    const firstRef = firstSlide?.evidenceRefs?.[0];
+    return completion(request.model, {
+      schemaVersion: 1,
+      findings: rules.map(([ruleId, messageCode]) => ({
+        ruleId,
+        slideId: firstRef ? firstSlide.slideId : null,
+        severity: 'info',
+        messageCode,
+        evidenceRefs: firstRef ? [firstRef] : [],
+        repairable: false,
+        suggestedActionCode: null,
+      })),
+    });
   }
   if (schemaName === 'template_semantic_profile_v1') {
     const repeatedTextCounts = new Map();

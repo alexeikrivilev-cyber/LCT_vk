@@ -33,11 +33,12 @@
 
 - Детерминированные проверки находят некоторые geometry, placeholder, numeric provenance, table/chart, density и duplicate-content проблемы.
 - Безопасный repair ограничен локальной проекцией/layout; модель не получает право произвольно редактировать OOXML.
-- Контекстная смысловая проверка полного качества изображения/соседних слайдов не подключена как production gate; нужен human review.
+- После генерации запускается один bounded text-only contextual audit на готовую deck через semantic adapter. Он проверяет выводы заголовков, соответствие содержания, provenance, смысловой тип визуализации, язык, повторения, мусор и связность повествования. Findings не обходят deterministic gate и не меняют содержимое автоматически.
+- Fake-only schema/runtime flow проверен; оценки настоящего Qwen и визуальное качество изображения/слайдов не подтверждены. Нужен human review.
 
 ## 6. Результаты и выводы
 
-- Локальный 12-slide fake smoke успешно создавал и структурно переоткрывал A/B/C PPTX, но занял 322.635 s целиком.
-- Текущая local fake matrix прошла 9/9 для VK Tech, WorkSpace и Education; тот же вход задачи/контекста использован для всех трёх шаблонов. Точный held-out AIOS onboarding прошёл A/B/C, audit и export/reopen, включая проверку source residue.
-- Это структурная локальная qualification, не подтверждение визуального качества в PowerPoint/LibreOffice или работы настоящей модели. 12-slide smoke превысил 300 секунд.
-- Следующий необходимый этап — выполнить визуальную проверку exports в native Office, закрыть performance gaps и затем провести ограниченный live Qwen/VK test.
+- Fake-only one-click qualification прошла для VK Tech (12 слайдов), WorkSpace, Education и held-out AIOS (по 3 слайда, task-only); selected/A/B/C PPTX были повторно открыты на каждом шаблоне.
+- AIOS source-residue gate проверил 80 уникальных template-specific фраз в selected/A/B/C: совпадений нет. VK Tech PDF прошёл проверку 12 страниц; HTML содержит 12 секций.
+- VK Tech 12-slide fake flow занял 78.645 s до завершения contextual audit и экспортов. Это измерение не включает реальный Qwen/VK inference.
+- Структурный local PASS не подтверждает визуальное качество в PowerPoint/LibreOffice или работу настоящей модели. Следующий этап — один ограниченный live qualification; его бюджет указан в [RELEASE_READINESS.md](../RELEASE_READINESS.md).

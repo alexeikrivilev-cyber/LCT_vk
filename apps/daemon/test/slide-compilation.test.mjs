@@ -10,7 +10,7 @@ import JSZip from 'jszip';
 
 import { inspectPptx } from '../src/presentation/adapters/python-inspector.ts';
 import { compileContentIR } from '../src/presentation/application/content-compiler.ts';
-import { CONTEXTUAL_AUDIT_GATES, validateContextualSlideAuditResponse } from '../src/presentation/application/contextual-audit-port.ts';
+import { CONTEXTUAL_AUDIT_RULES, CONTEXTUAL_AUDIT_MESSAGE_CODES, validateContextualDeckAuditResponse } from '../src/presentation/application/contextual-audit-port.ts';
 import { auditCompiledPresentation, repairCompiledPresentationOnce } from '../src/presentation/application/deterministic-audit.ts';
 import { buildPresentationQualityReport, PRESENTATION_QUALITY_CATEGORIES } from '../src/presentation/application/presentation-quality-report.ts';
 import { createTemplateIR } from '../src/presentation/application/template-mapper.ts';
@@ -2037,32 +2037,32 @@ test('persisted planning state replays offline and the manifest omits endpoint U
   assert.ok(serialized.includes('deck_plan_draft_v1'));
 });
 
-test('contextual audit port validates all eight gates through a local fake Supervisor capability', async () => {
+test('contextual deck audit validates all nine text-only checks and rejects invalid slide/evidence references', () => {
+  const context = {
+    slideContentRefs: new Map([['slide-fake-1', new Set(['unit_fixture'])]]),
+    knownEvidenceRefs: new Set(['unit_fixture']),
+  };
   const response = {
     schemaVersion: 1,
-    slideId: 'slide-fake-1',
-    findings: CONTEXTUAL_AUDIT_GATES.map((gate) => ({ gate, result: 'unknown', rationale: 'Synthetic fake response; no model call was made.', evidenceRefs: [] })),
+    findings: CONTEXTUAL_AUDIT_RULES.map((ruleId) => ({
+      ruleId,
+      slideId: 'slide-fake-1',
+      severity: 'info',
+      messageCode: CONTEXTUAL_AUDIT_MESSAGE_CODES[ruleId][0],
+      evidenceRefs: ['unit_fixture'],
+      repairable: false,
+      suggestedActionCode: null,
+    })),
   };
-  let calls = 0;
-  const fakeSupervisorCapability = {
-    async review(request) {
-      calls += 1;
-      assert.equal(request.slideId, 'slide-fake-1');
-      return validateContextualSlideAuditResponse(response, request.slideId);
-    },
-  };
-  const reviewed = await fakeSupervisorCapability.review({
-    slideId: 'slide-fake-1',
-    renderedSlide: { mediaType: 'image/png', base64: 'c3ludGhldGlj' },
-    title: 'Synthetic title',
-    body: ['Synthetic evidence line'],
-    provenanceEvidence: [{ contentRef: 'unit_fixture', text: 'Synthetic source evidence' }],
-    previousSlideSummary: null,
-    nextSlideSummary: null,
-  });
-  assert.equal(calls, 1);
-  assert.equal(reviewed.findings.length, 8);
+  const reviewed = validateContextualDeckAuditResponse(response, context);
+  assert.equal(reviewed.findings.length, 9);
   const incomplete = structuredClone(response);
   incomplete.findings.pop();
-  assert.throws(() => validateContextualSlideAuditResponse(incomplete, 'slide-fake-1'), /invalid shape/);
+  assert.throws(() => validateContextualDeckAuditResponse(incomplete, context), /invalid shape/);
+  const unknownSlide = structuredClone(response);
+  unknownSlide.findings[0].slideId = 'slide-not-in-deck';
+  assert.throws(() => validateContextualDeckAuditResponse(unknownSlide, context), /unknown slide/);
+  const unrelatedEvidence = structuredClone(response);
+  unrelatedEvidence.findings[0].evidenceRefs = ['unit_not_in_content'];
+  assert.throws(() => validateContextualDeckAuditResponse(unrelatedEvidence, context), /unknown or duplicate evidence/);
 });

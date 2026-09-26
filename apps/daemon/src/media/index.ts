@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { writePresentationFile } from '../presentation-files.js';
+import { presentationImageConfig } from './models.js';
 
 export interface GeneratePresentationImageInput {
   projectsRoot: string;
@@ -9,6 +10,7 @@ export interface GeneratePresentationImageInput {
   output?: string;
   aspect?: string;
   quality?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 type ImageResponse = {
@@ -27,13 +29,6 @@ function imageSize(aspect?: string): string {
     default:
       return '1024x1024';
   }
-}
-
-function imageConfig(env: NodeJS.ProcessEnv = process.env) {
-  const apiKey = env.LCT_IMAGE_API_KEY?.trim() || env.OPENAI_API_KEY?.trim() || '';
-  const baseUrl = (env.LCT_IMAGE_BASE_URL?.trim() || env.OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1').replace(/\/$/, '');
-  const model = env.LCT_IMAGE_MODEL?.trim() || 'gpt-image-1';
-  return { apiKey, baseUrl, model };
 }
 
 function safeOutput(value?: string): string {
@@ -57,14 +52,24 @@ export async function generatePresentationImage(input: GeneratePresentationImage
   const prompt = input.prompt?.trim();
   if (!prompt) throw new Error('image prompt is required');
 
-  const config = imageConfig();
+  const config = presentationImageConfig(input.env);
+  if (!config.configured || !config.baseUrl || !config.model) {
+    const error = new Error('image generation is not configured; explicitly set LCT_IMAGE_BASE_URL and LCT_IMAGE_MODEL') as Error & { status?: number };
+    error.status = 503;
+    throw error;
+  }
   if (!config.apiKey) {
-    const error = new Error('image generation is not configured; set LCT_IMAGE_API_KEY or OPENAI_API_KEY') as Error & { status?: number };
+    const error = new Error('image endpoint authentication is not configured; set LCT_IMAGE_API_KEY when required') as Error & { status?: number };
     error.status = 503;
     throw error;
   }
 
   const model = input.model?.trim() || config.model;
+  if (model !== config.model) {
+    const error = new Error('requested image model does not match the explicitly configured model') as Error & { status?: number };
+    error.status = 400;
+    throw error;
+  }
   const response = await fetch(`${config.baseUrl}/images/generations`, {
     method: 'POST',
     headers: {

@@ -348,6 +348,50 @@ export const ru = {
     unsupported: 'Не поддерживается',
     notParsed: 'Ещё не проверено',
   },
+  workflow: {
+    action: 'Сгенерировать презентацию',
+    working: 'Создаём презентацию…',
+    openResult: 'Результат готов',
+    requireTemplateAndTask: 'Выберите шаблон PowerPoint и опишите задачу. Исходные материалы можно не добавлять.',
+    stages: {
+      analyzing_template: 'Анализируем шаблон',
+      understanding_template: 'Изучаем структуру шаблона',
+      planning: 'Создаём и проверяем план',
+      generating: (ready: number, total: number | null) => total === null ? 'Создаём варианты' : `Создаём слайды: ${ready} из ${total}`,
+      contextual_audit: 'Проверяем смысл и связность',
+      ready: 'Презентация готова к просмотру',
+      failed: 'Не удалось завершить создание презентации',
+    },
+    error: 'Не удалось создать презентацию. Проверьте шаблон и задачу, затем повторите попытку.',
+    audit: 'Смысловая проверка',
+    auditClean: 'Замечаний нет',
+    auditFindings: (count: number) => `Замечаний: ${count}`,
+    auditStale: 'Выбранные варианты изменились после смысловой проверки.',
+    auditRerun: 'Проверить выбранные варианты',
+    suggestionsOnly: 'Это подсказки для проверки. Они не меняют факты и не исправляют слайды автоматически.',
+    slideLabel: (index: number) => `Слайд ${index}`,
+    deckLabel: 'Вся презентация',
+    messages: {
+      TITLE_TAKEAWAY_CLEAR: 'Заголовки выражают основные выводы.',
+      TITLE_TAKEAWAY_REVIEW: 'Проверьте, выражает ли заголовок главный вывод слайда.',
+      TITLE_CONTENT_ALIGNED: 'Содержание соответствует заголовкам.',
+      TITLE_CONTENT_MISMATCH: 'Проверьте соответствие заголовка и содержания.',
+      FACTS_GROUNDED: 'Факты связаны с исходными материалами.',
+      FACTS_UNGROUNDED: 'Проверьте факты по исходным материалам.',
+      VISUAL_SEMANTIC_FIT: 'Тип визуализации соответствует содержанию.',
+      VISUAL_SEMANTIC_MISMATCH: 'Проверьте, подходит ли выбранный тип визуализации.',
+      LANGUAGE_CONSISTENT: 'Язык и стиль выдержаны последовательно.',
+      LANGUAGE_MIXED: 'Проверьте единообразие языка и стиля.',
+      NARRATIVE_CONTINUOUS: 'Переходы между слайдами связны.',
+      NARRATIVE_BREAK: 'Проверьте переход между соседними слайдами.',
+      NO_REDUNDANCY: 'Повторяющихся выводов не найдено.',
+      CONTENT_REPEATED: 'Проверьте, не повторяет ли слайд уже раскрытую мысль.',
+      NO_PROMPT_GARBAGE: 'Инструкций и служебных фрагментов не найдено.',
+      PROMPT_GARBAGE: 'Удалите случайно попавшие в презентацию инструкции или служебный текст.',
+      SUMMARY_CLEAR: 'Смысл каждого слайда можно кратко сформулировать.',
+      SUMMARY_UNCLEAR: 'Уточните основную мысль слайда.',
+    },
+  },
 } as const;
 
 export function formatUiDateTime(date: Date): string {
@@ -421,6 +465,19 @@ export function variantStatusLabel(status: string): string {
   if (status === 'failed') return ru.generation.failed;
   if (status === 'pending') return ru.generation.pending;
   return ru.status.unknown;
+}
+
+export function productWorkflowStageLabel(stage: string, readySlides: number, totalSlides: number | null): string {
+  switch (stage) {
+    case 'analyzing_template': return ru.workflow.stages.analyzing_template;
+    case 'understanding_template': return ru.workflow.stages.understanding_template;
+    case 'planning': return ru.workflow.stages.planning;
+    case 'generating': return ru.workflow.stages.generating(readySlides, totalSlides);
+    case 'contextual_audit': return ru.workflow.stages.contextual_audit;
+    case 'ready': return ru.workflow.stages.ready;
+    case 'failed': return ru.workflow.stages.failed;
+    default: return ru.status.unknown;
+  }
 }
 
 export function auditFindingMessage(ruleId: string): string {

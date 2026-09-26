@@ -84,6 +84,24 @@ test('local fake still accepts task-only planning without inventing content unit
   assert.equal(draft.slides[0].takeaway, 'Prepare a short deck about reliable automation.');
 });
 
+test('local fake preserves distinct task-only steps as one grounded source', () => {
+  const task = 'Подготовить краткий план запуска презентации.\nПроверить готовность исходных материалов.\nСогласовать следующий проверяемый шаг команды.';
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v1', {
+    brief: { purpose: task },
+    requestedSlideCount: 3,
+    contentIR: { sources: [{ id: 'task-source', kind: 'brief-task' }], units: [
+      { id: 'task', sourceId: 'task-source', kind: 'text', text: task },
+    ] },
+  }));
+  const draft = JSON.parse(response.choices[0].message.content);
+  assert.deepEqual(draft.slides.map((slide) => slide.takeaway), [
+    'Подготовить краткий план запуска презентации.',
+    'Проверить готовность исходных материалов.',
+    'Согласовать следующий проверяемый шаг команды.',
+  ]);
+  assert.ok(draft.slides.every((slide) => slide.contentRefs.length === 1 && slide.contentRefs[0] === 'task'));
+});
+
 test('local fake returns generic strict-schema template role mappings from supplied evidence', () => {
   const hash = 'a'.repeat(64);
   const evidence = {

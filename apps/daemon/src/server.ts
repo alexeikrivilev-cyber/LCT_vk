@@ -38,7 +38,7 @@ import {
   resolveDesignSystemPreview,
 } from './presentation-catalog.js';
 import { generatePresentationImage } from './media/index.js';
-import { presentationImageModels } from './media/models.js';
+import { presentationImageConfig, presentationImageModels } from './media/models.js';
 import {
   OpenAICompatibleSemanticInferenceAdapter,
   probeSemanticEndpoint,
@@ -46,6 +46,7 @@ import {
 } from './presentation/adapters/openai-compatible-semantic-inference.js';
 import type { SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
 import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
+import { ProductWorkflowError, ProductWorkflowService } from './presentation/application/product-workflow-service.js';
 import { projectTemplateSemanticProfileCache, TemplateSemanticProfiler } from './presentation/application/template-semantic-profiler.js';
 import {
   PresentationGenerationError,
@@ -227,6 +228,14 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     ...(options.performanceDiagnostics ? { performanceDiagnostics: options.performanceDiagnostics } : {}),
     ...(options.presentationRenderer ? { renderer: options.presentationRenderer } : {}),
     ...(options.presentationPreview ? { preview: options.presentationPreview } : {}),
+  });
+  const productWorkflowService = new ProductWorkflowService({
+    projectRoot,
+    projectsRoot,
+    planningService,
+    generationService,
+    getInferenceAdapter: getSemanticAdapter,
+    ...(profileTemplate ? { profileTemplate } : {}),
   });
   const app = express();
   const deletingProjects = new Set<string>();
@@ -480,6 +489,50 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     }
   });
 
+  app.get('/api/projects/:id/workflow', async (req, res) => {
+    if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+    try {
+      res.json({ operation: await productWorkflowService.get(req.params.id) });
+    } catch (error) {
+      if (error instanceof ProductWorkflowError) {
+        res.locals.errorCode = error.code;
+        return res.status(error.status).json({ error: { code: error.code, message: 'Не удалось загрузить состояние презентации.' } });
+      }
+      return apiError(res, 500, error);
+    }
+  });
+
+  app.post('/api/projects/:id/workflow/generate', async (req, res) => {
+    if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+    if (!smallGenerationBody(req)) return apiError(res, 413, new Error('product workflow request must be a small JSON object'));
+    try {
+      const operation = await productWorkflowService.start(req.params.id, req.body);
+      res.status(operation.status === 'running' ? 202 : 200).json({ operation });
+    } catch (error) {
+      if (error instanceof ProductWorkflowError) {
+        res.locals.errorCode = error.code;
+        return res.status(error.status).json({ error: { code: error.code, message: 'Не удалось запустить создание презентации.' } });
+      }
+      return apiError(res, 500, error);
+    }
+  });
+
+  app.post('/api/projects/:id/workflow/contextual-audit', async (req, res) => {
+    if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+    if (!smallGenerationBody(req) || Object.keys(req.body as Record<string, unknown>).length > 0) {
+      return apiError(res, 400, new Error('contextual audit request must be an empty JSON object'));
+    }
+    try {
+      res.json({ operation: await productWorkflowService.auditCurrentSelection(req.params.id) });
+    } catch (error) {
+      if (error instanceof ProductWorkflowError) {
+        res.locals.errorCode = error.code;
+        return res.status(error.status).json({ error: { code: error.code, message: 'Не удалось проверить смысл презентации.' } });
+      }
+      return apiError(res, 500, error);
+    }
+  });
+
   app.get('/api/projects/:id/planning', async (req, res) => {
     if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
     try {
@@ -708,11 +761,21 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   });
 
   app.get('/api/media/models', (_req, res) => {
-    res.json({ image: presentationImageModels() });
+    const config = presentationImageConfig();
+    res.json({
+      image: presentationImageModels(),
+      configured: config.configured,
+      message: config.configured ? null : 'Генерация изображений не настроена.',
+    });
   });
 
   app.post('/api/media/generate', async (req, res) => {
     try {
+      const config = presentationImageConfig();
+      if (!config.configured) {
+        res.locals.errorCode = 'IMAGE_GENERATION_NOT_CONFIGURED';
+        return res.status(503).json({ error: { code: 'IMAGE_GENERATION_NOT_CONFIGURED', message: 'Генерация изображений не настроена.' } });
+      }
       const projectId = typeof req.body?.projectId === 'string' ? req.body.projectId : '';
       if (!projectId || !getPresentationProject(db, projectId)) return projectNotFound(res);
       if (req.body?.surface && req.body.surface !== 'image') {
@@ -786,10 +849,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   const url = `http://${urlHost}:${boundPort}`;
 
   const shutdown = async () => {
+    productWorkflowService.requestShutdown();
     const [planningDrained, generationDrained] = await Promise.all([
       planningService.shutdown().catch(() => false),
       generationService.shutdown().catch(() => false),
     ]);
+    await productWorkflowService.waitForIdle().catch(() => undefined);
     const closeStore = () => { try { db.close(); } catch { /* already closed */ } };
     if (planningDrained && generationDrained) closeStore();
     else void Promise.all([planningService.waitForIdle(), generationService.waitForIdle()]).finally(closeStore);

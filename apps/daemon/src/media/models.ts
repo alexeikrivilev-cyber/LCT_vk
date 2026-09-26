@@ -5,15 +5,22 @@ export interface PresentationImageModel {
   supportsReferences: boolean;
 }
 
-const DEFAULT_MODELS: PresentationImageModel[] = [
-  { id: 'gpt-image-1', label: 'GPT Image 1', provider: 'openai-compatible', supportsReferences: false },
-];
+export interface PresentationImageConfig {
+  baseUrl: string | null;
+  model: string | null;
+  apiKey: string | null;
+  configured: boolean;
+}
+
+export function presentationImageConfig(env: NodeJS.ProcessEnv = process.env): PresentationImageConfig {
+  const baseUrl = env.LCT_IMAGE_BASE_URL?.trim().replace(/\/$/, '') || null;
+  const model = env.LCT_IMAGE_MODEL?.trim() || null;
+  const apiKey = env.LCT_IMAGE_API_KEY?.trim() || null;
+  return { baseUrl, model, apiKey, configured: Boolean(baseUrl && model) };
+}
 
 export function presentationImageModels(env: NodeJS.ProcessEnv = process.env): PresentationImageModel[] {
-  const configured = env.LCT_IMAGE_MODEL?.trim();
-  if (!configured || configured === DEFAULT_MODELS[0].id) return DEFAULT_MODELS.map((model) => ({ ...model }));
-  return [
-    { id: configured, label: configured, provider: 'openai-compatible', supportsReferences: false },
-    ...DEFAULT_MODELS.map((model) => ({ ...model })),
-  ];
+  const config = presentationImageConfig(env);
+  if (!config.configured || !config.model) return [];
+  return [{ id: config.model, label: config.model, provider: 'openai-compatible', supportsReferences: false }];
 }

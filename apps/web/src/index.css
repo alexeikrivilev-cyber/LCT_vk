@@ -139,6 +139,21 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .planning-notice { margin-top: 12px; padding: 10px 12px; border: 1px dashed #c9c9c2; border-radius: 8px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .planning-notice-warning { border-style: solid; border-color: #e3c49b; background: #fffaf1; color: #704c22; }
 .planning-error { margin-top: 11px; }
+.product-workflow-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 11px 16px; margin-top: 14px; padding: 14px; border: 1px solid #c9d8ca; border-radius: 10px; background: #f4f8f3; }
+.product-workflow-copy { min-width: 0; }
+.product-workflow-copy strong { color: var(--strong); font-size: 13px; }
+.product-workflow-copy p, .product-contextual-audit p { margin: 4px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.product-workflow-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.product-workflow-status { max-width: 260px; border: 1px solid var(--line); border-radius: 999px; padding: 6px 9px; background: white; color: #55554f; font-size: 10px; line-height: 1.35; }
+.product-workflow-status.status-ready { border-color: #b8d4c0; background: #eff8f1; color: #255c35; }
+.product-workflow-status.status-failed { border-color: #ddb4af; background: #fff3f2; color: var(--danger); }
+.product-workflow-error, .product-workflow-failure { grid-column: 1 / -1; margin: 0; }
+.product-contextual-audit { grid-column: 1 / -1; padding-top: 10px; border-top: 1px solid #dce6dc; color: #44443f; font-size: 10px; }
+.product-contextual-audit > strong { display: block; font-size: 11px; }
+.product-contextual-audit details { margin-top: 7px; }
+.product-contextual-audit ul { display: grid; gap: 5px; margin: 7px 0; padding-left: 18px; line-height: 1.45; }
+.product-contextual-audit li small { margin-left: 6px; color: var(--muted); }
+.product-contextual-audit button { margin-top: 8px; }
 .planning-form-grid { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(320px, 1.2fr); gap: 14px; margin-top: 14px; }
 .planning-file-picker { min-width: 0; min-height: 0; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; }
 .planning-file-picker legend { padding: 0 4px; color: var(--strong); font-size: 11px; font-weight: 700; }
@@ -298,6 +313,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .planning-head-actions { width: 100%; justify-content: space-between; }
   .planning-panel-head h2 { font-size: 18px; }
   .planning-form-grid { grid-template-columns: 1fr; }
+  .product-workflow-card { grid-template-columns: 1fr; }
+  .product-workflow-controls { justify-content: flex-start; }
   .planning-file-list { max-height: 170px; }
   .planning-brief { grid-template-columns: 1fr; }
   .planning-slide-grid { grid-template-columns: 1fr; }

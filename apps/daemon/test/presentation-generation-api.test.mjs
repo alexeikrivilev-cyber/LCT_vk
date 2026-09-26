@@ -11,6 +11,7 @@ import Database from 'better-sqlite3';
 register();
 const require = createRequire(import.meta.url);
 const PptxGenJS = require('pptxgenjs');
+const JSZip = require('jszip');
 const { startServer } = await import('../src/server.ts');
 const { PDFDocument } = await import('pdf-lib');
 const { compileContentIR } = await import('../src/presentation/application/content-compiler.ts');
@@ -22,6 +23,7 @@ const { inspectOfficeKitPackage } = await import('../src/presentation/adapters/o
 const { PresentationGenerationService } = await import('../src/presentation/application/generation-service.ts');
 const { createPresentationProject, openPresentationStore } = await import('../src/presentation-store.ts');
 const { getPresentationGeneration, startPresentationGeneration } = await import('../src/presentation-generation-store.ts');
+const { startFakeSemanticEndpoint } = await import('../../../scripts/lib/fake-openai-compatible-endpoint.mjs');
 
 const repoRoot = path.resolve(import.meta.dirname, '../../..');
 const variants = ['A', 'B', 'C'];
@@ -183,7 +185,7 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
   return { contentIR, plan };
 }
 
-function gateRenderer(targetSlideId) {
+function gateRenderer(targetSlideId = null) {
   const renderer = new OfficeKitPptxRenderer();
   let enter;
   let release;
@@ -203,7 +205,7 @@ function gateRenderer(targetSlideId) {
       id: 'office-kit',
       async render(input) {
         renderSlideCounts.push(input.compiledPresentation.slides.length);
-        if (!blocked && input.compiledPresentation.slides[0]?.sourceDeckPlanSlideId === targetSlideId) {
+        if (!blocked && (targetSlideId === null || input.compiledPresentation.slides[0]?.sourceDeckPlanSlideId === targetSlideId)) {
           blocked = true;
           enter();
           await gate;
@@ -660,6 +662,214 @@ test('a changed ready plan can replace a completed generation with a fresh idemp
     else process.env.LCT_PPTX_BACKEND = priorBackend;
   }
 });
+
+test('one-click product workflow is idempotent, persisted, audits one selected deck, and exports all formats', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-one-click-workflow-'));
+  t.after(() => removeTempDirectory(temp));
+  const dataDir = path.join(temp, 'data');
+  const projectId = 'one-click-workflow';
+  const endpoint = await startFakeSemanticEndpoint({ model: 'offline-fake-planner' });
+  t.after(() => endpoint.close());
+  const oldConfig = {
+    baseUrl: process.env.LCT_SEMANTIC_BASE_URL,
+    model: process.env.LCT_SEMANTIC_MODEL,
+    apiKey: process.env.LCT_SEMANTIC_API_KEY,
+    backend: process.env.LCT_PPTX_BACKEND,
+    image: Object.fromEntries(['LCT_IMAGE_BASE_URL', 'LCT_IMAGE_MODEL', 'LCT_IMAGE_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_KEY'].map((key) => [key, process.env[key]])),
+  };
+  process.env.LCT_SEMANTIC_BASE_URL = endpoint.baseUrl;
+  process.env.LCT_SEMANTIC_MODEL = 'offline-fake-planner';
+  delete process.env.LCT_SEMANTIC_API_KEY;
+  process.env.LCT_PPTX_BACKEND = 'office-kit';
+  for (const key of Object.keys(oldConfig.image)) delete process.env[key];
+  let started;
+  try {
+    started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
+    await createProject(started, projectId);
+    const imageModels = await json(await fetch(`${started.url}/api/media/models`));
+    assert.deepEqual(imageModels.image, []);
+    assert.equal(imageModels.configured, false);
+    const pptx = await makeValidSyntheticPptx(path.join(temp, 'template'));
+    await upload(started, projectId, 'synthetic-template.pptx', pptx);
+    const input = {
+      templateFilePath: 'synthetic-template.pptx',
+      contentFiles: [],
+      brief: {
+        audience: 'Руководители продукта',
+        purpose: 'Подготовить краткую презентацию о развитии продукта на основе задачи и контекста.',
+        preferences: [],
+        requestedSlideCount: 3,
+      },
+    };
+    const begin = await fetch(`${started.url}/api/projects/${projectId}/workflow/generate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input),
+    });
+    assert.equal(begin.status, 202, await begin.clone().text());
+    const first = (await json(begin)).operation;
+    const duplicate = await fetch(`${started.url}/api/projects/${projectId}/workflow/generate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input),
+    });
+    assert.ok([200, 202].includes(duplicate.status), await duplicate.clone().text());
+    assert.equal((await json(duplicate)).operation.operationId, first.operationId);
+
+    const getOperation = async () => (await json(await fetch(`${started.url}/api/projects/${projectId}/workflow`))).operation;
+    const ready = await waitFor(getOperation, (operation) => operation?.status === 'ready' || operation?.status === 'failed', 'one-click operation ready', 120_000);
+    const generationOnFailure = ready.status === 'failed' ? await getGeneration(started, projectId) : null;
+    assert.equal(ready.status, 'ready', JSON.stringify({ failure: ready.failure, generation: generationOnFailure?.failure }));
+    assert.equal(ready.stage, 'ready');
+    assert.equal(ready.totalSlides, 3);
+    assert.equal(ready.readySlides, 3);
+    assert.equal(ready.contextualAudit.status, 'ready');
+    assert.equal(ready.contextualAudit.findings.length, 9);
+
+    const plan = await json(await fetch(`${started.url}/api/projects/${projectId}/planning`));
+    assert.equal(plan.status, 'ready');
+    assert.equal(plan.deckPlan.slides.length, 3);
+    const generationResponse = await fetch(`${started.url}/api/projects/${projectId}/generation`);
+    const generation = (await json(generationResponse)).generation;
+    assert.equal(generation.status, 'completed');
+    assert.equal(generation.slides.length, 3);
+    assert.ok(generation.slides.every((pack) => ['A', 'B', 'C'].every((variant) => pack.variants[variant].status === 'ready')));
+    assert.deepEqual(endpoint.state.inference.map((entry) => entry.operation).sort(), [
+      'contextual-deck-audit', 'deck-plan', 'plan-review', 'template-semantic-profile',
+    ].sort());
+    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 1);
+    assert.equal(endpoint.state.inference.length, 4);
+
+    const exportArtifact = async (mode, format) => {
+      const response = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode, format }),
+      });
+      assert.equal(response.status, 201, await response.clone().text());
+      const body = await json(response);
+      const download = await fetch(`${started.url}${body.artifact.downloadUrl}`);
+      assert.equal(download.status, 200);
+      return { artifact: body.artifact, bytes: Buffer.from(await download.arrayBuffer()), type: download.headers.get('content-type') };
+    };
+    for (const mode of ['selected', 'A', 'B', 'C']) {
+      const exported = await exportArtifact(mode, 'pptx');
+      assert.equal(exported.artifact.validationStatus, 'passed');
+      assert.ok(exported.bytes.length > 1000);
+      const zip = await JSZip.loadAsync(exported.bytes);
+      assert.ok(Object.keys(zip.files).includes('ppt/presentation.xml'));
+      assert.equal(Object.keys(zip.files).filter((name) => /^ppt\/slides\/slide\d+\.xml$/i.test(name)).length, 3);
+    }
+    const pdf = await exportArtifact('selected', 'pdf');
+    assert.ok(pdf.bytes.subarray(0, 5).toString('ascii').startsWith('%PDF-'));
+    const pdfDocument = await PDFDocument.load(pdf.bytes);
+    assert.equal(pdfDocument.getPageCount(), 3);
+    const html = await exportArtifact('selected', 'html');
+    assert.match(html.bytes.toString('utf8'), /<!doctype html>/i);
+    assert.equal((html.bytes.toString('utf8').match(/<section class="slide"/g) ?? []).length, 3);
+
+    const pickedTrack = await mutate(started, projectId, '/selection', {
+      scope: 'deck', variant: 'C', expectedVersion: generation.selectionVersion,
+    });
+    assert.equal(pickedTrack.status, 200, await pickedTrack.clone().text());
+    const selected = (await json(pickedTrack)).generation;
+    const lock = await mutate(started, projectId, `/slides/${selected.slides[0].slideId}/lock`, {
+      locked: true, variant: 'C', expectedVersion: selected.slides[0].version,
+    });
+    assert.equal(lock.status, 200, await lock.clone().text());
+
+    const afterReload = await getOperation();
+    assert.equal(afterReload.operationId, first.operationId);
+    assert.equal(afterReload.contextualAudit.stale, true, 'changing the selected deck makes the prior semantic review stale');
+    assert.equal(endpoint.state.inference.length, 4, 'repeat reads and exports must not issue semantic inference');
+
+    await closeStartedServer(started);
+    started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
+    const restored = await getOperation();
+    assert.equal(restored.operationId, first.operationId);
+    assert.equal(restored.contextualAudit.stale, true);
+    const restoredGeneration = (await json(await fetch(`${started.url}/api/projects/${projectId}/generation`))).generation;
+    assert.equal(restoredGeneration.defaultTrack, 'C');
+    assert.equal(restoredGeneration.slides[0].lockedVariant, 'C');
+    assert.equal(restoredGeneration.exports.length, 6);
+    assert.equal(endpoint.state.inference.length, 4, 'restart reuses persisted template, plan, generation, and contextual review');
+
+    const sourceProjectId = 'one-click-with-optional-source';
+    await createProject(started, sourceProjectId);
+    await upload(started, sourceProjectId, 'source-template.pptx', pptx);
+    await upload(started, sourceProjectId, 'market-context.md', Buffer.from('# Current position\nThe product serves three customer segments.\n\n# Next step\nThe team will validate the smallest pilot first.', 'utf8'));
+    const withSourceInput = {
+      ...input,
+      templateFilePath: 'source-template.pptx',
+      contentFiles: ['market-context.md'],
+      brief: { ...input.brief, purpose: 'Summarize the supplied customer context and propose a bounded next step.' },
+    };
+    const withSourceResponse = await fetch(`${started.url}/api/projects/${sourceProjectId}/workflow/generate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(withSourceInput),
+    });
+    assert.equal(withSourceResponse.status, 202, await withSourceResponse.clone().text());
+    const sourceWorkflow = await waitFor(async () => (await json(await fetch(`${started.url}/api/projects/${sourceProjectId}/workflow`))).operation,
+      (operation) => operation?.status === 'ready' || operation?.status === 'failed', 'one-click optional source', 120_000);
+    assert.equal(sourceWorkflow.status, 'ready', JSON.stringify(sourceWorkflow.failure));
+    const sourcePlanning = await json(await fetch(`${started.url}/api/projects/${sourceProjectId}/planning`));
+    assert.deepEqual(sourcePlanning.contentFiles, ['market-context.md']);
+    assert.ok(sourcePlanning.contentIR.units.some((unit) => unit.text?.includes('three customer segments')));
+    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 2);
+    assert.equal(endpoint.state.inference.length, 8);
+
+    const recoveryDataDir = path.join(temp, 'recovery-data');
+    const recoveryProjectId = 'one-click-recovery-during-generation';
+    const recoveryTemplate = await makeValidSyntheticPptx(path.join(temp, 'recovery-template'));
+    const recoveryRendererGate = gateRenderer();
+    started = await closeAndRestartWithRenderer(started, recoveryDataDir, repoRoot, recoveryRendererGate.renderer);
+    await createProject(started, recoveryProjectId);
+    await upload(started, recoveryProjectId, 'recovery-template.pptx', recoveryTemplate);
+    const beforeRecoveryCalls = endpoint.state.inference.length;
+    const recoveryInput = {
+      templateFilePath: 'recovery-template.pptx', contentFiles: [],
+      brief: { purpose: 'Показать безопасное восстановление генерации после перезапуска.', preferences: [], requestedSlideCount: 3 },
+    };
+    const recoveryStart = await fetch(`${started.url}/api/projects/${recoveryProjectId}/workflow/generate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(recoveryInput),
+    });
+    assert.equal(recoveryStart.status, 202, await recoveryStart.clone().text());
+    await recoveryRendererGate.entered;
+    const interrupted = (await json(await fetch(`${started.url}/api/projects/${recoveryProjectId}/workflow`))).operation;
+    assert.equal(interrupted.stage, 'generating');
+    const callsBeforeRestart = endpoint.state.inference.length;
+    assert.equal(callsBeforeRestart - beforeRecoveryCalls, 3, 'the persisted stage follows profiler, Worker, and planning Supervisor');
+    started.server.closeAllConnections?.();
+    await new Promise((resolve, reject) => started.server.close((error) => error ? reject(error) : resolve()));
+    const shutdown = started.shutdown();
+    recoveryRendererGate.release();
+    await shutdown;
+    const interruptedState = JSON.parse(await readFile(path.join(recoveryDataDir, 'projects', recoveryProjectId, '.workflow', 'state.json'), 'utf8'));
+    assert.equal(interruptedState.status, 'running');
+    assert.equal(interruptedState.stage, 'generating');
+    assert.equal(interruptedState.failure, null);
+    started = await startServer({
+      host: '127.0.0.1', port: 0, dataDir: recoveryDataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+    });
+    const recovered = await waitFor(async () => (await json(await fetch(`${started.url}/api/projects/${recoveryProjectId}/workflow`))).operation,
+      (operation) => operation?.status === 'ready' || operation?.status === 'failed', 'workflow recovery after generation interruption', 120_000);
+    assert.equal(recovered.status, 'ready', JSON.stringify(recovered.failure));
+    assert.equal(recovered.totalSlides, 3);
+    assert.equal(endpoint.state.inference.length - callsBeforeRestart, 1,
+      'recovery reuses template profile and plan, issuing only one contextual audit after generation');
+    const recoveredGeneration = (await json(await fetch(`${started.url}/api/projects/${recoveryProjectId}/generation`))).generation;
+    assert.ok(recoveredGeneration.slides.every((slide) => ['A', 'B', 'C'].every((variant) => slide.variants[variant].status === 'ready')));
+  } finally {
+    if (started) await closeStartedServer(started);
+    if (oldConfig.baseUrl === undefined) delete process.env.LCT_SEMANTIC_BASE_URL; else process.env.LCT_SEMANTIC_BASE_URL = oldConfig.baseUrl;
+    if (oldConfig.model === undefined) delete process.env.LCT_SEMANTIC_MODEL; else process.env.LCT_SEMANTIC_MODEL = oldConfig.model;
+    if (oldConfig.apiKey === undefined) delete process.env.LCT_SEMANTIC_API_KEY; else process.env.LCT_SEMANTIC_API_KEY = oldConfig.apiKey;
+    if (oldConfig.backend === undefined) delete process.env.LCT_PPTX_BACKEND; else process.env.LCT_PPTX_BACKEND = oldConfig.backend;
+    for (const [key, value] of Object.entries(oldConfig.image)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
+async function closeAndRestartWithRenderer(started, dataDir, projectRoot, renderer) {
+  await closeStartedServer(started);
+  return startServer({
+    host: '127.0.0.1', port: 0, dataDir, projectRoot, serveWeb: false, returnServer: true, presentationRenderer: renderer,
+  });
+}
 
 test('shutdown preserves every terminal generation when its task is still settling', async (t) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-generation-shutdown-terminal-'));

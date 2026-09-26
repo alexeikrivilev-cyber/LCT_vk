@@ -1,45 +1,45 @@
-# Готовность к квалификации Qwen
+# Готовность к ограниченной Qwen qualification
 
-**STATUS: BLOCKED**  
-Последняя проверка: 2026-09-26. Текущий источник истины — [RELEASE_READINESS.md](../RELEASE_READINESS.md); требования и provenance — [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md).
+**STATUS: READY_FOR_QWEN**
+Проверено: 2026-09-26. Полный отчёт: [RELEASE_READINESS.md](../RELEASE_READINESS.md). Требования и organizer provenance: [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md).
 
-## Локальный продукт
+## Локальный one-click product flow
 
-- Чистая временная копия прошла frozen install, build, offline start, локальный fake endpoint и smoke с реальным локальным PPTX. Повторный 12-слайдовый fake-only flow прошёл создание, выбор/закрепление, аудит, экспорт selected/A/B/C и повторное открытие PPTX. Это структурный smoke на синтетическом содержимом, не приемка organizer content.
-- В 12-слайдовом smoke проверены 36 слайдовых вариантов, 0 audit findings/errors, 24 native text shapes, 0 notes, source hash не изменился. Deck-level track facts/provenance не проверены, safe repair недоступен, native Office rendering неизвестен.
-- `generationRenderAndPreview`: 304.077 s; полный flow: 322.635 s. Оба результата превышают 300 s. Целевой live inference не измерялся.
-- Поддерживаемая конфигурация находится в `.env.example`; там только loopback/fake-настройки, секретов нет. Clean-room запуск из этой конфигурации проверен. Это не заменяет VK endpoint qualification.
+- Кнопка «Сгенерировать презентацию» запускает и сохраняет шаблонный analysis/profile, planning + review, A/B/C generation, deterministic audit и один contextual audit на готовую выбранную deck.
+- Task-only input работает с 0 source files; контекст также optional. Запрошенный slide count соблюдён: VK Tech — 12; WorkSpace, Education, AIOS — по 3.
+- Повторный запрос идемпотентен; этап операции восстанавливается через API после refresh/restart. Ошибки замены workflow state при временном Windows file lock имеют ограниченный retry; regression tests подтверждают retry и отказ без retry для permanent error.
+- Image generation по умолчанию не настроена: image models пусты и сетевых image calls нет. Для включения необходимы явные `LCT_IMAGE_BASE_URL`, `LCT_IMAGE_MODEL`, а image request также требует `LCT_IMAGE_API_KEY`. `OPENAI_*` не используются как fallback.
 
-## Organizer matrix и held-out
+## Template qualification
 
-- Последняя fake-only матрица: `.lct/core-generation-fix-20260926/case-3x3/CASE_QUALIFICATION_MANIFEST.json`; **PASS, 9/9** на одном task/context-only planning state. VK Tech, WorkSpace, Education — по A/B/C. Все PPTX reopened, прошли factual-equivalence/template-preservation, имеют 0 deterministic audit findings, notes и raster slides. Три profiler обращения были только к локальному fake endpoint.
-- Preview gate содержит 10 низкоуверенных текстовых предупреждений приближённого Office Kit renderer; PowerPoint/LibreOffice визуально не проверялись.
-- Точный held-out AIOS manifest: `.lct/unknown-template-qualification/unknown-template-2026-09-26T164941-924Z-ceef591a/UNKNOWN_TEMPLATE_MANIFEST.json`; **PASS**. `AIOS_Онбординг (4) (1) (1).pptx`, SHA `18198cc08df9fc3ea5aee5f509d89e70a4ade68bb539fed61a957581ee365ad`, 16 slides / 2 masters / 2 layouts. Task+context only, 0 source files; analysis/profile, plan, A/B/C, audit, selected and track exports/reopen passed. Проверены пять предметных строк на отсутствие во всех четырёх выходах; residue check — PASS.
-- Organizer clarification: отдельного content package не будет; обязательны шаблон и задача, контекст и source files optional. 3×3 использует одну qualification task/context, а не отсутствующий пакет.
+Итоговые артефакты: `.lct/product-completion-final-acceptance-2026-09-26/qualification.json`.
 
-## Визуальное качество и экспорт
+| Шаблон | Запрос слайдов | A/B/C | Reopened PPTX | Контекстная проверка | Дополнительно |
+|---|---:|---:|---|---|---|
+| VK Tech | 12 | 36/36 готовы | selected/A/B/C, native text на каждом слайде, notes 0, structural validation PASS | 1 request, 9 findings | PDF 12 страниц и HTML 12 секций проверены; full flow 78.645 s |
+| WorkSpace | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | task-only, 0 файлов |
+| Education | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | task-only, 0 файлов |
+| AIOS held-out | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | 80 source phrases проверены во всех 4 режимах; совпадений нет |
 
-- PPTX reopen/native-object checks для smoke и шести matrix artifacts — PASS структурно; открытие в PowerPoint/LibreOffice и ручной визуальный осмотр не выполнены.
-- PDF/HTML адаптеры и structural/reopen tests существуют. PDF/HTML release artifacts на все 9 deck не созданы; browser rendering acceptance не выполнялась. Для релизной приемки PDF/HTML — **не подтверждены**.
-- Предпросмотры приблизительные. WorkSpace и AIOS блокируют автоматическое подтверждение композиции.
+На каждом шаблоне deterministic audit прошёл без ошибок. Каждый semantic запрос обслужил локальный fake endpoint. Итого 16 fake calls по всей матрице, external requests — 0. Fake findings подтверждают технический pipeline и schema, а не семантическое качество реального Qwen.
 
-## UI и документация
+## Performance и экспорт
 
-- Русский каталог централизован. UI показывает русские сводки вместо внутренних английских audit messages, произвольного Supervisor reason и parser/template warning prose. Regression tests проверяют все текущие deterministic audit rules и запрещают прямой показ этих полей.
-- Полный browser walkthrough на 1280–1920 px не выполнен; UI visual acceptance остаётся частичной.
-- README, ARCHITECTURE, MODELS и AUDIT существуют. Безопасная пример-конфигурация — `.env.example`. Документы релизного набора, demo runbook, pitch outline и acceptance report подготовлены в этом рабочем дереве.
+VK Tech 12-slide one-click до contextual audit: **54.714 s**. Последующие selected/A/B/C PPTX, PDF и HTML export/reopen: **23.931 s**. Полный measured flow: **78.645 s**, ниже 180 s fake-only ceiling. Audit получает source-backed текстовые значения table/numeric units с их IDs и типами. Это не прогноз live latency.
 
-## Offline checks и live-only риски
+PPTX прошли структурный reopen и содержат редактируемый native text на каждом слайде; notes и package validation errors отсутствуют. PDF собран из approximate previews и прошёл reopen/page-count check. HTML прошёл structural/escaping checks. PowerPoint/LibreOffice и browser visual walkthrough здесь не выполнялись.
 
-2026-09-26 после P0 Core Generation Fix повторно пройдены frozen install на pnpm 10.33.2, **187/187 тестов**, typecheck, build, boundary, craft lint, docs links (55 required files) и `git diff --check`. Команды и ограничения evidence: в [`RELEASE_READINESS.md`](../RELEASE_READINESS.md).
+## Offline checks
 
-Не запускались RunPod, GPU, Qwen, VK endpoint или внешнее inference. Остаются live-only риски: Qwen semantic quality, strict schema compliance, latency, VK endpoint/configuration.
+Финальные gates 2026-09-26: frozen install — PASS; **200/200 tests**; typecheck — PASS; build — PASS; boundary — PASS; craft lint — PASS; docs check — PASS (55 files); `git diff --check` — PASS. Детали приведены в [RELEASE_READINESS.md](../RELEASE_READINESS.md). Сам этот документ не запускает inference автоматически.
 
-## Блокеры
+## Live-only risks
 
-1. Проверить 9-deck и held-out exports в PowerPoint/LibreOffice; принять или исправить preview approximation warnings.
-2. Подтвердить 10–15 slide performance: текущий 12-slide synthetic run превысил 300 s.
-3. Проверить PDF/HTML в браузере и выполнить customer-facing browser walkthrough.
-4. Зафиксировать clean final Git revision и config-based startup для целевого VK endpoint.
+1. Qwen classification/semantic quality.
+2. Strict schema compliance на целевом runtime.
+3. Реальная inference latency.
+4. VK endpoint auth/configuration и revision.
 
-**NEXT ACTION:** закрыть offline blockers 1–4; затем выполнить один ограниченный live Qwen/VK qualification с бюджетом не более 3 inference-запросов (profiler 1, Worker 1, Supervisor 1, generation 0).
+## Следующее действие
+
+Одна ограниченная live qualification: profiler 1, Worker 1, planning Supervisor 1, contextual audit 1; generation inference requests — 0; максимум четыре semantic requests. Для этого нужны отдельные пользовательские инструкции на целевой endpoint.

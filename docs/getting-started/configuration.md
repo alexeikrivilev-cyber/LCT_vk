@@ -32,13 +32,11 @@
 
 | Переменная | Обязательна | Значение по умолчанию / fallback | Scope / секрет | Назначение |
 |---|---|---|---|---|
-| `LCT_IMAGE_API_KEY` | Условно | fallback `OPENAI_API_KEY` | daemon; **секрет** | Ключ image API. Не входит в fake-only старт |
-| `LCT_IMAGE_BASE_URL` | Нет | `OPENAI_BASE_URL`, затем `https://api.openai.com/v1` | daemon; endpoint может раскрывать поставщика | Base URL image provider |
-| `LCT_IMAGE_MODEL` | Нет | `gpt-image-1` | daemon; alias, не секрет | Model alias image provider; базовый hackathon path не квалифицирован как open-weight-compliant |
-| `OPENAI_API_KEY` | Условно | fallback для `LCT_IMAGE_API_KEY` | daemon; **секрет** | Совместимый legacy alias |
-| `OPENAI_BASE_URL` | Нет | используется только как fallback для image URL | daemon | Совместимый legacy alias |
+| `LCT_IMAGE_API_KEY` | Условно | отсутствует | daemon; **секрет** | Текущий image adapter требует явный ключ для запроса. Не входит в fake-only старт |
+| `LCT_IMAGE_BASE_URL` | Условно | отсутствует | daemon; URL может быть внутренним | Явный OpenAI-compatible endpoint; без переменной image generation не настроена |
+| `LCT_IMAGE_MODEL` | Условно | отсутствует | daemon; alias, не секрет | Явный model alias; без переменной image generation не настроена |
 
-Image provider может отправлять prompt внешней стороне и создавать расходы. Не задавайте его для обычного fake-only старта. Лицензии и scope — в [MODELS.md](../../MODELS.md).
+Без `LCT_IMAGE_BASE_URL` и `LCT_IMAGE_MODEL` приложение не перечисляет image models и не делает запросов. У `OPENAI_API_KEY` и `OPENAI_BASE_URL` нет fallback-поведения и они игнорируются image adapter. При явной настройке endpoint prompt отправляется этому провайдеру и может создавать расходы; для фактического image request сейчас также необходим `LCT_IMAGE_API_KEY`. Не задавайте image-параметры для обычного fake-only старта. Лицензии и scope — в [MODELS.md](../../MODELS.md).
 
 ## Fake, тесты и qualification
 
