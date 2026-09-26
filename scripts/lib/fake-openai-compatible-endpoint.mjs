@@ -79,22 +79,24 @@ function deterministicPlanningResponse(request) {
   if (schemaName === 'supervisor_plan_review_v1') {
     return completion(request.model, { checkpointVersion: evidence.checkpointVersion, outcome: 'pass', findings: [], operations: [] });
   }
-  if (schemaName === 'contextual_deck_audit_v1') {
-    const rules = [
-      ['titleTakeaway', 'TITLE_TAKEAWAY_CLEAR'],
-      ['titleContentAlignment', 'TITLE_CONTENT_ALIGNED'],
-      ['factGrounding', 'FACTS_GROUNDED'],
-      ['visualSemanticFit', 'VISUAL_SEMANTIC_FIT'],
-      ['languageConsistency', 'LANGUAGE_CONSISTENT'],
-      ['narrativeContinuity', 'NARRATIVE_CONTINUOUS'],
-      ['redundancy', 'NO_REDUNDANCY'],
-      ['garbage', 'NO_PROMPT_GARBAGE'],
-      ['oneSentenceSummary', 'SUMMARY_CLEAR'],
-    ];
+    if (schemaName === 'contextual_deck_audit_v2') {
+      const rules = [
+        ['titleTakeaway', 'TITLE_TAKEAWAY_CLEAR'],
+        ['titleContentAlignment', 'TITLE_CONTENT_ALIGNED'],
+        ['oneSentenceSummary', 'SUMMARY_CLEAR'],
+        ['factGrounding', 'FACTS_GROUNDED'],
+        ['visualSemanticFit', 'VISUAL_SEMANTIC_FIT'],
+        ['garbage', 'NO_PROMPT_GARBAGE'],
+        ['spelling', 'SPELLING_CLEAR'],
+        ['languageConsistency', 'LANGUAGE_CONSISTENT'],
+        ['tableLegendUsefulness', 'TABLE_LEGEND_USEFUL'],
+        ['narrativeContinuity', 'NARRATIVE_CONTINUOUS'],
+        ['redundancy', 'NO_REDUNDANCY'],
+      ];
     const firstSlide = evidence.slides?.[0];
     const firstRef = firstSlide?.evidenceRefs?.[0];
     return completion(request.model, {
-      schemaVersion: 1,
+        schemaVersion: 2,
       findings: rules.map(([ruleId, messageCode]) => ({
         ruleId,
         slideId: firstRef ? firstSlide.slideId : null,

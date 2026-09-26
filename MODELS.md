@@ -1,6 +1,6 @@
 # Модели и versioned instructions
 
-В таблице различаются model checkpoint, публичный model alias и целевая интеграция. Карточки проверены 2026-09-26. Pinned revision фиксирует snapshot, но не подтверждает GPU fit, качество или latency.
+В таблице различаются model checkpoint, публичный model alias и целевая интеграция. Pinned revision фиксирует snapshot, но не подтверждает GPU fit, качество или latency. `Qwen/Qwen3.8-27B` — ожидаемая семантическая модель, но real-model quality/schema/latency ещё не квалифицированы. Для отбора в top-10 требуется organizer-provided VK inference с Qwen 3.8 27B; VK endpoint пока не квалифицирован. RunPod — только инженерный self-hosted вариант, не замена VK requirement.
 
 ## Семантическая модель
 
@@ -22,7 +22,7 @@
 |---|---|---|---|
 | [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) | 7B, BF16 по карточке | Qwen Research License Agreement, не Apache-2.0/MIT | Кандидат не включён в базовую поставку и не подходит под документированный license gate |
 
-Image generation не настроена и выключена по умолчанию. Для явного включения нужны все три конфигурационных параметра: `LCT_IMAGE_BASE_URL`, `LCT_IMAGE_MODEL` и `LCT_IMAGE_API_KEY`. `OPENAI_*` не являются fallback и не настраивают image provider. Ни одна image model не считается выбранной по умолчанию; допустимый open-weight image provider и соответствие star task не квалифицированы.
+Image generation не настроена и выключена по умолчанию. Для явного включения нужны все три конфигурационных параметра: `LCT_IMAGE_BASE_URL`, `LCT_IMAGE_MODEL` и `LCT_IMAGE_API_KEY`. `OPENAI_*` не являются fallback; скрытого или неявного hosted OpenAI model нет. Допустимый open-weight text-to-image provider и соответствие star task не квалифицированы: задача кейса отдельно указывает лимит ≤20B, а общий раздел generative models — LLM/VLM/text-to-image ≤35B. Применимость двух лимитов требует уточнения; до него для star task действует более строгая формулировка ≤20B. Никакая image model не выбрана и star task остаётся `NOT IMPLEMENTED / OPEN`, не блокируя обычную генерацию текстовых презентаций.
 
 ## Граница inference
 
@@ -33,9 +33,10 @@ SemanticInferenceAdapter получает role, operation, messages и schema; �
 | Роль | Agent и skill | Prompt | Schema | Назначение |
 |---|---|---|---|---|
 | Worker | deck-plan-worker.v1 / presentation-planning.v1 | worker-deck-plan.v2 | deck_plan_draft_v1 | План презентации из брифа и фактов ContentIR |
-| Supervisor | plan-review-supervisor.v1 / bounded-plan-review.v1 | supervisor-plan-review.v1 | supervisor_plan_review_v1 | Bounded review и предложение patch/re-plan |
-| Template profiler | template-profiler.v1 / template-semantics.v1 | template-profiler.v1 | template_semantic_profile_v1 | Разметить роли по фактам TemplateIR без выбора макета |
+| Planning Supervisor | plan-review-supervisor.v1 / bounded-plan-review.v1 | supervisor-plan-review.v1 | supervisor_plan_review_v1 | Bounded review и предложение patch/re-plan |
+| Template Profiler | template-profiler.v1 / template-semantics.v1 | template-profiler.v1 | template_semantic_profile_v1 | Разметить роли по фактам TemplateIR без выбора макета |
+| Contextual Auditor | contextual-audit-supervisor.v1 / presentation-contextual-audit.v1 | contextual-deck-audit.v2 | contextual_deck_audit_v2 | Однократный advisory review текста/metadata/evidence готовой колоды, 11 правил |
 
-Workflow metadata: [agent-workflows.v1.json](./apps/daemon/src/presentation/contracts/agent-workflows.v1.json) и [template-profiler.v1.json](./apps/daemon/src/presentation/contracts/template-profiler.v1.json). Runtime prompt files: [worker](./apps/daemon/prompts/worker-deck-plan.v2.md), [supervisor](./apps/daemon/prompts/supervisor-plan-review.v1.md), [template profiler](./apps/daemon/prompts/template-profiler.v1.md). Planning fingerprint включает prompt/config hashes; profiler cache разделён по hash шаблона и prompt/config fingerprint.
+Workflow metadata: [agent-workflows.v1.json](./apps/daemon/src/presentation/contracts/agent-workflows.v1.json) и [template-profiler.v1.json](./apps/daemon/src/presentation/contracts/template-profiler.v1.json). Runtime prompt files: [worker](./apps/daemon/prompts/worker-deck-plan.v2.md), [planning supervisor](./apps/daemon/prompts/supervisor-plan-review.v1.md), [template profiler](./apps/daemon/prompts/template-profiler.v1.md), [contextual auditor](./apps/daemon/prompts/contextual-deck-audit.v2.md). Для Template Profiler отдельный versioned config остаётся source of truth. Planning fingerprint включает только Worker/Planning Supervisor contract и prompt/config hashes, поэтому смена contextual auditor не инвалидирует DeckPlan. Отдельный contextual fingerprint включает agent/skill/prompt hash/schema/rules и делает прежний audit stale.
 
-System prompts сохранены на английском, чтобы локализация справочной документации не меняла поведение модели. Каталог skills/ содержит reference skills для авторской работы; planning runtime не загружает их содержимое автоматически. Agent roles — логические договорённости, а не отдельные процессы.
+System prompts сохранены на английском, чтобы локализация справочной документации не меняла поведение модели. Каталог skills/ содержит reference skills; их тексты не подгружаются автоматически в runtime. Agent roles — логические договорённости, а не отдельные процессы.

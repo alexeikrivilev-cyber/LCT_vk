@@ -1,6 +1,10 @@
 # Аудит качества и безопасности презентации
 
-Детерминированный safety audit отделён от контекстной оценки и остаётся authoritative: ответ модели не может разрешить geometry/provenance errors или менять факты. После генерации приложение отправляет один bounded текстовый запрос на всю выбранную deck revision через `SemanticInferenceAdapter`; raw PPTX и preview images не отправляются. Контекстные findings — проверяемые подсказки, не автоматическое исправление. Полная матрица требований и ограничений — в [CASE_REQUIREMENTS.md](./docs/compliance/CASE_REQUIREMENTS.md).
+Детерминированный safety audit отделён от контекстной оценки и остаётся authoritative: ответ модели не может разрешить geometry/provenance errors или менять факты. Для фиксированных `CompiledPresentation`, `ContentIR` и `TemplateIR` audit — чистая функция: `auditCompiledPresentation(presentation, contentIR, templateIR)`. Она не вызывает сеть, модель, часы или случайные генераторы и не меняет входы. Два запуска на одинаковых входах возвращают одинаковый report; тест также проверяет независимые копии объектов и ожидаемое изменение hash после геометрической ошибки.
+
+`canonicalDeterministicAuditSha256` хеширует каноническое представление версии правил, findings и checks; run-specific `presentationId` в него не входит. Canonical runner записывает aggregate fingerprint всех A/B/C audit reports в manifest. Это локальная идентичность детерминированных свидетельств, а не оценка смыслового качества.
+
+После генерации приложение отправляет один bounded текстовый запрос на всю выбранную deck revision через `SemanticInferenceAdapter`; raw PPTX и preview images не отправляются. Контекстные findings — проверяемые подсказки, не автоматическое исправление. Полная матрица требований и ограничений — в [CASE_REQUIREMENTS.md](./docs/compliance/CASE_REQUIREMENTS.md).
 
 ## Реально выполняемые проверки
 
@@ -18,16 +22,22 @@
 
 ## Контекстные критерии
 
+Текущий версионированный набор — `contextual-deck-audit.v2`, ровно 11 правил: `titleTakeaway`, `titleContentAlignment`, `oneSentenceSummary`, `factGrounding`, `visualSemanticFit`, `garbage`, `spelling`, `languageConsistency`, `tableLegendUsefulness`, `narrativeContinuity`, `redundancy`. Validator требует каждый ID ровно один раз и отклоняет неизвестные правила, message/action codes и невалидные ссылки. На всю выбранную колоду выполняется один запрос, а не отдельный запрос на слайд.
+
 | Критерий | Тип | Этап | Уровень | Автоисправление | Источник | Риск ложного срабатывания | Реальный статус |
 |---|---|---|---|---|---|---|---|
 | Заголовок передаёт вывод; содержание соответствует заголовку; слайд пересказывается одним предложением | Контекстная | One-click deck audit | Info/warning/error | Нет; только подсказка пользователю | Задача, ContentIR, DeckPlan и текст готовых слайдов | Смысловая оценка субъективна; fake endpoint не оценивает качество модели | Подключён один bounded request на deck; строгая schema и refs проходят runtime validation |
 | Факты связаны с источниками; визуальный тип соответствует содержанию; язык и соседние слайды согласованы | Контекстная | One-click deck audit | Info/warning/error | Нет | Provenance refs, визуальная семантика и последовательность DeckPlan | Проверка текстовая, не pixel/VLM оценка; валидная ссылка сама по себе не доказывает entailment | Контракт/схема и fake flow проверены; реальные Qwen findings не подтверждены |
 | Нет повторов, prompt fragments, placeholder prose и служебных инструкций | Контекстная | One-click deck audit | Info/warning/error | Нет | Текст готовых слайдов и задача | Модель может пропустить перефразированный мусор | Один запрос на готовую deck; выводы кодированы messageCode и локализованы UI |
 
-Contextual audit работает через provider-neutral semantic adapter и сохраняет findings по fingerprint выбранных A/B/C. В UI показываются локализованные message codes; произвольная model prose не используется. Недействительные slide/evidence refs отклоняются. Fake qualification подтвердила один contextual request на deck; достоверность оценок настоящего Qwen и визуальный смысл картинки неизвестны. Состояние qualification: [READY_FOR_QWEN.md](./docs/READY_FOR_QWEN.md).
+Contextual audit работает через provider-neutral semantic adapter и сохраняет findings вместе с fingerprint выбранных A/B/C и версией auditor/schema/prompt. UI различает «Детерминированная проверка» и «Контекстуальная проверка». Произвольная model prose не используется; недействительные slide/evidence refs отклоняются. Контекстное замечание не может понизить или удалить deterministic finding. Исправление deterministic finding по-прежнему запускается явным действием пользователя; contextual findings предлагают только ограниченное действие проверки.
+
+Оценка только текстовая и основана на переданных evidence и метаданных. Pixel/VLM review не выполняется; `visualSemanticFit` оценивает заявленный тип визуализации/композиции, а не изображение на слайде. Fake qualification подтверждает контракт и pipeline, но не качество real Qwen/VK judgment.
+
+Office Kit `auditTextLayout` evidence включается отдельно в `PresentationQualityReport` как renderer-derived post-render evidence. Текстовые метрики помечаются approximate/low-confidence; даже повторяемое свидетельство одного renderer не доказывает поведение Microsoft PowerPoint. Оно не подменяет deterministic safety audit. PowerPoint visual QA остаётся отдельным ручным gate. Состояние qualification: [READY_FOR_QWEN.md](./docs/READY_FOR_QWEN.md).
 
 ## Ограничения, исправления и согласие пользователя
 
 Безопасная локальная починка может один раз выбрать другую измеренную композицию для конкретного варианта. Она не меняет смысл текста, диаграммы, lock или соседние слайды. После починки изменённый вариант проходит повторный render и audit; если blocker остался, результат отклоняется. Семантическая перепланировка и смысловые изменения не являются скрытым автоматическим repair. Вариант без безопасной композиции withheld; пользователь выбирает, закрепляет и экспортирует вариант явно.
 
-Низкий contrast ratio, Office clipping, смысловая эквивалентность, полная орфография и универсальная визуальная точность не заявляются проверенными. Approximate preview не является oracle для PowerPoint. Этот audit не заменяет human review или organizer acceptance.
+Низкий contrast ratio, Office clipping, смысловая эквивалентность и качество spelling judgment реальной модели не заявляются проверенными. Наличие contextual `spelling` rule не означает наличие language-specific spellchecker. Approximate preview не является oracle для PowerPoint. A05 (template guides) остаётся без implementation, A13 (effective contrast ≥4.5:1) — без достоверного cascade resolver; их статусы не повышаются. Этот audit не заменяет human review или organizer acceptance.

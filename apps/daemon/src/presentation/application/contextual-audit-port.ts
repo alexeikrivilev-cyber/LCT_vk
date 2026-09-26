@@ -1,14 +1,23 @@
+import { createHash } from 'node:crypto';
+import { CONTEXTUAL_AUDITOR_CONTRACT_SHA256, CONTEXTUAL_AUDITOR_WORKFLOW } from './workflow-versions.js';
+
 /** Internal replaceable boundary for one text-only review of the selected deck. */
+export const CONTEXTUAL_AUDIT_RULE_SET_VERSION = 'contextual-deck-audit.v2' as const;
+export const CONTEXTUAL_AUDIT_SCHEMA_VERSION = 2 as const;
+export const CONTEXTUAL_AUDIT_SCHEMA_NAME = 'contextual_deck_audit_v2' as const;
+
 export const CONTEXTUAL_AUDIT_RULES = [
   'titleTakeaway',
   'titleContentAlignment',
+  'oneSentenceSummary',
   'factGrounding',
   'visualSemanticFit',
+  'garbage',
+  'spelling',
   'languageConsistency',
+  'tableLegendUsefulness',
   'narrativeContinuity',
   'redundancy',
-  'garbage',
-  'oneSentenceSummary',
 ] as const;
 
 export type ContextualAuditRule = typeof CONTEXTUAL_AUDIT_RULES[number];
@@ -17,13 +26,15 @@ export type ContextualAuditSeverity = 'info' | 'warning' | 'error';
 export const CONTEXTUAL_AUDIT_MESSAGE_CODES = {
   titleTakeaway: ['TITLE_TAKEAWAY_CLEAR', 'TITLE_TAKEAWAY_REVIEW'],
   titleContentAlignment: ['TITLE_CONTENT_ALIGNED', 'TITLE_CONTENT_MISMATCH'],
+  oneSentenceSummary: ['SUMMARY_CLEAR', 'SUMMARY_UNCLEAR'],
   factGrounding: ['FACTS_GROUNDED', 'FACTS_UNGROUNDED'],
   visualSemanticFit: ['VISUAL_SEMANTIC_FIT', 'VISUAL_SEMANTIC_MISMATCH'],
+  garbage: ['NO_PROMPT_GARBAGE', 'PROMPT_GARBAGE'],
+  spelling: ['SPELLING_CLEAR', 'SPELLING_REVIEW'],
   languageConsistency: ['LANGUAGE_CONSISTENT', 'LANGUAGE_MIXED'],
+  tableLegendUsefulness: ['TABLE_LEGEND_USEFUL', 'TABLE_LEGEND_REVIEW'],
   narrativeContinuity: ['NARRATIVE_CONTINUOUS', 'NARRATIVE_BREAK'],
   redundancy: ['NO_REDUNDANCY', 'CONTENT_REPEATED'],
-  garbage: ['NO_PROMPT_GARBAGE', 'PROMPT_GARBAGE'],
-  oneSentenceSummary: ['SUMMARY_CLEAR', 'SUMMARY_UNCLEAR'],
 } as const satisfies Record<ContextualAuditRule, readonly [string, string]>;
 
 export const CONTEXTUAL_AUDIT_ACTION_CODES = [
@@ -35,9 +46,25 @@ export const CONTEXTUAL_AUDIT_ACTION_CODES = [
   'REVIEW_DUPLICATE',
   'REMOVE_INSTRUCTIONS',
   'SIMPLIFY_SLIDE',
+  'CHECK_SPELLING',
+  'REVIEW_TABLE',
 ] as const;
 
 export type ContextualAuditActionCode = typeof CONTEXTUAL_AUDIT_ACTION_CODES[number];
+
+export const CONTEXTUAL_AUDIT_REVIEW_ACTIONS = {
+  titleTakeaway: 'REVIEW_TITLE',
+  titleContentAlignment: 'REVIEW_TITLE',
+  oneSentenceSummary: 'SIMPLIFY_SLIDE',
+  factGrounding: 'CHECK_SOURCE',
+  visualSemanticFit: 'REVIEW_VISUAL',
+  garbage: 'REMOVE_INSTRUCTIONS',
+  spelling: 'CHECK_SPELLING',
+  languageConsistency: 'CHECK_LANGUAGE',
+  tableLegendUsefulness: 'REVIEW_TABLE',
+  narrativeContinuity: 'REVIEW_NARRATIVE',
+  redundancy: 'REVIEW_DUPLICATE',
+} as const satisfies Record<ContextualAuditRule, ContextualAuditActionCode>;
 
 export interface ContextualDeckAuditFinding {
   ruleId: ContextualAuditRule;
@@ -50,7 +77,7 @@ export interface ContextualDeckAuditFinding {
 }
 
 export interface ContextualDeckAuditResponse {
-  schemaVersion: 1;
+  schemaVersion: typeof CONTEXTUAL_AUDIT_SCHEMA_VERSION;
   findings: ContextualDeckAuditFinding[];
 }
 
@@ -62,7 +89,7 @@ export interface ContextualDeckAuditValidationContext {
 const JSON_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
-    schemaVersion: { type: 'integer', const: 1 },
+    schemaVersion: { type: 'integer', const: CONTEXTUAL_AUDIT_SCHEMA_VERSION },
     findings: {
       type: 'array', minItems: CONTEXTUAL_AUDIT_RULES.length, maxItems: CONTEXTUAL_AUDIT_RULES.length,
       items: {
@@ -83,6 +110,39 @@ const JSON_SCHEMA = {
   required: ['schemaVersion', 'findings'],
 } as const;
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (typeof value === 'object' && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** Version identity includes agent/skill/prompt hash plus exact schema and rule IDs. */
+export function buildContextualAuditVersionFingerprint(overrides: {
+  ruleSetVersion?: string;
+  schema?: unknown;
+  auditor?: Record<string, unknown>;
+  auditorContractSha256?: string;
+} = {}): string {
+  return createHash('sha256').update(canonicalJson({
+    ruleSetVersion: overrides.ruleSetVersion ?? CONTEXTUAL_AUDIT_RULE_SET_VERSION,
+    schemaName: CONTEXTUAL_AUDIT_SCHEMA_NAME,
+    schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION,
+    schema: overrides.schema ?? JSON_SCHEMA,
+    rules: CONTEXTUAL_AUDIT_RULES,
+    messageCodes: CONTEXTUAL_AUDIT_MESSAGE_CODES,
+    actionCodes: CONTEXTUAL_AUDIT_ACTION_CODES,
+    reviewActions: CONTEXTUAL_AUDIT_REVIEW_ACTIONS,
+    auditor: overrides.auditor ?? CONTEXTUAL_AUDITOR_WORKFLOW,
+    auditorContractSha256: overrides.auditorContractSha256 ?? CONTEXTUAL_AUDITOR_CONTRACT_SHA256,
+  })).digest('hex');
+}
+
+export const CONTEXTUAL_AUDIT_VERSION_FINGERPRINT = buildContextualAuditVersionFingerprint();
+
 export function contextualDeckAuditSchema(): Readonly<Record<string, unknown>> {
   return JSON_SCHEMA;
 }
@@ -102,7 +162,7 @@ export function validateContextualDeckAuditResponse(
   value: unknown,
   context: ContextualDeckAuditValidationContext,
 ): ContextualDeckAuditResponse {
-  if (!isRecord(value) || !exactKeys(value, ['schemaVersion', 'findings']) || value.schemaVersion !== 1
+  if (!isRecord(value) || !exactKeys(value, ['schemaVersion', 'findings']) || value.schemaVersion !== CONTEXTUAL_AUDIT_SCHEMA_VERSION
       || !Array.isArray(value.findings) || value.findings.length !== CONTEXTUAL_AUDIT_RULES.length) {
     throw new TypeError('Contextual deck audit response has an invalid shape');
   }
@@ -134,7 +194,8 @@ export function validateContextualDeckAuditResponse(
     if (item.severity === 'info' && (item.messageCode !== codes[0] || item.repairable || action !== null)) {
       throw new TypeError('Passing contextual checks cannot suggest a repair');
     }
-    if (item.severity !== 'info' && (item.messageCode !== codes[1] || action === null)) {
+    if (item.severity !== 'info' && (item.messageCode !== codes[1] || item.repairable
+        || action !== CONTEXTUAL_AUDIT_REVIEW_ACTIONS[rule])) {
       throw new TypeError('Contextual findings require a matching message and bounded action code');
     }
     if (!Array.isArray(item.evidenceRefs) || item.evidenceRefs.length > 8
@@ -157,5 +218,5 @@ export function validateContextualDeckAuditResponse(
     };
   });
   if (seen.size !== CONTEXTUAL_AUDIT_RULES.length) throw new TypeError('Contextual deck audit omitted a required rule');
-  return { schemaVersion: 1, findings };
+  return { schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION, findings };
 }

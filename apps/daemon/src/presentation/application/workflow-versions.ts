@@ -18,7 +18,14 @@ export interface AgentWorkflowVersions {
 }
 
 export const AGENT_WORKFLOW_CONTRACT = workflowContract;
-export const AGENT_WORKFLOW_CONTRACT_SHA256 = createHash('sha256').update(JSON.stringify(workflowContract)).digest('hex');
+// Planning snapshots depend only on the planning agents; contextual-auditor-only changes must not stale a DeckPlan.
+export const AGENT_WORKFLOW_CONTRACT_SHA256 = createHash('sha256').update(JSON.stringify({
+  worker: workflowContract.agents.worker,
+  supervisor: workflowContract.agents.supervisor,
+})).digest('hex');
+export const CONTEXTUAL_AUDITOR_WORKFLOW = { ...workflowContract.agents.contextualAuditor };
+export const CONTEXTUAL_AUDITOR_CONTRACT_SHA256 = createHash('sha256')
+  .update(JSON.stringify(CONTEXTUAL_AUDITOR_WORKFLOW)).digest('hex');
 export const AGENT_WORKFLOW_VERSIONS: AgentWorkflowVersions = {
   worker: { ...workflowContract.agents.worker },
   supervisor: { ...workflowContract.agents.supervisor },

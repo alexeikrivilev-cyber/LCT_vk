@@ -72,6 +72,20 @@ test('every deterministic audit rule uses a Russian customer-facing message', ()
   assert.equal(auditFindingMessage('future.unknown-rule'), ru.generation.findingUnknown);
 });
 
+test('deterministic and contextual audit sources are visibly distinct and repairs stay user-triggered', () => {
+  const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  assert.equal(ru.generation.deterministicAudit, 'Детерминированная проверка');
+  assert.equal(ru.workflow.contextualAudit, 'Контекстуальная проверка');
+  assert.match(appSource, /data-audit-source="deterministic"/u);
+  assert.match(appSource, /data-audit-source="contextual"/u);
+  const contextualStart = appSource.indexOf('data-audit-source="contextual"');
+  const contextualEnd = appSource.indexOf('</section>', contextualStart);
+  const contextualMarkup = appSource.slice(contextualStart, contextualEnd);
+  assert.doesNotMatch(contextualMarkup, /\brepair\(/u, 'contextual findings must never invoke deterministic repair');
+  assert.match(appSource, /safeFix \? <button[^\n]*onClick=\{\(\) => repair\(/u, 'deterministic repair remains an explicit user action');
+  for (const message of Object.values(ru.workflow.actionMessages)) assert.match(message, /[А-Яа-яЁё]/u);
+});
+
 test('visible dates use Russian locale formatting', () => {
   assert.match(formatUiDateTime(new Date('2026-09-26T09:05:00.000Z')), /\d{2}\.\d{2}\.\d{4}/u);
 });

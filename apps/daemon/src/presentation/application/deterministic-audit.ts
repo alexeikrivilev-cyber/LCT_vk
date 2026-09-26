@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { ContentIR } from '../domain/content-ir.js';
 import type { TemplateIR } from '../domain/template-ir.js';
 import type { CompiledPresentation, CompiledSlide, PlacementBox } from './slide-compilation.js';
@@ -17,10 +18,32 @@ export interface DeterministicAuditFinding {
 
 export interface DeterministicAuditReport {
   schemaVersion: 1;
-  ruleSetVersion: 'deterministic-audit.v1';
+  ruleSetVersion: typeof DETERMINISTIC_AUDIT_RULE_SET_VERSION;
   presentationId: string;
   findings: DeterministicAuditFinding[];
   checks: Array<{ ruleId: string; status: 'checked' | 'unknown' | 'not_applicable'; reason: string }>;
+}
+
+export const DETERMINISTIC_AUDIT_RULE_SET_VERSION = 'deterministic-audit.v1' as const;
+
+function canonicalAuditJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalAuditJson).join(',')}]`;
+  if (typeof value === 'object' && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalAuditJson(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** Hash only audit evidence, excluding run-specific presentation identity and timestamps. */
+export function canonicalDeterministicAuditSha256(report: DeterministicAuditReport): string {
+  return createHash('sha256').update(canonicalAuditJson({
+    schemaVersion: report.schemaVersion,
+    ruleSetVersion: report.ruleSetVersion,
+    findings: report.findings,
+    checks: report.checks,
+  })).digest('hex');
 }
 
 function overlaps(a: PlacementBox, b: PlacementBox): boolean {
@@ -424,7 +447,7 @@ export function auditCompiledPresentation(
 
   return {
     schemaVersion: 1,
-    ruleSetVersion: 'deterministic-audit.v1',
+    ruleSetVersion: DETERMINISTIC_AUDIT_RULE_SET_VERSION,
     presentationId: presentation.id,
     findings,
     checks: [

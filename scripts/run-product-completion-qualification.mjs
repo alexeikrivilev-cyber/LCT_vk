@@ -210,7 +210,7 @@ async function main() {
       assert.equal(operation.totalSlides, template.slides);
       assert.equal(operation.readySlides, template.slides);
       assert.equal(operation.contextualAudit?.status, 'ready');
-      assert.equal(operation.contextualAudit.findings.length, 9);
+      assert.equal(operation.contextualAudit.findings.length, 11);
 
       const planning = await requestJson(server.url, `/api/projects/${encodeURIComponent(projectId)}/planning`);
       assert.equal(planning.status, 'ready');

@@ -251,16 +251,21 @@ export function buildPresentationQualityReport(input: BuildPresentationQualityRe
   })) ?? [];
   for (const issue of textIssues) {
     const record = typeof issue === 'object' && issue !== null ? issue as Record<string, unknown> : {};
-    const approximate = record.approximate === true || record.confidence === 'low';
-    const severity = approximate ? 'warning' as const : record.severity === 'error' ? 'error' as const : 'warning' as const;
+    const officeKitEvidence = typeof record.source === 'string' && record.source.startsWith('@office-kit/');
+    const approximate = record.approximate === true || record.confidence === 'low' || officeKitEvidence;
+    const severity = approximate || record.confidence === 'unknown' ? 'warning' as const
+      : record.severity === 'error' ? 'error' as const : 'warning' as const;
     add({ category: 'text-fit', severity, slideId: typeof record.slideIndex === 'number'
       ? input.presentation.slides[record.slideIndex]?.id ?? null : null,
     ruleId: approximate ? 'text-fit.approximate-metric-warning' : 'text-fit.rendered-layout-issue',
     message: approximate ? 'Rendered text-fit estimate is approximate; inspect the preview manually.' : 'Rendered text layout reports a potential overflow or unexpected wrap.',
-    evidence: { kind: typeof record.kind === 'string' ? record.kind : 'unknown', approximate,
+    evidence: { source: officeKitEvidence ? 'office-kit-render-evidence' : 'preview-render-evidence',
+      reportedSource: typeof record.source === 'string' ? record.source : null,
+      classification: typeof record.classification === 'string' ? record.classification : 'unknown',
+      kind: typeof record.kind === 'string' ? record.kind : 'unknown', approximate,
       overflowPx: typeof record.overflowPx === 'number' ? record.overflowPx : null,
       extraLines: typeof record.extraLines === 'number' ? record.extraLines : null },
-    confidence: approximate ? 'low' : 'medium' });
+      confidence: approximate ? 'low' : 'medium' });
   }
 
   if (input.safetyAudit) {
@@ -396,11 +401,11 @@ export function buildPresentationQualityReport(input: BuildPresentationQualityRe
     findings,
     trackStrategy,
     contextualReview: [
-      { id: 'takeaway-quality', status: 'manual-review-required', reason: 'Whether the title is the strongest useful takeaway is semantic/contextual.' },
-      { id: 'content-title-alignment', status: 'manual-review-required', reason: 'A title/content contradiction cannot be ruled out by exact string and provenance checks.' },
-      { id: 'one-sentence-summary', status: 'manual-review-required', reason: 'Slide-level one-sentence clarity requires contextual review.' },
-      { id: 'visual-relevance', status: 'manual-review-required', reason: 'Source presence is deterministic; relevance to the claim is contextual.' },
-      { id: 'adjacent-slide-coherence', status: 'manual-review-required', reason: 'Exact repetition is checked; story flow still needs contextual review.' },
+      { id: 'takeaway-quality', status: 'manual-review-required', reason: 'Runtime contextual audit evidence is stored separately; consult the ProductWorkflow contextualAudit state. Real model judgment is not implied by this report.' },
+      { id: 'content-title-alignment', status: 'manual-review-required', reason: 'Runtime contextual audit evidence is stored separately; this report does not merge model judgments with deterministic findings.' },
+      { id: 'one-sentence-summary', status: 'manual-review-required', reason: 'Runtime contextual audit evidence is stored separately; verify its current version and selected-deck fingerprint.' },
+      { id: 'visual-relevance', status: 'manual-review-required', reason: 'Runtime contextual audit is metadata/text based and stored separately; this report does not inspect pixels.' },
+      { id: 'adjacent-slide-coherence', status: 'manual-review-required', reason: 'Runtime contextual audit evidence is stored separately; this report does not merge its narrative judgment.' },
     ],
     deterministicSafetyAuditIsSeparate: true,
   };

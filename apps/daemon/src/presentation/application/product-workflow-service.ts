@@ -15,15 +15,24 @@ import type { DeckPlan } from '../domain/deck-plan.js';
 import type { SemanticInferenceAdapter, SemanticInferenceRequest, SemanticJsonSchema, SemanticInferenceTelemetry } from './semantic-inference-port.js';
 import { SemanticInferenceError } from './semantic-inference-port.js';
 import {
+  CONTEXTUAL_AUDIT_RULE_SET_VERSION,
   CONTEXTUAL_AUDIT_RULES,
+  CONTEXTUAL_AUDIT_SCHEMA_VERSION,
+  CONTEXTUAL_AUDIT_SCHEMA_NAME,
+  CONTEXTUAL_AUDIT_VERSION_FINGERPRINT,
   contextualDeckAuditSchema,
   validateContextualDeckAuditResponse,
   type ContextualDeckAuditFinding,
   type ContextualDeckAuditResponse,
   type ContextualDeckAuditValidationContext,
 } from './contextual-audit-port.js';
+import { CONTEXTUAL_AUDITOR_WORKFLOW } from './workflow-versions.js';
 
-export const CONTEXTUAL_DECK_AUDIT_PROMPT_VERSION = 'contextual-deck-audit.v1';
+export const CONTEXTUAL_DECK_AUDIT_PROMPT_VERSION = CONTEXTUAL_AUDITOR_WORKFLOW.promptVersion;
+const LEGACY_CONTEXTUAL_AUDIT_RULES = [
+  'titleTakeaway', 'titleContentAlignment', 'factGrounding', 'visualSemanticFit', 'languageConsistency',
+  'narrativeContinuity', 'redundancy', 'garbage', 'oneSentenceSummary',
+] as const;
 const MAX_SELECTED_FILES = 12;
 const MAX_AUDIT_INPUT_CHARS = 128 * 1024;
 const GENERATION_WAIT_MS = 12 * 60 * 1000;
@@ -58,6 +67,9 @@ export interface ProductWorkflowTelemetry {
 }
 
 export interface ProductContextualAuditState {
+  schemaVersion: 1 | typeof CONTEXTUAL_AUDIT_SCHEMA_VERSION;
+  ruleSetVersion: 'contextual-deck-audit.v1' | typeof CONTEXTUAL_AUDIT_RULE_SET_VERSION;
+  auditVersionFingerprint: string | null;
   status: 'ready' | 'failed';
   deckFingerprint: string;
   findings: ContextualDeckAuditFinding[] | null;
@@ -185,20 +197,27 @@ function isStage(value: unknown): value is ProductWorkflowStage {
   return ['analyzing_template', 'understanding_template', 'planning', 'generating', 'contextual_audit', 'ready', 'failed'].includes(String(value));
 }
 
-function isSafeAuditState(value: unknown): value is ProductContextualAuditState {
+function isSafeAuditState(value: unknown): value is ProductContextualAuditState | Record<string, unknown> {
   if (!isRecord(value) || !['ready', 'failed'].includes(String(value.status)) || !safeFingerprint(value.deckFingerprint)
       || typeof value.checkedAt !== 'string' || !Number.isFinite(Date.parse(value.checkedAt))
       || !(value.failureCode === null || typeof value.failureCode === 'string' && value.failureCode.length <= 80)) return false;
+  const legacy = value.schemaVersion === undefined && value.ruleSetVersion === undefined && value.auditVersionFingerprint === undefined;
+  const current = value.schemaVersion === CONTEXTUAL_AUDIT_SCHEMA_VERSION
+    && value.ruleSetVersion === CONTEXTUAL_AUDIT_RULE_SET_VERSION
+    && value.auditVersionFingerprint === CONTEXTUAL_AUDIT_VERSION_FINGERPRINT;
+  if (!legacy && !current) return false;
   if (value.telemetry !== null && (!isRecord(value.telemetry) || typeof value.telemetry.model !== 'string' || value.telemetry.model.length > 160
       || !Number.isFinite(value.telemetry.wallTimeMs) || Number(value.telemetry.wallTimeMs) < 0
       || !(value.telemetry.finishReason === null || typeof value.telemetry.finishReason === 'string' && value.telemetry.finishReason.length <= 64))) return false;
-  if (value.status === 'ready' && (!Array.isArray(value.findings) || value.findings.length !== CONTEXTUAL_AUDIT_RULES.length
+  if (value.status === 'ready' && (!Array.isArray(value.findings)
+      || value.findings.length !== (legacy ? LEGACY_CONTEXTUAL_AUDIT_RULES.length : CONTEXTUAL_AUDIT_RULES.length)
       || value.failureCode !== null || value.telemetry === null)) return false;
   if (value.status === 'failed' && (value.findings !== null || value.failureCode === null)) return false;
   if (Array.isArray(value.findings)) {
     const ruleIds = new Set<string>();
     for (const finding of value.findings) {
-      if (!isRecord(finding) || typeof finding.ruleId !== 'string' || !CONTEXTUAL_AUDIT_RULES.includes(finding.ruleId as never)
+      const allowedRules: readonly string[] = legacy ? LEGACY_CONTEXTUAL_AUDIT_RULES : CONTEXTUAL_AUDIT_RULES;
+      if (!isRecord(finding) || typeof finding.ruleId !== 'string' || !allowedRules.includes(finding.ruleId)
           || ruleIds.has(finding.ruleId) || !(finding.slideId === null || typeof finding.slideId === 'string' && finding.slideId.length <= 128)
           || !['info', 'warning', 'error'].includes(String(finding.severity)) || typeof finding.messageCode !== 'string'
           || finding.messageCode.length > 64 || !Array.isArray(finding.evidenceRefs) || finding.evidenceRefs.length > 8
@@ -207,9 +226,28 @@ function isSafeAuditState(value: unknown): value is ProductContextualAuditState 
           || !(finding.suggestedActionCode === null || typeof finding.suggestedActionCode === 'string' && finding.suggestedActionCode.length <= 64)) return false;
       ruleIds.add(finding.ruleId);
     }
-    if (ruleIds.size !== CONTEXTUAL_AUDIT_RULES.length) return false;
+    const expectedRules: readonly string[] = legacy ? LEGACY_CONTEXTUAL_AUDIT_RULES : CONTEXTUAL_AUDIT_RULES;
+    if (ruleIds.size !== expectedRules.length || expectedRules.some((ruleId) => !ruleIds.has(ruleId))) return false;
   }
   return true;
+}
+
+function normalizeStoredAudit(value: unknown): ProductContextualAuditState | null {
+  if (value === null) return null;
+  if (!isSafeAuditState(value) || !isRecord(value)) return null;
+  if (value.schemaVersion === undefined) {
+    // Keep old evidence explicitly tagged as v1/legacy so freshness checks can only expose it as stale.
+    return { ...(value as unknown as Omit<ProductContextualAuditState, 'schemaVersion' | 'ruleSetVersion' | 'auditVersionFingerprint'>),
+      schemaVersion: 1, ruleSetVersion: 'contextual-deck-audit.v1', auditVersionFingerprint: null };
+  }
+  return value as unknown as ProductContextualAuditState;
+}
+
+export function isCurrentContextualAuditState(value: unknown): value is ProductContextualAuditState {
+  return isSafeAuditState(value) && isRecord(value) && value.schemaVersion === CONTEXTUAL_AUDIT_SCHEMA_VERSION
+    && value.ruleSetVersion === CONTEXTUAL_AUDIT_RULE_SET_VERSION
+    && value.auditVersionFingerprint === CONTEXTUAL_AUDIT_VERSION_FINGERPRINT
+    && value.status === 'ready' && Array.isArray(value.findings) && value.findings.length === CONTEXTUAL_AUDIT_RULES.length;
 }
 
 function validateStored(value: unknown): StoredProductWorkflow {
@@ -232,7 +270,7 @@ function validateStored(value: unknown): StoredProductWorkflow {
   if (sha256(canonicalJson(inputs)) !== value.inputFingerprint) {
     throw new ProductWorkflowError('PRODUCT_WORKFLOW_STATE_INVALID', 'Saved presentation inputs do not match their fingerprint.', 500);
   }
-  return value as unknown as StoredProductWorkflow;
+  return { ...value, contextualAudit: normalizeStoredAudit(value.contextualAudit) } as unknown as StoredProductWorkflow;
 }
 
 async function statePath(projectsRoot: string, projectId: string): Promise<string> {
@@ -437,7 +475,7 @@ export class ProductWorkflowService {
       throw new ProductWorkflowError('PRODUCT_WORKFLOW_ALREADY_RUNNING', 'Wait until the current presentation operation finishes.', 409);
     }
     const latest = await this.read(projectId);
-    if (latest?.contextualAudit?.deckFingerprint === deckFingerprint && latest.contextualAudit.status === 'ready') {
+    if (latest?.contextualAudit?.deckFingerprint === deckFingerprint && isCurrentContextualAuditState(latest.contextualAudit)) {
       return (await this.snapshotWithFreshness(projectId, latest))!;
     }
     const task = Promise.resolve().then(async () => {
@@ -605,7 +643,7 @@ export class ProductWorkflowService {
       knownEvidenceRefs: selected.knownEvidenceRefs,
     };
     const contract = {
-      name: 'contextual_deck_audit_v1',
+      name: CONTEXTUAL_AUDIT_SCHEMA_NAME,
       schema: contextualDeckAuditSchema() as SemanticJsonSchema,
       validate: (value: unknown): value is ContextualDeckAuditResponse => {
         try { validateContextualDeckAuditResponse(value, validationContext); return true; }
@@ -635,6 +673,9 @@ export class ProductWorkflowService {
     if (!current || current.operationId !== saved.operationId) return;
     const checkedAt = this.now().toISOString();
     const auditState: ProductContextualAuditState = {
+      schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION,
+      ruleSetVersion: CONTEXTUAL_AUDIT_RULE_SET_VERSION,
+      auditVersionFingerprint: CONTEXTUAL_AUDIT_VERSION_FINGERPRINT,
       status: 'ready',
       deckFingerprint,
       findings: report.findings,
@@ -650,8 +691,17 @@ export class ProductWorkflowService {
     const moduleDir = path.dirname(fileURLToPath(import.meta.url));
     const roots = [path.join(this.options.projectRoot, 'apps', 'daemon', 'prompts'), path.resolve(moduleDir, '../../../prompts')];
     for (const root of roots) {
-      try { return await readFile(path.join(root, file), 'utf8'); }
+      let prompt: string | null = null;
+      try {
+        prompt = await readFile(path.join(root, file), 'utf8');
+      }
       catch { /* try packaged daemon prompt location */ }
+      if (prompt === null) continue;
+      const digest = createHash('sha256').update(prompt).digest('hex');
+      if (digest !== CONTEXTUAL_AUDITOR_WORKFLOW.promptSha256) {
+        throw new ProductWorkflowError('PROMPT_ASSET_VERSION_MISMATCH', 'Версия инструкции смысловой проверки не совпадает с контрактом.', 500);
+      }
+      return prompt;
     }
     throw new ProductWorkflowError('PROMPT_ASSET_UNAVAILABLE', 'Версия инструкции смысловой проверки отсутствует.', 500);
   }
@@ -664,6 +714,9 @@ export class ProductWorkflowService {
       const timestamp = this.now().toISOString();
       const auditFailure: ProductContextualAuditState | null = stage === 'contextual_audit'
         ? {
+          schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION,
+          ruleSetVersion: CONTEXTUAL_AUDIT_RULE_SET_VERSION,
+          auditVersionFingerprint: CONTEXTUAL_AUDIT_VERSION_FINGERPRINT,
           status: 'failed',
           deckFingerprint: sha256(`${current.inputFingerprint}:failed-audit:${timestamp}`),
           findings: null,
@@ -688,7 +741,8 @@ export class ProductWorkflowService {
     if (!saved.contextualAudit || saved.contextualAudit.status !== 'ready') return publicSnapshot(saved);
     try {
       const current = await this.options.generationService.getSnapshot(projectId);
-      const stale = !current || current.status !== 'completed' || selectedDeckFingerprint(current) !== saved.contextualAudit.deckFingerprint;
+      const stale = !isCurrentContextualAuditState(saved.contextualAudit) || !current || current.status !== 'completed'
+        || selectedDeckFingerprint(current) !== saved.contextualAudit.deckFingerprint;
       return publicSnapshot(saved, stale);
     } catch {
       return publicSnapshot(saved, true);

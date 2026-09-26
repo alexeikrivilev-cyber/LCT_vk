@@ -15,6 +15,14 @@ import {
   semanticInferenceConfigFromEnvironment,
 } from '../apps/daemon/src/presentation/adapters/openai-compatible-semantic-inference.ts';
 import { SemanticInferenceError } from '../apps/daemon/src/presentation/application/semantic-inference-port.ts';
+import { canonicalDeterministicAuditSha256, DETERMINISTIC_AUDIT_RULE_SET_VERSION } from '../apps/daemon/src/presentation/application/deterministic-audit.ts';
+import {
+  CONTEXTUAL_AUDIT_RULE_SET_VERSION,
+  CONTEXTUAL_AUDIT_RULES,
+  CONTEXTUAL_AUDIT_SCHEMA_NAME,
+  CONTEXTUAL_AUDIT_SCHEMA_VERSION,
+  CONTEXTUAL_AUDIT_VERSION_FINGERPRINT,
+} from '../apps/daemon/src/presentation/application/contextual-audit-port.ts';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const daemonRequire = createRequire(path.join(repoRoot, 'apps/daemon/package.json'));
@@ -286,6 +294,12 @@ function safeManifestBase(options, input, model) {
     },
     workflow: { stages: [], finalStatus: 'not-started' },
     generation: { variantsReady: 0, deterministicAudit: { status: 'not-run', errorCount: null, warningCount: null }, contextualAudit: { status: 'not-run', findingCount: null, ruleIds: [] } },
+    audit: {
+      deterministic: { ruleSetVersion: DETERMINISTIC_AUDIT_RULE_SET_VERSION, canonicalSha256: null, auditedVariants: 0 },
+      contextual: { ruleSetVersion: CONTEXTUAL_AUDIT_RULE_SET_VERSION, schemaName: CONTEXTUAL_AUDIT_SCHEMA_NAME,
+        schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION, expectedRules: CONTEXTUAL_AUDIT_RULES.length, actualRules: null,
+        versionFingerprint: CONTEXTUAL_AUDIT_VERSION_FINGERPRINT },
+    },
     exports: { pptx: {}, pdf: null, html: null },
     timing: {
       templateAnalysisMs: null, templateSemanticProfileMs: null, planningMs: null,
@@ -481,7 +495,12 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     if (operation.status !== 'ready') throw errorWithCode(operation.failure?.code ?? 'PRODUCT_WORKFLOW_FAILED', 'Product workflow ended before READY.');
     if (operation.totalSlides !== options.slides || operation.readySlides !== options.slides) throw errorWithCode('REQUESTED_SLIDE_COUNT_MISMATCH', 'Product workflow did not complete the requested slide count.');
     if (operation.contextualAudit?.status !== 'ready' || operation.contextualAudit?.stale !== false
-        || operation.contextualAudit.findings?.length !== 9) throw errorWithCode('CONTEXTUAL_AUDIT_INVALID', 'Contextual audit is missing, stale, or incomplete.');
+        || operation.contextualAudit.schemaVersion !== CONTEXTUAL_AUDIT_SCHEMA_VERSION
+        || operation.contextualAudit.ruleSetVersion !== CONTEXTUAL_AUDIT_RULE_SET_VERSION
+        || operation.contextualAudit.auditVersionFingerprint !== CONTEXTUAL_AUDIT_VERSION_FINGERPRINT
+        || operation.contextualAudit.findings?.length !== CONTEXTUAL_AUDIT_RULES.length) {
+      throw errorWithCode('CONTEXTUAL_AUDIT_INVALID', 'Contextual audit is missing, stale, or incomplete.');
+    }
     const operationThroughAuditMs = Math.round(performance.now() - workflowStarted);
 
     stage = 'retrieving-product-state';
@@ -491,6 +510,13 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     if (generation?.status !== 'completed' || generation.slides?.length !== options.slides) throw errorWithCode('GENERATION_STATE_INVALID', 'Generated slide packs are incomplete.');
     const unready = generation.slides.flatMap((slide) => ['A', 'B', 'C'].filter((variant) => slide.variants?.[variant]?.status !== 'ready'));
     if (unready.length) throw errorWithCode('VARIANT_WITHHELD', `${unready.length} A/B/C variants are not ready.`);
+    const deterministicReports = generation.slides.flatMap((slide) => ['A', 'B', 'C'].map((variant) => {
+      const audit = slide.variants[variant]?.audit;
+      if (!audit || audit.ruleSetVersion !== DETERMINISTIC_AUDIT_RULE_SET_VERSION || !Array.isArray(audit.findings) || !Array.isArray(audit.checks)) {
+        throw errorWithCode('DETERMINISTIC_AUDIT_MISSING', `Slide ${slide.slideId} variant ${variant} has no versioned deterministic audit.`);
+      }
+      return { slideId: slide.slideId, variant, canonicalSha256: canonicalDeterministicAuditSha256(audit) };
+    }));
     const deterministicFindings = generation.slides.flatMap((slide) => ['A', 'B', 'C'].flatMap((variant) =>
       slide.variants[variant]?.audit?.findings ?? []));
     const deterministicErrors = deterministicFindings.filter((finding) => finding.severity === 'error');
@@ -510,6 +536,12 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
       status: 'passed', findingCount: operation.contextualAudit.findings.length,
       ruleIds: operation.contextualAudit.findings.map((finding) => finding.ruleId).sort(),
     };
+    manifest.audit.deterministic.canonicalSha256 = sha256Text(JSON.stringify({
+      ruleSetVersion: DETERMINISTIC_AUDIT_RULE_SET_VERSION,
+      reports: deterministicReports,
+    }));
+    manifest.audit.deterministic.auditedVariants = deterministicReports.length;
+    manifest.audit.contextual.actualRules = operation.contextualAudit.findings.length;
     manifest.timing.templateAnalysisMs = stageClock(stageTransitions, 'analyzing_template');
     manifest.timing.templateSemanticProfileMs = operationTimes(budget.records).templateSemanticProfileMs;
     manifest.timing.planningMs = stageClock(stageTransitions, 'planning');

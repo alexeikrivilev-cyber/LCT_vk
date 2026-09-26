@@ -10,8 +10,8 @@ import JSZip from 'jszip';
 
 import { inspectPptx } from '../src/presentation/adapters/python-inspector.ts';
 import { compileContentIR } from '../src/presentation/application/content-compiler.ts';
-import { CONTEXTUAL_AUDIT_RULES, CONTEXTUAL_AUDIT_MESSAGE_CODES, validateContextualDeckAuditResponse } from '../src/presentation/application/contextual-audit-port.ts';
-import { auditCompiledPresentation, repairCompiledPresentationOnce } from '../src/presentation/application/deterministic-audit.ts';
+import { CONTEXTUAL_AUDIT_RULES, CONTEXTUAL_AUDIT_MESSAGE_CODES, CONTEXTUAL_AUDIT_SCHEMA_VERSION, validateContextualDeckAuditResponse } from '../src/presentation/application/contextual-audit-port.ts';
+import { auditCompiledPresentation, canonicalDeterministicAuditSha256, repairCompiledPresentationOnce } from '../src/presentation/application/deterministic-audit.ts';
 import { buildPresentationQualityReport, PRESENTATION_QUALITY_CATEGORIES } from '../src/presentation/application/presentation-quality-report.ts';
 import { createTemplateIR } from '../src/presentation/application/template-mapper.ts';
 import { runOfflinePresentationMatrix } from '../src/presentation/application/offline-matrix-runner.ts';
@@ -502,7 +502,8 @@ test('PresentationQualityReport keeps the safety audit separate, flags tiny body
       ],
       sourceContentResidue: { status: 'checked', findings: [{ slideId: slide.id, sourceSlideIndex: 1, sourceElementId: 'donor-copy', textSha256: 'c'.repeat(64), outputShapeId: '42' }] },
     },
-    previewEvidence: [{ textLayoutIssues: [], geometryIssues: [] }],
+    previewEvidence: [{ slideIndex: 1, textLayoutIssues: [{ slideIndex: 1, kind: 'line-wrap', approximate: true,
+      severity: 'warning', source: '@office-kit/pptx-preview.auditTextLayout', classification: 'PREVIEW_TEXT_METRIC_APPROXIMATION' }], geometryIssues: [] }],
     safetyAudit: auditCompiledPresentation(presentation, contentIR, templateIR),
   });
   assert.deepEqual(Object.keys(report.categories).sort(), [...PRESENTATION_QUALITY_CATEGORIES].sort());
@@ -512,6 +513,10 @@ test('PresentationQualityReport keeps the safety audit separate, flags tiny body
   assert.equal(report.categories['variant-distinctness'].status, 'pass');
   assert.ok(report.trackStrategy.A.visualEvidenceSlides > 0, 'table/chart/KPI/process content contributes to track strategy evidence');
   assert.equal(report.categories.contrast.status, 'unknown', 'foreground alone does not prove contrast without the resolved background');
+  assert.equal(report.categories['text-fit'].status, 'warning');
+  assert.ok(report.findings.some((finding) => finding.ruleId === 'text-fit.approximate-metric-warning'
+    && finding.confidence === 'low' && finding.evidence.source === 'office-kit-render-evidence'));
+  assert.ok(report.contextualReview.every((item) => item.reason.includes('stored separately')));
   assert.ok(report.findings.some((finding) => finding.ruleId === 'hierarchy.autofit-too-small'));
   assert.ok(report.findings.some((finding) => finding.ruleId === 'source-content-residue.unprojected-donor-text'));
 });
@@ -1507,6 +1512,30 @@ test('deterministic audit finds bad geometry, unsupported numbers, and broken pr
   assert.equal(report.checks.find((item) => item.ruleId === 'fidelity.semantic').status, 'unknown');
 });
 
+test('deterministic audit is pure, repeatable, canonical across cloned inputs, and changes with blocking geometry', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-audit-determinism-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { contentIR, deckPlan, templates } = await scenario(root, 1, Array(5).fill('none'));
+  const template = templates[0].templateIR;
+  const compiled = compilePresentation(deckPlan, contentIR, template, VARIANT_POLICIES[0]);
+  const before = structuredClone({ compiled, contentIR, template });
+
+  const first = auditCompiledPresentation(compiled, contentIR, template);
+  const second = auditCompiledPresentation(compiled, contentIR, template);
+  const cloned = auditCompiledPresentation(structuredClone(compiled), structuredClone(contentIR), structuredClone(template));
+  assert.deepEqual(first, second);
+  assert.deepEqual(first, cloned);
+  assert.equal(canonicalDeterministicAuditSha256(first), canonicalDeterministicAuditSha256(second));
+  assert.equal(canonicalDeterministicAuditSha256(first), canonicalDeterministicAuditSha256(cloned));
+  assert.deepEqual({ compiled, contentIR, template }, before, 'audit must not mutate any supplied IR');
+
+  const movedOutsideCanvas = structuredClone(compiled);
+  movedOutsideCanvas.slides[0].placements.title.x = -1;
+  const changed = auditCompiledPresentation(movedOutsideCanvas, contentIR, template);
+  assert.ok(changed.findings.some((finding) => finding.ruleId === 'geometry.out-of-bounds' && finding.severity === 'error'));
+  assert.notEqual(canonicalDeterministicAuditSha256(first), canonicalDeterministicAuditSha256(changed));
+});
+
 test('reserved visual geometry may bleed when unused, while generated visual placements remain strictly in bounds', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-audit-reserved-visual-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -2037,13 +2066,13 @@ test('persisted planning state replays offline and the manifest omits endpoint U
   assert.ok(serialized.includes('deck_plan_draft_v1'));
 });
 
-test('contextual deck audit validates all nine text-only checks and rejects invalid slide/evidence references', () => {
+test('contextual deck audit validates all eleven text-only checks and rejects invalid slide/evidence references', () => {
   const context = {
     slideContentRefs: new Map([['slide-fake-1', new Set(['unit_fixture'])]]),
     knownEvidenceRefs: new Set(['unit_fixture']),
   };
   const response = {
-    schemaVersion: 1,
+    schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION,
     findings: CONTEXTUAL_AUDIT_RULES.map((ruleId) => ({
       ruleId,
       slideId: 'slide-fake-1',
@@ -2055,7 +2084,7 @@ test('contextual deck audit validates all nine text-only checks and rejects inva
     })),
   };
   const reviewed = validateContextualDeckAuditResponse(response, context);
-  assert.equal(reviewed.findings.length, 9);
+  assert.equal(reviewed.findings.length, 11);
   const incomplete = structuredClone(response);
   incomplete.findings.pop();
   assert.throws(() => validateContextualDeckAuditResponse(incomplete, context), /invalid shape/);

@@ -1323,8 +1323,8 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             message: friendlyErrorMessage(productOperation.failure.code, 500, 'generation'),
             code: productOperation.failure.code,
           }} /> : null}
-          {productOperation?.contextualAudit ? <div className="product-contextual-audit" role="status">
-            <strong>{ru.workflow.audit}: {ru.workflow.auditFindings(productOperation.contextualAudit.findings?.filter((finding) => finding.severity !== 'info').length ?? 0)}</strong>
+          {productOperation?.contextualAudit ? <div className="product-contextual-audit" data-audit-source="contextual" role="status">
+            <strong>{ru.workflow.contextualAudit}: {ru.workflow.auditFindings(productOperation.contextualAudit.findings?.filter((finding) => finding.severity !== 'info').length ?? 0)}</strong>
             {productOperation.contextualAudit.stale ? <p>{ru.workflow.auditStale}</p> : null}
             {productOperation.contextualAudit.status === 'failed' ? <p>{ru.workflow.error}</p> : null}
             <p>{ru.workflow.suggestionsOnly}</p>
@@ -1332,6 +1332,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
               <summary>{ru.planning.reviewLabel}</summary>
               <ul>{productOperation.contextualAudit.findings.filter((finding) => finding.severity !== 'info').map((finding) => <li key={`${finding.ruleId}-${finding.slideId ?? 'deck'}`}>
                 <span>{ru.workflow.messages[finding.messageCode]}</span>
+                {finding.suggestedActionCode ? <small>{ru.workflow.actionMessages[finding.suggestedActionCode as keyof typeof ru.workflow.actionMessages]}</small> : null}
                 <small>{finding.slideId ? ru.workflow.slideLabel(planningSlides.findIndex((slide) => stringValue(record(slide)?.id) === finding.slideId) + 1) : ru.workflow.deckLabel}</small>
               </li>)}</ul>
             </details> : <p>{ru.workflow.auditClean}</p>}
@@ -1796,8 +1797,8 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
               <button className="quiet" disabled={pack.status !== 'ready' || Boolean(busy)} onClick={() => toggleLock(pack)}>
                 {pack.lockedVariant ? ru.generation.unlock(pack.lockedVariant) : ru.generation.lock(pack.selectedVariant)}
               </button>
-              <details className="generation-audit" id={pack.index === 1 ? 'generation-review' : undefined}>
-                <summary>{ru.generation.audit}</summary>
+              <details className="generation-audit" data-audit-source="deterministic" id={pack.index === 1 ? 'generation-review' : undefined}>
+                <summary>{ru.generation.deterministicAudit}</summary>
                 {pack.variants[pack.selectedVariant].audit?.findings?.length ? <ul>
                   {pack.variants[pack.selectedVariant].audit?.findings?.map((findingValue, index) => {
                     const finding = record(findingValue);

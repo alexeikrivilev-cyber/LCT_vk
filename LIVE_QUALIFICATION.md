@@ -98,6 +98,10 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
 - реальные наблюдённые стадии product workflow и времена template analysis, planning, generation, contextual audit и exports;
 - hashes входных файлов, число слайдов, audit summary, выбранные экспорты и результат.
 
+Audit provenance в manifest содержит deterministic rule-set version и canonical SHA-256 всех проверенных A/B/C variant reports, а также contextual rule-set/schema versions, версии auditor contract и число ожидаемых/фактических правил. Current contextual schema `contextual_deck_audit_v2` требует ровно 11 правил. Старое persisted audit v1 с 9 правилами не считается свежим и должен быть запущен повторно. Deterministic report вычисляется только из явных `CompiledPresentation`, `ContentIR` и `TemplateIR` inputs; его hash не включает run-specific presentation ID.
+
+Проверка contextual — текстовая и metadata/evidence based. Runner не отправляет preview images и не вызывает VLM; поэтому `visualSemanticFit` не является pixel review и не заменяет PowerPoint visual gate. Контекстная подсказка не может отменить deterministic safety finding и не запускает автоматический rewrite.
+
 Manifest не содержит task/context text, prompt, endpoint URL, API key или Authorization. Fake/full E2E также проверяет image provider как незапущенный: image endpoint не вызывается.
 
 ## RunPod и self-hosted startup — отдельная последовательность

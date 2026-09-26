@@ -720,7 +720,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(ready.totalSlides, 3);
     assert.equal(ready.readySlides, 3);
     assert.equal(ready.contextualAudit.status, 'ready');
-    assert.equal(ready.contextualAudit.findings.length, 9);
+    assert.equal(ready.contextualAudit.findings.length, 11);
 
     const plan = await json(await fetch(`${started.url}/api/projects/${projectId}/planning`));
     assert.equal(plan.status, 'ready');

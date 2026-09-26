@@ -155,7 +155,12 @@ test('same one-click ProductWorkflow API uses four fake semantic requests for 3 
     assert.equal(manifest.semantic.automaticRetries, 0);
     assert.equal(manifest.generation.variantsReady, slides * 3);
     assert.equal(manifest.generation.deterministicAudit.status, 'passed');
-    assert.equal(manifest.generation.contextualAudit.findingCount, 9);
+    assert.equal(manifest.generation.contextualAudit.findingCount, 11);
+    assert.equal(manifest.audit.contextual.expectedRules, 11);
+    assert.equal(manifest.audit.contextual.actualRules, 11);
+    assert.equal(manifest.audit.contextual.ruleSetVersion, 'contextual-deck-audit.v2');
+    assert.match(manifest.audit.deterministic.canonicalSha256, /^[a-f0-9]{64}$/u);
+    assert.equal(manifest.audit.deterministic.auditedVariants, slides * 3);
     assert.equal(manifest.exports.pptx.selected.slides, slides);
     assert.equal(manifest.exports.pptx.A.slides, slides);
     assert.equal(manifest.exports.pptx.B.slides, slides);

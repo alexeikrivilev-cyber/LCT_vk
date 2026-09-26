@@ -7,9 +7,10 @@
 ## Текущий состав
 
 - `pptx-html-fidelity-audit` — сценарий сопоставления PPTX с исходным HTML deck и проверки визуального расхождения.
+- `presentation-contextual-audit` — ограниченные правила текстового контекстного аудита; runtime contract фиксирует его agent/skill/prompt/schema версии, но автоматически текст skill не загружает.
 - `reference-design-contract` — преобразование design reference и визуальных предпочтений в явный design contract.
 
-Это reusable guidance, не дополнительный слой application architecture. Worker/Supervisor instructions, которые реально загружаются в planning runtime, находятся в `apps/daemon/prompts/`; их версии и schema указаны в `apps/daemon/src/presentation/contracts/` и [MODELS.md](../MODELS.md).
+Это reusable guidance, не дополнительный слой application architecture. Runtime prompts находятся в `apps/daemon/prompts/`; их версии и schema указаны в `apps/daemon/src/presentation/contracts/` и [MODELS.md](../MODELS.md).
 
 ## Правила поддержки
 
@@ -17,4 +18,4 @@
 
 До добавления upstream кода проверьте license, provenance и maintenance. Сохраняйте NOTICE/upstream атрибуцию и не копируйте prompt/craft текст без проверки лицензии.
 
-Runtime сейчас не подгружает тексты этих двух skills автоматически и не prewarm-ит их. Не описывайте target architecture как действующее поведение.
+Runtime сейчас не подгружает тексты skills автоматически и не prewarm-ит их. Не описывайте target architecture как действующее поведение.

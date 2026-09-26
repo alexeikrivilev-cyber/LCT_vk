@@ -1,7 +1,7 @@
 # Готовность к ограниченной Qwen qualification
 
 **STATUS: READY_FOR_QWEN**
-Проверено: 2026-09-26. Полный отчёт: [RELEASE_READINESS.md](../RELEASE_READINESS.md). Требования и organizer provenance: [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md).
+Базовая product acceptance проверена 2026-09-26; final pre-live hardening — 2026-09-27. Полный отчёт: [RELEASE_READINESS.md](../RELEASE_READINESS.md). Требования и organizer provenance: [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md).
 
 ## Локальный one-click product flow
 
@@ -16,22 +16,22 @@
 
 | Шаблон | Запрос слайдов | A/B/C | Reopened PPTX | Контекстная проверка | Дополнительно |
 |---|---:|---:|---|---|---|
-| VK Tech | 12 | 36/36 готовы | selected/A/B/C, native text на каждом слайде, notes 0, structural validation PASS | 1 request, 9 findings | PDF 12 страниц и HTML 12 секций проверены в matrix run |
-| WorkSpace | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | task-only, 0 файлов |
-| Education | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | task-only, 0 файлов |
-| AIOS held-out | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | 80 source phrases проверены во всех 4 режимах; совпадений нет |
+| VK Tech | 12 | 36/36 готовы | selected/A/B/C, native text, notes 0, structural validation PASS | Текущий run: 1 request, 11 правил v2 | 78.820 s; PDF 12 страниц; HTML 12 секций; deterministic SHA записан |
+| WorkSpace | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | Свежий run: 1 request, 11 правил v2 | Task-only, 0 файлов; run PASS |
+| Education | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | Только исторический audit v1: 9 правил, теперь stale | Текущий contextual v2 audit не запускался |
+| AIOS held-out | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | Свежий run по прежней task-only задаче: 1 request, 11 правил v2 | 80 source phrases были проверены прежней qualification; другая общая task-формулировка сейчас завершилась `VARIANTS_NOT_DISTINCT` |
 
-На каждом шаблоне deterministic audit прошёл без ошибок. Каждый semantic запрос обслужил локальный fake endpoint. Итого 16 fake calls по всей матрице, external requests — 0. Fake findings подтверждают технический pipeline и schema, а не семантическое качество реального Qwen.
+Историческая 4-template matrix имела 16 локальных fake calls и 0 external requests; её persisted contextual v1/9-rule findings теперь stale и не используются как current v2 evidence. Дополнительные текущие hardening runs VK Tech/WorkSpace/AIOS прошли через local fake endpoint с 4 requests на run, 11/11 contextual rules и 0 generation calls. Fake findings подтверждают технический pipeline/schema, не семантическое качество Qwen.
 
 ## Performance и экспорт
 
-Для свежей проверки canonical runner на 54-слайдовом реальном VK Tech template собрал 12 слайдов: template analysis 1.468 s, planning 0.558 s, generation 57.550 s, exports/reopen 24.859 s, полный runner flow **87.597 s**. Выполнены четыре fake semantic requests (profiler/Worker/planning Supervisor/contextual audit), 36/36 A/B/C готовы; deterministic и contextual audit прошли. Selected/A/B/C PPTX повторно открыты Office Kit, по 2 editable text shapes на каждый слайд, notes=0, package errors=0; PDF=12 страниц; HTML=12 секций без активной разметки; исходный шаблон неизменён. Manifest: `.lct/product-e2e/20260926203719-fake-1f45fad3/manifest.json`. Более раннее измерение 78.645 s superseded этим полным canonical run. Это не прогноз live latency.
+Последний canonical runner на 54-слайдовом VK Tech template собрал 12 слайдов: template analysis 1.393 s, planning 0.485 s, generation 52.512 s, exports/reopen 21.509 s, полный fake flow **78.820 s**. Выполнены ровно четыре fake requests (profiler/Worker/planning Supervisor/contextual audit), 36/36 A/B/C готовы; deterministic audit без ошибок, contextual audit 11/11. Selected/A/B/C PPTX structurally reopened: editable native text, notes=0, package errors=0; PDF=12 страниц; HTML=12 секций; исходный шаблон не изменён. Manifest: `.lct/product-e2e/20260926212925-fake-377db269/manifest.json`; deterministic aggregate SHA-256 `a3bd9f74b407728e873b72eba015e72e4408e09337fd21d04a1a949bf78272fa`. Это не прогноз live latency.
 
 PPTX прошли структурный reopen и содержат редактируемый native text на каждом слайде; notes и package validation errors отсутствуют. PDF собран из approximate previews и прошёл reopen/page-count check. HTML прошёл structural/escaping checks. PowerPoint/LibreOffice и browser visual walkthrough здесь не выполнялись.
 
 ## Offline checks
 
-Финальные gates 2026-09-26: frozen install — PASS; **207/207 tests**; typecheck — PASS; build — PASS; boundary — PASS; craft lint — PASS; docs check — PASS (55 files); `git diff --check` — PASS. Детали приведены в [RELEASE_READINESS.md](../RELEASE_READINESS.md). Сам этот документ не запускает inference автоматически.
+Предыдущие repository gates от 2026-09-26 дали 207 тестов; это исторический набор. Final pre-live hardening gates от 2026-09-27: pnpm 10.33.2 offline frozen install — PASS; **212/212 tests**; workspace typecheck — PASS; web/daemon builds — PASS; boundary/craft lint/docs check — PASS (55 docs); `git diff --check` — PASS. Подробности и способ вызова workspace typecheck указаны в [RELEASE_READINESS.md](../RELEASE_READINESS.md). Сам этот документ не запускает inference автоматически.
 
 ## Dual-mode runner
 

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "createdAt": "2026-09-26",
-  "updatedAt": "2026-09-26",
+  "updatedAt": "2026-09-27",
   "recordKind": "agent-skill-workflow-contract",
   "agents": {
     "worker": {
@@ -20,6 +20,16 @@
       "skillVersion": "bounded-plan-review.v1",
       "promptVersion": "supervisor-plan-review.v1",
       "schemaVersion": "supervisor_plan_review_v1",
+      "modelRole": "supervisor"
+    },
+    "contextualAuditor": {
+      "agentId": "contextual-audit-supervisor",
+      "agentVersion": "contextual-audit-supervisor.v1",
+      "skillId": "presentation-contextual-audit",
+      "skillVersion": "presentation-contextual-audit.v1",
+      "promptVersion": "contextual-deck-audit.v2",
+      "promptSha256": "de27539c70387b047ad4f225a600f40e36390c7a17d9107a167feea6c5890510",
+      "schemaVersion": "contextual_deck_audit_v2",
       "modelRole": "supervisor"
     }
   }
