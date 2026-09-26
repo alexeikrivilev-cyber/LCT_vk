@@ -12,7 +12,7 @@ LCT принимает PPTX-шаблон и задачу, использует �
 - Три варианта A/B/C для каждого слайда из одного плана.
 - Детерминированная проверка, ограниченная локальная починка и экспорт в PPTX, PDF или HTML.
 
-Полная совместимость с произвольными PPTX и визуальная точность PowerPoint не заявлены. PDF использует растровое приблизительное превью; HTML — отдельный формат просмотра. Fake-only product qualification подтвердила VK Tech (12 слайдов), WorkSpace, Education и held-out AIOS (по 3 слайда): для каждого reopened selected/A/B/C PPTX; для VK Tech также проверены PDF/HTML и 12 страниц/слайдов. Один deck-level contextual audit использует один fake semantic request. 12-слайдовый flow занял 78.5 s с аудитом и экспортами. Это подготовка к ограниченной live qualification, а не доказательство качества Qwen/VK. Подробности: [статус готовности](./docs/READY_FOR_QWEN.md).
+Полная совместимость с произвольными PPTX и визуальная точность PowerPoint не заявлены. PDF использует растровое приблизительное превью; HTML — отдельный формат просмотра. Fake-only qualification подтвердила шаблоны VK Tech (12 слайдов), WorkSpace, Education и held-out AIOS (по 3 слайда): selected/A/B/C PPTX прошли структурное reopen; у VK Tech дополнительно проверены PDF и HTML. Canonical one-click runner на 54-слайдовом VK Tech шаблоне создал 12-слайдовую колоду, выполнил 4 fake semantic calls, проверил A/B/C, оба audit и экспорты за 87.597 s. Это локальная проверка pipeline, не оценка качества или latency Qwen/VK. Один canonical runner для fake/external режимов и его лимит в 4 semantic request описаны в [TESTING.md](./TESTING.md) и [LIVE_QUALIFICATION.md](./LIVE_QUALIFICATION.md).
 
 ## Архитектура в двух словах
 
@@ -69,6 +69,20 @@ git diff --check
 ```
 
 Подробности: [TESTING.md](./TESTING.md). Полная карта: [docs/index.md](./docs/index.md).
+
+## One-click product E2E
+
+Для локального fake E2E без Qwen, RunPod и внешнего inference:
+
+```powershell
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
+  --semantic-mode fake `
+  --template "C:\path\to\VK Tech шаблон.pptx" `
+  --task "Подготовить презентацию по задаче и исходным материалам" `
+  --slides 12
+```
+
+Runner сам поднимает fake endpoint и проходит тот же persisted one-click backend workflow, что использует UI. Результат и PPTX/PDF/HTML артефакты сохраняются в ignored `.lct/product-e2e/`.
 
 ## Ограничения
 

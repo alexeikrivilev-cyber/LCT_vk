@@ -20,6 +20,7 @@
     "docs:check": "node ./scripts/check-doc-links.mjs",
     "check:boundary": "node ./scripts/check-presentation-boundary.mjs",
     "qualify:case-3x3": "node --import tsx ./scripts/run-case-release-qualification.mjs",
+    "qualify:product-e2e": "node --import tsx ./scripts/run-product-e2e.mjs",
     "qualify:unknown-template": "node --import tsx ./scripts/run-unknown-template-qualification.mjs",
     "test": "node --import tsx --test",
     "typecheck": "pnpm -r --filter @lct/web --filter @lct/daemon run typecheck"

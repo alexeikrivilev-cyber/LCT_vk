@@ -68,6 +68,33 @@ function localTargets(markdown) {
 }
 
 const failures = [];
+const liveQualificationContract = JSON.parse(await readFile(path.join(root, 'scripts/lib/live-qualification-contract.json'), 'utf8'));
+const expectedSemanticRequests = Object.values(liveQualificationContract.expectedOperations)
+  .reduce((total, count) => total + count, liveQualificationContract.generationSemanticRequests);
+if (liveQualificationContract.maxSemanticRequests !== expectedSemanticRequests) {
+  failures.push('live qualification contract: semantic operation counts do not equal the hard request cap');
+}
+const liveQualificationGuide = await readFile(path.join(root, 'LIVE_QUALIFICATION.md'), 'utf8');
+if (!liveQualificationGuide.includes(`cap \`${liveQualificationContract.maxSemanticRequests}\``)) {
+  failures.push('LIVE_QUALIFICATION.md: documented semantic request cap differs from the versioned contract');
+}
+const testingGuide = await readFile(path.join(root, 'TESTING.md'), 'utf8');
+if (!/3 organizer templates × A\/B\/C = \*\*9\/9 локально\*\*/u.test(testingGuide)) {
+  failures.push('TESTING.md: current organizer matrix must remain explicitly documented as 9/9 local fake-only');
+}
+const modelsGuide = await readFile(path.join(root, 'MODELS.md'), 'utf8');
+if (/gpt-image-1/i.test(modelsGuide)) failures.push('MODELS.md: remove the stale hosted image-model example from active model configuration');
+const caseRequirements = await readFile(path.join(root, 'docs/compliance/CASE_REQUIREMENTS.md'), 'utf8');
+const coreStatuses = caseRequirements.split(/\r?\n/u).filter((line) => /^\| C\d{2} \|/u.test(line))
+  .map((line) => line.split('|')[3]?.trim() ?? '').reduce((counts, status) => {
+    const normalized = status.startsWith('PASS') ? 'PASS' : status;
+    counts[normalized] = (counts[normalized] ?? 0) + 1;
+    return counts;
+  }, {});
+const statusSummary = caseRequirements.match(/\*\*Core gate:\*\* `PASS (\d+)\/25`; `PARTIAL (\d+)\/25`; `FAIL (\d+)\/25`; `NOT_APPLICABLE (\d+)\/25`/u);
+if (!statusSummary || ['PASS', 'PARTIAL', 'FAIL', 'NOT_APPLICABLE'].some((status, index) => Number(statusSummary[index + 1]) !== (coreStatuses[status] ?? 0))) {
+  failures.push('CASE_REQUIREMENTS.md: Core gate totals do not match the status rows');
+}
 for (const file of requiredFiles) {
   try { await stat(path.join(root, file)); }
   catch { failures.push(`missing required file: ${file}`); }

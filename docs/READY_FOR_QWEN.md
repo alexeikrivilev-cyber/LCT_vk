@@ -16,7 +16,7 @@
 
 | Шаблон | Запрос слайдов | A/B/C | Reopened PPTX | Контекстная проверка | Дополнительно |
 |---|---:|---:|---|---|---|
-| VK Tech | 12 | 36/36 готовы | selected/A/B/C, native text на каждом слайде, notes 0, structural validation PASS | 1 request, 9 findings | PDF 12 страниц и HTML 12 секций проверены; full flow 78.645 s |
+| VK Tech | 12 | 36/36 готовы | selected/A/B/C, native text на каждом слайде, notes 0, structural validation PASS | 1 request, 9 findings | PDF 12 страниц и HTML 12 секций проверены в matrix run |
 | WorkSpace | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | task-only, 0 файлов |
 | Education | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | task-only, 0 файлов |
 | AIOS held-out | 3 | 9/9 готовы | selected/A/B/C, structural validation PASS | 1 request, 9 findings | 80 source phrases проверены во всех 4 режимах; совпадений нет |
@@ -25,13 +25,17 @@
 
 ## Performance и экспорт
 
-VK Tech 12-slide one-click до contextual audit: **54.714 s**. Последующие selected/A/B/C PPTX, PDF и HTML export/reopen: **23.931 s**. Полный measured flow: **78.645 s**, ниже 180 s fake-only ceiling. Audit получает source-backed текстовые значения table/numeric units с их IDs и типами. Это не прогноз live latency.
+Для свежей проверки canonical runner на 54-слайдовом реальном VK Tech template собрал 12 слайдов: template analysis 1.468 s, planning 0.558 s, generation 57.550 s, exports/reopen 24.859 s, полный runner flow **87.597 s**. Выполнены четыре fake semantic requests (profiler/Worker/planning Supervisor/contextual audit), 36/36 A/B/C готовы; deterministic и contextual audit прошли. Selected/A/B/C PPTX повторно открыты Office Kit, по 2 editable text shapes на каждый слайд, notes=0, package errors=0; PDF=12 страниц; HTML=12 секций без активной разметки; исходный шаблон неизменён. Manifest: `.lct/product-e2e/20260926203719-fake-1f45fad3/manifest.json`. Более раннее измерение 78.645 s superseded этим полным canonical run. Это не прогноз live latency.
 
 PPTX прошли структурный reopen и содержат редактируемый native text на каждом слайде; notes и package validation errors отсутствуют. PDF собран из approximate previews и прошёл reopen/page-count check. HTML прошёл structural/escaping checks. PowerPoint/LibreOffice и browser visual walkthrough здесь не выполнялись.
 
 ## Offline checks
 
-Финальные gates 2026-09-26: frozen install — PASS; **200/200 tests**; typecheck — PASS; build — PASS; boundary — PASS; craft lint — PASS; docs check — PASS (55 files); `git diff --check` — PASS. Детали приведены в [RELEASE_READINESS.md](../RELEASE_READINESS.md). Сам этот документ не запускает inference автоматически.
+Финальные gates 2026-09-26: frozen install — PASS; **207/207 tests**; typecheck — PASS; build — PASS; boundary — PASS; craft lint — PASS; docs check — PASS (55 files); `git diff --check` — PASS. Детали приведены в [RELEASE_READINESS.md](../RELEASE_READINESS.md). Сам этот документ не запускает inference автоматически.
+
+## Dual-mode runner
+
+`LIVE_PATH_STATUS: LIVE_PATH_READY` означает только готовность инструмента к отдельно разрешённой qualification. Canonical runner вызывает тот же one-click workflow endpoint, fake и external mode имеют hard cap 4, generation model calls — 0, пятый запрос блокируется до adapter. Regression tests подтверждают ровно четыре семантических запроса для 3 и 12 слайдов. External dry-run не выполняет сетевых запросов; preflight проверен на локальном test double и отправляет только models GET, без completion. В этой сессии настоящий external inference не запускался.
 
 ## Live-only risks
 

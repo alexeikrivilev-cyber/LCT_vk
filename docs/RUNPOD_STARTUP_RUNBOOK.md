@@ -52,4 +52,17 @@ curl --fail --silent http://127.0.0.1:8080/v1/models
 
 Application adapter получает значения `LCT_SEMANTIC_BASE_URL`, `LCT_SEMANTIC_MODEL` и при необходимости секрет `LCT_SEMANTIC_API_KEY` через app environment. При VK remote endpoint локальный model volume не нужен; смена endpoint не требует изменений Worker/Supervisor/application logic, если protocol/schema совместим.
 
+Локальная product qualification выполняется отдельно, после успешного model startup:
+
+1. Запустить существующий container на уже подключённом persistent volume.
+2. Выполнить offline preflight внутри container с `LCT_INFERENCE_OFFLINE_PREFLIGHT=1`. Он должен подтвердить точный полный snapshot до обычного vLLM startup.
+3. Если exact snapshot отсутствует или incomplete, остановиться и разобраться с mount/cache. Не запускать обычный startup, если цель — проверить cache без download.
+4. Только при PASS offline preflight отдельно запустить vLLM, дождаться `/health` и проверить `/v1/models` на ожидаемый публичный alias.
+5. На локальном ПК задать app env `LCT_SEMANTIC_BASE_URL`, `LCT_SEMANTIC_MODEL` и при необходимости `LCT_SEMANTIC_API_KEY`.
+6. Сначала выполнить `scripts/run-product-e2e.mjs --semantic-mode external --preflight-only`: один models GET, ноль chat completions. При неуспехе остановиться.
+7. Только после отдельного разрешения выполнить один 3-slide product E2E с `--max-semantic-requests 4`. При semantic failure runner останавливается, без automatic retry.
+8. Когда активных запросов/операций больше нет и qualification закончена, GPU можно остановить.
+
+После backend PASS UI проверяется отдельно: повторить тот же PPTX и задачу через кнопку «Сгенерировать презентацию», экспортировать и проверить восстановление состояния после refresh. После любого live run `selected.pptx` дополнительно открыть в PowerPoint, сохранить и открыть повторно; структурный reopen из runner не заменяет этот ручной gate.
+
 GPU можно безопасно остановить после ограниченной qualification, когда нет активных запросов/операций, использующих endpoint, и snapshot находится на нужном persistent volume. Compile caches остаются временными. Для общего описания deployment см. [INFERENCE.md](../INFERENCE.md).

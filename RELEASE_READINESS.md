@@ -45,7 +45,11 @@
 
 ## PERFORMANCE
 
-VK Tech, 12 слайдов: генерация + contextual audit — **54.714 s**; экспорты после audit — **23.931 s**; полный one-click flow до проверенных экспортов — **78.645 s**, ниже предела 180 s. Это local fake-only measurement после включения table/numeric source evidence в contextual audit, не latency настоящего inference.
+Новый canonical fake one-click runner на 54-слайдовом VK Tech template запросил 12 output slides: template analysis — 1.468 s; planning — 0.558 s; generation — **57.550 s**; экспорт и reopen selected/A/B/C PPTX + PDF/HTML — **24.859 s**; весь runner flow — **87.597 s**. Выполнено ровно 4 локальных fake semantic calls, 36/36 вариантов готовы, deterministic/contextual audit PASS, PPTX structurally reopened (native editable text на каждом слайде, notes/package errors 0), PDF 12 страниц, HTML 12 секций, input template hash сохранён. Manifest: `.lct/product-e2e/20260926203719-fake-1f45fad3/manifest.json`. Это offline pipeline measurement; не latency настоящего inference. Более ранний результат 78.645 s больше не является текущим.
+
+## DUAL-MODE RUNNER
+
+**LIVE_PATH_STATUS: LIVE_PATH_READY** — это статус canonical qualification runner, не результат live Qwen/VK acceptance. Fake и external modes входят через один `/api/projects/:id/workflow/generate`; неиспользованный fifth semantic request отклоняется до adapter; automatic inference retry отсутствует. Regression E2E подтверждает 4 запроса для 3- и 12-слайдового workflow и 0 generation calls. External dry-run дал 0 network requests; models-only preflight проверен на локальном fake test double: один `/v1/models` GET, 0 chat completions. API key и URL проверены на отсутствие в reports/manifests. Настоящий endpoint не вызывался.
 
 ## UI / DOCUMENTATION
 
@@ -55,7 +59,7 @@ VK Tech, 12 слайдов: генерация + contextual audit — **54.714 s
 
 ## TESTS
 
-2026-09-26: `pnpm dlx pnpm@10.33.2 install --frozen-lockfile` — PASS; полный suite — **200 passed, 0 failed**; typecheck — PASS; production build — PASS; boundary — PASS; craft lint — PASS; docs check — PASS (**55 required files**, local Markdown links resolve); `git diff --check` — PASS. Windows показал только предупреждения о нормализации LF→CRLF.
+2026-09-26: `pnpm dlx pnpm@10.33.2 install --frozen-lockfile` — PASS; полный suite — **207 passed, 0 failed**; typecheck — PASS; production build — PASS; boundary — PASS; craft lint — PASS; docs check — PASS (**55 required files**, local Markdown links resolve); `git diff --check` — PASS. Windows показал только предупреждения о нормализации LF→CRLF.
 
 Qualification machine report: `.lct/product-completion-final-acceptance-2026-09-26/qualification.json`; `status=PASS`, `noExternalCalls=true`, 16 fake requests. Файлы артефактов остаются в ignored `.lct`.
 
