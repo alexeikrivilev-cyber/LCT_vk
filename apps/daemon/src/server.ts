@@ -54,6 +54,7 @@ import {
 import type { PptxRendererPort } from './presentation/application/pptx-backend-port.js';
 import type { PptxPreviewPort } from './presentation/application/pptx-preview-port.js';
 import { createPptxRenderer, resolvePptxBackend } from './presentation/adapters/pptx-renderer-factory.js';
+import type { PerformanceDiagnosticsPort } from './presentation/performance-diagnostics.js';
 import {
   compileTemplate,
   getTemplateCompilation,
@@ -73,6 +74,8 @@ export interface StartServerOptions {
   presentationRenderer?: PptxRendererPort;
   /** Replaceable preview seam used by offline application tests. */
   presentationPreview?: PptxPreviewPort;
+  /** Scoped local measurement seam for deterministic qualification runs. */
+  performanceDiagnostics?: PerformanceDiagnosticsPort;
 }
 
 export interface StartedPresentationServer {
@@ -186,7 +189,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     ? semanticInferenceConfigFromEnvironment()
     : null;
   const backend = resolvePptxBackend();
-  const renderer = options.presentationRenderer ?? createPptxRenderer(backend);
+  const renderer = options.presentationRenderer ?? createPptxRenderer(backend, options.performanceDiagnostics);
   const dataDir = resolveDataDir(projectRoot, options.dataDir);
   const projectsRoot = path.join(dataDir, 'projects');
   await mkdir(projectsRoot, { recursive: true });
@@ -221,6 +224,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     backend,
     renderer,
     ...(profileTemplate ? { profileTemplate } : {}),
+    ...(options.performanceDiagnostics ? { performanceDiagnostics: options.performanceDiagnostics } : {}),
     ...(options.presentationRenderer ? { renderer: options.presentationRenderer } : {}),
     ...(options.presentationPreview ? { preview: options.presentationPreview } : {}),
   });

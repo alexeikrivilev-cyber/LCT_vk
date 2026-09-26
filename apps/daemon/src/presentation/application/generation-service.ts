@@ -20,6 +20,7 @@ import {
   applyPersistedExemplarSelection,
   applyVariantCompositionAssignment,
   assessVariantCompositionDistinctness,
+  createCompositionVisualClassificationCache,
   exemplarSelectionReference,
   type ExemplarSelectionReference,
   type VariantCompositionAssignment,
@@ -35,6 +36,7 @@ import type { ContentIR } from '../domain/content-ir.js';
 import type { DeckPlan } from '../domain/deck-plan.js';
 import type { TemplateIR } from '../domain/template-ir.js';
 import type { TemplateSemanticProfile } from './template-semantic-profiler.js';
+import { recordElapsed, type PerformanceDiagnosticsPort } from '../../presentation/performance-diagnostics.js';
 
 export type GenerationStatus = 'preparing' | 'generating' | 'completed' | 'failed' | 'cancelled' | 'stale';
 export type SlideGenerationStatus = 'pending' | 'rendering' | 'ready' | 'failed';
@@ -149,6 +151,7 @@ export interface PresentationGenerationServiceOptions {
   /** Replaceable dependency seams for offline API tests. */
   inspectPackage?: typeof inspectOfficeKitPackage;
   profileTemplate?: (projectId: string, template: TemplateCompilationResponse) => Promise<TemplateSemanticProfile>;
+  performanceDiagnostics?: PerformanceDiagnosticsPort;
   now?: () => Date;
 }
 
@@ -386,7 +389,7 @@ export class PresentationGenerationService {
   constructor(private readonly options: PresentationGenerationServiceOptions) {
     this.now = options.now ?? (() => new Date());
     this.renderer = options.renderer ?? { id: options.backend, render: (input) => renderPresentation(input, options.backend) };
-    this.preview = options.preview ?? new OfficeKitPreviewAdapter();
+    this.preview = options.preview ?? new OfficeKitPreviewAdapter(options.performanceDiagnostics);
     this.inspectPackage = options.inspectPackage ?? inspectOfficeKitPackage;
     this.pdfExporter = options.pdfExporter ?? new OfficeKitPdfExportAdapter();
     this.htmlExporter = options.htmlExporter ?? new SemanticHtmlExportAdapter();
@@ -850,8 +853,13 @@ export class PresentationGenerationService {
     }
     const task = Promise.resolve().then(() => this.performExport(initial, projectId, mode, format, exportId));
     this.exportTasks.set(taskKey, task);
+    const exportStartedAt = performance.now();
     try { return await task; }
-    finally { if (this.exportTasks.get(taskKey) === task) this.exportTasks.delete(taskKey); }
+    finally {
+      recordElapsed(this.options.performanceDiagnostics, 'export.total', exportStartedAt);
+      recordElapsed(this.options.performanceDiagnostics, `export.${mode}`, exportStartedAt);
+      if (this.exportTasks.get(taskKey) === task) this.exportTasks.delete(taskKey);
+    }
   }
 
   private async performExport(
@@ -1021,13 +1029,19 @@ export class PresentationGenerationService {
   }
 
   private async run(projectId: string, generationId: string, signal: AbortSignal): Promise<void> {
+    const generationStartedAt = performance.now();
     let currentSlideId: string | null = null;
     try {
       const initial = this.current(projectId);
       if (initial.generationId !== generationId || initial.status === 'cancelled') return;
       const context = await this.context(projectId);
       this.assertSameContext(initial, context);
+      let stageStartedAt = performance.now();
       const tracks = this.compileTracks(context);
+      recordElapsed(this.options.performanceDiagnostics, 'generation.compileTracks', stageStartedAt);
+      // Template visual safety classification is immutable during this run; keep this
+      // cache local to the generation so it cannot leak across templates/projects.
+      const visualClassificationCache = createCompositionVisualClassificationCache();
       for (const initialPack of initial.slides) {
         if (signal.aborted) return;
         const fresh = this.current(projectId);
@@ -1043,13 +1057,20 @@ export class PresentationGenerationService {
           updatedAt: this.now().toISOString(),
         }));
         if (!startUpdate) return;
+        stageStartedAt = performance.now();
         const variantSlides = VARIANT_IDS.map((variant) => {
           const presentation = variantsById(tracks, variant);
           const slide = presentation.slides.find((candidate) => candidate.sourceDeckPlanSlideId === currentSlideId);
           if (!slide) throw new PresentationGenerationError('PLAN_CHANGED', 'A planned slide is missing from the compiled output.', 409);
           return slide;
         });
-        const compositionDistinctness = assessVariantCompositionDistinctness(variantSlides, context.templateIR, this.options.backend, context.semanticProfile);
+        let compositionStartedAt = performance.now();
+        const compositionDistinctness = assessVariantCompositionDistinctness(variantSlides, context.templateIR, this.options.backend, context.semanticProfile,
+          this.options.performanceDiagnostics, visualClassificationCache);
+        recordElapsed(this.options.performanceDiagnostics, 'generation.resolveCompositions', compositionStartedAt);
+        this.options.performanceDiagnostics?.increment('generation.compositionResolverCallCount');
+        this.options.performanceDiagnostics?.increment('generation.compositionOptionCount', compositionDistinctness.candidateCounts.safeExemplarOptions
+          + compositionDistinctness.candidateCounts.safeLayoutOptions);
         if (!compositionDistinctness.distinct) {
           throw new PresentationGenerationError(
             'VARIANTS_NOT_DISTINCT',
@@ -1057,12 +1078,16 @@ export class PresentationGenerationService {
             422,
           );
         }
+        compositionStartedAt = performance.now();
         const assignedVariantSlides = variantSlides.map((slide) => {
           const assignment = compositionDistinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
           if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
           return applyVariantCompositionAssignment(slide, assignment, context.templateIR, context.semanticProfile);
         });
+        recordElapsed(this.options.performanceDiagnostics, 'generation.applyCompositionAssignments', compositionStartedAt);
+        recordElapsed(this.options.performanceDiagnostics, 'generation.compositionAssignment', stageStartedAt);
         const audits = {} as Record<PresentationVariantId, DeterministicAuditReport>;
+        stageStartedAt = performance.now();
         for (const variant of VARIANT_IDS) {
           if (signal.aborted || this.current(projectId).status === 'cancelled') return;
           const presentation = variantsById(tracks, variant);
@@ -1074,6 +1099,7 @@ export class PresentationGenerationService {
           }
           audits[variant] = audit;
         }
+        recordElapsed(this.options.performanceDiagnostics, 'generation.audit', stageStartedAt);
         const currentPack = this.current(projectId).slides.find((item) => item.slideId === currentSlideId)!;
         const pendingResults = await this.renderVariantPack(
           projectId, this.current(projectId), currentPack, variantsById(tracks, 'A'), assignedVariantSlides, audits, context,
@@ -1119,7 +1145,9 @@ export class PresentationGenerationService {
         updatedAt: this.now().toISOString(),
       }));
       if (completed) await this.writeRunManifest(projectId, completed.state, context);
+      recordElapsed(this.options.performanceDiagnostics, 'generation.total', generationStartedAt);
     } catch (error) {
+      recordElapsed(this.options.performanceDiagnostics, 'generation.total', generationStartedAt);
       if (signal.aborted) return;
       const stored = getPresentationGeneration<PresentationGenerationState>(this.options.db, projectId);
       if (!stored || stored.generationId !== generationId || stored.state.status === 'cancelled') return;
@@ -1256,9 +1284,20 @@ export class PresentationGenerationService {
         }
       }
       const bytes = await readFile(temp.absolute);
+      const inspectStartedAt = performance.now();
       const inspected = await this.inspectPackage(bytes);
+      recordElapsed(this.options.performanceDiagnostics, 'generation.inspectPackage', inspectStartedAt);
+      this.options.performanceDiagnostics?.increment('presentationReopenCount');
       if (inspected.slideCount !== VARIANT_IDS.length || inspected.validationIssues.some((issue) => issue.severity === 'error')) {
         throw new PresentationGenerationError('RENDER_REOPEN_FAILED', 'Rendered A/B/C slide pack could not be reopened and structurally validated.', 422);
+      }
+      const previewBatch = this.preview.previewDeck
+        ? await this.preview.previewDeck(bytes, VARIANT_IDS.map((_, index) => index), 1280)
+        : null;
+      if (previewBatch && (previewBatch.length !== VARIANT_IDS.length
+          || new Set(previewBatch.map((item) => item.slideIndex)).size !== VARIANT_IDS.length
+          || VARIANT_IDS.some((_, index) => !previewBatch.some((item) => item.slideIndex === index)))) {
+        throw new PresentationGenerationError('PREVIEW_FAILED', 'The A/B/C slide previews could not be rendered as a complete batch.', 422);
       }
       const results = {} as Record<PresentationVariantId, Omit<GeneratedVariantState, 'status' | 'version'>>;
       for (const [index, variant] of VARIANT_IDS.entries()) {
@@ -1267,11 +1306,15 @@ export class PresentationGenerationService {
         if (!projected) throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_MISSING', `Renderer omitted the ${variant} composition evidence.`, 422);
         const previewRef = `${state.generationId}/slides/${String(pack.index).padStart(2, '0')}/${variant}-v1.png`;
         const previewPath = await this.generatedFile(projectId, previewRef.split('/'), true);
-        const preview = await this.preview.preview(bytes, index, 1280);
+        const preview = previewBatch
+          ? previewBatch.find((item) => item.slideIndex === index)!.result
+          : await this.preview.preview(bytes, index, 1280);
         if (preview.slideCount !== VARIANT_IDS.length || !preview.png.length) {
           throw new PresentationGenerationError('PREVIEW_FAILED', `The ${variant} slide preview could not be rendered.`, 422);
         }
+        const previewWriteStartedAt = performance.now();
         await this.writeArtifact(previewPath.absolute, preview.png);
+        recordElapsed(this.options.performanceDiagnostics, 'preview.writeArtifact', previewWriteStartedAt);
         const unresolvedVisualTypes = rendered.unresolvedVisualTypes.filter((type) => type === slide.visualization.type);
         const unresolved = unresolvedVisualTypes.length > 0 || slide.visualization.status === 'unresolved';
         results[variant] = {
@@ -1400,12 +1443,14 @@ export class PresentationGenerationService {
     generationId: string,
     mutate: (current: PresentationGenerationState) => PresentationGenerationState,
   ) {
+    const startedAt = performance.now();
     const stored = updatePresentationGeneration<PresentationGenerationState>(this.options.db, projectId, generationId, (value) => {
       const current = validateStoredGeneration(value);
       const next = mutate(current);
       next.updatedAt = this.now().toISOString();
       return next;
     });
+    recordElapsed(this.options.performanceDiagnostics, 'statePersistence', startedAt);
     return stored ? { ...stored, state: validateStoredGeneration(stored.state) } : null;
   }
 
@@ -1491,6 +1536,7 @@ export class PresentationGenerationService {
   }
 
   private async writeArtifact(target: string, content: Uint8Array): Promise<void> {
+    const startedAt = performance.now();
     const temp = `${target}.${randomUUID()}.tmp`;
     try {
       await writeFile(temp, content, { flag: 'wx' });
@@ -1499,6 +1545,7 @@ export class PresentationGenerationService {
       await rm(temp, { force: true }).catch(() => undefined);
       throw error;
     }
+    recordElapsed(this.options.performanceDiagnostics, 'artifactIO', startedAt);
   }
 
   private async writeRunManifest(projectId: string, state: PresentationGenerationState, context: GenerationContext): Promise<void> {

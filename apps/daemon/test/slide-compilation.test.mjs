@@ -22,9 +22,11 @@ import {
   assessVariantCompositionDistinctness as assessVariantCompositionDistinctnessRaw,
   assessExemplarSelection as assessExemplarSelectionRaw,
   classifyExemplarArchetype,
+  createCompositionVisualClassificationCache,
   generatedFallbackCompositionSignature,
   selectExemplarSlide as selectExemplarSlideRaw,
 } from '../src/presentation/application/exemplar-slide-selector.ts';
+import { PerformanceDiagnostics } from '../src/presentation/performance-diagnostics.ts';
 import { OfficeKitPptxRenderer } from '../src/presentation/adapters/office-kit-pptx-renderer.ts';
 import { OfficeKitPreviewAdapter } from '../src/presentation/adapters/office-kit-preview-adapter.ts';
 import { isValidTemplateSemanticProfile } from '../src/presentation/application/template-semantic-profiler.ts';
@@ -1007,6 +1009,21 @@ test('two exemplar tracks and one native-placeholder track qualify only when the
   assert.ok(slides.every(Boolean));
   const distinctness = assessVariantCompositionDistinctnessRaw(
     slides, template.templateIR, 'office-kit', semanticProfile);
+  const classificationCache = createCompositionVisualClassificationCache();
+  const cacheDiagnostics = new PerformanceDiagnostics();
+  const cachedFirst = assessVariantCompositionDistinctnessRaw(
+    slides, template.templateIR, 'office-kit', semanticProfile, cacheDiagnostics, classificationCache);
+  assert.deepEqual(cachedFirst, distinctness, 'memoizing immutable template visual classification cannot change A/B/C assignment');
+  const missesAfterFirst = cacheDiagnostics.snapshot().counts['composition.visualClassificationCacheMiss'];
+  const hitsAfterFirst = cacheDiagnostics.snapshot().counts['composition.visualClassificationCacheHit'] ?? 0;
+  assert.ok((missesAfterFirst ?? 0) > 0, 'the first resolver pass builds scoped classifications');
+  const cachedSecond = assessVariantCompositionDistinctnessRaw(
+    slides, template.templateIR, 'office-kit', semanticProfile, cacheDiagnostics, classificationCache);
+  assert.deepEqual(cachedSecond, distinctness, 'cache reuse retains identical qualification evidence and composition identity');
+  assert.equal(cacheDiagnostics.snapshot().counts['composition.visualClassificationCacheMiss'], missesAfterFirst,
+    'repeated track assessment does not rescan already classified template slides');
+  assert.ok((cacheDiagnostics.snapshot().counts['composition.visualClassificationCacheHit'] ?? 0) > hitsAfterFirst,
+    'subsequent A/B/C resolver passes reuse bounded generation-scoped classifications');
   assert.equal(distinctness.distinct, true, JSON.stringify(distinctness));
   assert.equal(new Set(distinctness.signatures).size, 3);
   const assessments = slides.map((slide) => assessExemplarSelectionRaw(slide, template.templateIR, semanticProfile));

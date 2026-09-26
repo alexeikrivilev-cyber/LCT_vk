@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
+import { PerformanceDiagnostics } from '../apps/daemon/src/presentation/performance-diagnostics.ts';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const daemonRequire = createRequire(path.join(repoRoot, 'apps/daemon/package.json'));
@@ -29,14 +30,16 @@ function parseArgs(argv) {
       result.slideCount = value;
       continue;
     }
-    if (!['--template', '--source', '--task', '--context'].includes(item)) throw new TypeError(`Unknown option: ${item}`);
+    if (!['--template', '--source', '--task', '--context', '--context-file'].includes(item)) throw new TypeError(`Unknown option: ${item}`);
     const value = argv[++index];
     if (value === undefined || value === '') throw new TypeError(`${item} requires a value`);
     if (item === '--template') result.templatePath = value;
     else if (item === '--source') result.sourcePath = value;
     else if (item === '--task') result.task = value;
-    else result.context = value;
+    else if (item === '--context') result.context = value;
+    else result.contextFile = value;
   }
+  if (result.context !== undefined && result.contextFile) throw new TypeError('Use either --context or --context-file, not both');
   if (!result.templatePath || !result.task.trim()) {
     throw new TypeError('Usage: node --import tsx scripts/run-local-product-smoke.mjs --template <template.pptx> --task <presentation task> [--context <optional context>] [--source <optional source.md>] [--slides 3..15]');
   }
@@ -96,7 +99,15 @@ async function waitForGeneration(baseUrl, projectId, timeoutMs = 600_000) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.contextFile) args.context = await readFile(await realpath(args.contextFile), 'utf8');
   const runStartedAt = performance.now();
+  const rssStartBytes = process.memoryUsage().rss;
+  let peakRssBytes = rssStartBytes;
+  const memorySampler = setInterval(() => {
+    peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+  }, 100);
+  memorySampler.unref();
+  const performanceDiagnostics = new PerformanceDiagnostics();
   const templatePath = await realpath(args.templatePath);
   const sourcePath = args.sourcePath ? await realpath(args.sourcePath) : null;
   const templateName = path.basename(templatePath);
@@ -133,7 +144,7 @@ async function main() {
     gates: {},
     timingsMs: {},
   };
-  const start = () => startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
+  const start = () => startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true, performanceDiagnostics });
   const ensure = async (body) => writeFile(path.join(runDir, 'smoke-report.json'), JSON.stringify(body, null, 2));
 
   try {
@@ -193,6 +204,22 @@ async function main() {
       body: JSON.stringify({ contentFiles: sourceName ? [sourceName] : [], brief }),
     });
     assert.equal(planning.status, 'ready', JSON.stringify(planning.failure));
+    const contextSourceIds = new Set(planning.contentIR.sources.filter((source) => source.kind === 'brief-context').map((source) => source.id));
+    const deckPlanEvidence = fake.state.inference.find((item) => item.operation === 'deck-plan')?.request.messages.at(-1)?.content;
+    const deckPlanEvidenceContentIR = typeof deckPlanEvidence === 'string' ? JSON.parse(deckPlanEvidence).contentIR : null;
+    const fakePlannerTaskSourceIds = new Set((deckPlanEvidenceContentIR?.sources ?? [])
+      .filter((source) => source.kind === 'brief-task').map((source) => source.id));
+    report.planningDiagnostics = {
+      contentUnitCount: planning.contentIR.units.length,
+      contextUnitCount: planning.contentIR.units.filter((unit) => contextSourceIds.has(unit.sourceId)).length,
+      fakePlannerContextUnitCount: Array.isArray(deckPlanEvidenceContentIR?.units)
+        ? deckPlanEvidenceContentIR.units.filter((unit) => !fakePlannerTaskSourceIds.has(unit.sourceId)).length
+        : null,
+      distinctTakeawayCount: new Set(planning.deckPlan.slides.map((slide) => slide.takeaway.trim().toLocaleLowerCase())).size,
+      distinctContentReferenceSetCount: new Set(planning.deckPlan.slides.map((slide) => [...slide.contentRefs].sort().join('|'))).size,
+      plannedSlideCount: planning.deckPlan.slides.length,
+    };
+    await ensure(report);
     assert.equal(planning.deckPlan.slides.length, args.slideCount);
     assert.equal(planning.review.outcome, 'pass');
     assert.ok(planning.contentIR.units.length > 0);
@@ -221,6 +248,7 @@ async function main() {
     report.contentIR = { hash: planning.contentIR.hash, sources: planning.contentIR.sources.length, units: planning.contentIR.units.length };
     report.fakeInferenceRequests = fake.state.inference.map((item) => ({
       role: item.role, operation: item.operation,
+      latencyMs: Math.round(item.durationMs ?? 0),
       strictJsonSchema: item.request.response_format?.type === 'json_schema' && item.request.response_format.json_schema?.strict === true,
     }));
     assert.deepEqual(report.fakeInferenceRequests.map((item) => item.operation), ['template-semantic-profile', 'deck-plan', 'plan-review']);
@@ -405,14 +433,79 @@ async function main() {
       'template profiling happens once during compile and remains cached after daemon reload');
     assert.equal(fake.state.inference.length, 3, 'generation, selection, repair, and export must not call semantic inference');
     report.fakeInferenceCallCount = fake.state.inference.length;
+    const performanceSnapshot = performanceDiagnostics.snapshot();
+    const performanceCounts = performanceSnapshot.counts;
+    const initialRendererCallCount = (performanceCounts.rendererCallCount ?? 0) - 4;
+    assert.ok(initialRendererCallCount <= args.slideCount + 1,
+      'renderer work is bounded to one initial A/B/C pack per slide plus at most one targeted repair');
+    assert.ok((performanceCounts.previewDeckLoadCount ?? 0) <= args.slideCount + 1,
+      'batched A/B/C previewing loads each pack once, plus at most one targeted repair');
+    assert.ok((performanceCounts['composition.visualClassificationCacheMiss'] ?? 0) <= report.templateIR.slides,
+      'generation-scoped immutable classification cache resolves each template slide at most once');
+    assert.ok((performanceCounts['composition.visualClassificationCacheHit'] ?? 0) > 0,
+      'A/B/C candidate assessment reuses visual classification within a generation');
+    const performanceDurations = performanceSnapshot.durationsMs;
+    const rendererExportMs = performanceDurations['export.total'] ?? 0;
+    report.performanceSummary = {
+      planningMs: report.timingsMs.planningIncludingFakeInference,
+      generationCompileMs: performanceDurations['generation.compileTracks'] ?? null,
+      renderTracksMs: Math.max(0, (performanceDurations['renderer.total'] ?? 0) - rendererExportMs),
+      previewEagerMs: performanceDurations['preview.total'] ?? null,
+      timeToDecksReadyMs: report.timingsMs.generationRenderAndPreview,
+      timeToAllPreviewsReadyMs: report.timingsMs.generationRenderAndPreview,
+      readinessSeparatedFromPreviews: false,
+      previewAllMs: performanceDurations['preview.total'] ?? null,
+      auditMs: performanceDurations['generation.audit'] ?? null,
+      exportMs: (report.timingsMs.selectedExportAndReopen ?? 0) + (report.timingsMs.trackExportsAndReopen ?? 0),
+      totalMs: report.timingsMs.total,
+      templateLoadCount: performanceCounts.templateLoadCount ?? 0,
+      rendererCallCount: performanceCounts.rendererCallCount ?? 0,
+      presentationSaveCount: performanceCounts.presentationSaveCount ?? 0,
+      presentationReopenCount: performanceCounts.presentationReopenCount ?? 0,
+      previewDeckLoadCount: performanceCounts.previewDeckLoadCount ?? 0,
+      rendererGenerationCallBound: args.slideCount + 1,
+      rendererExportCallCount: 4,
+      resourceUsage: {
+        rssStartBytes,
+        rssPeakBytes: Math.max(peakRssBytes, process.memoryUsage().rss),
+        rssEndBytes: process.memoryUsage().rss,
+        largestExportPptxBytes: Math.max(report.export?.bytes ?? 0, ...(report.trackExports ?? []).map((item) => item.bytes), 0),
+        maxSimultaneousRendererJobs: 1,
+        rssSamplingIntervalMs: 100,
+      },
+      measurementNote: 'A/B/C renders remain grouped per slide pack for progressive slide-level readiness; each pack preview is now decoded once for all three variants.',
+    };
     report.timingsMs.total = Math.round(performance.now() - runStartedAt);
+    report.performanceSummary.totalMs = report.timingsMs.total;
     report.status = 'passed';
   } catch (error) {
     report.status = 'failed';
     report.failure = error instanceof Error ? error.message : String(error);
+    report.fakeEndpointDiagnostics = fake.state.errors.map((message) => ({ message }));
+    report.fakeRequestDiagnostics = fake.state.inference.map((item) => {
+      const content = item.request.messages.at(-1)?.content;
+      let evidence;
+      try { evidence = typeof content === 'string' ? JSON.parse(content) : null; } catch { evidence = null; }
+      const contentIR = evidence?.contentIR;
+      const contextSourceIds = new Set((contentIR?.sources ?? []).filter((source) => source.kind === 'brief-context').map((source) => source.id));
+      return {
+        operation: item.operation,
+        requestedSlideCount: evidence?.requestedSlideCount ?? null,
+        sourceKinds: (contentIR?.sources ?? []).map((source) => source.kind),
+        unitCount: contentIR?.units?.length ?? null,
+        textUnitCount: (contentIR?.units ?? []).filter((unit) => typeof unit.text === 'string' && unit.text.trim()).length,
+        contextUnitCount: (contentIR?.units ?? []).filter((unit) => contextSourceIds.has(unit.sourceId)).length,
+      };
+    });
     throw error;
   } finally {
+    clearInterval(memorySampler);
+    if (report.performanceSummary?.resourceUsage) {
+      report.performanceSummary.resourceUsage.rssPeakBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+      report.performanceSummary.resourceUsage.rssEndBytes = process.memoryUsage().rss;
+    }
     report.completedAt = new Date().toISOString();
+    report.performanceDiagnostics = performanceDiagnostics.snapshot();
     await ensure(report).catch(() => undefined);
     if (process.env.LCT_SMOKE_RESULT_FILE) {
       const allowedRoot = `${path.resolve(repoRoot, '.lct')}${path.sep}`.toLocaleLowerCase('en-US');

@@ -184,7 +184,7 @@ export async function startFakeSemanticEndpoint({
   failure,
   respond = deterministicPlanningResponse,
 } = {}) {
-  const state = { inference: [], authHeaders: [], healthCalls: 0, modelCalls: 0 };
+  const state = { inference: [], authHeaders: [], healthCalls: 0, modelCalls: 0, errors: [] };
   const server = createServer(async (request, response) => {
     try {
       if (request.method === 'GET' && request.url === '/health') {
@@ -204,7 +204,8 @@ export async function startFakeSemanticEndpoint({
       const body = await readJson(request);
       const role = request.headers['x-lct-semantic-role'];
       const operation = request.headers['x-lct-semantic-operation'];
-      state.inference.push({ role, operation, request: body });
+      const requestRecord = { role, operation, request: body, startedAt: performance.now(), durationMs: null };
+      state.inference.push(requestRecord);
       state.authHeaders.push(request.headers.authorization ?? null);
       const failureKind = failure?.(role, operation, state.inference.length);
       if (failureKind === 'http-524') {
@@ -228,8 +229,10 @@ export async function startFakeSemanticEndpoint({
         return;
       }
       const result = await respond(body, { role, operation, index: state.inference.length });
+      requestRecord.durationMs = performance.now() - requestRecord.startedAt;
       response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
     } catch (error) {
+      state.errors.push(error instanceof Error ? error.message : 'fake endpoint error');
       response.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: error instanceof Error ? error.message : 'fake endpoint error' } }));
     }
   });

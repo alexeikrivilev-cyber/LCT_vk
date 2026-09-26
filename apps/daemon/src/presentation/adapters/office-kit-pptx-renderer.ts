@@ -56,6 +56,7 @@ import {
 import { collectSourceSlideVisualArtifacts, relationshipPartFor, removeUnreachableSourceVisualArtifacts } from '../application/pptx-source-artifacts.js';
 import type { CompiledSlide } from '../application/slide-compilation.js';
 import type { PptxRenderInput, PptxRenderResult, PptxRendererPort } from '../application/pptx-backend-port.js';
+import { recordElapsed, type PerformanceDiagnosticsPort } from '../performance-diagnostics.js';
 
 const MAX_TEMPLATE_BYTES = 64 * 1024 * 1024;
 const REWRITTEN_PACKAGE_PARTS = new Set([
@@ -374,10 +375,27 @@ async function writeAtomically(filePath: string, bytes: Uint8Array): Promise<str
 export class OfficeKitPptxRenderer implements PptxRendererPort {
   readonly id = 'office-kit' as const;
 
+  constructor(private readonly diagnostics?: PerformanceDiagnosticsPort) {}
+
   async render(input: PptxRenderInput): Promise<PptxRenderResult> {
+    const totalStartedAt = performance.now();
+    this.diagnostics?.increment('rendererCallCount');
+    try {
+      return await this.renderMeasured(input);
+    } finally {
+      recordElapsed(this.diagnostics, 'renderer.total', totalStartedAt);
+    }
+  }
+
+  private async renderMeasured(input: PptxRenderInput): Promise<PptxRenderResult> {
+    let stageStartedAt = performance.now();
     const sourceBytes = await readFile(input.templatePath);
+    recordElapsed(this.diagnostics, 'renderer.readTemplate', stageStartedAt);
+    this.diagnostics?.increment('templateLoadCount');
     if (sourceBytes.byteLength > MAX_TEMPLATE_BYTES) throw new TypeError('Template PPTX exceeds the 64 MiB render limit');
+    stageStartedAt = performance.now();
     const templateHash = createHash('sha256').update(sourceBytes).digest('hex');
+    recordElapsed(this.diagnostics, 'renderer.verifyTemplateHash', stageStartedAt);
     if (templateHash !== input.templateIR.source.sha256) throw new TypeError('Template PPTX bytes do not match the compiled TemplateIR source hash');
     if (input.compiledPresentation.templateIRHash !== input.templateIR.hash || input.compiledPresentation.contentIRHash !== input.contentIR.hash) {
       throw new TypeError('Compiled presentation source hashes do not match the render inputs');
@@ -387,9 +405,17 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
     if (blocking.length) throw new TypeError(`Office Kit render blocked by ${blocking.length} deterministic error(s)`);
     if (!input.compiledPresentation.slides.length) throw new TypeError('Cannot render an empty presentation');
 
+    stageStartedAt = performance.now();
     const presentation = await loadPresentation(sourceBytes);
+    recordElapsed(this.diagnostics, 'renderer.loadPresentation', stageStartedAt);
+    stageStartedAt = performance.now();
     const sourcePackage = await JSZip.loadAsync(sourceBytes);
+    recordElapsed(this.diagnostics, 'renderer.loadZip', stageStartedAt);
+    this.diagnostics?.increment('sourceZipLoadCount');
+    stageStartedAt = performance.now();
     const sourceVisualArtifacts = await collectSourceSlideVisualArtifacts(sourcePackage);
+    recordElapsed(this.diagnostics, 'renderer.collectSourceArtifacts', stageStartedAt);
+    stageStartedAt = performance.now();
     const layoutsByPart = new Map(input.compiledPresentation.slides.map((compiled) => {
       const layoutPartName = compiled.layoutSourcePart.startsWith('/') ? compiled.layoutSourcePart : `/${compiled.layoutSourcePart}`;
       const layout = findSlideLayoutByPartName(presentation, layoutPartName);
@@ -416,7 +442,9 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       if (!selection || !sourceSlidesByPart.has(selection.sourcePart)) return [];
       return [[compiled.id, selection] as const];
     }));
+    recordElapsed(this.diagnostics, 'renderer.prepareLayoutsAndSources', stageStartedAt);
     const duplicatedSlides = new Map<string, ReturnType<typeof duplicateSlide>>();
+    stageStartedAt = performance.now();
     for (const compiled of input.compiledPresentation.slides) {
       const selection = exemplarSelections.get(compiled.id);
       if (!selection) continue;
@@ -426,9 +454,14 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       removeSlideNotes(duplicate);
       duplicatedSlides.set(compiled.id, duplicate);
     }
+    recordElapsed(this.diagnostics, 'renderer.duplicateSlides', stageStartedAt);
+    stageStartedAt = performance.now();
     for (const slide of sourceSlides) removeSlideNotes(slide);
     for (const slide of sourceSlides) removeSlide(presentation, slide);
+    recordElapsed(this.diagnostics, 'renderer.removeSourceSlides', stageStartedAt);
+    stageStartedAt = performance.now();
     compactPackage(presentation);
+    recordElapsed(this.diagnostics, 'renderer.compactPackage', stageStartedAt);
 
     let nativeTableCount = 0;
     let nativeChartCount = 0;
@@ -574,16 +607,29 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       if (compiled.visualization.type !== 'none' && compiled.visualization.status === 'unresolved') unresolvedVisualTypes.add(compiled.visualization.type);
     }
 
+    stageStartedAt = performance.now();
     const savedBytes = await savePresentation(presentation);
+    recordElapsed(this.diagnostics, 'renderer.savePresentation', stageStartedAt);
+    this.diagnostics?.increment('presentationSaveCount');
+    stageStartedAt = performance.now();
     const outputPackage = await JSZip.loadAsync(savedBytes);
     await removeUnreachableSourceVisualArtifacts(outputPackage, sourceVisualArtifacts);
     const outputBytes = await outputPackage.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    recordElapsed(this.diagnostics, 'renderer.compactOutputZip', stageStartedAt);
+    stageStartedAt = performance.now();
     const reopened = await loadPresentation(outputBytes);
+    recordElapsed(this.diagnostics, 'renderer.reopenPresentation', stageStartedAt);
+    this.diagnostics?.increment('presentationReopenCount');
+    stageStartedAt = performance.now();
     if (getSlides(reopened).length !== input.compiledPresentation.slides.length) {
       throw new PptxBackendError('SLIDE_PROJECTION_FAILED', 'The active output slide list does not match the generated presentation slide count.');
     }
     const validationIssues = normalizeIssues(validatePresentation(reopened));
+    recordElapsed(this.diagnostics, 'renderer.validatePresentation', stageStartedAt);
+    stageStartedAt = performance.now();
     const templatePreservationStatus = await comparePreservedTemplateParts(sourceBytes, outputBytes, sourceVisualArtifacts) ? 'passed' as const : 'failed' as const;
+    recordElapsed(this.diagnostics, 'renderer.templatePreservationValidation', stageStartedAt);
+    this.diagnostics?.increment('rendererReopenValidationCount');
     if (templatePreservationStatus === 'failed') {
       validationIssues.push({ severity: 'error', message: 'One or more retained template package parts changed or were removed.', partName: null });
     }

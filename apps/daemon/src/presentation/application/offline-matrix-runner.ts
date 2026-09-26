@@ -10,7 +10,12 @@ import { validateTemplateSemanticProfile, type TemplateSemanticProfile } from '.
 import { auditCompiledPresentation } from './deterministic-audit.js';
 import { buildPresentationQualityReport } from './presentation-quality-report.js';
 import { reviewDeckLevel, type DeckReviewComposition } from './deck-level-review.js';
-import { applyVariantCompositionAssignment, assessExemplarSelection, assessVariantCompositionDistinctness } from './exemplar-slide-selector.js';
+import {
+  applyVariantCompositionAssignment,
+  assessExemplarSelection,
+  assessVariantCompositionDistinctness,
+  createCompositionVisualClassificationCache,
+} from './exemplar-slide-selector.js';
 import { renderPresentation, resolvePptxBackend } from '../adapters/pptx-renderer-factory.js';
 import type { PptxBackendId, PptxRenderResult } from './pptx-backend-port.js';
 import type { PptxPreviewPort } from './pptx-preview-port.js';
@@ -167,6 +172,9 @@ export async function runOfflinePresentationMatrix(input: {
 
   for (let templateIndex = 0; templateIndex < input.templates.length; templateIndex += 1) {
     const template = input.templates[templateIndex]!;
+    // This qualification pass uses one immutable template/profile pair for all
+    // planned slides; reuse visual safety evidence only inside this template run.
+    const visualClassificationCache = createCompositionVisualClassificationCache();
     let semanticProfile = semanticProfiles.get(template.templateIR.hash);
     let semanticProfileStatus: OfflineMatrixResult['templateQualifications'][number]['semanticProfileStatus'] = input.profileTemplate ? 'failed' : 'not-requested';
     let profileFailure: string | null = null;
@@ -195,11 +203,13 @@ export async function runOfflinePresentationMatrix(input: {
     const qualifiedSlides: OfflineMatrixResult['templateQualifications'][number]['slides'] = [];
     for (let slideIndex = 0; slideIndex < input.deckPlan.slides.length; slideIndex += 1) {
       const variantSlides = policies.map((policy) => compiledByVariant.get(policy.id)!.slides[slideIndex]!);
-      const distinctness = assessVariantCompositionDistinctness(variantSlides, template.templateIR, backend, semanticProfile);
+      const distinctness = assessVariantCompositionDistinctness(variantSlides, template.templateIR, backend, semanticProfile,
+        undefined, visualClassificationCache);
       // Preserve donor diagnostics from the pre-assignment candidates. A layout-backed
       // assignment is deliberately short-circuited by assessExemplarSelection once marked,
       // but the qualification report still needs to show which donors were considered.
-      const donorAssessments = variantSlides.map((slide) => assessExemplarSelection(slide, template.templateIR, semanticProfile));
+      const donorAssessments = variantSlides.map((slide) => assessExemplarSelection(slide, template.templateIR, semanticProfile,
+        undefined, visualClassificationCache));
       const assignedVariantSlides = distinctness.distinct
         ? variantSlides.map((slide) => {
           const assignment = distinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);

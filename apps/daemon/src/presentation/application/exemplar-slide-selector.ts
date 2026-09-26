@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { PerformanceDiagnosticsPort } from '../performance-diagnostics.js';
 
 import type { CompiledSlide, CompatibleLayoutMatchCandidate } from './slide-compilation.js';
 import type { TemplateElement, TemplateGeometry, TemplateIR, TemplateSlide } from '../domain/template-ir.js';
@@ -361,10 +362,19 @@ function visualKinds(slide: TemplateSlide): TemplateElement[] {
 
 type VisualSafetyKind = 'template-decoration' | 'content-slot' | 'source-specific-content' | 'opaque-unsafe';
 
-interface VisualSafetyClassification {
+export interface VisualSafetyClassification {
   elementId: string;
   kind: VisualSafetyKind;
   reason: string;
+}
+
+/** Generation-scoped memoization of immutable template/profile visual safety evidence. */
+export interface CompositionVisualClassificationCache {
+  readonly classifications: Map<string, VisualSafetyClassification[]>;
+}
+
+export function createCompositionVisualClassificationCache(): CompositionVisualClassificationCache {
+  return { classifications: new Map() };
 }
 
 function supportedNestedElements(slide: TemplateSlide): boolean {
@@ -459,6 +469,28 @@ function visualClassification(
     if (smallPicture && family.length >= 2 && repeated >= minimum) return { elementId: element.id, kind: 'template-decoration', reason: 'small visual object recurs in the layout family' };
     return { elementId: element.id, kind: 'opaque-unsafe', reason: `unrecognized native visual kind ${element.kind}` };
   });
+}
+
+function cachedVisualClassification(
+  slide: TemplateSlide,
+  template: TemplateIR,
+  profileVisualIds: readonly string[],
+  cache: CompositionVisualClassificationCache | undefined,
+  diagnostics: PerformanceDiagnosticsPort | undefined,
+): VisualSafetyClassification[] {
+  if (!cache) return visualClassification(slide, template, profileVisualIds);
+  const key = JSON.stringify([template.hash, slide.sourcePart, slide.index, profileVisualIds]);
+  const existing = cache.classifications.get(key);
+  if (existing) {
+    diagnostics?.increment('composition.visualClassificationCacheHit');
+    return existing;
+  }
+  diagnostics?.increment('composition.visualClassificationCacheMiss');
+  const startedAt = performance.now();
+  const result = visualClassification(slide, template, profileVisualIds);
+  diagnostics?.recordDuration('composition.visualClassification', performance.now() - startedAt);
+  cache.classifications.set(key, result);
+  return result;
 }
 
 function classifyStructuralArchetype(
@@ -643,7 +675,10 @@ function bodySlotsFor(
   candidates: TemplateElement[],
   compiled: CompiledSlide,
   allowMultiple: boolean,
+  diagnostics?: PerformanceDiagnosticsPort,
 ): BodySlotsChoice[] {
+  const startedAt = performance.now();
+  diagnostics?.increment('composition.bodySlotSearchCount');
   if (!candidates.length) return [];
   const sourceText = compiled.body.join('\n');
   const boundaryPattern = /(?:\r?\n)+|(?<=[.!?])(?=\s|$)/gu;
@@ -751,6 +786,8 @@ function bodySlotsFor(
       }
     }
   }
+  diagnostics?.recordDuration('composition.bodySlotSearch', performance.now() - startedAt);
+  diagnostics?.increment('composition.bodySlotChoiceCount', choices.length);
   return choices;
 }
 
@@ -762,10 +799,14 @@ function candidateFor(
   bodyEvidence: NonNullable<CompiledSlide['layoutCandidates'][number]['slotEvidence']['body']> | null,
   profileSlide: TemplateSemanticSlideProfile | undefined,
   bodyMappingOptionIndex = 0,
+  diagnostics?: PerformanceDiagnosticsPort,
+  visualClassificationCache?: CompositionVisualClassificationCache,
 ): CandidateBuild {
+  const startedAt = performance.now();
+  diagnostics?.increment('composition.candidateBuildCount');
   const trustedProfile = profileSlide && profileSlide.confidence >= 0.6 ? profileSlide : null;
   const preservedChromeIds = chromeIds(template, slide.layoutId ?? '');
-  const visualClasses = visualClassification(slide, template, trustedProfile?.visualElementIds ?? []);
+  const visualClasses = cachedVisualClassification(slide, template, trustedProfile?.visualElementIds ?? [], visualClassificationCache, diagnostics);
   const visualElementIds = trustedProfile?.visualElementIds ?? visualClasses.map((item) => item.elementId);
   const diagnostic: CandidateDiagnostic = {
     sourceSlideIndex: slide.index,
@@ -788,6 +829,7 @@ function candidateFor(
     titleGeometryNormalized: null, bodyGeometryNormalized: null, titleBodyFontHierarchy: null, evidence: [],
   };
   const reject = (gate: string, reason: string): CandidateBuild => {
+    diagnostics?.recordDuration('composition.candidateBuild', performance.now() - startedAt);
     diagnostic.gate = gate;
     diagnostic.rejectReason = reason;
     diagnostic.evidence = [reason];
@@ -838,7 +880,7 @@ function candidateFor(
     }))
     .filter((item) => trustedProfile && semanticBodyCandidates?.length ? true : item.overlap >= 0.65)
     .sort((left, right) => right.areaRatio - left.areaRatio || left.element.order - right.element.order);
-  const bodyChoices = bodySlotsFor(bodyCandidates.map((item) => item.element), compiled, Boolean(trustedProfile));
+  const bodyChoices = bodySlotsFor(bodyCandidates.map((item) => item.element), compiled, Boolean(trustedProfile), diagnostics);
   diagnostic.bodyMappingOptionCount = bodyChoices.length;
   const bodyChoice = bodyChoices[bodyMappingOptionIndex];
   if (!bodyChoice) return reject('body-role-fit', trustedProfile
@@ -1047,6 +1089,7 @@ function candidateFor(
   diagnostic.titleBodyFontHierarchy = selection.titleBodyFontHierarchy;
   diagnostic.evidence = evidence;
   const candidate: Candidate = { selection, score, projectionSafe, contentSafe, selectionReason, diagnostic };
+  diagnostics?.recordDuration('composition.candidateBuild', performance.now() - startedAt);
   return { candidate, diagnostic };
 }
 
@@ -1144,7 +1187,11 @@ export function assessExemplarSelection(
   compiled: CompiledSlide,
   template: TemplateIR,
   semanticProfileInput?: TemplateSemanticProfile,
+  diagnostics?: PerformanceDiagnosticsPort,
+  visualClassificationCache?: CompositionVisualClassificationCache,
 ): ExemplarSelectionAssessment {
+  const startedAt = performance.now();
+  diagnostics?.increment('composition.exemplarAssessmentCount');
   if (compiled.nativeLayoutFallback) return {
     selection: null,
     safeSelections: [],
@@ -1154,7 +1201,9 @@ export function assessExemplarSelection(
     supportedCandidateCount: 0,
     evidence: ['the qualified composition assignment requires the measured native layout placeholders'],
   };
+  const validationStartedAt = performance.now();
   const semanticProfile = semanticProfileInput ? validateTemplateSemanticProfile(semanticProfileInput, template) : undefined;
+  diagnostics?.recordDuration('composition.semanticProfileValidation', performance.now() - validationStartedAt);
   const layout = compiled.layoutCandidates.find((candidate) => candidate.layoutId === compiled.layoutId
     && candidate.sourcePart === compiled.layoutSourcePart);
   const titleEvidence = layout?.slotEvidence.title;
@@ -1171,10 +1220,10 @@ export function assessExemplarSelection(
     const title = hasHighStructuralEvidence ? titleEvidence! : null;
     const body = hasHighStructuralEvidence ? bodyEvidence! : null;
     const profile = profileByIndex.get(slide.index);
-    const first = candidateFor(compiled, template, slide, title, body, profile, 0);
+    const first = candidateFor(compiled, template, slide, title, body, profile, 0, diagnostics, visualClassificationCache);
     attempts.push(first);
     for (let optionIndex = 1; optionIndex < first.diagnostic.bodyMappingOptionCount; optionIndex += 1) {
-      attempts.push(candidateFor(compiled, template, slide, title, body, profile, optionIndex));
+      attempts.push(candidateFor(compiled, template, slide, title, body, profile, optionIndex, diagnostics, visualClassificationCache));
     }
   }
   const candidates = attempts.map((attempt) => attempt.candidate).filter((candidate): candidate is Candidate => candidate !== null);
@@ -1209,7 +1258,7 @@ export function assessExemplarSelection(
   });
   const familyIndex = VARIANT_FAMILY_INDEX[compiled.variantId];
   const selection = safeSelections[familyIndex] ?? null;
-  return {
+  const result = {
     selection,
     safeSelections,
     availableDistinctFamilies: families.length,
@@ -1221,6 +1270,9 @@ export function assessExemplarSelection(
       `variant ${compiled.variantId} has no preferred rank, but every item in safeSelections remains available to joint assignment`,
     ],
   };
+  diagnostics?.recordDuration('composition.exemplarAssessment', performance.now() - startedAt);
+  diagnostics?.increment('composition.candidateAttemptCount', attempts.length);
+  return result;
 }
 
 /** Select the safe post-projection family rank for this variant, or null if that distinct rank is unavailable. */
@@ -1248,6 +1300,8 @@ export function assessVariantCompositionDistinctness(
   template: TemplateIR,
   backend: 'custom' | 'office-kit',
   semanticProfile?: TemplateSemanticProfile,
+  diagnostics?: PerformanceDiagnosticsPort,
+  visualClassificationCache?: CompositionVisualClassificationCache,
 ): VariantCompositionDistinctness {
   const variants = ['A', 'B', 'C'];
   if (slides.length !== variants.length || variants.some((variant) => !slides.some((slide) => slide.variantId === variant))) {
@@ -1277,7 +1331,7 @@ export function assessVariantCompositionDistinctness(
         : [`availableDistinctFamilies=${availableDistinctFamilies}; duplicate projected compositions are withheld`],
     };
   } else {
-    const assessments = ordered.map((slide) => assessExemplarSelection(slide, template, semanticProfile));
+    const assessments = ordered.map((slide) => assessExemplarSelection(slide, template, semanticProfile, diagnostics, visualClassificationCache));
     type Option = VariantCompositionAssignment;
     const optionsByVariant = ordered.map((slide, index) => {
       const options: Option[] = [];
