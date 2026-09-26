@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -29,6 +29,36 @@ test('presentation file paths stay inside their project directory', async (t) =>
   for (const value of ['../outside.txt', 'nested/../../outside.txt', '..\\outside.txt']) {
     await assert.rejects(resolvePresentationFilePath(projectsRoot, 'project-a', value), /invalid project file path/);
   }
+});
+
+test('presentation writes reject project and nested directory symlinks that escape storage', async (t) => {
+  const projectsRoot = await mkdtemp(path.join(os.tmpdir(), 'lct-presentation-symlink-'));
+  const outside = await mkdtemp(path.join(os.tmpdir(), 'lct-presentation-outside-'));
+  t.after(async () => {
+    await rm(projectsRoot, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
+  const project = path.join(projectsRoot, 'project-a');
+  await mkdir(project);
+  try {
+    await symlink(outside, path.join(project, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+    await symlink(outside, path.join(projectsRoot, 'project-escape'), process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOTSUP'].includes(error?.code)) {
+      t.skip('directory symlinks are not available in this environment');
+      return;
+    }
+    throw error;
+  }
+
+  await assert.rejects(
+    resolvePresentationFilePath(projectsRoot, 'project-a', 'linked/out.txt', { createParent: true }),
+    /symlink escapes project root/,
+  );
+  await assert.rejects(
+    resolvePresentationFilePath(projectsRoot, 'project-escape', 'out.txt', { createParent: true }),
+    /project directory escapes projects root/,
+  );
 });
 
 test('presentation MIME type lookup is case insensitive', () => {

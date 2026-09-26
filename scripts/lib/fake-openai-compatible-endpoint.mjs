@@ -39,19 +39,20 @@ function deterministicPlanningResponse(request) {
       const takeaway = (heading || firstContentText?.split(/(?<=[.!?])\s/u, 1)[0] || 'Source-backed content').slice(0, 180);
       return {
         narrativeRole: count > 1 && index === 0 ? 'opening' : count > 1 && index === count - 1 ? 'closing' : 'content',
-        purpose: index === 0 ? 'Introduce the supplied topic using the linked source evidence.'
-          : index === count - 1 ? 'Close with the final linked source section.'
-            : 'Explain the linked source section.',
+        purpose: index === 0 ? 'Представить тему по исходным материалам.'
+          : index === count - 1 ? 'Подвести итог по последнему разделу источников.'
+            : 'Раскрыть раздел, на который ссылается источник.',
         takeaway,
-        contentRefs: selectedSection.contentUnits.slice(0, 5).map((unit) => unit.id),
+        contentRefs: [...(selectedSection.heading ? [selectedSection.heading] : []), ...selectedSection.contentUnits]
+          .slice(0, 5).map((unit) => unit.id),
         mediaRefs: [],
         semanticVisualType: 'none',
         targetDensity: 'balanced',
       };
     });
     return completion(request.model, {
-      workingTitle: 'Presentation from supplied source material',
-      narrativeSummary: `Organize the supplied evidence for ${evidence.brief.purpose}.`,
+      workingTitle: 'Презентация по исходным материалам',
+      narrativeSummary: `Систематизировать материалы для задачи: ${evidence.brief.purpose}.`,
       slides,
     });
   }
@@ -99,7 +100,7 @@ function deterministicPlanningResponse(request) {
         });
         if (overlapsSelected) continue;
         bodyElements.push(candidate);
-        if (bodyElements.length >= 3) break;
+        if (bodyElements.length >= 4) break;
       }
       const visualElements = slide.elements.filter((element) => !textElements.includes(element)
         && /picture|image|table|chart|graphicframe|group|connector|shape/i.test(element.kind));
@@ -121,6 +122,19 @@ function deterministicPlanningResponse(request) {
       else if (separatedBodyColumns) archetype = 'content-split';
       else if (bodyElements.length >= 5) archetype = 'content-dense';
       else if (title && bodyElements.length <= 1 && titleBodyRatio >= 3) archetype = 'cover';
+      const mappedTextIds = new Set([...(title ? [title.id] : []), ...bodyElements.map((element) => element.id)]);
+      const preservedElements = textElements.filter((element) => {
+        if (mappedTextIds.has(element.id)) return false;
+        const geometry = box(element);
+        const edgeFurniture = geometry.y <= canvas.height * 0.12 || geometry.y + geometry.height >= canvas.height * 0.92;
+        const recurring = (repeatedTextCounts.get(element.text.trim().replace(/\s+/gu, ' ').toLowerCase()) ?? 0)
+          >= Math.max(2, Math.ceil(evidence.slides.length * 0.6));
+        return recurring && edgeFurniture && numericFont(element) <= 12 && geometry.height <= canvas.height * 0.06;
+      });
+      const preservedIds = new Set(preservedElements.map((element) => element.id));
+      const replaceableTextElements = textElements.filter((element) => !mappedTextIds.has(element.id)
+        && !preservedIds.has(element.id) && element.kind === 'shape' && element.geometry
+        && element.text.trim().length > 3);
       return {
         sourceSlideIndex: slide.sourceSlideIndex,
         archetype,
@@ -128,6 +142,8 @@ function deterministicPlanningResponse(request) {
         titleElementId: title?.id ?? null,
         bodyElementIds: bodyElements.slice(0, 32).map((element) => element.id),
         visualElementIds: visualElements.slice(0, 8).map((element) => element.id),
+        preservedElementIds: preservedElements.map((element) => element.id),
+        replaceableTextElementIds: replaceableTextElements.map((element) => element.id),
         confidence: title && bodyElements.length ? 0.82 : 0.32,
         reasonCodes: ['offline_fake', title && bodyElements.length ? 'geometry_text_roles' : 'incomplete_role_evidence'],
       };

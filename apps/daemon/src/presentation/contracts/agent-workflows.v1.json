@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-09-26",
+  "updatedAt": "2026-09-26",
+  "recordKind": "agent-skill-workflow-contract",
+  "agents": {
+    "worker": {
+      "agentId": "deck-plan-worker",
+      "agentVersion": "deck-plan-worker.v1",
+      "skillId": "presentation-planning",
+      "skillVersion": "presentation-planning.v1",
+      "promptVersion": "worker-deck-plan.v2",
+      "schemaVersion": "deck_plan_draft_v1",
+      "modelRole": "worker"
+    },
+    "supervisor": {
+      "agentId": "plan-review-supervisor",
+      "agentVersion": "plan-review-supervisor.v1",
+      "skillId": "bounded-plan-review",
+      "skillVersion": "bounded-plan-review.v1",
+      "promptVersion": "supervisor-plan-review.v1",
+      "schemaVersion": "supervisor_plan_review_v1",
+      "modelRole": "supervisor"
+    }
+  }
+}

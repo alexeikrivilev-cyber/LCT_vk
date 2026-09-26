@@ -8,11 +8,50 @@ import type { DeckPlan } from '../domain/deck-plan.js';
 import type { TemplateIR } from '../domain/template-ir.js';
 import { validateTemplateSemanticProfile, type TemplateSemanticProfile } from './template-semantic-profiler.js';
 import { auditCompiledPresentation } from './deterministic-audit.js';
-import { assessExemplarSelection, assessVariantCompositionDistinctness, generatedFallbackCompositionSignature } from './exemplar-slide-selector.js';
+import { buildPresentationQualityReport } from './presentation-quality-report.js';
+import { reviewDeckLevel, type DeckReviewComposition } from './deck-level-review.js';
+import { applyVariantCompositionAssignment, assessExemplarSelection, assessVariantCompositionDistinctness } from './exemplar-slide-selector.js';
 import { renderPresentation, resolvePptxBackend } from '../adapters/pptx-renderer-factory.js';
 import type { PptxBackendId, PptxRenderResult } from './pptx-backend-port.js';
 import type { PptxPreviewPort } from './pptx-preview-port.js';
 import { compilePresentation, extractCanonicalFactualPayload, VARIANT_POLICIES, type VariantPolicy } from './slide-compilation.js';
+
+type MatrixPreviewStatus = 'passed' | 'passed-with-warnings' | 'failed' | 'unknown';
+
+function classifySourceTemplateBleed(issue: unknown, compiledSlide: ReturnType<typeof compilePresentation>['slides'][number], template: TemplateIR, profile?: TemplateSemanticProfile): unknown {
+  if (typeof issue !== 'object' || issue === null || !('shapeName' in issue) || !('bounds' in issue)) return issue;
+  const shapeName = typeof issue.shapeName === 'string' ? issue.shapeName : null;
+  const bounds = issue.bounds;
+  if (!shapeName || typeof bounds !== 'object' || bounds === null || !('x' in bounds) || !('y' in bounds) || !('width' in bounds) || !('height' in bounds)) return issue;
+  const selection = assessExemplarSelection(compiledSlide, template, profile).selection;
+  if (!selection) return issue;
+  const sourceSlide = template.slides.find((slide) => slide.sourcePart === selection.sourcePart);
+  const layout = template.layouts.find((candidate) => candidate.id === selection.layoutId);
+  const master = layout?.masterId ? template.masters.find((candidate) => candidate.id === layout.masterId) : null;
+  const candidates = [...(sourceSlide?.elements ?? []), ...(layout?.elements ?? []), ...(master?.elements ?? [])].filter((element) => {
+    const geometry = element.geometry.resolved ?? element.geometry.direct;
+    return element.name === shapeName && geometry
+      && Math.abs(geometry.x - Number(bounds.x)) <= 1 && Math.abs(geometry.y - Number(bounds.y)) <= 1
+      && Math.abs(geometry.width - Number(bounds.width)) <= 1 && Math.abs(geometry.height - Number(bounds.height)) <= 1;
+  });
+  if (candidates.length !== 1) return issue;
+  const origin = sourceSlide?.elements.includes(candidates[0]!) ? sourceSlide.sourcePart : layout?.sourcePart ?? master?.sourcePart ?? null;
+  return {
+    ...(issue as Record<string, unknown>),
+    classification: 'SOURCE_TEMPLATE_BLEED',
+    severity: 'warning',
+    source: origin ? `TemplateIR:${origin}` : 'TemplateIR source geometry',
+    confidence: 'high',
+    message: 'The exact out-of-canvas object is inherited from the selected source template; retained as a visible template-bleed warning.',
+  };
+}
+
+function matrixPreviewStatus(preview: Awaited<ReturnType<NonNullable<PptxPreviewPort>['preview']>>, geometryIssues: readonly unknown[]): MatrixPreviewStatus {
+  if (preview.status === 'failed' && geometryIssues.some((issue) => typeof issue !== 'object' || issue === null || !('severity' in issue) || issue.severity !== 'warning')) return 'failed';
+  if (preview.status === 'failed' && preview.textLayoutIssues.some((issue) => typeof issue !== 'object' || issue === null || !('severity' in issue) || issue.severity === 'error')) return 'failed';
+  if (preview.status === 'warning' || preview.textLayoutIssues.length || geometryIssues.length) return 'passed-with-warnings';
+  return 'passed';
+}
 
 export interface OfflineMatrixTemplate {
   pptxPath: string;
@@ -36,10 +75,12 @@ export interface OfflineMatrixResult {
     status: 'passed' | 'blocked';
     profileFailure: string | null;
     renderStatus: 'passed' | 'failed' | 'not-run';
-    previewStatus: 'passed' | 'failed' | 'not-requested' | 'not-run';
+    previewStatus: 'passed' | 'passed-with-warnings' | 'failed' | 'not-requested' | 'not-run';
     previewIssueCounts: Array<{ variantId: string; issueCount: number; issues: unknown[] }>;
     renderFailure: string | null;
     diagnosticArtifactPath: string | null;
+    deckReviewStatus: 'passed' | 'warning' | 'failed' | 'unknown' | 'not-run';
+    deckReviewPath: string | null;
     slides: Array<{
       plannedSlideIndex: number;
       intent: string;
@@ -51,6 +92,8 @@ export interface OfflineMatrixResult {
       variants: Array<{
         variantId: string;
         compositionKind: 'exemplar-backed' | 'layout-placeholder-backed' | 'safe-generated-fallback' | 'unavailable';
+        layoutCandidateIndex: number | null;
+        layoutId: string | null;
         projectedCompositionSignature: string | null;
         selectedDonor: {
           sourceSlideIndex: number;
@@ -68,13 +111,14 @@ export interface OfflineMatrixResult {
       }>;
     }>;
   }>;
-  timingsMs: { total: number; compile: number; audit: number; render: number; preview: number | null };
+  timingsMs: { total: number; semanticProfile: number; compile: number; audit: number; render: number; preview: number | null };
   backend: PptxBackendId;
   outputs: Array<{
     templateIndex: number;
     variantId: string;
     pptxPath: string;
     auditPath: string;
+    qualityPath: string;
     findingCount: number;
     compiledPresentationId: string;
     artifactSha256: string;
@@ -82,7 +126,7 @@ export interface OfflineMatrixResult {
     reopenStatus: PptxRenderResult['reopenStatus'];
     validationStatus: PptxRenderResult['validationStatus'];
     nativeObjectCounts: { text: number; tables: number; charts: number; images: number; shapes: number; connectors: number; notes: number; rasterSlides: 0 };
-    previewStatus: 'passed' | 'failed' | 'unknown';
+    previewStatus: MatrixPreviewStatus;
     templatePreservationStatus: PptxRenderResult['templatePreservationStatus'];
     factualEquivalenceStatus: 'passed' | 'failed';
     unresolvedVisualTypes: readonly string[];
@@ -109,7 +153,7 @@ export async function runOfflinePresentationMatrix(input: {
     throw new TypeError('The current matrix runner expects three distinct A/B/C variant policies');
   }
   const started = performance.now();
-  const timings = { compile: 0, audit: 0, render: 0, preview: input.previewAdapter ? 0 : null as number | null };
+  const timings = { semanticProfile: 0, compile: 0, audit: 0, render: 0, preview: input.previewAdapter ? 0 : null as number | null };
   const outputs: OfflineMatrixResult['outputs'] = [];
   const templateQualifications: OfflineMatrixResult['templateQualifications'] = [];
   const outputRoot = path.resolve(input.outputRoot);
@@ -125,6 +169,7 @@ export async function runOfflinePresentationMatrix(input: {
     let semanticProfileStatus: OfflineMatrixResult['templateQualifications'][number]['semanticProfileStatus'] = input.profileTemplate ? 'failed' : 'not-requested';
     let profileFailure: string | null = null;
     if (!semanticProfile && input.profileTemplate) {
+      const profileStarted = performance.now();
       try {
         templateProfilerRequests += 1;
         semanticProfile = validateTemplateSemanticProfile(await input.profileTemplate(template), template.templateIR);
@@ -133,6 +178,8 @@ export async function runOfflinePresentationMatrix(input: {
       } catch (error) {
         profileFailure = error instanceof Error ? error.message : 'Template semantic profile failed validation.';
         if (!input.continueOnBlocked) throw error;
+      } finally {
+        timings.semanticProfile += performance.now() - profileStarted;
       }
     } else if (semanticProfile) {
       semanticProfileStatus = 'validated';
@@ -147,18 +194,35 @@ export async function runOfflinePresentationMatrix(input: {
     for (let slideIndex = 0; slideIndex < input.deckPlan.slides.length; slideIndex += 1) {
       const variantSlides = policies.map((policy) => compiledByVariant.get(policy.id)!.slides[slideIndex]!);
       const distinctness = assessVariantCompositionDistinctness(variantSlides, template.templateIR, backend, semanticProfile);
-      const assessments = variantSlides.map((slide) => assessExemplarSelection(slide, template.templateIR, semanticProfile));
-      const variants = variantSlides.map((slide, variantIndex) => {
-        const assessment = assessments[variantIndex]!;
-        const selection = assessment.selection;
-        const signature = distinctness.signatures[variantIndex];
-        const isFallback = signature !== undefined && signature === generatedFallbackCompositionSignature(slide, template.templateIR);
+      // Preserve donor diagnostics from the pre-assignment candidates. A layout-backed
+      // assignment is deliberately short-circuited by assessExemplarSelection once marked,
+      // but the qualification report still needs to show which donors were considered.
+      const donorAssessments = variantSlides.map((slide) => assessExemplarSelection(slide, template.templateIR, semanticProfile));
+      const assignedVariantSlides = distinctness.distinct
+        ? variantSlides.map((slide) => {
+          const assignment = distinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
+          if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
+          return applyVariantCompositionAssignment(slide, assignment, template.templateIR);
+        })
+        : variantSlides;
+      if (distinctness.distinct) for (const assigned of assignedVariantSlides) {
+        const presentation = compiledByVariant.get(assigned.variantId)!;
+        compiledByVariant.set(assigned.variantId, {
+          ...presentation,
+          slides: presentation.slides.map((slide, index) => index === slideIndex ? assigned : slide),
+        });
+      }
+      const variants = assignedVariantSlides.map((slide, variantIndex) => {
+        const assessment = donorAssessments[variantIndex]!;
+        const assignment = distinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
+        const selection = assignment?.compositionKind === 'exemplar-backed' ? assessment.selection : null;
         return {
           variantId: slide.variantId,
-          projectedCompositionSignature: signature ?? null,
-          compositionKind: selection ? 'exemplar-backed' as const
-            : isFallback ? backend === 'custom' ? 'safe-generated-fallback' as const : 'layout-placeholder-backed' as const
-              : 'unavailable' as const,
+          projectedCompositionSignature: assignment?.projectedCompositionSignature ?? null,
+          compositionKind: assignment?.compositionKind ?? 'unavailable' as const,
+          layoutCandidateIndex: assignment?.layoutCandidateIndex ?? null,
+          layoutId: assignment?.compositionKind === 'layout-placeholder-backed'
+            ? slide.layoutCandidates[assignment.layoutCandidateIndex]?.layoutId ?? null : slide.layoutId,
           selectedDonor: selection ? {
             sourceSlideIndex: selection.sourceSlideIndex,
             structuralArchetype: assessment.candidateDiagnostics.find((candidate) => candidate.sourceSlideIndex === selection.sourceSlideIndex)?.structuralArchetype ?? selection.semanticArchetype,
@@ -197,6 +261,8 @@ export async function runOfflinePresentationMatrix(input: {
       previewIssueCounts: [],
       renderFailure: null,
       diagnosticArtifactPath: null,
+      deckReviewStatus: 'not-run',
+      deckReviewPath: null,
       slides: qualifiedSlides,
     };
     templateQualifications.push(qualification);
@@ -211,6 +277,7 @@ export async function runOfflinePresentationMatrix(input: {
     const templateDirectory = path.join(outputRoot, `template-${templateIndex + 1}`);
     const stagingDirectory = path.join(outputRoot, `.template-${templateIndex + 1}-${randomUUID()}.tmp`);
     const templateOutputs: OfflineMatrixResult['outputs'] = [];
+    const renderedByVariant = new Map<VariantPolicy['id'], PptxRenderResult>();
     const previewIssueCounts: Array<{ variantId: string; issueCount: number; issues: unknown[] }> = [];
     try {
       await mkdir(stagingDirectory, { recursive: false });
@@ -242,6 +309,7 @@ export async function runOfflinePresentationMatrix(input: {
           outputPath: pptxPath,
           contentRoot: template.contentRoot,
         }, backend);
+        renderedByVariant.set(policy.id, rendered);
         timings.render += performance.now() - renderStarted;
         if (rendered.projectedCompositions.length !== compiled.slides.length) {
           throw new TypeError(`Template ${templateIndex + 1} ${policy.id} renderer projected ${rendered.projectedCompositions.length} composition(s) for ${compiled.slides.length} compiled slides`);
@@ -258,7 +326,7 @@ export async function runOfflinePresentationMatrix(input: {
         if (rendered.reopenStatus === 'failed' || rendered.validationStatus === 'failed') {
           throw new TypeError(`Template ${templateIndex + 1} ${policy.id} failed package reopen or validation`);
         }
-        const previews: Array<{ slideIndex: number; status: 'passed' | 'failed'; textLayoutIssues: readonly unknown[]; textLayoutIssueCount: number; svgPath: string; pngPath: string; limitations: readonly string[] }> = [];
+        const previews: Array<{ slideIndex: number; status: MatrixPreviewStatus; textLayoutIssues: readonly unknown[]; geometryIssues: readonly unknown[]; textLayoutIssueCount: number; svgPath: string; pngPath: string; limitations: readonly string[] }> = [];
         if (input.previewAdapter) {
           const previewBytes = await readFile(pptxPath);
           const previewIndexes = input.previewAllSlides ? compiled.slides.map((_slide, index) => index) : [0];
@@ -268,6 +336,8 @@ export async function runOfflinePresentationMatrix(input: {
             const previewStarted = performance.now();
             const preview = await input.previewAdapter.preview(previewBytes, slideIndex);
             timings.preview = (timings.preview ?? 0) + performance.now() - previewStarted;
+            const compiledSlide = compiled.slides[slideIndex]!;
+            const geometryIssues = (preview.geometryIssues ?? []).map((issue) => classifySourceTemplateBleed(issue, compiledSlide, template.templateIR, semanticProfile));
             const fileStem = `slide-${String(slideIndex + 1).padStart(2, '0')}`;
             await Promise.all([
               writeFile(path.join(previewDirectory, `${fileStem}.svg`), preview.svg, 'utf8'),
@@ -275,18 +345,38 @@ export async function runOfflinePresentationMatrix(input: {
             ]);
             previews.push({
               slideIndex,
-              status: preview.status,
+              status: matrixPreviewStatus(preview, geometryIssues),
               textLayoutIssues: preview.textLayoutIssues,
-              textLayoutIssueCount: preview.textLayoutIssues.length,
+              geometryIssues,
+              textLayoutIssueCount: preview.textLayoutIssues.length + geometryIssues.length,
               svgPath: `previews/${fileStem}.svg`,
               pngPath: `previews/${fileStem}.png`,
               limitations: preview.limitations,
             });
           }
-          const uniqueIssues = new Map(previews.flatMap((preview) => preview.textLayoutIssues.map((issue) => [JSON.stringify(issue), issue] as const)));
+          const uniqueIssues = new Map(previews.flatMap((preview) => [...preview.textLayoutIssues, ...preview.geometryIssues]
+            .map((issue) => [JSON.stringify(issue), issue] as const)));
           previewIssueCounts.push({ variantId: policy.id, issueCount: uniqueIssues.size, issues: [...uniqueIssues.values()] });
         }
         const auditPath = path.join(variantDirectory, 'audit.json');
+        const qualityPath = path.join(variantDirectory, 'quality.json');
+        const signaturesByVariant = Object.fromEntries(policies.map((item) => [item.id,
+          qualifiedSlides.map((slide) => slide.variants.find((candidate) => candidate.variantId === item.id)?.projectedCompositionSignature ?? ''),
+        ])) as Record<VariantPolicy['id'], string[]>;
+        const kindsByVariant = Object.fromEntries(policies.map((item) => [item.id,
+          qualifiedSlides.map((slide) => slide.variants.find((candidate) => candidate.variantId === item.id)?.compositionKind ?? 'unavailable'),
+        ])) as Record<VariantPolicy['id'], string[]>;
+        const presentationQuality = buildPresentationQualityReport({
+          presentation: compiled,
+          contentIR: input.contentIR,
+          templateIR: template.templateIR,
+          tracks: policies.map((item) => compiledByVariant.get(item.id)!).filter(Boolean),
+          composition: { signaturesByVariant, kindsByVariant },
+          ...(rendered.qualityEvidence ? { renderEvidence: rendered.qualityEvidence } : {}),
+          previewEvidence: previews,
+          safetyAudit: audit,
+        });
+        await writeFile(qualityPath, `${JSON.stringify(presentationQuality, null, 2)}\n`, 'utf8');
         await writeFile(auditPath, `${JSON.stringify({
           schemaVersion: 1,
           planId: input.deckPlan.id,
@@ -299,13 +389,15 @@ export async function runOfflinePresentationMatrix(input: {
           compiledPresentationId: compiled.id,
           renderer: backend,
           audit,
+          presentationQuality,
           render: rendered,
           preview: previews.length > 0
             ? {
-              status: previews.every((preview) => preview.status === 'passed') ? 'passed' : 'failed',
+              status: previews.some((preview) => preview.status === 'failed') ? 'failed'
+                : previews.some((preview) => preview.status === 'passed-with-warnings') ? 'passed-with-warnings' : 'passed',
               slideCount: previews.length,
               textLayoutIssueCount: previews.reduce((sum, preview) => sum + preview.textLayoutIssueCount, 0),
-              artifacts: previews.map(({ slideIndex, svgPath, pngPath, textLayoutIssues }) => ({ slideIndex, svg: svgPath, png: pngPath, textLayoutIssues })),
+              artifacts: previews.map(({ slideIndex, svgPath, pngPath, textLayoutIssues, geometryIssues, status }) => ({ slideIndex, svg: svgPath, png: pngPath, status, textLayoutIssues, geometryIssues })),
               limitations: previews[0]!.limitations,
             }
             : { status: 'unknown', reason: 'No preview adapter was supplied.' },
@@ -316,6 +408,7 @@ export async function runOfflinePresentationMatrix(input: {
           variantId: policy.id,
           pptxPath,
           auditPath,
+          qualityPath,
           findingCount: rendered.auditFindingCount,
           compiledPresentationId: compiled.id,
           artifactSha256: rendered.artifactSha256,
@@ -327,14 +420,38 @@ export async function runOfflinePresentationMatrix(input: {
             images: rendered.nativeImageCount, shapes: rendered.nativeShapeCount, connectors: rendered.nativeConnectorCount,
             notes: rendered.nativeNotesCount, rasterSlides: rendered.rasterSlideCount,
           },
-          previewStatus: previews.length > 0 ? previews.every((preview) => preview.status === 'passed') ? 'passed' : 'failed' : 'unknown',
+          previewStatus: previews.length > 0 ? previews.some((preview) => preview.status === 'failed') ? 'failed'
+            : previews.some((preview) => preview.status === 'passed-with-warnings') ? 'passed-with-warnings' : 'passed' : 'unknown',
           templatePreservationStatus: rendered.templatePreservationStatus,
           factualEquivalenceStatus,
           unresolvedVisualTypes: rendered.unresolvedVisualTypes,
         });
       }
+      const compositionsByVariant = Object.fromEntries(policies.map((policy) => [policy.id,
+        (renderedByVariant.get(policy.id)?.projectedCompositions ?? []).map((composition, slideIndex) => ({
+          slideId: compiledByVariant.get(policy.id)!.slides[slideIndex]!.sourceDeckPlanSlideId,
+          signature: composition.projectedCompositionSignature,
+          archetype: composition.semanticArchetype,
+        } satisfies DeckReviewComposition)),
+      ])) as Record<VariantPolicy['id'], DeckReviewComposition[]>;
+      const deckReview = reviewDeckLevel({
+        deckPlan: input.deckPlan,
+        contentIR: input.contentIR,
+        compiledTracks: policies.map((policy) => compiledByVariant.get(policy.id)!).filter(Boolean),
+        compositionsByVariant,
+      });
+      const deckReviewPath = path.join(stagingDirectory, 'deck-review.json');
+      await writeFile(deckReviewPath, `${JSON.stringify(deckReview, null, 2)}\n`, 'utf8');
+      for (const output of templateOutputs) {
+        const auditRecord = JSON.parse(await readFile(output.auditPath, 'utf8')) as Record<string, unknown>;
+        auditRecord.deckLevelReview = deckReview;
+        await writeFile(output.auditPath, `${JSON.stringify(auditRecord, null, 2)}\n`, 'utf8');
+      }
+      qualification.deckReviewStatus = deckReview.status === 'pass' ? 'passed'
+        : deckReview.status === 'warning' ? 'warning' : deckReview.status === 'error' ? 'failed' : 'unknown';
+      qualification.deckReviewPath = deckReviewPath;
       const previewFailed = input.previewAdapter !== undefined && templateOutputs.some((output) => output.previewStatus === 'failed');
-      if (previewFailed) throw new TypeError(`Template ${templateIndex + 1} Office Kit preview reported text-layout issues; inspect staged matrix artifacts before qualification`);
+      if (previewFailed) throw new TypeError(`Template ${templateIndex + 1} Office Kit preview found an exact geometry/text blocker; inspect staged matrix artifacts before qualification`);
       await stat(templateDirectory).then(
         () => { throw new TypeError(`Template output already exists: ${templateDirectory}`); },
         (error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; },
@@ -344,9 +461,12 @@ export async function runOfflinePresentationMatrix(input: {
         ...output,
         pptxPath: output.pptxPath.replace(stagingDirectory, templateDirectory),
         auditPath: output.auditPath.replace(stagingDirectory, templateDirectory),
+        qualityPath: output.qualityPath.replace(stagingDirectory, templateDirectory),
       })));
       qualification.renderStatus = 'passed';
-      qualification.previewStatus = input.previewAdapter ? 'passed' : 'not-requested';
+      qualification.deckReviewPath = deckReviewPath.replace(stagingDirectory, templateDirectory);
+      qualification.previewStatus = !input.previewAdapter ? 'not-requested'
+        : templateOutputs.some((output) => output.previewStatus === 'passed-with-warnings') ? 'passed-with-warnings' : 'passed';
       qualification.previewIssueCounts = previewIssueCounts;
     } catch (error) {
       if (input.continueOnBlocked) {
@@ -359,7 +479,7 @@ export async function runOfflinePresentationMatrix(input: {
         }
       } else await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
       qualification.status = 'blocked';
-      const previewFailed = error instanceof Error && error.message.includes('Office Kit preview reported text-layout issues');
+      const previewFailed = error instanceof Error && error.message.includes('Office Kit preview found an exact geometry/text blocker');
       qualification.renderStatus = previewFailed ? 'passed' : 'failed';
       qualification.previewStatus = previewFailed ? 'failed' : 'not-run';
       qualification.previewIssueCounts = previewIssueCounts;

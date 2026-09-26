@@ -609,8 +609,10 @@ export async function runLiveQualification(options) {
         backend,
         previewAdapter: options.previewAdapter ?? new OfficeKitPreviewAdapter(),
         previewAllSlides: true,
+        localSemantic: options.localSemanticMatrix === true,
       });
-      if (matrixResult.matrix.inferenceRequests !== 0 || matrixResult.matrix.outputCount !== 3) {
+      const expectedMatrixProfileRequests = options.localSemanticMatrix === true ? 1 : 0;
+      if (matrixResult.matrix.inferenceRequests !== expectedMatrixProfileRequests || matrixResult.matrix.outputCount !== 3) {
         throw Object.assign(new Error('Offline A/B/C replay violated its output or inference budget'), { code: 'OFFLINE_REPLAY_INVARIANT_FAILED' });
       }
       const matrixMs = performance.now() - matrixStarted;

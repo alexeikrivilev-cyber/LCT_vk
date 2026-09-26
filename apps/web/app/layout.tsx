@@ -1,10 +1,11 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
+import { ru } from '../src/i18n/ru';
 import '../src/index.css';
 
 export const metadata: Metadata = {
-  title: 'LCT Presentation Core',
-  description: 'Presentation workspace for template understanding, generation, editing and export.',
+  title: ru.metadata.title,
+  description: ru.metadata.description,
 };
 
 export const viewport: Viewport = {
@@ -13,7 +14,7 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="ru">
       <body>{children}</body>
     </html>
   );

@@ -4,15 +4,27 @@ import { spawn } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseConfiguredLoopbackHost } from './lib/host.mjs';
+import { parseConfiguredPort } from './lib/port.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = Number(process.env.LCT_PORT) || 7456;
-const webPort = Number(process.env.PORT) || 3000;
+let port;
+let webPort;
+let webHost;
+try {
+  port = parseConfiguredPort(process.env.LCT_PORT, 'LCT_PORT', 7456);
+  webPort = parseConfiguredPort(process.env.PORT, 'PORT', 3000);
+  webHost = parseConfiguredLoopbackHost(process.env.LCT_WEB_HOST, 'LCT_WEB_HOST', '127.0.0.1');
+} catch (error) {
+  console.error(`[lct] invalid development configuration: ${error instanceof Error ? error.message : 'invalid port'}`);
+  process.exit(2);
+}
 const daemonUrl = `http://127.0.0.1:${port}`;
 const env = {
   ...process.env,
   LCT_BIND_HOST: '127.0.0.1',
   LCT_PORT: String(port),
+  LCT_WEB_HOST: webHost,
   PORT: String(webPort),
   LCT_NEXT_DIST_DIR: process.env.LCT_NEXT_DIST_DIR?.trim() || `.next/dev-${webPort}`,
 };
@@ -89,8 +101,9 @@ try {
 
   const nextCli = path.join(root, 'apps', 'web', 'node_modules', 'next', 'dist', 'bin', 'next');
   await access(nextCli);
-  console.log(`[lct] web ready at http://127.0.0.1:${webPort}`);
-  start('web', process.execPath, [nextCli, 'dev', '--turbopack', '-p', String(webPort)], path.join(root, 'apps', 'web'));
+  const displayHost = webHost === '::1' ? '[::1]' : webHost;
+  console.log(`[lct] web ready at http://${displayHost}:${webPort}`);
+  start('web', process.execPath, [nextCli, 'dev', '--turbopack', '--hostname', webHost, '-p', String(webPort)], path.join(root, 'apps', 'web'));
 } catch (error) {
   console.error(`[lct] development startup failed: ${error instanceof Error ? error.message : 'unknown error'}`);
   process.exitCode = 1;

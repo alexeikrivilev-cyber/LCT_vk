@@ -1,6 +1,19 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { contentSourceStatus, contentSourceStatusLabel, type ContentSourceStatus } from './content-source-status';
+import {
+  auditFindingMessage,
+  formatUiDateTime,
+  friendlyErrorMessage,
+  generationStatusLabel,
+  planningStatusLabel,
+  ru,
+  slidePackStatusLabel,
+  templateStatusLabel,
+  variantStatusLabel,
+} from './i18n/ru';
+import { clearWorkspaceDraft, readWorkspaceDraft, writeWorkspaceDraft } from './workspace-draft';
 
 type Project = {
   id: string;
@@ -27,7 +40,15 @@ type DesignSystem = {
 
 type Route = { kind: 'home' } | { kind: 'project'; projectId: string };
 
-type ApiError = { error?: string | { message?: string }; message?: string };
+type ApiError = { error?: string | { code?: string; message?: string }; message?: string; code?: string };
+type UiFailure = { message: string; code?: string; status?: number };
+
+class ApplicationUiError extends Error {
+  constructor(readonly failure: UiFailure) {
+    super(failure.message);
+    this.name = 'ApplicationUiError';
+  }
+}
 
 type TemplateCompileStatus = 'uncompiled' | 'ready' | 'stale' | 'failed';
 type TemplateCompileResponse = {
@@ -94,7 +115,7 @@ type GenerationState = {
   selectionVersion: number;
   slides: GenerationPack[];
   failure: { code: string; message: string } | null;
-  exports: Array<{ id: string; mode: 'selected' | GenerationVariantId; downloadUrl: string; validationStatus: string; nativeOfficeStatus: string }>;
+  exports: Array<{ id: string; mode: 'selected' | GenerationVariantId; format?: 'pptx' | 'pdf' | 'html'; downloadUrl: string; validationStatus: string; nativeOfficeStatus: string }>;
 };
 
 type DataRecord = Record<string, unknown>;
@@ -143,16 +164,42 @@ function rawFileUrl(projectId: string, path: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}/raw/${encoded}`;
 }
 
-function messageFromApiError(body: ApiError | null, status: number): string {
-  if (typeof body?.error === 'string') return body.error;
-  if (body?.error && typeof body.error === 'object' && body.error.message) return body.error.message;
-  if (body?.message) return body.message;
-  return `Request failed (${status})`;
+function messageFromApiError(body: ApiError | null, status: number, operation: Parameters<typeof friendlyErrorMessage>[2] = 'generic'): ApplicationUiError {
+  const nested = record(body?.error);
+  const code = stringValue(nested?.code ?? body?.code);
+  return new ApplicationUiError({
+    message: friendlyErrorMessage(code, status, operation),
+    ...(code ? { code } : {}),
+    status,
+  });
 }
 
-async function errorMessage(response: Response): Promise<string> {
+function normalizePreferenceLines(value: string): string {
+  return value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean).join('\n');
+}
+
+async function errorMessage(response: Response, operation: Parameters<typeof friendlyErrorMessage>[2] = 'generic'): Promise<ApplicationUiError> {
   const body = await response.json().catch(() => null) as ApiError | null;
-  return messageFromApiError(body, response.status);
+  return messageFromApiError(body, response.status, operation);
+}
+
+function uiFailure(error: unknown, fallback: string = ru.errors.generic): UiFailure {
+  if (error instanceof ApplicationUiError) return error.failure;
+  return { message: fallback };
+}
+
+function ErrorNotice({ failure, className, role = 'alert' }: { failure: UiFailure | string | null; className?: string; role?: 'alert' | 'status' }) {
+  if (!failure) return null;
+  const value = typeof failure === 'string' ? { message: failure } : failure;
+  const showDiagnostics = process.env.NODE_ENV !== 'production' && (value.code || value.status);
+  return <div className={className} role={role}>
+    <span>{value.message}</span>
+    {showDiagnostics ? <details className="ui-error-details">
+      <summary>{ru.errors.diagnostics}</summary>
+      {value.code ? <code>{ru.errors.code(value.code)}</code> : null}
+      {value.status ? <code>{ru.errors.status(value.status)}</code> : null}
+    </details> : null}
+  </div>;
 }
 
 function pickPreviewFile(files: ProjectFile[], selected?: string | null): string | null {
@@ -189,7 +236,7 @@ function arrayValue(value: unknown, paths: string[]): unknown[] {
 function countLabel(value: unknown, arrayPaths: string[], countPaths: string[]): string {
   const found = firstValue(value, arrayPaths);
   if (Array.isArray(found)) return String(found.length);
-  return stringValue(firstValue(value, countPaths), 'Not reported');
+  return stringValue(firstValue(value, countPaths), ru.template.dataUnavailable);
 }
 
 function stringValue(value: unknown, fallback = ''): string {
@@ -215,18 +262,6 @@ function parseTemplateCompileResponse(value: unknown): TemplateCompileResponse {
   return body as unknown as TemplateCompileResponse;
 }
 
-function readableValue(value: unknown): string {
-  if (typeof value === 'string' || typeof value === 'number') return String(value);
-  const item = record(value);
-  if (!item) return '';
-  const primary = stringValue(firstValue(item, ['name', 'displayName', 'label', 'family', 'fontFamily', 'value', 'message', 'reason', 'description', 'detail']));
-  if (primary) return primary;
-  return [
-    stringValue(firstValue(item, ['kind', 'type', 'code'])),
-    stringValue(firstValue(item, ['part', 'sourcePart', 'path'])),
-  ].filter(Boolean).join(' · ');
-}
-
 function formatAspectRatio(width: unknown, height: unknown, declared?: unknown): string {
   if (typeof declared === 'string' && declared.trim()) return declared;
   if (typeof declared === 'number' && Number.isFinite(declared)) return `${declared.toFixed(2)}:1`;
@@ -240,19 +275,32 @@ function formatAspectRatio(width: unknown, height: unknown, declared?: unknown):
 }
 
 function formatCanvasDimensions(width: unknown, height: unknown, unit: unknown): string {
-  if (typeof width !== 'number' || typeof height !== 'number') return 'Dimensions not reported';
+  if (typeof width !== 'number' || typeof height !== 'number') return ru.template.dimensionsUnknown;
   if (unit === 'EMU') return `${(width / 914400).toFixed(2)} × ${(height / 914400).toFixed(2)} in`;
   return `${width} × ${height}${typeof unit === 'string' && unit ? ` ${unit}` : ''}`;
 }
 
-function templateFailureText(value: unknown): string {
-  if (typeof value === 'string') return value;
-  return readableValue(value) || 'The structural scan could not be completed.';
+function templateFailureInfo(value: unknown): UiFailure {
+  const failure = record(value);
+  const code = stringValue(failure?.code) || undefined;
+  return { message: friendlyErrorMessage(code, 422, 'template'), ...(code ? { code } : {}) };
 }
 
 function uniqueStrings(values: unknown[]): string[] {
   const collected = values.map(readableValue).map((value) => value.trim()).filter(Boolean);
   return [...new Set(collected)];
+}
+
+function readableValue(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  const item = record(value);
+  if (!item) return '';
+  const primary = stringValue(firstValue(item, ['name', 'displayName', 'label', 'family', 'fontFamily', 'value']));
+  if (primary) return primary;
+  return [
+    stringValue(firstValue(item, ['kind', 'type', 'code'])),
+    stringValue(firstValue(item, ['part', 'sourcePart', 'path'])),
+  ].filter(Boolean).join(' · ');
 }
 
 function colorEntry(value: unknown): { label: string; value: string } | null {
@@ -288,18 +336,18 @@ function PresentationHome({ onOpen }: { onOpen: (projectId: string) => void }) {
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<UiFailure | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const response = await fetch('/api/projects', { cache: 'no-store' });
-      if (!response.ok) throw new Error(await errorMessage(response));
+      if (!response.ok) throw await errorMessage(response);
       const body = await response.json() as { projects?: Project[] };
       setProjects(body.projects ?? []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(uiFailure(err));
     } finally {
       setLoading(false);
     }
@@ -308,7 +356,7 @@ function PresentationHome({ onOpen }: { onOpen: (projectId: string) => void }) {
   useEffect(() => { void load(); }, [load]);
 
   const create = async () => {
-    const title = name.trim() || 'Untitled presentation';
+    const title = name.trim() || ru.home.genericProject;
     setCreating(true);
     setError(null);
     try {
@@ -323,13 +371,13 @@ function PresentationHome({ onOpen }: { onOpen: (projectId: string) => void }) {
           designSystemId: null,
         }),
       });
-      if (!response.ok) throw new Error(await errorMessage(response));
+      if (!response.ok) throw await errorMessage(response);
       const body = await response.json() as { project?: Project };
-      if (!body.project?.id) throw new Error('Project response did not include a project id.');
+      if (!body.project?.id) throw new ApplicationUiError({ message: ru.errors.generic, code: 'PROJECT_ID_MISSING' });
       setName('');
       onOpen(body.project.id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(uiFailure(err));
     } finally {
       setCreating(false);
     }
@@ -339,42 +387,42 @@ function PresentationHome({ onOpen }: { onOpen: (projectId: string) => void }) {
     <main className="home-shell">
       <header className="home-header">
         <div>
-          <div className="eyebrow">LCT · presentation core</div>
-          <h1>Presentations, without the generic product shell.</h1>
-          <p className="lede">One workspace for source material, design-system constraints, editable files and a live deck preview.</p>
+          <div className="eyebrow">{ru.home.eyebrow}</div>
+          <h1>{ru.home.title}</h1>
+          <p className="lede">{ru.home.lede}</p>
         </div>
       </header>
 
-      <section className="create-panel" aria-label="Create presentation">
+      <section className="create-panel" aria-label={ru.home.createLabel}>
         <input
           value={name}
           onChange={(event) => setName(event.target.value)}
           onKeyDown={(event) => { if (event.key === 'Enter' && !creating) void create(); }}
-          placeholder="Presentation name"
-          aria-label="Presentation name"
+          placeholder={ru.home.createPlaceholder}
+          aria-label={ru.home.createLabel}
         />
         <button className="primary" disabled={creating} onClick={() => void create()}>
-          {creating ? 'Creating…' : 'New presentation'}
+          {creating ? ru.home.creating : ru.home.create}
         </button>
       </section>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      <ErrorNotice failure={error} className="error-banner" />
 
       <section className="projects-section">
         <div className="section-heading">
-          <h2>Projects</h2>
-          <button className="quiet" onClick={() => void load()} disabled={loading}>Refresh</button>
+          <h2>{ru.home.projects}</h2>
+          <button className="quiet" onClick={() => void load()} disabled={loading}>{ru.home.refresh}</button>
         </div>
-        {loading ? <div className="empty-state">Loading projects…</div> : null}
+        {loading ? <div className="empty-state" role="status">{ru.home.loading}</div> : null}
         {!loading && projects.length === 0 ? (
-          <div className="empty-state">No projects yet. Create the first presentation above.</div>
+          <div className="empty-state">{ru.home.empty}</div>
         ) : null}
         <div className="project-grid">
           {projects.map((project) => (
             <button key={project.id} className="project-card" onClick={() => onOpen(project.id)}>
-              <span className="project-card-kind">PRESENTATION</span>
-              <strong>{project.name || 'Untitled presentation'}</strong>
-              <span className="project-card-meta">{project.updatedAt ? `Updated ${new Date(project.updatedAt).toLocaleString()}` : project.id}</span>
+              <span className="project-card-kind">{ru.home.projectKind}</span>
+              <strong>{project.name || ru.home.genericProject}</strong>
+              <span className="project-card-meta">{project.updatedAt ? ru.home.updated(formatUiDateTime(new Date(project.updatedAt))) : project.id}</span>
             </button>
           ))}
         </div>
@@ -391,12 +439,13 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [templateFile, setTemplateFile] = useState<string | null>(null);
   const [templateScan, setTemplateScan] = useState<TemplateCompileResponse | null>(null);
-  const [templateLoading, setTemplateLoading] = useState(false);
-  const [templateError, setTemplateError] = useState<string | null>(null);
+  const [templateFetching, setTemplateFetching] = useState(false);
+  const [templateAnalyzing, setTemplateAnalyzing] = useState(false);
+  const [templateError, setTemplateError] = useState<UiFailure | null>(null);
   const [planning, setPlanning] = useState<PlanningResponse | null>(null);
   const [planningLoading, setPlanningLoading] = useState(false);
   const [planningGenerating, setPlanningGenerating] = useState(false);
-  const [planningError, setPlanningError] = useState<string | null>(null);
+  const [planningError, setPlanningError] = useState<UiFailure | null>(null);
   const [selectedContentFiles, setSelectedContentFiles] = useState<string[]>([]);
   const [briefAudience, setBriefAudience] = useState('');
   const [briefPurpose, setBriefPurpose] = useState('');
@@ -407,22 +456,33 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const [editorDirty, setEditorDirty] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<UiFailure | null>(null);
   const [newFileName, setNewFileName] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [draftHydrated, setDraftHydrated] = useState(false);
+  const draftHydratedRef = useRef(false);
+  const [generationComplete, setGenerationComplete] = useState(false);
+  const [generationExported, setGenerationExported] = useState(false);
+  const filesRef = useRef(files);
+  const templateScanRef = useRef(templateScan);
+  filesRef.current = files;
+  templateScanRef.current = templateScan;
 
   const loadProject = useCallback(async () => {
     const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, { cache: 'no-store' });
-    if (!response.ok) throw new Error(await errorMessage(response));
+    if (!response.ok) throw await errorMessage(response);
     const body = await response.json() as { project?: Project };
-    if (!body.project) throw new Error('Project not found.');
+    if (!body.project) throw new ApplicationUiError({ message: ru.errors.notFound, code: 'PROJECT_NOT_FOUND', status: 404 });
     setProject(body.project);
   }, [projectId]);
 
   const loadFiles = useCallback(async () => {
     const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`, { cache: 'no-store' });
-    if (!response.ok) throw new Error(await errorMessage(response));
+    if (!response.ok) throw await errorMessage(response);
     const body = await response.json() as { files?: ProjectFile[] };
-    setFiles((body.files ?? []).filter((file) => !file.isDirectory));
+    const loaded = (body.files ?? []).filter((file) => !file.isDirectory);
+    setFiles(loaded);
+    return loaded;
   }, [projectId]);
 
   const loadDesignSystems = useCallback(async () => {
@@ -433,17 +493,41 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   }, []);
 
   const loadTemplateScan = useCallback(async () => {
-    setTemplateLoading(true);
+    setTemplateFetching(true);
     setTemplateError(null);
     try {
       const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/template`, { cache: 'no-store' });
-      if (!response.ok) throw new Error(await errorMessage(response));
-      setTemplateScan(parseTemplateCompileResponse(await response.json()));
+      if (!response.ok) throw await errorMessage(response, 'template');
+      const scan = parseTemplateCompileResponse(await response.json());
+      setTemplateScan(scan);
+      return scan;
     } catch (err) {
-      setTemplateError(err instanceof Error ? err.message : String(err));
+      setTemplateError(uiFailure(err, ru.errors.template));
+      return null;
     } finally {
-      setTemplateLoading(false);
+      setTemplateFetching(false);
     }
+  }, [projectId]);
+
+  const restoreDraft = useCallback((savedPlanning: PlanningResponse | null, loadedFiles?: ProjectFile[], loadedScan?: TemplateCompileResponse | null) => {
+    if (typeof window === 'undefined') return;
+    let storage: Storage;
+    try { storage = window.sessionStorage; }
+    catch { return; }
+    const currentFiles = loadedFiles ?? filesRef.current;
+    const currentScan = loadedScan === undefined ? templateScanRef.current : loadedScan;
+    const scanPath = sourcePathOf(currentScan);
+    const firstTemplate = currentFiles.find((file) => /\.pptx$/i.test(filePath(file)));
+    const selectedTemplate = scanPath ?? (firstTemplate ? filePath(firstTemplate) : null);
+    const availablePaths = new Set(currentFiles.map(filePath).filter((path) => path !== selectedTemplate));
+    const draft = readWorkspaceDraft(storage, projectId, savedPlanning?.updatedAt, availablePaths);
+    if (!draft) return;
+    setSelectedContentFiles(draft.selectedContentFiles);
+    setBriefAudience(draft.briefAudience);
+    setBriefPurpose(draft.briefPurpose);
+    setBriefExpectedOutcome(draft.briefExpectedOutcome);
+    setBriefPreferences(draft.briefPreferences);
+    setRequestedSlideCount(draft.requestedSlideCount);
   }, [projectId]);
 
   const loadPlanning = useCallback(async () => {
@@ -451,7 +535,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     setPlanningError(null);
     try {
       const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/planning`, { cache: 'no-store' });
-      if (!response.ok) throw new Error(await errorMessage(response));
+      if (!response.ok) throw await errorMessage(response, 'planning');
       const body = await response.json() as PlanningResponse;
       setPlanning(body);
       setSelectedContentFiles(Array.isArray(body.contentFiles) ? body.contentFiles.slice(0, 12) : []);
@@ -463,23 +547,45 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         ? brief.preferences.filter((item): item is string => typeof item === 'string').join('\n')
         : '');
       setRequestedSlideCount(typeof brief?.requestedSlideCount === 'number' ? String(brief.requestedSlideCount) : '');
+      if (draftHydratedRef.current) restoreDraft(body);
+      return body;
     } catch (err) {
-      setPlanningError(err instanceof Error ? err.message : String(err));
+      setPlanningError(uiFailure(err, ru.errors.plan));
+      return null;
     } finally {
       setPlanningLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, restoreDraft]);
 
   const reload = useCallback(async () => {
     setError(null);
     try {
-      await Promise.all([loadProject(), loadFiles(), loadDesignSystems(), loadTemplateScan(), loadPlanning()]);
+      const [, loadedFiles, , loadedScan, savedPlanning] = await Promise.all([
+        loadProject(), loadFiles(), loadDesignSystems(), loadTemplateScan(), loadPlanning(),
+      ]);
+      restoreDraft(savedPlanning, loadedFiles, loadedScan);
+      draftHydratedRef.current = true;
+      setDraftHydrated(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(uiFailure(err));
     }
-  }, [loadDesignSystems, loadFiles, loadPlanning, loadProject, loadTemplateScan]);
+  }, [loadDesignSystems, loadFiles, loadPlanning, loadProject, loadTemplateScan, restoreDraft]);
 
   useEffect(() => { void reload(); }, [reload]);
+
+  useEffect(() => {
+    if (!draftHydrated || typeof window === 'undefined') return;
+    try {
+      writeWorkspaceDraft(window.sessionStorage, projectId, {
+        selectedContentFiles: selectedContentFiles.slice(0, 12),
+        briefAudience,
+        briefPurpose,
+        briefExpectedOutcome,
+        briefPreferences,
+        requestedSlideCount,
+      });
+    } catch { /* Browser storage can be disabled by policy. */ }
+  }, [briefAudience, briefExpectedOutcome, briefPreferences, briefPurpose, draftHydrated, projectId, requestedSlideCount, selectedContentFiles]);
 
   const previewFile = useMemo(() => pickPreviewFile(files, selectedFile), [files, selectedFile]);
   const templateFiles = useMemo(() => files.filter((file) => /\.pptx$/i.test(filePath(file))), [files]);
@@ -488,14 +594,10 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const visibleTemplateStatus: TemplateCompileStatus | null = scanSelectionMismatch
     ? 'stale'
     : templateScan?.status ?? null;
-  const templateBadgeStatus = visibleTemplateStatus ?? (templateLoading ? 'loading' : templateError ? 'unavailable' : 'uncompiled');
-  const templateBadgeLabel = templateLoading ? 'Analyzing…'
-    : templateBadgeStatus === 'ready' ? 'Understood'
-      : templateBadgeStatus === 'stale' ? 'Needs re-scan'
-        : templateBadgeStatus === 'uncompiled' ? 'Not analyzed'
-          : templateBadgeStatus === 'failed' ? 'Failed'
-            : templateBadgeStatus === 'unavailable' ? 'Unavailable'
-              : templateBadgeStatus;
+  const templateBadgeStatus = visibleTemplateStatus ?? (templateAnalyzing ? 'analyzing' : templateFetching ? 'loading' : templateError ? 'unavailable' : 'uncompiled');
+  const templateBadgeLabel = templateAnalyzing ? ru.template.analyzing
+    : templateFetching ? ru.template.fetching
+      : templateStatusLabel(visibleTemplateStatus ?? (templateError ? 'unavailable' : 'uncompiled'));
   const templateIR = record(templateScan?.templateIR);
   const presentationDesignSystem = record(templateScan?.presentationDesignSystem);
   const canvas = record(firstValue(presentationDesignSystem, ['canvas']))
@@ -536,15 +638,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const unsupported = [
     ...arrayValue(templateIR, ['unsupported', 'unsupportedParts']),
     ...arrayValue(presentationDesignSystem, ['unsupported']),
-  ].map((entry) => {
-    const item = record(entry);
-    if (!item) return readableValue(entry);
-    return [
-      stringValue(firstValue(item, ['kind']), 'unsupported'),
-      stringValue(firstValue(item, ['part']), 'part unknown'),
-      stringValue(firstValue(item, ['reason'])),
-    ].filter(Boolean).join(' · ');
-  });
+  ];
   const warnings = [
     ...arrayValue(templateIR, ['warnings']),
     ...arrayValue(presentationDesignSystem, ['warnings']),
@@ -554,9 +648,37 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const planningSourceFiles = files.filter((file) => filePath(file) !== excludedPlanningPath);
   const availablePlanningPaths = new Set(planningSourceFiles.map(filePath));
   const planningSelectedPaths = selectedContentFiles.filter((path) => availablePlanningPaths.has(path)).slice(0, 12);
+  const savedBrief = record(planning?.brief);
+  const savedContentFiles = arrayValue(planning, ['contentFiles']).filter((item): item is string => typeof item === 'string');
+  const savedPreferences = Array.isArray(savedBrief?.preferences)
+    ? savedBrief.preferences.filter((item): item is string => typeof item === 'string').join('\n')
+    : '';
+  const planningDraftDirty = planning?.status === 'ready' && (
+    JSON.stringify([...planningSelectedPaths].sort()) !== JSON.stringify([...savedContentFiles].sort())
+    || briefAudience.trim() !== stringValue(savedBrief?.audience)
+    || briefPurpose.trim() !== stringValue(savedBrief?.purpose)
+    || briefExpectedOutcome.trim() !== stringValue(savedBrief?.expectedOutcome)
+    || normalizePreferenceLines(briefPreferences) !== normalizePreferenceLines(savedPreferences)
+    || requestedSlideCount.trim() !== (typeof savedBrief?.requestedSlideCount === 'number' ? String(savedBrief.requestedSlideCount) : '')
+  );
+  const savedPlanReady = planning?.status === 'ready' && !planningDraftDirty;
   const planningDeckPlan = record(planning?.deckPlan);
   const planningSlides = arrayValue(planningDeckPlan, ['slides']);
   const contentIR = record(planning?.contentIR);
+  const contentSourceStatusByPath = new Map(arrayValue(contentIR, ['sources']).flatMap((source) => {
+    const item = record(source);
+    const sourcePath = stringValue(firstValue(item, ['sourcePath']));
+    if (!sourcePath) return [];
+    const kind = firstValue(item, ['kind']);
+    const warnings = arrayValue(item, ['warnings']).map((warning) => ({ code: stringValue(firstValue(record(warning), ['code'])) }));
+    const status = planning?.status === 'ready'
+      ? contentSourceStatus({
+        kind: kind === 'text' || kind === 'image' || kind === 'unsupported' ? kind : 'unsupported',
+        warnings,
+      })
+      : 'not-parsed';
+    return [[sourcePath, status] as const];
+  }));
   const sourcePathById = new Map(arrayValue(contentIR, ['sources']).flatMap((source) => {
     const item = record(source);
     const sourceId = stringValue(firstValue(item, ['id']));
@@ -583,7 +705,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     }
     if (validCurrent.includes(path)) return;
     if (validCurrent.length >= 12) {
-      setPlanningError('Select no more than 12 source files.');
+      setPlanningError({ message: ru.validation.maxFiles });
       return;
     }
     setSelectedContentFiles([...validCurrent, path]);
@@ -592,21 +714,21 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const generatePlan = async () => {
     setPlanningError(null);
     if (planningSelectedPaths.length < 1 || planningSelectedPaths.length > 12) {
-      setPlanningError('Select between 1 and 12 project source files.');
+      setPlanningError({ message: ru.validation.filesRange });
       return;
     }
     if (!briefAudience.trim() || !briefPurpose.trim() || !briefExpectedOutcome.trim()) {
-      setPlanningError('Audience, purpose, and expected outcome are required.');
+      setPlanningError({ message: ru.validation.briefRequired });
       return;
     }
     const count = requestedSlideCount.trim() ? Number(requestedSlideCount) : undefined;
     if (count !== undefined && (!Number.isInteger(count) || count < 1 || count > 30)) {
-      setPlanningError('Requested slide count must be an integer from 1 to 30.');
+      setPlanningError({ message: ru.validation.slideCount });
       return;
     }
-    const preferences = briefPreferences.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+    const preferences = normalizePreferenceLines(briefPreferences).split('\n').filter(Boolean);
     if (preferences.length > 12 || preferences.some((item) => item.length > 200)) {
-      setPlanningError('Enter at most 12 preferences, with no more than 200 characters per line.');
+      setPlanningError({ message: ru.validation.preferences });
       return;
     }
     const brief = {
@@ -623,14 +745,15 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contentFiles: planningSelectedPaths, brief }),
       });
-      if (!response.ok) throw new Error(await errorMessage(response));
+      if (!response.ok) throw await errorMessage(response, 'planning');
       const body = await response.json() as PlanningResponse;
       setPlanning(body);
       setSelectedContentFiles(Array.isArray(body.contentFiles) ? body.contentFiles.slice(0, 12) : planningSelectedPaths);
+      try { if (typeof window !== 'undefined') clearWorkspaceDraft(window.sessionStorage, projectId); }
+      catch { /* Saved planning state is on the server even if browser storage is unavailable. */ }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
       await loadPlanning();
-      setPlanningError(message);
+      setPlanningError(uiFailure(err, ru.errors.plan));
     } finally {
       setPlanningGenerating(false);
     }
@@ -638,7 +761,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
 
   const analyzeTemplate = async () => {
     if (!templateFile) return;
-    setTemplateLoading(true);
+    setTemplateAnalyzing(true);
     setTemplateError(null);
     try {
       const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/template/compile`, {
@@ -650,17 +773,17 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       if (!response.ok) {
         const failed = record(body);
         if (failed?.status === 'failed') setTemplateScan(parseTemplateCompileResponse(body));
-        throw new Error(failed?.failure
-          ? templateFailureText(failed.failure)
-          : messageFromApiError(record(body) as ApiError | null, response.status));
+        const failure = record(failed?.failure);
+        const code = stringValue(failure?.code) || undefined;
+        throw new ApplicationUiError({ message: friendlyErrorMessage(code, response.status, 'template'), ...(code ? { code } : {}), status: response.status });
       }
       setTemplateScan(parseTemplateCompileResponse(body));
       await loadPlanning();
     } catch (err) {
-      setTemplateError(err instanceof Error ? err.message : String(err));
+      setTemplateError(uiFailure(err, ru.errors.template));
       await loadPlanning();
     } finally {
-      setTemplateLoading(false);
+      setTemplateAnalyzing(false);
     }
   };
 
@@ -704,14 +827,14 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     void (async () => {
       try {
         const response = await fetch(rawFileUrl(projectId, selectedFile), { cache: 'no-store' });
-        if (!response.ok) throw new Error(await errorMessage(response));
+        if (!response.ok) throw await errorMessage(response, 'file');
         const text = await response.text();
         if (!cancelled) {
           setEditorText(text);
           setEditorDirty(false);
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        if (!cancelled) setError(uiFailure(err, ru.errors.fileRead));
       }
     })();
     return () => { cancelled = true; };
@@ -727,13 +850,13 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: selectedFile, content: editorText }),
       });
-      if (!response.ok) throw new Error(await errorMessage(response));
+      if (!response.ok) throw await errorMessage(response);
       setEditorDirty(false);
       await loadFiles();
       await refreshPreview();
       await loadPlanning();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(uiFailure(err));
     } finally {
       setBusy(false);
     }
@@ -748,14 +871,14 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, content: name.endsWith('.html') ? '<!doctype html>\n<html>\n<head><meta charset="utf-8"><title>Presentation</title></head>\n<body></body>\n</html>\n' : '' }),
+        body: JSON.stringify({ name, content: name.endsWith('.html') ? `<!doctype html>\n<html>\n<head><meta charset="utf-8"><title>${ru.workspace.newHtmlTitle}</title></head>\n<body></body>\n</html>\n` : '' }),
       });
-      if (!response.ok) throw new Error(await errorMessage(response));
+      if (!response.ok) throw await errorMessage(response);
       setNewFileName('');
       await loadFiles();
       setSelectedFile(name);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(uiFailure(err));
     } finally {
       setBusy(false);
     }
@@ -766,13 +889,14 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     const incomingFiles = Array.from(incoming);
     const uploadedFiles: ProjectFile[] = [];
     setBusy(true);
+    setUploading(true);
     setError(null);
     try {
       for (let offset = 0; offset < incomingFiles.length; offset += 2) {
         const form = new FormData();
         for (const file of incomingFiles.slice(offset, offset + 2)) form.append('files', file);
         const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/upload`, { method: 'POST', body: form });
-        if (!response.ok) throw new Error(await errorMessage(response));
+        if (!response.ok) throw await errorMessage(response, 'upload');
         const body = await response.json().catch(() => null) as { files?: ProjectFile[] } | null;
         uploadedFiles.push(...(body?.files ?? []));
       }
@@ -787,10 +911,11 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       await loadPlanning();
     } catch (err) {
       if (uploadedFiles.length) await loadFiles();
-      setError(err instanceof Error ? err.message : String(err));
+      setError(uiFailure(err));
     } finally {
       if (uploadRef.current) uploadRef.current.value = '';
       setBusy(false);
+      setUploading(false);
     }
   };
 
@@ -803,49 +928,55 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ designSystemId: designSystemId || null }),
       });
-      if (!response.ok) throw new Error(await errorMessage(response));
+      if (!response.ok) throw await errorMessage(response);
       const body = await response.json() as { project?: Project };
       if (body.project) setProject(body.project);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(uiFailure(err));
     } finally {
       setBusy(false);
     }
   };
 
-  if (!project && !error) return <div className="boot-state">Loading presentation workspace…</div>;
+  const reportGenerationState = useCallback((complete: boolean, exported: boolean) => {
+    setGenerationComplete(complete);
+    setGenerationExported(exported);
+  }, []);
+
+  if (!project && !error) return <div className="boot-state" role="status">{ru.workspace.boot}</div>;
 
   return (
     <main className="workspace-shell">
       <header className="workspace-topbar">
-        <button className="quiet" onClick={onBack}>← Projects</button>
+        <button className="quiet" onClick={onBack}>{ru.workspace.back}</button>
         <div className="project-title-block">
-          <span className="eyebrow">PRESENTATION WORKSPACE</span>
+          <span className="eyebrow">{ru.workspace.eyebrow}</span>
           <strong>{project?.name ?? projectId}</strong>
         </div>
         <div className="topbar-actions">
-          <button className="quiet" onClick={() => void reload()}>Reload</button>
-          <button className="primary" onClick={() => uploadRef.current?.click()} disabled={busy}>Add sources</button>
-          <input ref={uploadRef} className="visually-hidden" type="file" multiple onChange={(event) => void upload(event.target.files)} />
+          <button className="quiet" onClick={() => void reload()}>{ru.workspace.reload}</button>
+          <button className="primary" onClick={() => uploadRef.current?.click()} disabled={busy}>{ru.workspace.addSources}</button>
+          <input ref={uploadRef} className="visually-hidden" type="file" multiple aria-label={ru.workspace.addSources} onChange={(event) => void upload(event.target.files)} />
         </div>
       </header>
 
-      {error ? <div className="error-banner workspace-error">{error}</div> : null}
+      <ErrorNotice failure={error} className="error-banner workspace-error" />
+      {uploading ? <p className="workspace-operation-status" role="status" aria-live="polite">{ru.workspace.uploading}</p> : null}
 
-      <nav className="workspace-stages" aria-label="Presentation stages">
-        <a href="#template-panel" data-complete={templateScan?.status === 'ready'}>Template</a>
-        <a href="#planning-panel" data-complete={planningSourceFiles.length > 0}>Content / brief</a>
-        <a href="#planning-panel" data-complete={planning?.status === 'ready'}>Plan</a>
-        <a href="#generation-panel" data-complete={planning?.status === 'ready'}>Generate</a>
-        <a href="#generation-review" data-complete={false}>Review / export</a>
+      <nav className="workspace-stages" aria-label={ru.workspace.stagesLabel}>
+        <a href="#template-panel" data-complete={visibleTemplateStatus === 'ready'}>{ru.workspace.templateStage}</a>
+        <a href="#planning-panel" data-complete={planningSourceFiles.length > 0}>{ru.workspace.contentStage}</a>
+        <a href="#planning-panel" data-complete={savedPlanReady}>{ru.workspace.planStage}</a>
+        <a href="#generation-panel" data-complete={generationComplete}>{ru.workspace.generateStage}</a>
+        <a href="#generation-review" data-complete={generationExported}>{ru.workspace.reviewStage}</a>
       </nav>
 
       <section className="template-panel" id="template-panel" aria-labelledby="template-panel-title">
         <div className="template-panel-head">
           <div>
-            <span className="eyebrow">TEMPLATE UNDERSTANDING</span>
-            <h2 id="template-panel-title">Structural template scan</h2>
-            <p>Reads the uploaded PowerPoint structure and records observed layout, theme and asset details.</p>
+          <span className="eyebrow">{ru.template.eyebrow}</span>
+            <h2 id="template-panel-title">{ru.template.title}</h2>
+            <p>{ru.template.description}</p>
           </div>
           <span className={`template-status status-${templateBadgeStatus}`} role="status">
             {templateBadgeLabel}
@@ -853,80 +984,80 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         </div>
 
         <div className="template-toolbar">
-          <label htmlFor="template-source">PowerPoint source</label>
+          <label htmlFor="template-source">{ru.template.sourceLabel}</label>
           <select
             id="template-source"
             value={templateFile ?? ''}
             onChange={(event) => setTemplateFile(event.target.value || null)}
-            disabled={templateFiles.length === 0 || templateLoading}
+            disabled={templateFiles.length === 0 || templateFetching || templateAnalyzing}
           >
-            {templateFiles.length === 0 ? <option value="">Upload a .pptx file first</option> : null}
+            {templateFiles.length === 0 ? <option value="">{ru.template.uploadFirst}</option> : null}
             {templateFiles.map((file) => {
               const path = filePath(file);
               return <option key={path} value={path}>{path}</option>;
             })}
           </select>
-          <button className="primary" onClick={() => void analyzeTemplate()} disabled={!templateFile || busy || templateLoading}>
-            {templateLoading ? 'Analyzing…' : 'Analyze as template'}
+          <button className="primary" onClick={() => void analyzeTemplate()} disabled={!templateFile || busy || templateFetching || templateAnalyzing}>
+            {templateAnalyzing ? ru.template.analyzing : ru.template.analyze}
           </button>
-          {templateScan?.compiledAt ? <span className="template-compiled-at">Last scan {new Date(templateScan.compiledAt).toLocaleString()}</span> : null}
+          {templateScan?.compiledAt ? <span className="template-compiled-at">{ru.template.lastScan(formatUiDateTime(new Date(templateScan.compiledAt)))}</span> : null}
         </div>
 
-        <p className="template-scope-note">This is a structural scan. It describes observed file data and does not promise universal compatibility with arbitrary or native PowerPoint templates.</p>
-        {templateError ? <div className="error-banner template-error">{templateError}</div> : null}
+        <p className="template-scope-note">{ru.template.scope}</p>
+        <ErrorNotice failure={templateError} className="error-banner template-error" />
 
         {visibleTemplateStatus === 'uncompiled' ? (
-          <div className="template-message">Choose an uploaded .pptx, then run the scan to inspect its structure.</div>
+          <div className="template-message">{ru.template.chooseAndAnalyze}</div>
         ) : null}
         {visibleTemplateStatus === 'stale' ? (
           <div className="template-message template-message-warning">
             {scanSelectionMismatch
-              ? `The displayed scan belongs to ${scanSourcePath}. Analyze ${templateFile ?? 'the selected file'} to refresh it.`
-              : 'The source file changed after this scan. Analyze it again to refresh the structural summary.'}
+              ? ru.template.staleOtherFile(scanSourcePath ?? '', templateFile ?? ru.workspace.selectedFileFallback)
+              : ru.template.staleChangedFile}
           </div>
         ) : null}
         {visibleTemplateStatus === 'failed' ? (
-          <div className="template-message template-message-warning">{templateFailureText(templateScan?.failure)}</div>
+          <ErrorNotice failure={templateFailureInfo(templateScan?.failure)} className="template-message template-message-warning" role="status" />
         ) : null}
-        {!templateLoading && !templateScan && templateError ? (
-          <div className="template-message template-message-warning">Template scan status could not be loaded.</div>
+        {!templateFetching && !templateAnalyzing && !templateScan && templateError ? (
+          <div className="template-message template-message-warning">{ru.template.scanUnavailable}</div>
         ) : null}
 
         {matchingScan && templateIR ? (
           <div className="template-report">
             <div className="template-source-line">
-              <span>Scanned file</span>
-              <strong>{stringValue(firstValue(templateScan?.source, ['originalName', 'filePath']), scanSourcePath ?? 'Source not reported')}</strong>
+              <span>{ru.template.scannedFile}</span>
+              <strong>{stringValue(firstValue(templateScan?.source, ['originalName', 'filePath']), scanSourcePath ?? ru.template.sourceNotReported)}</strong>
             </div>
 
             <div className="template-metrics">
-              <div className="template-metric"><span>Canvas / aspect</span><strong>{formatCanvasDimensions(width, height, firstValue(slideSize, ['unit']))} · {formatAspectRatio(width, height, firstValue(canvas, ['aspectRatio']))}</strong></div>
-              <div className="template-metric"><span>Slides</span><strong>{countLabel(templateIR, ['slides'], ['slideCount', 'summary.slideCount'])}</strong></div>
-              <div className="template-metric"><span>Masters</span><strong>{countLabel(templateIR, ['masters'], ['masterCount', 'summary.masterCount'])}</strong></div>
-              <div className="template-metric"><span>Layouts</span><strong>{countLabel(presentationDesignSystem, ['layouts'], [])}</strong></div>
+              <div className="template-metric"><span>{ru.template.canvas}</span><strong>{formatCanvasDimensions(width, height, firstValue(slideSize, ['unit']))} · {formatAspectRatio(width, height, firstValue(canvas, ['aspectRatio']))}</strong></div>
+              <div className="template-metric"><span>{ru.template.slides}</span><strong>{countLabel(templateIR, ['slides'], ['slideCount', 'summary.slideCount'])}</strong></div>
+              <div className="template-metric"><span>{ru.template.masters}</span><strong>{countLabel(templateIR, ['masters'], ['masterCount', 'summary.masterCount'])}</strong></div>
+              <div className="template-metric"><span>{ru.template.layouts}</span><strong>{countLabel(presentationDesignSystem, ['layouts'], [])}</strong></div>
             </div>
 
             <div className="template-observations">
               <section className="template-observation-block">
                 <div className="template-block-heading">
-                  <h3>Observed theme</h3>
-                  <span>{themeName || (theme ? 'Theme data present' : 'Name not reported')}</span>
+                  <h3>{ru.template.observedTitle}</h3>
+                  <span>{themeName || (theme ? ru.template.themeData : ru.template.noThemeName)}</span>
                 </div>
-                <strong className="template-subheading">Observed fonts</strong>
+                <strong className="template-subheading">{ru.template.observedFonts}</strong>
                 <div className="template-chip-list">
-                  {fonts.length ? fonts.map((font) => <span className="template-chip" key={font}>{font}</span>) : <span className="template-muted">No observed fonts reported.</span>}
+                  {fonts.length ? fonts.map((font) => <span className="template-chip" key={font}>{font}</span>) : <span className="template-muted">{ru.template.noFonts}</span>}
                 </div>
-                <strong className="template-subheading">Observed font sizes</strong>
+                <strong className="template-subheading">{ru.template.observedSizes}</strong>
                 <div className="template-chip-list">
-                  {fontSizes.length ? fontSizes.map((size) => <span className="template-chip" key={size}>{size} pt</span>) : <span className="template-muted">No observed font sizes reported.</span>}
+                  {fontSizes.length ? fontSizes.map((size) => <span className="template-chip" key={size}>{size} pt</span>) : <span className="template-muted">{ru.template.noFontSizes}</span>}
                 </div>
-                <strong className="template-subheading">Theme fonts</strong>
+                <strong className="template-subheading">{ru.template.themeFonts}</strong>
                 <div className="template-chip-list">
                   {themeFontEntries.length ? themeFontEntries.map((entry) => (
-                    <span className="template-chip" key={entry.role}>{entry.role}: {entry.font}</span>
-                  )) : <span className="template-muted">Theme font roles not reported.</span>}
+                    <span className="template-chip" key={entry.role}>{entry.role === 'Major' ? ru.template.majorFont : entry.role === 'Minor' ? ru.template.minorFont : entry.role}: {entry.font}</span>
+                  )) : <span className="template-muted">{ru.template.noThemeFonts}</span>}
                 </div>
-                <strong className="template-subheading">Direct palette</strong>
+                <strong className="template-subheading">{ru.template.directPalette}</strong>
                 <div className="template-chip-list template-palette-list">
                   {directColors.length ? directColors.map((color, index) => (
                     <span className="template-chip template-color-chip" key={`${color.label}-${index}`}>
@@ -934,39 +1065,39 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                       <span>{color.label}</span>
                       <code>{color.value}</code>
                     </span>
-                  )) : <span className="template-muted">No direct palette values reported.</span>}
+                  )) : <span className="template-muted">{ru.template.noPalette}</span>}
                 </div>
-                {themeColors.length ? <p className="template-theme-colors">Theme colors: {themeColors.map((color) => `${color.label}: ${color.value}`).join(' · ')}</p> : null}
+                {themeColors.length ? <p className="template-theme-colors">{ru.template.themeColors}: {themeColors.map((color) => `${color.label}: ${color.value}`).join(' · ')}</p> : null}
               </section>
 
               <section className="template-observation-block">
                 <div className="template-block-heading">
-                  <h3>Assets</h3>
-                  <span>{templateAssets.length || reusableAssets.length} observed</span>
+                  <h3>{ru.template.assets}</h3>
+                  <span>{ru.template.assetCount(templateAssets.length || reusableAssets.length)}</span>
                 </div>
                 {templateAssets.length || reusableAssets.length ? (
                   <div className="template-asset-list">
                     {Object.entries((templateAssets.length ? templateAssets : reusableAssets).reduce<Record<string, number>>((counts, asset) => {
-                      const kind = stringValue(firstValue(asset, ['kind', 'type', 'contentType']), 'Unclassified');
+                      const kind = stringValue(firstValue(asset, ['kind', 'type', 'contentType']), ru.template.unclassified);
                       counts[kind] = (counts[kind] ?? 0) + 1;
                       return counts;
                     }, {})).map(([kind, count]) => <span key={kind}>{kind}<strong>{count}</strong></span>)}
                   </div>
-                ) : <p className="template-muted">No assets were reported by this scan.</p>}
+                ) : <p className="template-muted">{ru.template.noAssets}</p>}
               </section>
             </div>
 
             <section className="template-layout-section">
               <div className="template-block-heading">
-                <div><span className="eyebrow">STRUCTURAL INVENTORY</span><h3>Layouts</h3></div>
-                <span>{layouts.length} reported</span>
+                <div><span className="eyebrow">{ru.template.inventory}</span><h3>{ru.template.layouts}</h3></div>
+                <span>{ru.template.layoutCount(layouts.length)}</span>
               </div>
               {layouts.length ? (
                 <div className="template-layout-grid">
                   {layouts.map((entry, index) => {
                     const layout = record(entry);
                     if (!layout) return null;
-                    const title = stringValue(firstValue(layout, ['matchingName', 'declaredName', 'name', 'title']), `Layout ${index + 1}`);
+                    const title = stringValue(firstValue(layout, ['matchingName', 'declaredName', 'name', 'title']), ru.template.layoutUnknown(index + 1));
                     const roles = uniqueStrings(arrayValue(layout, ['placeholderRoles', 'structure.placeholderRoles']));
                     const elementCounts = record(firstValue(layout, ['elementCounts']));
                     const elementKinds = record(firstValue(elementCounts, ['byKind'])) ?? {};
@@ -978,16 +1109,16 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                       <article className="template-layout-card" key={`${layoutPart || title}-${index}`}>
                         <div className="template-layout-card-head">
                           <div><strong>{title}</strong>{layoutType ? <span>{layoutType}</span> : null}</div>
-                          <span className="template-usage">{typeof usageCount === 'number' ? `${usageCount} uses` : 'Usage unknown'}</span>
+                          <span className="template-usage">{typeof usageCount === 'number' ? ru.template.usage(usageCount) : ru.template.usageUnknown}</span>
                         </div>
                         {layoutPart ? <code className="template-layout-part">{layoutPart}</code> : null}
-                        <strong className="template-subheading">Placeholder composition</strong>
+                        <strong className="template-subheading">{ru.template.placeholderComposition}</strong>
                         <div className="template-chip-list">
-                          {roles.length ? roles.map((role, roleIndex) => <span className="template-chip" key={`${role}-${roleIndex}`}>{role}</span>) : <span className="template-muted">No placeholder roles reported.</span>}
+                          {roles.length ? roles.map((role, roleIndex) => <span className="template-chip" key={`${role}-${roleIndex}`}>{role}</span>) : <span className="template-muted">{ru.template.noPlaceholders}</span>}
                         </div>
                         {elementCounts && Object.keys(elementCounts).length ? (
                           <div className="template-element-counts">
-                          {typeof totalElements === 'number' ? <span>Total<strong>{totalElements}</strong></span> : null}
+                          {typeof totalElements === 'number' ? <span>{ru.template.total}<strong>{totalElements}</strong></span> : null}
                           {Object.entries(elementKinds).map(([kind, count]) => <span key={kind}>{kind}<strong>{stringValue(count, '—')}</strong></span>)}
                           </div>
                         ) : null}
@@ -995,17 +1126,20 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                     );
                   })}
                 </div>
-              ) : <div className="template-message">No layout details were reported.</div>}
+              ) : <div className="template-message">{ru.template.noLayoutDetails}</div>}
             </section>
 
             <section className="template-notes-section">
-              <h3>Unsupported features and warnings</h3>
+              <h3>{ru.template.unsupported}</h3>
               {unsupported.length || warnings.length ? (
-                <ul>
-                  {uniqueStrings(unsupported).map((item, index) => <li key={`unsupported-${index}`}><strong>Unsupported:</strong> {item}</li>)}
-                  {uniqueStrings(warnings).map((item, index) => <li key={`warning-${index}`}>{item}</li>)}
-                </ul>
-              ) : <p className="template-muted">No unsupported features or warnings were reported. This does not imply complete PowerPoint compatibility.</p>}
+                <details>
+                  <summary>{ru.template.diagnosticLabel} · {unsupported.length + warnings.length}</summary>
+                  <ul>
+                    {unsupported.length ? <li>{ru.template.unsupportedSummary(unsupported.length)}</li> : null}
+                    {warnings.length ? <li>{ru.template.warningSummary(warnings.length)}</li> : null}
+                  </ul>
+                </details>
+              ) : <p className="template-muted">{ru.template.noUnsupported}</p>}
             </section>
           </div>
         ) : null}
@@ -1014,39 +1148,40 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       <section className="planning-panel" id="planning-panel" aria-labelledby="planning-panel-title">
         <div className="planning-panel-head">
           <div>
-            <span className="eyebrow">CONTENT PLANNING</span>
-            <h2 id="planning-panel-title">Build a presentation outline</h2>
-            <p>Select source files and describe the intended presentation. The plan is reviewed before it is saved.</p>
+            <span className="eyebrow">{ru.planning.eyebrow}</span>
+            <h2 id="planning-panel-title">{ru.planning.title}</h2>
+            <p>{ru.planning.description}</p>
           </div>
           <div className="planning-head-actions">
-            <span className={`planning-status planning-status-${planningGenerating ? 'generating' : planning?.status ?? 'loading'}`} role="status">
-              {planningLoading ? 'Loading' : planningGenerating ? 'Generating' : planning?.status?.replaceAll('_', ' ') ?? 'Unavailable'}
+            <span className={`planning-status planning-status-${planningGenerating ? 'generating' : planningDraftDirty ? 'stale' : planning?.status ?? 'loading'}`} role="status">
+              {planningLoading ? ru.planning.loading : planningGenerating ? ru.planning.understanding : planningStatusLabel(planningDraftDirty ? 'stale' : planning?.status)}
             </span>
-            <button className="quiet" onClick={() => void loadPlanning()} disabled={planningLoading || planningGenerating}>Reload plan</button>
+            <button className="quiet" onClick={() => void loadPlanning()} disabled={planningLoading || planningGenerating}>{ru.planning.reload}</button>
           </div>
         </div>
 
         {planning?.templateStatus !== 'ready' || !matchingScan ? (
           <div className="planning-notice" role="status">
-            Analyze the selected PowerPoint template before generating a plan.
+            {ru.planning.analyzeTemplateFirst}
           </div>
         ) : null}
-        {planningLoading && !planning ? <div className="planning-notice">Loading saved planning inputs…</div> : null}
-        {planningError ? <div className="error-banner planning-error" role="alert">{planningError}</div> : null}
-        {planning?.status === 'stale' ? <div className="planning-notice planning-notice-warning" role="status">
-          This saved outline uses earlier template, source, brief, or prompt inputs. Generate a new plan to refresh it.
-        </div> : null}
-        {planningFailure?.message ? <div className="planning-notice planning-notice-warning" role="status">
-          {stringValue(planningFailure.message)}{planningFailure.code ? ` (${stringValue(planningFailure.code)})` : ''}
-        </div> : null}
+        {planningLoading && !planning ? <div className="planning-notice" role="status">{ru.planning.loading}</div> : null}
+        <ErrorNotice failure={planningError} className="error-banner planning-error" />
+        {planning?.status === 'stale' ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.stale}</div> : null}
+        {planningDraftDirty ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.draftChanged}</div> : null}
+        {planningFailure?.message ? <ErrorNotice role="status" className="planning-notice planning-notice-warning" failure={{
+          message: friendlyErrorMessage(stringValue(planningFailure.code), 422, 'planning'),
+          ...(planningFailure.code ? { code: stringValue(planningFailure.code) } : {}),
+        }} /> : null}
 
         <div className="planning-form-grid">
           <fieldset className="planning-file-picker">
-            <legend>Source files <span>{planningSelectedPaths.length}/12 selected</span></legend>
+            <legend>{ru.planning.sourceFiles} <span>{ru.planning.selected(planningSelectedPaths.length)}</span></legend>
             {planningSourceFiles.length ? (
               <div className="planning-file-list">
                 {planningSourceFiles.map((file) => {
                   const path = filePath(file);
+                  const sourceStatus = contentSourceStatusByPath.get(path) as ContentSourceStatus | undefined ?? 'not-parsed';
                   return (
                     <label className="planning-file-option" key={path} title={path}>
                       <input
@@ -1056,52 +1191,55 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                         disabled={planningGenerating || (!planningSelectedPaths.includes(path) && planningSelectedPaths.length >= 12)}
                       />
                       <span>{path}</span>
+                      <small className="content-source-status" data-status={sourceStatus} aria-label={`${contentSourceStatusLabel(sourceStatus)}: ${path}`}>
+                        {contentSourceStatusLabel(sourceStatus)}
+                      </small>
                       <small>{formatBytes(file.size)}</small>
                     </label>
                   );
                 })}
               </div>
-            ) : <p className="planning-muted">Upload source material to choose files for the outline.</p>}
+            ) : <p className="planning-muted">{ru.planning.uploadSources}</p>}
           </fieldset>
 
           <div className="planning-brief">
-            <label>Audience
-              <input maxLength={500} value={briefAudience} onChange={(event) => setBriefAudience(event.target.value)} disabled={planningGenerating} placeholder="Who will use this presentation?" />
+            <label>{ru.planning.audience}
+              <input maxLength={500} value={briefAudience} onChange={(event) => setBriefAudience(event.target.value)} disabled={planningGenerating} placeholder={ru.planning.audiencePlaceholder} />
             </label>
-            <label>Purpose
-              <textarea maxLength={1000} value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)} disabled={planningGenerating} rows={2} placeholder="What should the presentation explain or support?" />
+            <label>{ru.planning.purpose}
+              <textarea maxLength={1000} value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)} disabled={planningGenerating} rows={2} placeholder={ru.planning.purposePlaceholder} />
             </label>
-            <label>Expected outcome
-              <textarea maxLength={1000} value={briefExpectedOutcome} onChange={(event) => setBriefExpectedOutcome(event.target.value)} disabled={planningGenerating} rows={2} placeholder="What should the audience understand or do?" />
+            <label>{ru.planning.outcome}
+              <textarea maxLength={1000} value={briefExpectedOutcome} onChange={(event) => setBriefExpectedOutcome(event.target.value)} disabled={planningGenerating} rows={2} placeholder={ru.planning.outcomePlaceholder} />
             </label>
-            <label>Preferences <span className="planning-label-note">one per line</span>
-              <textarea value={briefPreferences} onChange={(event) => setBriefPreferences(event.target.value)} disabled={planningGenerating} rows={2} placeholder="Optional style, emphasis, or constraints" />
+            <label>{ru.planning.preferences} <span className="planning-label-note">{ru.planning.perLine}</span>
+              <textarea value={briefPreferences} onChange={(event) => setBriefPreferences(event.target.value)} disabled={planningGenerating} rows={2} placeholder={ru.planning.preferencesPlaceholder} />
             </label>
-            <label className="planning-slide-count">Requested slide count <span className="planning-label-note">optional · 1–30</span>
-              <input type="number" min="1" max="30" step="1" value={requestedSlideCount} onChange={(event) => setRequestedSlideCount(event.target.value)} disabled={planningGenerating} placeholder="Auto" />
+            <label className="planning-slide-count">{ru.planning.slideCount} <span className="planning-label-note">{ru.planning.optionalRange}</span>
+              <input type="number" min="1" max="30" step="1" value={requestedSlideCount} onChange={(event) => setRequestedSlideCount(event.target.value)} disabled={planningGenerating} placeholder={ru.planning.automatic} />
             </label>
             <div className="planning-submit-row">
-              <span className="planning-muted">Requires a ready template and at least one source file.</span>
-              <button className="primary" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateLoading || planning?.templateStatus !== 'ready' || !matchingScan}>
-                {planningGenerating ? 'Generating…' : 'Generate plan'}
+              <span className="planning-muted">{ru.planning.requires}</span>
+              <button className="primary" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateFetching || templateAnalyzing || planning?.templateStatus !== 'ready' || !matchingScan}>
+                {planningGenerating ? ru.planning.generating : ru.planning.generate}
               </button>
             </div>
           </div>
         </div>
 
         {planningWarnings.length ? (
-          <div className="planning-warnings"><strong>Source warnings</strong><ul>{planningWarnings.map((warning, index) => <li key={`planning-warning-${index}`}>{readableValue(warning)}</li>)}</ul></div>
+          <details className="planning-warnings"><summary>{ru.planning.sourceWarningCount(planningWarnings.length)}</summary><p>{ru.planning.sourceWarningSummary}</p></details>
         ) : null}
 
         {planningDeckPlan ? (
           <section className="planning-result" aria-labelledby="planning-result-title">
             <div className="planning-result-head">
               <div>
-                <span className="eyebrow">{planningDeckPlan.id ? `PLAN ${stringValue(planningDeckPlan.id)}` : 'GENERATED OUTLINE'}</span>
-                <h3 id="planning-result-title">{stringValue(planningDeckPlan.workingTitle, 'Presentation outline')}</h3>
+                <span className="eyebrow">{ru.planning.generated}</span>
+                <h3 id="planning-result-title">{stringValue(planningDeckPlan.workingTitle, ru.planning.generatedTitle)}</h3>
                 <p>{stringValue(planningDeckPlan.narrativeSummary)}</p>
               </div>
-              {planning?.updatedAt ? <span className="planning-updated">Updated {new Date(planning.updatedAt).toLocaleString()}</span> : null}
+              {planning?.updatedAt ? <span className="planning-updated">{ru.planning.planUpdated(formatUiDateTime(new Date(planning.updatedAt)))}</span> : null}
             </div>
             <div className="planning-slide-grid">
               {planningSlides.map((slide, index) => {
@@ -1113,17 +1251,17 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                   <article className="planning-slide-card" key={stringValue(firstValue(item, ['id']), `slide-${index + 1}`)}>
                     <div className="planning-slide-card-head">
                       <strong>{stringValue(firstValue(item, ['order']), String(index + 1)).padStart(2, '0')}</strong>
-                      <span>{stringValue(firstValue(item, ['narrativeRole']), 'slide').replaceAll('-', ' ')}</span>
+                      <span>{ru.planning.narrativeRole(stringValue(firstValue(item, ['narrativeRole']), 'slide'))}</span>
                     </div>
-                    <h4>{stringValue(firstValue(item, ['purpose']), 'Purpose not reported')}</h4>
-                    <p className="planning-takeaway">{stringValue(firstValue(item, ['takeaway']), 'Takeaway not reported')}</p>
+                    <h4>{stringValue(firstValue(item, ['purpose']), ru.planning.purposeUnknown)}</h4>
+                    <p className="planning-takeaway">{stringValue(firstValue(item, ['takeaway']), ru.planning.takeawayUnknown)}</p>
                     <div className="planning-slide-meta">
-                      <span>{stringValue(firstValue(item, ['semanticVisualType']), 'Visual not reported')}</span>
-                      <span>{stringValue(firstValue(item, ['targetDensity']), 'Density not reported')}</span>
+                      <span>{ru.planning.visualType(stringValue(firstValue(item, ['semanticVisualType']), 'unknown'))}</span>
+                      <span>{ru.planning.density(stringValue(firstValue(item, ['targetDensity']), 'unknown'))}</span>
                     </div>
                     <div className="planning-source-paths">
-                      <strong>Sources</strong>
-                      {paths.length ? paths.map((path) => <span key={path} title={path}>{path}</span>) : <span>No source path cited</span>}
+                      <strong>{ru.planning.sources}</strong>
+                      {paths.length ? paths.map((path) => <span key={path} title={path}>{path}</span>) : <span>{ru.planning.noSource}</span>}
                     </div>
                   </article>
                 );
@@ -1133,43 +1271,44 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         ) : null}
 
         {planningReview ? (
-          <section className="planning-review" aria-label="Supervisor review">
+          <section className="planning-review" aria-label={ru.planning.reviewLabel}>
             <div className="planning-review-head">
-              <h3>Supervisor review</h3>
+              <h3>{ru.planning.reviewLabel}</h3>
               <span className={`planning-review-outcome outcome-${stringValue(planningReview.outcome, 'unknown')}`}>
-                {stringValue(planningReview.outcome, 'Outcome not reported').replaceAll('-', ' ')}
+                {ru.planning.reviewOutcome(stringValue(planningReview.outcome, 'unknown'))}
               </span>
             </div>
             {planningFindings.length ? (
               <ul>{planningFindings.map((finding, index) => {
                 const item = record(finding);
                 return <li key={`finding-${index}`}>
-                  <span className={`finding-severity severity-${stringValue(firstValue(item, ['severity']), 'unknown')}`}>{stringValue(firstValue(item, ['severity']), 'finding')}</span>
-                  <span>{stringValue(firstValue(item, ['reason']), 'Finding details not reported.')}</span>
-                  <small>{stringValue(firstValue(item, ['targetType']), 'deck')}{firstValue(item, ['slideId']) ? ` · ${stringValue(firstValue(item, ['slideId']))}` : ''}</small>
+                  <span className={`finding-severity severity-${stringValue(firstValue(item, ['severity']), 'unknown')}`}>{ru.planning.findingSeverity(stringValue(firstValue(item, ['severity']), 'unknown'))}</span>
+                  <span>{ru.planning.findingSummary(stringValue(firstValue(item, ['targetType']), 'slide'))}</span>
+                  <small>{ru.planning.targetType(stringValue(firstValue(item, ['targetType']), 'deck'))}</small>
                 </li>;
               })}</ul>
-            ) : <p className="planning-muted">No findings were reported.</p>}
+            ) : <p className="planning-muted">{ru.planning.noPlanFindings}</p>}
           </section>
         ) : null}
       </section>
 
       <PresentationGenerationPanel
         projectId={projectId}
-        planningReady={planning?.status === 'ready'}
+        planningReady={savedPlanReady}
         inputFingerprint={planning?.inputFingerprint ?? null}
         planHash={stringValue(firstValue(planningDeckPlan, ['hash']))}
         contentIRHash={stringValue(firstValue(contentIR, ['hash']))}
         templateIRHash={stringValue(firstValue(templateIR, ['hash']))}
+        onStateChange={reportGenerationState}
       />
 
       <div className="workspace-grid">
         <aside className="workspace-sidebar">
           <section className="sidebar-section">
-            <div className="sidebar-heading"><span>Files</span><span>{files.length}</span></div>
+            <div className="sidebar-heading"><span>{ru.workspace.files}</span><span>{files.length}</span></div>
             <div className="new-file-row">
-              <input value={newFileName} onChange={(event) => setNewFileName(event.target.value)} placeholder="new-file.html" />
-              <button className="quiet compact" onClick={() => void createTextFile()} disabled={busy || !newFileName.trim()}>+</button>
+              <input aria-label={ru.workspace.newFile} value={newFileName} onChange={(event) => setNewFileName(event.target.value)} placeholder={ru.workspace.newFile} />
+              <button className="quiet compact" aria-label={ru.workspace.createFile} title={ru.workspace.createFile} onClick={() => void createTextFile()} disabled={busy || !newFileName.trim()}>+</button>
             </div>
             <div className="file-list">
               {files.map((file) => {
@@ -1181,35 +1320,35 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                   </button>
                 );
               })}
-              {files.length === 0 ? <div className="sidebar-empty">Upload a PPTX, PDF, image or HTML deck to start.</div> : null}
+              {files.length === 0 ? <div className="sidebar-empty">{ru.workspace.emptyFiles}</div> : null}
             </div>
           </section>
 
           <section className="sidebar-section design-system-section">
-            <label className="sidebar-heading" htmlFor="design-system"><span>Design system</span></label>
+            <label className="sidebar-heading" htmlFor="design-system"><span>{ru.workspace.designSystem}</span></label>
             <select id="design-system" value={project?.designSystemId ?? ''} onChange={(event) => void applyDesignSystem(event.target.value)} disabled={busy}>
-              <option value="">Unspecified</option>
-              {designSystems.map((system) => <option key={system.id} value={system.id}>{system.displayName || system.name || system.id}</option>)}
+              <option value="">{ru.workspace.unspecified}</option>
+              {designSystems.map((system) => <option key={system.id} value={system.id}>{ru.workspace.designSystemLabel(system.displayName || system.name || system.id)}</option>)}
             </select>
-            <p className="sidebar-note">Uploaded template understanding should resolve into this project constraint, not into a generic style gallery.</p>
+            <p className="sidebar-note">{ru.workspace.designSystemNote}</p>
           </section>
         </aside>
 
         <section className="preview-panel">
           <div className="panel-header">
             <div>
-              <span className="eyebrow">LIVE PREVIEW</span>
-              <strong>{previewFile ?? 'No HTML output yet'}</strong>
+              <span className="eyebrow">{ru.workspace.livePreview}</span>
+              <strong>{previewFile ?? ru.workspace.noHtml}</strong>
             </div>
-            <button className="quiet" onClick={() => void refreshPreview()} disabled={!previewFile}>Refresh</button>
+            <button className="quiet" onClick={() => void refreshPreview()} disabled={!previewFile}>{ru.home.refresh}</button>
           </div>
           <div className="preview-stage">
             {previewUrl ? (
-              <iframe key={previewUrl} title="Presentation preview" src={previewUrl} sandbox="allow-scripts allow-same-origin allow-forms allow-popups" />
+                <iframe key={previewUrl} title={ru.workspace.previewTitle} src={previewUrl} sandbox="allow-scripts allow-same-origin allow-forms allow-popups" />
             ) : (
               <div className="preview-empty">
-                <strong>No renderable deck yet.</strong>
-                <span>Generate or upload an HTML presentation. The preview will bind to index.html automatically.</span>
+                <strong>{ru.workspace.noDeck}</strong>
+                <span>{ru.workspace.previewHint}</span>
               </div>
             )}
           </div>
@@ -1218,11 +1357,11 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         <section className="editor-panel">
           <div className="panel-header">
             <div>
-              <span className="eyebrow">SOURCE / EDIT</span>
-              <strong>{selectedFile ?? 'Select a file'}</strong>
+              <span className="eyebrow">{ru.workspace.sourceEdit}</span>
+              <strong>{selectedFile ?? ru.workspace.selectFile}</strong>
             </div>
             {selectedFile && isTextFile(selectedFile) ? (
-              <button className="primary" onClick={() => void saveText()} disabled={busy || !editorDirty}>{busy ? 'Saving…' : 'Save'}</button>
+              <button className="primary" onClick={() => void saveText()} disabled={busy || !editorDirty}>{busy ? ru.workspace.saving : ru.workspace.save}</button>
             ) : null}
           </div>
           {selectedFile && isTextFile(selectedFile) ? (
@@ -1234,7 +1373,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             />
           ) : (
             <div className="editor-empty">
-              {selectedFile ? 'Binary source selected. Keep it as reference/media; edit generated text/HTML files here.' : 'Select an HTML, CSS, JS, JSON, Markdown or text file to edit.'}
+              {selectedFile ? ru.workspace.binary : ru.workspace.editorHint}
             </div>
           )}
         </section>
@@ -1243,18 +1382,19 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   );
 }
 
-function PresentationGenerationPanel({ projectId, planningReady, inputFingerprint, planHash, contentIRHash, templateIRHash }: {
+function PresentationGenerationPanel({ projectId, planningReady, inputFingerprint, planHash, contentIRHash, templateIRHash, onStateChange }: {
   projectId: string;
   planningReady: boolean;
   inputFingerprint: string | null;
   planHash: string;
   contentIRHash: string;
   templateIRHash: string;
+  onStateChange: (complete: boolean, exported: boolean) => void;
 }) {
   const [generation, setGeneration] = useState<GenerationState | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<UiFailure | null>(null);
   const generationRef = useRef<GenerationState | null>(null);
   const idempotencyRef = useRef<string | null>(null);
   const activeRef = useRef(false);
@@ -1265,6 +1405,11 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
   useEffect(() => {
     if (generation && !matchesCurrentInputs(generation)) idempotencyRef.current = null;
   }, [generation?.generationId, generation?.status, inputFingerprint, planHash, contentIRHash, templateIRHash]);
+
+  useEffect(() => {
+    const isCurrent = matchesCurrentInputs(generation);
+    onStateChange(Boolean(isCurrent && generation?.status === 'completed'), Boolean(isCurrent && generation?.exports.length));
+  }, [contentIRHash, generation?.exports.length, generation?.generationId, generation?.status, inputFingerprint, onStateChange, planHash, templateIRHash]);
 
   const apply = useCallback((next: GenerationState | null) => {
     const current = generationRef.current;
@@ -1278,37 +1423,39 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
   const load = useCallback(async () => {
     try {
       const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/generation`, { cache: 'no-store' });
-      if (!response.ok) throw new Error(await errorMessage(response));
+      if (!response.ok) throw await errorMessage(response);
       const body = await response.json() as { generation?: GenerationState | null };
       apply(body.generation ?? null);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(uiFailure(err, ru.errors.render));
     } finally {
       setLoading(false);
     }
   }, [apply, projectId]);
 
+  useEffect(() => { void load(); }, [load, projectId]);
+
   useEffect(() => {
+    if (!generation || !activeRef.current) return;
     let disposed = false;
     let timer: number | undefined;
     const poll = async () => {
       await load();
       if (!disposed && activeRef.current) timer = window.setTimeout(() => void poll(), 850);
     };
-    void poll();
+    timer = window.setTimeout(() => void poll(), 850);
     return () => {
       disposed = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [load, projectId]);
+  }, [generation?.generationId, generation?.status, load, projectId]);
 
   const request = async (url: string, init: RequestInit = {}) => {
     const response = await fetch(url, init);
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (!response.ok) {
-      const message = await errorMessage(new Response(JSON.stringify(body), { status: response.status }));
-      throw new Error(message);
+      throw await errorMessage(new Response(JSON.stringify(body), { status: response.status }), 'generation');
     }
     return body ?? {};
   };
@@ -1317,7 +1464,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
     setBusy(key);
     setError(null);
     try { await operation(); }
-    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    catch (err) { setError(uiFailure(err, ru.errors.render)); }
     finally { setBusy(null); }
   };
 
@@ -1379,10 +1526,10 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
     });
   };
 
-  const exportDeck = (mode: 'selected' | GenerationVariantId) => {
-    void withBusy(`export-${mode}`, async () => {
+  const exportDeck = (mode: 'selected' | GenerationVariantId, format: 'pptx' | 'pdf' | 'html') => {
+    void withBusy(`export-${mode}-${format}`, async () => {
       const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/export`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, format }),
       }) as { state?: GenerationState };
       if (body.state) apply(body.state);
     });
@@ -1391,115 +1538,126 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
   const isActive = generation?.status === 'preparing' || generation?.status === 'generating';
   const currentGeneration = matchesCurrentInputs(generation);
   const canExport = currentGeneration && generation?.status === 'completed' && generation.readySlides === generation.totalSlides;
+  const canChooseTrack = Boolean(generation?.slides.length) && generation!.slides.every((pack) => pack.status === 'ready'
+    && ['A', 'B', 'C'].every((variant) => pack.variants[variant as GenerationVariantId]?.status === 'ready'));
 
   return (
     <section className="generation-panel" id="generation-panel" aria-labelledby="generation-panel-title">
       <div className="generation-panel-head">
         <div>
-          <span className="eyebrow">PROGRESSIVE SLIDE GENERATION</span>
-          <h2 id="generation-panel-title">Generate and review slide packs</h2>
-          <p>The saved outline is compiled into A/B/C alternatives once. Changing a selection does not run planning again.</p>
+          <span className="eyebrow">{ru.generation.eyebrow}</span>
+          <h2 id="generation-panel-title">{ru.generation.title}</h2>
+          <p>{ru.generation.description}</p>
         </div>
         <div className="generation-actions">
-          {isActive ? <button className="quiet" onClick={() => void cancel()} disabled={Boolean(busy)}>Cancel generation</button>
+          {isActive ? <button className="quiet" onClick={() => void cancel()} disabled={Boolean(busy)}>{ru.generation.cancel}</button>
             : <button className="primary" onClick={() => void start()} disabled={!planningReady || loading || Boolean(busy) || currentGeneration && (generation?.status === 'completed' || generation?.status === 'cancelled')}>
-              {currentGeneration && generation?.status === 'failed' ? 'Resume generation' : currentGeneration && generation?.status === 'completed' ? 'Generated' : 'Generate slide packs'}
+              {currentGeneration && generation?.status === 'failed' ? ru.generation.resume : currentGeneration && generation?.status === 'completed' ? ru.generation.generated : ru.generation.generate}
             </button>}
           <span className={`generation-status generation-status-${generation?.status ?? 'idle'}`} role="status">
-            {loading ? 'Loading saved generation' : generation?.status === 'completed' && !currentGeneration ? 'Plan changed · ready to regenerate' : generation ? generation.status.replaceAll('_', ' ') : planningReady ? 'Ready to generate' : 'Waiting for a ready plan'}
+            {loading ? ru.generation.loading : generation?.status === 'completed' && !currentGeneration ? ru.planning.planChanged : generation ? generationStatusLabel(generation.status) : planningReady ? ru.planning.readyToGenerate : ru.planning.waiting}
           </span>
         </div>
       </div>
 
-      {!planningReady ? <p className="generation-notice">Finish and save a valid plan before starting slide generation.</p> : null}
-      {error ? <p className="generation-error" role="alert">{error}</p> : null}
-      {generation?.failure ? <p className="generation-notice" role="status">{generation.failure.message}</p> : null}
+      {!planningReady ? <p className="generation-notice">{ru.generation.incompletePlan}</p> : null}
+      <ErrorNotice failure={error} className="generation-error" />
+      {generation?.failure ? <ErrorNotice role="status" className="generation-notice" failure={{
+        message: friendlyErrorMessage(generation.failure.code, 500, 'generation'), code: generation.failure.code,
+      }} /> : null}
 
       {generation ? <>
         <div className="generation-progress-row" role="status" aria-live="polite">
-          <strong>{generation.readySlides} / {generation.totalSlides} slides ready</strong>
-          <span>{generation.currentSlideId ? `Working on slide ${generation.slides.find((pack) => pack.slideId === generation.currentSlideId)?.index ?? ''}` : generation.status}</span>
+          <strong>{ru.generation.slideProgress(generation.readySlides, generation.totalSlides)}</strong>
+          <span>{generation.currentSlideId ? ru.generation.workingOnSlide(generation.slides.find((pack) => pack.slideId === generation.currentSlideId)?.index) : generationStatusLabel(generation.status)}</span>
         </div>
-        <div className="generation-track-picker" role="group" aria-label="Default deck track">
-          <span>Default track</span>
+        <div className="generation-track-picker" role="group" aria-label={ru.generation.defaultTrack}>
+          <span>{ru.generation.defaultTrack}</span>
           {(['A', 'B', 'C'] as const).map((variant) => <button key={variant} className={generation.defaultTrack === variant ? 'active' : ''}
-            aria-pressed={generation.defaultTrack === variant} disabled={Boolean(busy)} onClick={() => chooseTrack(variant)}>
-            All {variant}{variant === 'A' ? ' · recommended' : ''}
+            aria-pressed={generation.defaultTrack === variant} disabled={!canChooseTrack || Boolean(busy)} onClick={() => chooseTrack(variant)}>
+            {ru.generation.track(variant, variant === 'A')}
           </button>)}
         </div>
         <div className="generation-slide-list">
           {generation.slides.map((pack) => <article className="generation-slide-card" key={pack.slideId} aria-labelledby={`generation-slide-${pack.index}`}>
             <div className="generation-slide-heading">
-              <div><span>SLIDE {String(pack.index).padStart(2, '0')}</span><h3 id={`generation-slide-${pack.index}`}>{pack.title}</h3></div>
-              <div className={`generation-pack-status pack-status-${pack.status}`} role="status">{pack.status}</div>
+              <div><span>{ru.generation.slide(String(pack.index).padStart(2, '0'))}</span><h3 id={`generation-slide-${pack.index}`}>{pack.title}</h3></div>
+              <div className={`generation-pack-status pack-status-${pack.status}`} role="status">{slidePackStatusLabel(pack.status, pack.failure?.code)}</div>
             </div>
+            {pack.failure?.code === 'VARIANTS_NOT_DISTINCT' ? <p className="generation-notice" role="status">{ru.generation.withheldReason}</p> : null}
             <div className="generation-variants">
               {(['A', 'B', 'C'] as const).map((variant) => {
                 const item = pack.variants[variant];
                 const audit = item.audit?.findings ?? [];
-                return <section className={`generation-variant ${pack.selectedVariant === variant ? 'selected' : ''}`} key={variant} aria-label={`Slide ${pack.index}, variant ${variant}`}>
+                const unavailablePack = pack.failure?.code === 'VARIANTS_NOT_DISTINCT';
+                const visibleVariantStatus = unavailablePack ? 'withheld' : item.status;
+                const variantReady = pack.status === 'ready' && item.status === 'ready';
+                return <section className={`generation-variant ${pack.selectedVariant === variant ? 'selected' : ''}`} key={variant} aria-label={ru.generation.slideVariantLabel(pack.index, variant)}>
                   <div className="generation-variant-heading">
-                    <strong>Variant {variant}</strong>
-                    {pack.recommendedVariant === variant ? <span className="recommended-mark">Recommended</span> : null}
+                    <strong>{ru.generation.variant(variant)}</strong>
+                    {pack.recommendedVariant === variant ? <span className="recommended-mark">{ru.generation.recommended}</span> : null}
+                    {pack.lockedVariant === variant ? <span className="locked-mark">{ru.generation.locked(variant)}</span> : null}
+                    <span className="variant-status" data-status={visibleVariantStatus}>{variantStatusLabel(visibleVariantStatus)}</span>
                   </div>
-                  {item.previewUrl ? <img className="generation-preview" src={`${item.previewUrl}?v=${item.version}`} alt={`Slide ${pack.index}, variant ${variant} preview`} />
-                    : <div className="generation-preview-empty" role="status">{pack.status === 'rendering' ? 'Preparing preview…' : item.status}</div>}
+                  {item.previewUrl ? <img className="generation-preview" src={`${item.previewUrl}?v=${item.version}`} alt={ru.generation.previewAlt(pack.index, variant)} />
+                    : <div className="generation-preview-empty" role="status">{unavailablePack ? ru.generation.withheldReason : pack.status === 'rendering' ? ru.generation.preparingPreview : item.status === 'failed' ? ru.generation.noPreview : variantStatusLabel(item.status)}</div>}
                   <div className="generation-variant-meta">
-                    <span>{item.visualSlotStatus === 'not-applicable' ? 'Text slide' : `Visual ${item.visualSlotStatus}`}</span>
-                    {item.layoutIssueCount ? <span>{item.layoutIssueCount} preview layout note(s)</span> : null}
-                    <span>{audit.length} audit finding(s)</span>
+                    <span>{item.visualSlotStatus === 'not-applicable' ? ru.generation.textSlide : ru.generation.visual(ru.status[item.visualSlotStatus as keyof typeof ru.status] ?? ru.status.unknown)}</span>
+                    {item.layoutIssueCount ? <span>{ru.generation.layoutNotes(item.layoutIssueCount)}</span> : null}
+                    <span>{ru.generation.auditCounts(audit.length)}</span>
                   </div>
                   <button className={pack.selectedVariant === variant ? 'primary generation-select' : 'quiet generation-select'}
-                    aria-pressed={pack.selectedVariant === variant} disabled={pack.status !== 'ready' || Boolean(busy)}
+                    aria-pressed={pack.selectedVariant === variant} disabled={!variantReady || Boolean(busy)}
                     onClick={() => chooseSlide(pack, variant)}>
-                    {pack.selectedVariant === variant ? `Selected ${variant}` : `Choose ${variant}`}
+                    {pack.selectedVariant === variant ? ru.generation.selected(variant) : ru.generation.choose(variant)}
                   </button>
                 </section>;
               })}
             </div>
             <div className="generation-slide-footer">
-              <span className="generation-audit-badge" data-errors={pack.auditSummary.errors > 0}>
-                A/B/C: {pack.auditSummary.errors} errors · {pack.auditSummary.warnings} warnings
+              <span className="generation-audit-badge" data-errors={pack.auditSummary.errors > 0} aria-label={ru.generation.audit}>
+                {ru.generation.auditSummary(pack.auditSummary.errors, pack.auditSummary.warnings)}
               </span>
               <button className="quiet" disabled={pack.status !== 'ready' || Boolean(busy)} onClick={() => toggleLock(pack)}>
-                {pack.lockedVariant ? `Unlock ${pack.lockedVariant}` : `Lock ${pack.selectedVariant}`}
+                {pack.lockedVariant ? ru.generation.unlock(pack.lockedVariant) : ru.generation.lock(pack.selectedVariant)}
               </button>
               <details className="generation-audit" id={pack.index === 1 ? 'generation-review' : undefined}>
-                <summary>Audit findings</summary>
+                <summary>{ru.generation.audit}</summary>
                 {pack.variants[pack.selectedVariant].audit?.findings?.length ? <ul>
                   {pack.variants[pack.selectedVariant].audit?.findings?.map((findingValue, index) => {
                     const finding = record(findingValue);
                     const findingId = stringValue(firstValue(finding, ['id']));
                     const rule = stringValue(firstValue(finding, ['ruleId']), 'audit');
-                    const message = stringValue(firstValue(finding, ['message']), 'Finding details are unavailable.');
                     const safeFix = firstValue(finding, ['autofixAvailable']) === true;
                     return <li key={`${findingId}-${index}`}>
-                      <span><strong>{rule}</strong> · {message}</span>
-                      {safeFix ? <button className="quiet compact" disabled={Boolean(busy)} onClick={() => repair(pack, pack.selectedVariant, findingId)}>Apply safe fix</button> : <small>Replan required</small>}
+                      <span>{auditFindingMessage(rule)}</span>
+                      {safeFix ? <button className="quiet compact" disabled={Boolean(busy)} onClick={() => repair(pack, pack.selectedVariant, findingId)}>{ru.generation.applyFix}</button> : <small>{ru.generation.replan}</small>}
                     </li>;
                   })}
-                </ul> : <p>No deterministic findings for the selected variant.</p>}
+                </ul> : <p>{ru.generation.noAuditFindings}</p>}
               </details>
             </div>
-            {pack.failure ? <p className="generation-notice" role="alert">{pack.failure.message}</p> : null}
+            {pack.failure && pack.failure.code !== 'VARIANTS_NOT_DISTINCT' ? <ErrorNotice role="status" className="generation-notice" failure={{
+              message: friendlyErrorMessage(pack.failure.code, 422, 'generation'), code: pack.failure.code,
+            }} /> : null}
           </article>)}
         </div>
 
         <section className="generation-export" aria-labelledby="generation-export-title">
-          <div><span className="eyebrow">REVIEW / EXPORT</span><h3 id="generation-export-title">Download editable PowerPoint</h3>
-            <p>Exports become available after package reopen validation. PowerPoint desktop rendering has not been reviewed.</p></div>
+          <div><span className="eyebrow">{ru.generation.exportTitle}</span><h3 id="generation-export-title">{ru.generation.exportHeading}</h3>
+            <p>{ru.generation.exportDescription}</p></div>
           <div className="generation-export-actions">
-            {(['selected', 'A', 'B', 'C'] as const).map((mode) => <button key={mode} className={mode === 'selected' ? 'primary' : 'quiet'}
-              disabled={!canExport || Boolean(busy)} onClick={() => exportDeck(mode)}>
-              {busy === `export-${mode}` ? 'Assembling…' : mode === 'selected' ? 'Download selected PPTX' : `Download ${mode}`}
-            </button>)}
+            {(['selected', 'A', 'B', 'C'] as const).flatMap((mode) => (['pptx', 'pdf', 'html'] as const).map((format) => <button key={`${mode}-${format}`} className={mode === 'selected' && format === 'pptx' ? 'primary' : 'quiet'}
+              disabled={!canExport || Boolean(busy)} onClick={() => exportDeck(mode, format)}>
+              {busy === `export-${mode}-${format}` ? ru.generation.assembling : ru.generation.exportAction(mode, format)}
+            </button>))}
           </div>
           {generation.exports.length ? <ul className="generation-export-list">{generation.exports.map((artifact) => <li key={artifact.id}>
-            <a href={artifact.downloadUrl}>Download {artifact.mode === 'selected' ? 'selected deck' : `track ${artifact.mode}`}</a>
-            <span>package validation passed · native Office review unknown</span>
+            <a href={artifact.downloadUrl} download>{ru.generation.exportAction(artifact.mode, artifact.format ?? 'pptx')}</a>
+            <span>{ru.generation.validated}</span>
           </li>)}</ul> : null}
         </section>
-      </> : <p className="generation-notice">A/B/C slide alternatives and previews will appear here as each pack is ready.</p>}
+      </> : <p className="generation-notice">{ru.generation.noGeneration}</p>}
     </section>
   );
 }

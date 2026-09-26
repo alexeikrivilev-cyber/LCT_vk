@@ -51,6 +51,24 @@ export interface PptxRenderResult {
     titleBodyFontHierarchy: { titlePt: number; bodyPt: number; ratio: number } | null;
     selectionReason: string;
   }[];
+  /** Internal post-reopen visual evidence. It is diagnostic data, not part of the safety audit/API. */
+  qualityEvidence?: {
+    textObjects: readonly {
+      slideId: string;
+      shapeId: string;
+      role: 'title' | 'body' | 'other';
+      textSha256: string;
+      textLength: number;
+      fontSizePt: number | null;
+      color: string | null;
+      autoFitScale: number | null;
+      bounds: { x: number; y: number; width: number; height: number } | null;
+    }[];
+    sourceContentResidue: {
+      status: 'checked' | 'not-applicable';
+      findings: readonly { slideId: string; sourceSlideIndex: number; sourceElementId: string; textSha256: string; outputShapeId: string }[];
+    };
+  };
 }
 
 /** A backend materializes one already-compiled deck without narrative decisions. */

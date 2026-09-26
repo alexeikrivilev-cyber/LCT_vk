@@ -1,237 +1,42 @@
-# Models, prompts, and skills
+# Модели и versioned instructions
 
-## Runtime policy
+В таблице различаются model checkpoint, публичный model alias и целевая интеграция. Карточки проверены 2026-09-26. Pinned revision фиксирует snapshot, но не подтверждает GPU fit, качество или latency.
 
-The semantic runtime target uses `Qwen/Qwen3.8-27B` through one logical inference service. Worker and supervisor share the same semantic weights and receive independently supplied request contexts. The current adapter is stateless and does not create persistent sessions or distinct KV namespaces.
+## Семантическая модель
 
-`INFERENCE.md` is canonical for physical GPU profiles, precision, sharding, prefix-cache warmup, scheduling, media inference, and the 300-second deadline. Do not duplicate those deployment details here.
+| Модель / source | Версия / revision | Размер / license / open-weight | Почему выбрана и роль | I/O и serving requirement | VRAM/profile | Fallback |
+|---|---|---|---|---|---|---|
+| [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | 27B; примерно 55.6 GB Hub files; BF16; Apache-2.0; открытые веса | Ожидаемая семантическая модель кейса; Worker/ Supervisor и опциональный Template Profiler | Brief, TemplateIR/ContentIR evidence → strict JSON Schema. Нужен self-hosted serving container либо совместимый remote endpoint | Self-hosted `A100_BF16`; заявленный GPU profile 80 GB, `max-model-len=16384`. Полный fit/KV/concurrency не квалифицированы | Фактически подтверждённого model fallback нет. Локальный fake — только dev; VK endpoint обязателен для top-10 и пока не проверен |
+| [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) | `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` | 27B; примерно 30.9 GB Hub files; FP8; Apache-2.0; открытые веса | Альтернативный проверяемый self-hosted precision profile той же semantic модели; не считается автоматическим fallback | Тот же JSON Schema запрос/ответ; нужен serving runtime с совместимой precision/hardware path | Self-hosted `H100_FP8`; заявленный GPU profile 80 GB, `max-model-len=32768`. Throughput/KV margin не измерены | BF16 profile — другой runtime/precision выбор, его нельзя подставлять молча; VK inference остаётся целевым final route |
+| Organizer-provided [VK inference Qwen 3.8 27B](./docs/compliance/CASE_REQUIREMENTS.md) | Точный endpoint/model revision неизвестен до organizer config | Требование кейса — Qwen 3.8 27B с remote VK inference; license/serving metadata нужно подтвердить для предоставленного checkpoint | Выбрана требованием top-10, не локальным benchmark | Те же application requests предполагаются только при подтверждённом adapter protocol, auth и strict schema support | VRAM/provider capacity управляет VK; данные неизвестны | Self-hosted RunPod не выполняет требование VK. Квалифицированного альтернативного provider пока нет |
 
-## Agent roles
+Размер файлов модели на Hub не равен свободной VRAM: runtime, KV cache, context и одновременные запросы используют дополнительную память. Смотрите [inference profiles](./INFERENCE.md) и [self-hosted runtime](./services/inference/README.md).
 
-### Worker
+### VK endpoint
 
-Worker owns forward semantic generation and user-requested semantic edits:
+Организаторский VK inference — целевой, но не проверенный путь. Приложение настраивает базовый URL, model alias и необязательный bearer key; endpoint должен поддерживать используемый OpenAI Chat Completions и strict JSON Schema request. Точные authentication fields, schema support, model revision и SLA нужно подтвердить у организатора. При remote endpoint локальный snapshot и model volume не нужны. При совпадении протокола Worker/Supervisor/application logic не меняются; live-интеграция пока не квалифицирована.
 
-- understand the brief and supplied content;
-- build the narrative and `DeckPlan`;
-- write conclusion-style titles and slide copy;
-- label template/layout semantics when exact parsing cannot provide meaning;
-- rank valid layout candidates;
-- choose semantic visual types;
-- create A/B/C decisions for each slide pack from one shared plan;
-- request/select same-type visual candidates;
-- perform local regeneration and scoped re-plans.
+### Image models
 
-Worker is the only role that initiates broad planning/re-planning. After the plan exists, it keeps producing the next slide pack until the deck is complete unless application state explicitly pauses/cancels or invalidates future plan scope.
+| Путь/модель | Параметры / версия | Лицензия / открытые веса | Назначение и вывод |
+|---|---|---|---|
+| [gpt-image-1](https://developers.openai.com/api/docs/models/gpt-image-1) | Кодовый alias по умолчанию необязательного image API; количество параметров и revision не заявлены | Размещённая модель; веса не доступны конфигурации приложения | Не проходит требование only open-weight. Не использовать в hackathon qualification; подключение к доказанному A/B/C пути отсутствует |
+| [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) | 7B, BF16 по карточке | Qwen Research License Agreement, не Apache-2.0/MIT | Кандидат не включён в базовую поставку и не подходит под документированный license gate |
 
-### Supervisor
+Модель изображений не включена в базовую поставку. `gpt-image-1` — только необязательный конфигурационный default текущего image API path; он не open-weight и не является соответствующим кейсу выбором. Генерация изображений не квалифицирована как соответствующая кейсу. До подтверждённо допустимой модели и end-to-end проверки нельзя заявлять соответствие image task.
 
-Supervisor is a bounded critic/repair role over the same model weights with separate instructions and mutable context.
+## Граница inference
 
-It reviews versioned checkpoints, rendered screenshots, structured specs, deterministic findings, locks, and deadline state. It should catch high-value semantic/compositional mistakes and return a small structured repair or local-replan request.
+SemanticInferenceAdapter получает role, operation, messages и schema; приложение валидирует ответ до изменения состояния. Worker и Supervisor — два запроса одного логического model service, не отдельные веса, процесс или persistent KV sessions. Конфигурация: [справочник env](./docs/getting-started/configuration.md) и [INFERENCE.md](./INFERENCE.md).
 
-Supervisor must not independently regenerate a deck, maintain a competing plan, bypass validation/locks, mutate PPTX structure directly, or become a serial approval gate between slide packs.
+## Agent / skill / prompt / schema версии
 
-Supervisor output is a validated `SupervisorDecision` tied to a checkpoint version. Stale/invalid/lock-conflicting decisions are rejected by code.
+| Роль | Agent и skill | Prompt | Schema | Назначение |
+|---|---|---|---|---|
+| Worker | deck-plan-worker.v1 / presentation-planning.v1 | worker-deck-plan.v2 | deck_plan_draft_v1 | План презентации из брифа и фактов ContentIR |
+| Supervisor | plan-review-supervisor.v1 / bounded-plan-review.v1 | supervisor-plan-review.v1 | supervisor_plan_review_v1 | Bounded review и предложение patch/re-plan |
+| Template profiler | template-profiler.v1 / template-semantics.v1 | template-profiler.v1 | template_semantic_profile_v1 | Разметить роли по фактам TemplateIR без выбора макета |
 
-### Implemented planning slice
+Workflow metadata: [agent-workflows.v1.json](./apps/daemon/src/presentation/contracts/agent-workflows.v1.json) и [template-profiler.v1.json](./apps/daemon/src/presentation/contracts/template-profiler.v1.json). Runtime prompt files: [worker](./apps/daemon/prompts/worker-deck-plan.v2.md), [supervisor](./apps/daemon/prompts/supervisor-plan-review.v1.md), [template profiler](./apps/daemon/prompts/template-profiler.v1.md). Planning fingerprint включает prompt/config hashes; profiler cache разделён по hash шаблона и prompt/config fingerprint.
 
-The current planning slice uses the versioned assets `apps/daemon/prompts/worker-deck-plan.v2.md` and `apps/daemon/prompts/supervisor-plan-review.v1.md`. Worker receives the validated brief, compact text/structured ContentIR evidence, and a bounded PresentationDesignSystem summary; it returns a DeckPlan draft without app ids, geometry, or renderer state. Image-only metadata is omitted from Worker context because no VLM extraction exists; image references remain in canonical ContentIR but cannot be cited as factual evidence. The application assigns canonical ids/order and validates all textual/structured content references. TemplateIR/PDS hashes, source and brief hashes, and both prompt-file SHA-256 values feed the input fingerprint. Supervisor reviews that immutable checkpoint and may pass, warn, propose an allowlisted patch, or request one local Worker re-plan. The application validates and persists the result. The planning API slice is exercised with fake inference; it does not verify Qwen quality or remote serving behavior.
-
-## Responsibility split
-
-Use the model for semantic decisions:
-
-- narrative and slide purpose;
-- wording;
-- semantic template/layout labeling;
-- ranking among valid structures;
-- visual-type choice;
-- treatment choice inside allowed structures;
-- recommended candidate selection;
-- contextual review;
-- bounded semantic repair.
-
-Use deterministic/programmatic logic for:
-
-- exact PPTX geometry/colors/fonts/relationships;
-- hard layout constraints/compatibility;
-- stable ids, checkpoint versions, and generation queue state;
-- locks and conflict detection;
-- native PPTX construction;
-- deterministic audit;
-- persistence/event publication;
-- deadline accounting and scheduling;
-- export integrity.
-
-The goal is to constrain model search space, not ask a 27B model to be the renderer or state machine.
-
-## Structured outputs
-
-Every model operation has a narrow machine-validated contract.
-
-Prefer stable ids, enums, bounded lists, expected checkpoint versions, and explicit patch operations. Validate before committing state. Malformed prose never reaches rendering or mutation.
-
-Model responses may reference only ids supplied in context. Supervisor patches must identify exact targets and expected source version.
-
-## Prompt and context architecture
-
-Separate **static instructions** from **mutable project evidence**.
-
-### Static instructions
-
-Guaranteed worker/supervisor pipeline instructions, role rules, stage prompts, tool/schema contracts, and stable architecture constraints are versioned assets. A serving runtime may prewarm reusable immutable prompt prefixes as described in `INFERENCE.md`; the adapter itself sends complete requests and does not provide role-specific cache namespaces.
-
-This means a stage does not repeatedly pay the cost of prefilling instructions that are known in advance to be required during every normal generation.
-
-### Mutable/project context
-
-Each call still receives only the project evidence needed for that decision:
-
-Worker examples:
-
-- brief/content slice;
-- relevant `PresentationDesignSystem` rules;
-- compatible layouts/slots;
-- current plan/selection/locks for the affected scope.
-
-Supervisor examples:
-
-- checkpoint under review;
-- concise source/plan context;
-- screenshot(s) where visual judgment matters;
-- deterministic findings;
-- locks;
-- deadline remaining.
-
-Do not put raw PPTX XML, the whole content package, every layout, all project history, or optional craft material into every call. Keep changing evidence narrow; a serving runtime may reuse stable instruction prefixes as an optimization.
-
-Project-specific immutable summaries may be prefix-cached after compilation when reuse is measurable, but they remain project/version scoped in application requests. Cache reuse is an optimization, not session history or an isolation boundary.
-
-## Skill architecture
-
-Use a thin orchestration layer and narrow specialized skills/capabilities.
-
-```text
-worker
-  presentation-orchestrator
-    -> template-semantics
-    -> deck-planner
-    -> layout-ranker / slide-pack planner
-    -> visual-planner
-    -> local-repair / re-plan
-
-supervisor
-  supervisor-review
-    -> plan-review
-    -> slide/contextual-review
-    -> visual-relevance-review
-    -> bounded-repair proposal
-```
-
-These capabilities do not create more runtime agent personas. Runtime semantic roles remain exactly Worker and Supervisor.
-
-Worker and Supervisor instructions are separate versioned files even though they share base-model weights.
-
-A skill should:
-
-- solve one repeatable semantic task;
-- define inputs, constraints, checkpoint expectations, and structured output;
-- reference canonical docs rather than copy long product rules;
-- avoid credentials/transport details;
-- avoid exact geometry/render/export responsibilities;
-- be independently benchmarkable/versionable.
-
-Prompts, few-shot examples, instruction bundles, and model configuration belong in versioned files, not large TypeScript literals.
-
-## Prompt style
-
-Prompt for goal, evidence, allowed choices, constraints, and output schema. Avoid verbose hidden workflows that deterministic code can enforce.
-
-Prefer:
-
-- choose among supplied compatible layouts, not invent coordinates;
-- fill known semantic slots, not position arbitrary objects;
-- rewrite one target, not regenerate unrelated slides;
-- return one bounded Supervisor finding/patch, not a replacement deck.
-
-Prompt text may remind the model about locks/selections, but programmatic enforcement remains the real boundary.
-
-## Continuous generation semantics
-
-Model orchestration must align with the product's progressive flow:
-
-- one shared `DeckPlan` precedes slide generation;
-- produce A/B/C as one logical slide pack;
-- commit/publish a valid pack and immediately continue toward the next planned slide;
-- do not wait for user selection before continuing;
-- allow Supervisor to review completed checkpoints opportunistically while Worker moves forward;
-- allow visual candidates to update already-published slots asynchronously;
-- local edits to ready slides do not restart unrelated pending generation.
-
-The model is not responsible for event delivery or queue correctness; the application scheduler/state machine is.
-
-## Versioning and traceability
-
-Every generated deck should record:
-
-- semantic model id/revision and serving profile;
-- Worker instruction/skill bundle version;
-- Supervisor instruction/skill bundle version;
-- immutable prompt-prefix versions;
-- template compiler/renderer/audit versions;
-- media model/revision;
-- generation timestamp;
-- candidate/selection lineage.
-
-Do not require exact stochastic reproducibility when unavailable. Preserve enough configuration to diagnose regressions.
-
-## Offline behavioral optimization
-
-A stronger offline critic may improve prompts/skills during development. It is not a runtime dependency and is distinct from Supervisor.
-
-Use a fixed benchmark loop:
-
-```text
-runtime model + current instructions
-  -> generated decks
-  -> deterministic metrics + screenshots + audit + runtime telemetry
-  -> offline critic proposes a specific patch
-  -> apply candidate patch
-  -> rerun full benchmark
-  -> accept only if aggregate quality improves without hard-gate regression
-  -> version accepted instructions
-```
-
-This is behavioral distillation into instructions/examples/retrieval/constraints/validators, not weight distillation.
-
-Runtime Supervisor fixes deck-specific issues. Offline critic improves the system across benchmark runs. Do not conflate them.
-
-## Benchmark dimensions
-
-Track:
-
-- template/layout compliance;
-- overflow/overlap and native editability;
-- A/B/C slide/visual validity;
-- progressive time-to-first-pack and pack cadence;
-- lock/local-edit preservation during background generation;
-- deterministic/contextual audit quality;
-- Supervisor repair value versus latency;
-- total runtime and failure rate;
-- prefix/KV cache pressure.
-
-Keep held-out unseen-template evaluation separate enough to detect overfitting.
-
-## Runtime failure behavior
-
-If model output is invalid/unavailable:
-
-1. preserve current project/ready-slide state;
-2. cancel stale work;
-3. retry through a bounded policy;
-4. use deterministic/default choices when safe;
-5. keep unrelated slide generation moving where possible;
-6. expose an actionable failure when semantics cannot be recovered safely.
-
-Never corrupt the template, selections, locks, ready packs, or deadline state merely to make progress.
+System prompts сохранены на английском, чтобы локализация справочной документации не меняла поведение модели. Каталог skills/ содержит reference skills для авторской работы; planning runtime не загружает их содержимое автоматически. Agent roles — логические договорённости, а не отдельные процессы.

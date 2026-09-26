@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { compileContentIR } from './content-compiler.js';
 import {
@@ -17,6 +18,13 @@ import {
 } from '../domain/deck-plan.js';
 import { validateContentIR, type ContentIR } from '../domain/content-ir.js';
 import {
+  AGENT_WORKFLOW_CONTRACT_SHA256,
+  AGENT_WORKFLOW_VERSIONS,
+  LEGACY_UNRECORDED_WORKFLOW_VERSIONS,
+  isAgentWorkflowVersions,
+  type AgentWorkflowVersions,
+} from './workflow-versions.js';
+import {
   getTemplateCompilation,
   type TemplateCompilationResponse,
 } from './template-compiler.js';
@@ -29,8 +37,8 @@ import {
   type SemanticInferenceTelemetry,
 } from './semantic-inference-port.js';
 
-export const WORKER_PLAN_PROMPT_VERSION = 'worker-deck-plan.v2';
-export const SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION = 'supervisor-plan-review.v1';
+export const WORKER_PLAN_PROMPT_VERSION = AGENT_WORKFLOW_VERSIONS.worker.promptVersion;
+export const SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION = AGENT_WORKFLOW_VERSIONS.supervisor.promptVersion;
 const MAX_SELECTED_FILES = 12;
 const MAX_EVIDENCE_CHARS = 256 * 1024;
 const MAX_FINDINGS = 12;
@@ -112,6 +120,7 @@ interface SuccessfulPlanSnapshot {
   review: PlanReview;
   telemetry: PlanningTelemetry;
   promptVersions: { worker: string; supervisor: string };
+  agentWorkflowVersions: AgentWorkflowVersions;
   model: string;
   createdAt: string;
 }
@@ -138,6 +147,7 @@ export interface PlanningResponse {
   review: PlanReview | null;
   telemetry: PlanningTelemetry | null;
   promptVersions: { worker: string; supervisor: string };
+  agentWorkflowVersions: AgentWorkflowVersions | null;
   failure: PlanningFailure | null;
   warnings: string[];
   updatedAt: string | null;
@@ -195,6 +205,7 @@ export function planningInputFingerprint(input: {
   briefHash: string;
   workerPromptSha256: string;
   supervisorPromptSha256: string;
+  agentWorkflowContractSha256?: string;
 }): string {
   return sha256({
     templateIRHash: input.templateIRHash,
@@ -205,6 +216,7 @@ export function planningInputFingerprint(input: {
     workerPromptSha256: input.workerPromptSha256,
     supervisorPromptVersion: SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION,
     supervisorPromptSha256: input.supervisorPromptSha256,
+    agentWorkflowContractSha256: input.agentWorkflowContractSha256 ?? AGENT_WORKFLOW_CONTRACT_SHA256,
   });
 }
 
@@ -216,21 +228,37 @@ interface PlanningPromptAssets {
 }
 
 async function readPlanningPromptAssets(projectRoot: string): Promise<PlanningPromptAssets> {
-  const promptRoot = path.join(projectRoot, 'apps', 'daemon', 'prompts');
-  try {
-    const [worker, supervisor] = await Promise.all([
-      readFile(path.join(promptRoot, 'worker-deck-plan.v2.md'), 'utf8'),
-      readFile(path.join(promptRoot, 'supervisor-plan-review.v1.md'), 'utf8'),
-    ]);
-    return {
-      worker,
-      supervisor,
-      workerSha256: createHash('sha256').update(worker, 'utf8').digest('hex'),
-      supervisorSha256: createHash('sha256').update(supervisor, 'utf8').digest('hex'),
-    };
-  } catch (error) {
-    throw new PlanningServiceError('PROMPT_ASSET_UNAVAILABLE', 'Versioned planning instructions are unavailable. Restore the prompt assets and retry.', 500, { cause: error });
+  const promptFile = (version: string) => {
+    if (!/^[a-z0-9][a-z0-9.-]*\.v[0-9]+$/.test(version)) {
+      throw new PlanningServiceError('PROMPT_ASSET_UNAVAILABLE', 'Planning prompt version is invalid.', 500);
+    }
+    return `${version}.md`;
+  };
+  const workerFile = promptFile(WORKER_PLAN_PROMPT_VERSION);
+  const supervisorFile = promptFile(SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION);
+  const modulePromptRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../prompts');
+  const promptRoots = [...new Set([
+    path.join(projectRoot, 'apps', 'daemon', 'prompts'),
+    modulePromptRoot,
+  ])];
+  let cause: unknown;
+  for (const promptRoot of promptRoots) {
+    try {
+      const [worker, supervisor] = await Promise.all([
+        readFile(path.join(promptRoot, workerFile), 'utf8'),
+        readFile(path.join(promptRoot, supervisorFile), 'utf8'),
+      ]);
+      return {
+        worker,
+        supervisor,
+        workerSha256: createHash('sha256').update(worker, 'utf8').digest('hex'),
+        supervisorSha256: createHash('sha256').update(supervisor, 'utf8').digest('hex'),
+      };
+    } catch (error) {
+      cause = error;
+    }
   }
+  throw new PlanningServiceError('PROMPT_ASSET_UNAVAILABLE', 'Versioned planning instructions are unavailable. Restore the prompt assets and retry.', 500, { cause });
 }
 
 async function statePath(projectsRoot: string, projectId: string): Promise<string> {
@@ -513,13 +541,16 @@ function validateStoredState(value: unknown): StoredPlanningState {
   let lastSuccessful: SuccessfulPlanSnapshot | null = null;
   if (value.lastSuccessful !== null) {
     const saved = value.lastSuccessful;
-    if (!isRecord(saved) || !exactKeys(saved, [
+    const savedKeys = [
       'contentFiles', 'brief', 'contentIR', 'inputFingerprint', 'checkpoint', 'deckPlan', 'review', 'telemetry', 'promptVersions', 'model', 'createdAt',
-    ]) || !Array.isArray(saved.contentFiles) || saved.contentFiles.length > MAX_SELECTED_FILES
+    ];
+    if (!isRecord(saved) || !(exactKeys(saved, savedKeys) || exactKeys(saved, [...savedKeys, 'agentWorkflowVersions']))
+        || !Array.isArray(saved.contentFiles) || saved.contentFiles.length > MAX_SELECTED_FILES
         || saved.contentFiles.some((item) => typeof item !== 'string') || !isHexHash(saved.inputFingerprint)
         || !isRecord(saved.promptVersions) || !exactKeys(saved.promptVersions, ['worker', 'supervisor'])
         || !['worker-deck-plan.v1', WORKER_PLAN_PROMPT_VERSION].includes(String(saved.promptVersions.worker))
         || saved.promptVersions.supervisor !== SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION
+        || !(saved.agentWorkflowVersions === undefined || isAgentWorkflowVersions(saved.agentWorkflowVersions))
         || typeof saved.model !== 'string' || saved.model.length > 256
         || typeof saved.createdAt !== 'string' || !Number.isFinite(Date.parse(saved.createdAt))
         || !isRecord(saved.telemetry)
@@ -556,6 +587,7 @@ function validateStoredState(value: unknown): StoredPlanningState {
       review: validatePlanReviewState(saved.review, checkpoint, contentIR),
       telemetry,
       promptVersions: { worker: String(saved.promptVersions.worker), supervisor: String(saved.promptVersions.supervisor) },
+      agentWorkflowVersions: saved.agentWorkflowVersions === undefined ? LEGACY_UNRECORDED_WORKFLOW_VERSIONS : saved.agentWorkflowVersions,
       model: saved.model,
       createdAt: saved.createdAt,
     };
@@ -606,6 +638,7 @@ function publicResponse(
     review: success?.review ?? null,
     telemetry: success?.telemetry ?? null,
     promptVersions: { worker: WORKER_PLAN_PROMPT_VERSION, supervisor: SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION },
+    agentWorkflowVersions: success?.agentWorkflowVersions ?? null,
     failure: overrides.failure === undefined ? state?.failure ?? null : overrides.failure,
     warnings: planContentIR?.warnings.map((warning) => warning.message)
       ?? overrides.warnings
@@ -740,7 +773,7 @@ function outcomeMessage(error: unknown): PlanningFailure {
 }
 
 export class PlanningService {
-  private readonly activeProjects = new Set<string>();
+  private readonly activeProjects = new Map<string, { controller: AbortController; done: Promise<void>; resolveDone: () => void }>();
   private readonly now: () => Date;
 
   constructor(private readonly options: PlanningServiceOptions) {
@@ -793,30 +826,30 @@ export class PlanningService {
         inputFingerprint: currentFingerprint,
       };
       const stale = state.lastSuccessful !== null && state.lastSuccessful.inputFingerprint !== currentFingerprint;
-      state = {
-        ...state,
-        inputs,
-        status: stale ? 'stale' : state.status === 'needs_revision' ? 'needs_revision'
+      const status: PlanningStatus = stale ? 'stale' : state.status === 'needs_revision' ? 'needs_revision'
           : state.status === 'failed' ? 'failed'
-            : state.lastSuccessful ? 'ready' : state.failure ? 'failed' : 'ready_for_planning',
-        updatedAt: this.now().toISOString(),
-      };
-      if (inputs.inputFingerprint !== currentFingerprint || state.status !== 'generating') {
+            : state.lastSuccessful ? 'ready' : state.failure ? 'failed' : 'ready_for_planning';
+      const stateChanged = savedInputs.inputFingerprint !== currentFingerprint || state.status !== status;
+      if (stateChanged) {
+        state = { ...state, inputs, status, updatedAt: this.now().toISOString() };
         await writeStoredState(this.options.projectsRoot, projectId, state);
       }
-      return publicResponse(state.status, template.status, state, { inputFingerprint: currentFingerprint, contentIR: currentContentIR });
+      return publicResponse(status, template.status, state, { inputFingerprint: currentFingerprint, contentIR: currentContentIR });
     } catch (error) {
       if (error instanceof PlanningServiceError) throw error;
       const failure = { code: 'INPUTS_STALE', message: 'A selected source file is missing, changed beyond current limits, or cannot be read. Check the files and generate again.' };
       const status: PlanningStatus = state.lastSuccessful ? 'stale' : 'failed';
-      state = { ...state, status, failure, updatedAt: this.now().toISOString() };
-      await writeStoredState(this.options.projectsRoot, projectId, state);
+      if (state.status !== status || state.failure?.code !== failure.code || state.failure?.message !== failure.message) {
+        state = { ...state, status, failure, updatedAt: this.now().toISOString() };
+        await writeStoredState(this.options.projectsRoot, projectId, state);
+      }
       return publicResponse(status, template.status, state, { failure });
     }
   }
 
-  async generate(projectId: string, input: GeneratePlanInput): Promise<PlanningResponse> {
+  async generate(projectId: string, input: GeneratePlanInput, signal?: AbortSignal): Promise<PlanningResponse> {
     if (this.activeProjects.has(projectId)) throw new PlanningServiceError('PLANNING_ALREADY_RUNNING', 'A plan is already being generated for this project.', 409);
+    if (this.activeProjects.size >= 2) throw new PlanningServiceError('PLANNING_CAPACITY', 'Planning capacity is full. Wait for another project to finish and retry.', 429);
     if (!isRecord(input) || !exactKeys(input as Record<string, unknown>, ['contentFiles', 'brief'])
         || !Array.isArray(input.contentFiles) || input.contentFiles.length < 1 || input.contentFiles.length > MAX_SELECTED_FILES
         || input.contentFiles.some((file) => typeof file !== 'string')
@@ -827,19 +860,34 @@ export class PlanningService {
     try { brief = validateBrief(input.brief); }
     catch (error) { throw new PlanningServiceError('INVALID_BRIEF', error instanceof Error ? error.message : 'Brief is invalid.', 400, { cause: error }); }
 
-    this.activeProjects.add(projectId);
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+    const operation = { controller: new AbortController(), done, resolveDone };
+    const abortOperation = () => operation.controller.abort();
+    signal?.addEventListener('abort', abortOperation, { once: true });
+    if (signal?.aborted) abortOperation();
+    this.activeProjects.set(projectId, operation);
     const totalStarted = Date.now();
     let state: StoredPlanningState | null = null;
     let stateLoaded = false;
     try {
+      const ensureActive = () => {
+        if (operation.controller.signal.aborted) {
+          throw new PlanningServiceError('PLANNING_CANCELLED', 'Planning was cancelled.', 409);
+        }
+      };
       state = await readStoredState(this.options.projectsRoot, projectId);
+      ensureActive();
       stateLoaded = true;
       const template = await getTemplateCompilation(this.options.projectsRoot, projectId);
+      ensureActive();
       if (template.status !== 'ready' || !template.templateIR || !template.presentationDesignSystem) {
         throw new PlanningServiceError('TEMPLATE_NOT_READY', 'Analyze the current project PPTX template before generating a plan.', 409);
       }
       const contentIR = await compileContentIR(this.options.projectsRoot, projectId, input.contentFiles);
+      ensureActive();
       const promptAssets = await readPlanningPromptAssets(this.options.projectRoot);
+      ensureActive();
       const fingerprint = planningInputFingerprint({
         templateIRHash: template.templateIR.hash,
         presentationDesignSystemHash: template.presentationDesignSystem.hash,
@@ -858,6 +906,7 @@ export class PlanningService {
         failure: null,
         currentCheckpoint: null,
       };
+      ensureActive();
       await writeStoredState(this.options.projectsRoot, projectId, state);
 
       const adapter = this.options.getInferenceAdapter();
@@ -890,9 +939,11 @@ export class PlanningService {
         temperature: 0.2,
         timeoutMs: 150_000,
         deadlineAtEpochMs,
+        signal: operation.controller.signal,
         metadata: { projectId, generationId: randomUUID() },
       };
       const workerResponse = await adapter.infer(workerRequest);
+      ensureActive();
       const workerDraft = asDraft(workerResponse.value, contentIR, brief);
       const planId = `dp_${randomUUID().replaceAll('-', '')}`;
       const checkpoint = canonicalizeDeckPlan(workerDraft, {
@@ -906,6 +957,7 @@ export class PlanningService {
         requestedSlideCount: brief.requestedSlideCount,
       });
       state = { ...state, currentCheckpoint: checkpoint, updatedAt: this.now().toISOString() };
+      ensureActive();
       await writeStoredState(this.options.projectsRoot, projectId, state);
 
       const reviewEvidence = {
@@ -936,9 +988,11 @@ export class PlanningService {
         temperature: 0,
         timeoutMs: 90_000,
         deadlineAtEpochMs,
+        signal: operation.controller.signal,
         metadata: { projectId, checkpointId: checkpoint.id },
       };
       const supervisorResponse = await adapter.infer(reviewRequest);
+      ensureActive();
       const review = validatePlanReview(supervisorResponse.value, checkpoint, contentIR);
       let deckPlan = checkpoint;
       let revisionWorkerSummary: TelemetrySummary | undefined;
@@ -963,9 +1017,11 @@ export class PlanningService {
             { role: 'system', content: promptAssets.worker },
             { role: 'user', content: revisionEvidenceText },
           ],
+          signal: operation.controller.signal,
           metadata: { projectId, generationId: randomUUID(), checkpointId: checkpoint.id },
         };
         const revisionResponse = await adapter.infer(revisionRequest);
+        ensureActive();
         const revisedDraft = asDraft(revisionResponse.value, contentIR, brief);
         deckPlan = canonicalizeDeckPlan(revisedDraft, {
           id: checkpoint.id,
@@ -982,8 +1038,11 @@ export class PlanningService {
       validateDeckPlan(deckPlan, allowedContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR));
 
       const finalTemplate = await getTemplateCompilation(this.options.projectsRoot, projectId);
+      ensureActive();
       const finalContentIR = await compileContentIR(this.options.projectsRoot, projectId, input.contentFiles);
+      ensureActive();
       const finalPromptAssets = await readPlanningPromptAssets(this.options.projectRoot);
+      ensureActive();
       const finalFingerprint = finalTemplate.status === 'ready' && finalTemplate.templateIR && finalTemplate.presentationDesignSystem
         ? planningInputFingerprint({
           templateIRHash: finalTemplate.templateIR.hash,
@@ -1013,6 +1072,7 @@ export class PlanningService {
         review,
         telemetry,
         promptVersions: { worker: WORKER_PLAN_PROMPT_VERSION, supervisor: SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION },
+        agentWorkflowVersions: AGENT_WORKFLOW_VERSIONS,
         model: telemetry.worker.model,
         createdAt: this.now().toISOString(),
       };
@@ -1025,9 +1085,13 @@ export class PlanningService {
         failure: null,
         currentCheckpoint: checkpoint,
       };
+      ensureActive();
       await writeStoredState(this.options.projectsRoot, projectId, state);
       return publicResponse(state.status, finalTemplate.status, state);
     } catch (error) {
+      if (operation.controller.signal.aborted) {
+        throw new PlanningServiceError('PLANNING_CANCELLED', 'Planning was cancelled.', 409, { cause: error });
+      }
       if (!stateLoaded) throw error;
       const failure = outcomeMessage(error);
       state = {
@@ -1052,7 +1116,42 @@ export class PlanningService {
       const reportedStatus = isRecord(error) && typeof error.status === 'number' ? error.status : 422;
       throw new PlanningServiceError(failure.code, failure.message, reportedStatus, { cause: error });
     } finally {
-      this.activeProjects.delete(projectId);
+      signal?.removeEventListener('abort', abortOperation);
+      if (this.activeProjects.get(projectId) === operation) this.activeProjects.delete(projectId);
+      operation.resolveDone();
     }
+  }
+
+  async cancel(projectId: string): Promise<boolean> {
+    const active = this.activeProjects.get(projectId);
+    if (!active) return true;
+    active.controller.abort();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([active.done.then(() => true), new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), 5_000);
+        timer.unref?.();
+      })]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async shutdown(): Promise<boolean> {
+    const active = [...this.activeProjects.values()];
+    for (const operation of active) operation.controller.abort();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([Promise.all(active.map((operation) => operation.done)).then(() => true), new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), 5_000);
+        timer.unref?.();
+      })]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async waitForIdle(): Promise<void> {
+    await Promise.all([...this.activeProjects.values()].map((operation) => operation.done));
   }
 }

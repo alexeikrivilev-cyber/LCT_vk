@@ -39,6 +39,34 @@ export interface SemanticInferenceConfig {
 
 export type SemanticFetch = typeof fetch;
 
+export async function probeSemanticEndpoint(
+  config: Pick<SemanticInferenceConfig, 'baseUrl' | 'model' | 'apiKey'>,
+  fetcher: SemanticFetch = globalThis.fetch,
+): Promise<boolean> {
+  const baseUrl = normalizeBaseUrl(config.baseUrl, config.apiKey);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3_000);
+  try {
+    const response = await fetcher(`${baseUrl}/models`, {
+      method: 'GET',
+      headers: { accept: 'application/json', ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}) },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      return false;
+    }
+    const text = await readBoundedText(response, controller.signal);
+    const payload: unknown = JSON.parse(text);
+    if (!isRecord(payload) || !Array.isArray(payload.data) || payload.data.length > 512) return false;
+    return payload.data.some((item) => isRecord(item) && item.id === config.model);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -419,6 +447,8 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
     let finishReason: string | undefined;
     if (request.signal?.aborted) {
       const telemetry = finishTelemetry(baseTelemetry, 'cancelled', startedMs, { errorCode: 'CANCELLED' });
+      console.log(JSON.stringify({ event: 'semantic.request', requestId, role: request.role, operation: request.operation,
+        model: this.config.model, latencyMs: telemetry.wallTimeMs, finishReason: null, status: telemetry.status, errorCode: telemetry.errorCode }));
       throw new SemanticInferenceError('CANCELLED', 'Semantic inference was cancelled before dispatch', { telemetry });
     }
 
@@ -428,6 +458,8 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       const remainingMs = request.deadlineAtEpochMs - Date.now();
       if (remainingMs <= 0) {
         const telemetry = finishTelemetry(baseTelemetry, 'error', startedMs, { errorCode: 'DEADLINE_EXCEEDED' });
+        console.log(JSON.stringify({ event: 'semantic.request', requestId, role: request.role, operation: request.operation,
+          model: this.config.model, latencyMs: telemetry.wallTimeMs, finishReason: null, status: telemetry.status, errorCode: telemetry.errorCode }));
         throw new SemanticInferenceError('DEADLINE_EXCEEDED', 'Semantic inference deadline has already expired', { telemetry });
       }
       if (remainingMs <= timeoutMs) {
@@ -476,6 +508,8 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       abortCode = timeoutCode;
       controller.abort();
     }, timeoutMs);
+    let outcome: SemanticInferenceTelemetry['status'] = 'error';
+    let outcomeErrorCode: string | null = null;
 
     try {
       let response: Response;
@@ -557,6 +591,7 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       const providerRequestId = typeof envelope.id === 'string' && envelope.id.length <= 256
         ? envelope.id : undefined;
       const usage = countUsage(envelope.usage);
+      outcome = 'success';
       return {
         value: parsed as T,
         telemetry: finishTelemetry(baseTelemetry, 'success', startedMs, {
@@ -573,16 +608,25 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
             ? 'Semantic inference exceeded its deadline'
             : 'Semantic inference request timed out', { cause: error })
         : error;
-      if (normalizedError instanceof SemanticInferenceError && normalizedError.telemetry) throw normalizedError;
+      if (normalizedError instanceof SemanticInferenceError && normalizedError.telemetry) {
+        outcome = normalizedError.telemetry.status;
+        outcomeErrorCode = normalizedError.telemetry.errorCode ?? null;
+        throw normalizedError;
+      }
       const telemetry = finishTelemetry(baseTelemetry, normalizedError instanceof SemanticInferenceError && normalizedError.code === 'CANCELLED'
         ? 'cancelled' : 'error', startedMs, {
         ...(normalizedError instanceof SemanticInferenceError ? { errorCode: normalizedError.code } : { errorCode: 'PROVIDER_ERROR' }),
         ...(finishReason ? { finishReason } : {}),
       });
+      outcome = telemetry.status;
+      outcomeErrorCode = telemetry.errorCode ?? null;
       throw withTelemetry(normalizedError, telemetry);
     } finally {
       clearTimeout(timer);
       request.signal?.removeEventListener('abort', onAbort);
+      console.log(JSON.stringify({ event: 'semantic.request', requestId, role: request.role, operation: request.operation,
+        model: this.config.model, latencyMs: Date.now() - startedMs, finishReason: finishReason ?? null,
+        status: outcome, errorCode: outcomeErrorCode }));
     }
   }
 }

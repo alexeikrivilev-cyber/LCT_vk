@@ -9,6 +9,7 @@ import {
   addSlideLine,
   addSlideTable,
   addSlideTextBox,
+  asColor,
   compactPackage,
   duplicateSlide,
   emu,
@@ -17,11 +18,14 @@ import {
   findSlidePlaceholderByIdx,
   getShapeId,
   getShapeKind,
+  getShapeBoundsResolved,
   getShapePlaceholderIdx,
   getShapePlaceholderType,
   getShapeParagraphCount,
   getShapeRunCount,
+  getShapeRunFormatEffective,
   getShapeText,
+  getShapeTextAutoFitParams,
   getSlideCharts,
   getSlidePartName,
   getSlideLayoutPlaceholders,
@@ -31,10 +35,13 @@ import {
   hasShapeText,
   loadPresentation,
   removeSlide,
+  removeShape,
   removeSlideNotes,
+  resolveDeckBodyTextColor,
   savePresentation,
   setShapeText,
   setShapeTextAutoFit,
+  setShapeTextFormat,
   validatePresentation,
 } from '@office-kit/pptx/node';
 import JSZip from 'jszip';
@@ -90,11 +97,11 @@ export class PptxBackendError extends Error {
   }
 }
 
-async function readVerifiedImage(input: PptxRenderInput, image: PptxRenderInput['compiledPresentation']['slides'][number]['imageRefs'][number]): Promise<Uint8Array> {
-  if (!input.contentRoot || !path.isAbsolute(input.contentRoot)) {
+export async function readVerifiedImageAt(contentRoot: string | undefined, image: PptxRenderInput['compiledPresentation']['slides'][number]['imageRefs'][number]): Promise<Uint8Array> {
+  if (!contentRoot || !path.isAbsolute(contentRoot)) {
     throw new PptxBackendError('MEDIA_ROOT_REQUIRED', 'Image rendering requires an absolute project content root.', image.sourcePath);
   }
-  const root = await realpath(input.contentRoot);
+  const root = await realpath(contentRoot);
   const candidate = path.resolve(root, ...image.sourcePath.split('/'));
   const file = await realpath(candidate).catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') throw new PptxBackendError('MISSING_ASSET', 'Referenced image file is missing from the project.', image.sourcePath, { cause: error });
@@ -118,12 +125,20 @@ async function readVerifiedImage(input: PptxRenderInput, image: PptxRenderInput[
   throw new PptxBackendError('CORRUPT_ASSET', 'Image bytes do not match the declared PNG or JPEG media type.', image.sourcePath);
 }
 
+async function readVerifiedImage(input: PptxRenderInput, image: PptxRenderInput['compiledPresentation']['slides'][number]['imageRefs'][number]): Promise<Uint8Array> {
+  return readVerifiedImageAt(input.contentRoot, image);
+}
+
 function normalizeIssues(issues: ReturnType<typeof validatePresentation>) {
   return issues.map((issue) => ({ severity: issue.severity, message: issue.message, partName: issue.partName ?? null }));
 }
 
 function normalizePart(partName: string): string {
   return partName.replace(/^\/+/, '');
+}
+
+function normalizedVisibleText(value: string): string {
+  return value.normalize('NFKC').replace(/\s+/gu, ' ').trim().toLowerCase();
 }
 
 function textSegmentation(shape: ReturnType<typeof getSlideShapes>[number]): { paragraphs: number; runs: number } {
@@ -139,6 +154,54 @@ function requiredDonorShape(slide: ReturnType<typeof getSlides>[number], nativeI
   return shape;
 }
 
+function roleTextStyle(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
+  slide: ReturnType<typeof getSlides>[number],
+  role: 'title' | 'body',
+  preferredShapes: readonly ReturnType<typeof getSlideShapes>[number][] = [],
+) {
+  const allowedTypes = role === 'title'
+    ? new Set(['title', 'ctrTitle', 'subTitle'])
+    : new Set(['body', 'obj', 'subTitle']);
+  const shapes = getSlideShapes(slide);
+  const candidates = [...preferredShapes, ...shapes.filter((shape) => allowedTypes.has(getShapePlaceholderType(shape) ?? '')),
+    ...shapes.filter((shape) => hasShapeText(shape))];
+  const seen = new Set<object>();
+  for (const shape of candidates) {
+    if (seen.has(shape)) continue;
+    seen.add(shape);
+    try {
+      const format = getShapeRunFormatEffective(presentation, shape, 0, 0);
+      const color = format.color ?? resolveDeckBodyTextColor(slide);
+      if (color) return { color, size: format.size !== undefined && Number.isFinite(format.size) && format.size > 0 ? format.size : undefined,
+        font: format.font ?? undefined, fontEastAsian: format.fontEastAsian ?? undefined,
+        fontComplexScript: format.fontComplexScript ?? undefined };
+    } catch {
+      // Try the next template role source; never fall back to a generic black text color.
+    }
+  }
+  const deckBodyColor = resolveDeckBodyTextColor(slide);
+  if (deckBodyColor) return { color: deckBodyColor };
+  throw new PptxBackendError('TEMPLATE_TEXT_STYLE_UNRESOLVED', `Could not derive a ${role} text color from the template role or theme.`);
+}
+
+function applyRoleTextStyle(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
+  slide: ReturnType<typeof getSlides>[number],
+  shape: ReturnType<typeof getSlideShapes>[number],
+  role: 'title' | 'body',
+  preferredShapes: readonly ReturnType<typeof getSlideShapes>[number][] = [],
+): void {
+  const style = roleTextStyle(presentation, slide, role, preferredShapes);
+  setShapeTextFormat(shape, {
+    color: asColor(style.color),
+    ...(style.size ? { size: style.size } : {}),
+    ...(style.font ? { font: style.font } : {}),
+    ...(style.fontEastAsian ? { fontEastAsian: style.fontEastAsian } : {}),
+    ...(style.fontComplexScript ? { fontComplexScript: style.fontComplexScript } : {}),
+  });
+}
+
 function projectExemplarText(
   slide: ReturnType<typeof getSlides>[number],
   compiled: CompiledSlide,
@@ -150,6 +213,15 @@ function projectExemplarText(
   const title = requiredDonorShape(slide, selection.slots.title.nativeId, 'title');
   const bodySlots = selection.slots.bodySlots.length ? selection.slots.bodySlots : [selection.slots.body];
   const bodyShapes = bodySlots.map((slot, index) => requiredDonorShape(slide, slot.nativeId, `body ${index + 1}`));
+  const bodyCount = Math.max(1, compiled.body.length);
+  if (selection.bodyContentRanges.length !== bodyShapes.length
+      || selection.bodyContentRanges.some((range, index) => !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
+        || range.start < 0 || range.end <= range.start || range.end > bodyCount
+        || (index > 0 && selection.bodyContentRanges[index - 1]!.end !== range.start))
+      || selection.bodyContentRanges[0]?.start !== 0
+      || selection.bodyContentRanges.at(-1)?.end !== bodyCount) {
+    throw new PptxBackendError('EXEMPLAR_BODY_ASSIGNMENT_INVALID', `The selected exemplar body assignment does not cover the source text exactly once.`);
+  }
   for (const [role, shape] of [['title', title] as const, ...bodyShapes.map((shape, index) => [`body ${index + 1}`, shape] as const)]) {
     const segmentation = textSegmentation(shape);
     textStyleWarnings.push(`Exemplar slide ${selection.sourceSlideIndex} ${role} donor was replaced with Office Kit setShapeText; paragraph-end formatting may not be retained.`);
@@ -166,9 +238,8 @@ function projectExemplarText(
   }
   setShapeText(title, compiled.title);
   for (let index = 0; index < bodyShapes.length; index += 1) {
-    const start = Math.floor(index * compiled.body.length / bodyShapes.length);
-    const end = Math.floor((index + 1) * compiled.body.length / bodyShapes.length);
-    setShapeText(bodyShapes[index]!, compiled.body.slice(start, end).join('\n'));
+    const range = selection.bodyContentRanges[index]!;
+    setShapeText(bodyShapes[index]!, compiled.body.slice(range.start, range.end).join('\n'));
   }
 }
 
@@ -181,7 +252,83 @@ function countExemplarObjects(slide: ReturnType<typeof getSlides>[number]) {
   return { textShapes, connectors, pictures, editableShapes, charts: getSlideCharts(slide).length, tables: getSlideTables(slide).length };
 }
 
+async function addProjectedVisual(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
+  slide: ReturnType<typeof getSlides>[number],
+  compiled: CompiledSlide,
+  visualBox: { x: number; y: number; width: number; height: number },
+  roleSources: { title: ReturnType<typeof getSlideShapes>[number]; body?: ReturnType<typeof getSlideShapes>[number] },
+  input: PptxRenderInput,
+): Promise<{ text: number; tables: number; charts: number; images: number; shapes: number; connectors: number }> {
+  const counts = { text: 0, tables: 0, charts: 0, images: 0, shapes: 0, connectors: 0 };
+  if (compiled.visualization.tableData) {
+    addSlideTable(slide, {
+      x: emu(visualBox.x), y: emu(visualBox.y), w: emu(visualBox.width), h: emu(visualBox.height),
+      rows: compiled.visualization.tableData,
+    });
+    counts.tables += 1;
+  }
+  if (compiled.visualization.chartData) {
+    addSlideChart(slide, {
+      x: emu(visualBox.x), y: emu(visualBox.y), w: emu(visualBox.width), h: emu(visualBox.height),
+      spec: {
+        kind: compiled.visualization.chartData.kind,
+        categories: compiled.visualization.chartData.categories,
+        series: compiled.visualization.chartData.series.map(({ name, values }) => ({ name, values })),
+        title: compiled.visualization.chartData.title,
+      },
+    });
+    counts.charts += 1;
+  }
+  if (compiled.visualization.kpi) {
+    const valueHeight = Math.max(1, Math.floor(visualBox.height * 0.62));
+    const value = addSlideTextBox(slide, {
+      x: emu(visualBox.x), y: emu(visualBox.y), w: emu(visualBox.width), h: emu(valueHeight),
+      text: compiled.visualization.kpi.value,
+    });
+    applyRoleTextStyle(presentation, slide, value, 'title', [roleSources.title]);
+    const label = addSlideTextBox(slide, {
+      x: emu(visualBox.x), y: emu(visualBox.y + valueHeight), w: emu(visualBox.width), h: emu(visualBox.height - valueHeight),
+      text: compiled.visualization.kpi.label,
+    });
+    applyRoleTextStyle(presentation, slide, label, 'body', roleSources.body ? [roleSources.body] : []);
+    counts.text += 2;
+    counts.shapes += 2;
+  }
+  if (compiled.visualization.processSteps.length >= 2) {
+    const gap = Math.max(1, Math.round(visualBox.width * 0.025));
+    const nodeWidth = Math.max(1, Math.floor((visualBox.width - gap * (compiled.visualization.processSteps.length - 1)) / compiled.visualization.processSteps.length));
+    const nodeY = visualBox.y + Math.floor(visualBox.height * 0.2);
+    const nodeHeight = Math.max(1, Math.floor(visualBox.height * 0.6));
+    const nodes = compiled.visualization.processSteps.map((step, index) => {
+      const x = visualBox.x + index * (nodeWidth + gap);
+      const node = addSlideTextBox(slide, { x: emu(x), y: emu(nodeY), w: emu(nodeWidth), h: emu(nodeHeight), text: step.text });
+      applyRoleTextStyle(presentation, slide, node, 'body', roleSources.body ? [roleSources.body] : []);
+      return { x, centerY: nodeY + Math.floor(nodeHeight / 2) };
+    });
+    counts.text += nodes.length;
+    counts.shapes += nodes.length;
+    for (let index = 0; index < nodes.length - 1; index += 1) {
+      const from = nodes[index]!;
+      const to = nodes[index + 1]!;
+      addSlideLine(slide, { from: { x: emu(from.x + nodeWidth), y: emu(from.centerY) }, to: { x: emu(to.x), y: emu(to.centerY) } });
+      counts.connectors += 1;
+    }
+  }
+  if (compiled.imageRefs.length) {
+    if (compiled.imageRefs.length > 1) throw new PptxBackendError('MULTIPLE_IMAGES_UNSUPPORTED', 'A slide currently supports one source-backed image in its selected visual slot.', compiled.imageRefs[1]!.sourcePath);
+    const image = compiled.imageRefs[0]!;
+    const imageBytes = await readVerifiedImage(input, image);
+    addSlideImage(slide, imageBytes, {
+      x: emu(visualBox.x), y: emu(visualBox.y), w: emu(visualBox.width), h: emu(visualBox.height), fit: 'contain',
+    });
+    counts.images += 1;
+  }
+  return counts;
+}
+
 function matchingNativePlaceholder(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
   slide: ReturnType<typeof getSlides>[number],
   layout: Parameters<typeof getSlideLayoutPlaceholders>[0],
   placement: { x: number; y: number; width: number; height: number },
@@ -190,20 +337,20 @@ function matchingNativePlaceholder(
   const allowedTypes = role === 'title'
     ? new Set(['title', 'ctrTitle', 'subTitle'])
     : new Set(['body', 'obj', 'subTitle']);
-  const matches = getSlideLayoutPlaceholders(layout).filter((placeholder) => {
-    if (!placeholder.bounds || !allowedTypes.has(placeholder.type ?? '')) return false;
-    return Math.abs(placeholder.bounds.x - placement.x) <= 1
-      && Math.abs(placeholder.bounds.y - placement.y) <= 1
-      && Math.abs(placeholder.bounds.w - placement.width) <= 1
-      && Math.abs(placeholder.bounds.h - placement.height) <= 1;
+  const matches = getSlideLayoutPlaceholders(layout).flatMap((placeholder) => {
+    const roleIsMeasuredGenericBody = role === 'body' && placeholder.type === null && Number.isSafeInteger(placeholder.idx);
+    if (!allowedTypes.has(placeholder.type ?? '') && !roleIsMeasuredGenericBody) return [];
+    const shape = typeof placeholder.idx === 'number'
+      ? findSlidePlaceholderByIdx(slide, placeholder.idx)
+      : findSlidePlaceholder(slide, placeholder.type as 'title' | 'ctrTitle' | 'subTitle' | 'body' | 'obj');
+    if (!shape || getShapePlaceholderIdx(shape) !== placeholder.idx || getShapePlaceholderType(shape) !== placeholder.type) return [];
+    const bounds = placeholder.bounds ?? getShapeBoundsResolved(presentation, shape);
+    if (!bounds || Math.abs(bounds.x - placement.x) > 1 || Math.abs(bounds.y - placement.y) > 1
+        || Math.abs(bounds.w - placement.width) > 1 || Math.abs(bounds.h - placement.height) > 1) return [];
+    return [{ shape }];
   });
   if (matches.length !== 1) return null;
-  const descriptor = matches[0]!;
-  const shape = typeof descriptor.idx === 'number'
-    ? findSlidePlaceholderByIdx(slide, descriptor.idx)
-    : findSlidePlaceholder(slide, descriptor.type as 'title' | 'ctrTitle' | 'subTitle' | 'body' | 'obj');
-  if (!shape || getShapePlaceholderIdx(shape) !== descriptor.idx || getShapePlaceholderType(shape) !== descriptor.type) return null;
-  return shape;
+  return matches[0]!.shape;
 }
 
 async function writeAtomically(filePath: string, bytes: Uint8Array): Promise<string> {
@@ -282,6 +429,18 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       let slide = duplicatedSlides.get(compiled.id);
       if (selection && slide) {
         projectExemplarText(slide, compiled, selection, textStyleWarnings);
+        if (selection.slots.visual) {
+          const visualShape = getSlideShapes(slide).find((shape) => String(getShapeId(shape)) === selection.slots.visual!.nativeId);
+          if (!visualShape) throw new PptxBackendError('EXEMPLAR_VISUAL_SLOT_MISSING', 'The selected source-free visual slot could not be mapped to its Office Kit shape.');
+          removeShape(visualShape);
+          const titleStyleSource = requiredDonorShape(slide, selection.slots.title.nativeId, 'title style');
+          const bodySlot = selection.slots.bodySlots[0] ?? selection.slots.body;
+          const bodyStyleSource = getSlideShapes(slide).find((shape) => String(getShapeId(shape)) === bodySlot.nativeId);
+          await addProjectedVisual(presentation, slide, compiled, selection.slots.visual.geometry,
+            { title: titleStyleSource, body: bodyStyleSource }, input);
+        } else if (compiled.visualization.status === 'unresolved') {
+          unresolvedVisualTypes.add(compiled.visualization.type);
+        }
         const counts = countExemplarObjects(slide);
         nativeTextShapeCount += counts.textShapes;
         nativeConnectorCount += counts.connectors;
@@ -294,18 +453,12 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       const layout = layoutsByPart.get(compiled.layoutSourcePart);
       if (!layout) throw new TypeError(`Office Kit cannot resolve selected layout part ${compiled.layoutSourcePart}`);
       slide = addSlide(presentation, { layout });
-      const titlePlaceholder = matchingNativePlaceholder(slide, layout, compiled.placements.title, 'title');
+      const titlePlaceholder = matchingNativePlaceholder(presentation, slide, layout, compiled.placements.title, 'title');
       if (titlePlaceholder) {
         setShapeText(titlePlaceholder, compiled.title);
-        setShapeTextAutoFit(titlePlaceholder, 'normal');
       }
-      else addSlideTextBox(slide, {
-          x: emu(compiled.placements.title.x),
-          y: emu(compiled.placements.title.y),
-          w: emu(compiled.placements.title.width),
-          h: emu(compiled.placements.title.height),
-          text: compiled.title,
-        });
+      else throw new PptxBackendError('NATIVE_TITLE_PLACEHOLDER_REQUIRED', 'Safe layout-backed output requires the measured native title placeholder; generic text boxes are not emitted.');
+      const bodyRolePlaceholder = matchingNativePlaceholder(presentation, slide, layout, compiled.placements.body, 'body');
       nativeTextShapeCount += 1;
       if (compiled.body.length) {
         const chartHasSlot = Boolean(compiled.placements.visual || compiled.body.length === 0);
@@ -316,18 +469,10 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
           || (compiled.visualization.processSteps.length >= 2 && processHasSlot)
           || (compiled.imageRefs.length && imageHasSlot) || compiled.visualization.tableData);
         if (!specialVisualUsesBody) {
-          const bodyPlaceholder = matchingNativePlaceholder(slide, layout, compiled.placements.body, 'body');
-          if (bodyPlaceholder) {
-            setShapeText(bodyPlaceholder, compiled.body.join('\n'));
-            setShapeTextAutoFit(bodyPlaceholder, 'normal');
+          if (bodyRolePlaceholder) {
+            setShapeText(bodyRolePlaceholder, compiled.body.join('\n'));
           }
-          else addSlideTextBox(slide, {
-            x: emu(compiled.placements.body.x),
-            y: emu(compiled.placements.body.y),
-            w: emu(compiled.placements.body.width),
-            h: emu(compiled.placements.body.height),
-            text: compiled.body.join('\n'),
-          });
+          else throw new PptxBackendError('NATIVE_BODY_PLACEHOLDER_REQUIRED', 'Safe layout-backed output requires the measured native body placeholder; generic text boxes are not emitted.');
         }
         if (!specialVisualUsesBody) nativeTextShapeCount += 1;
       }
@@ -364,10 +509,12 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
             x: emu(visualBox.x), y: emu(visualBox.y), w: emu(visualBox.width), h: emu(valueHeight),
             text: compiled.visualization.kpi.value,
           });
-          addSlideTextBox(slide, {
+          applyRoleTextStyle(presentation, slide, value, 'title', [titlePlaceholder]);
+          const label = addSlideTextBox(slide, {
             x: emu(visualBox.x), y: emu(visualBox.y + valueHeight), w: emu(visualBox.width), h: emu(visualBox.height - valueHeight),
             text: compiled.visualization.kpi.label,
           });
+          applyRoleTextStyle(presentation, slide, label, 'body', bodyRolePlaceholder ? [bodyRolePlaceholder] : []);
           nativeTextShapeCount += 2;
           nativeShapeCount += 2;
           void value;
@@ -383,7 +530,8 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
           const nodeHeight = Math.max(1, Math.floor(visualBox.height * 0.6));
           const nodes = compiled.visualization.processSteps.map((step, index) => {
             const x = visualBox.x + index * (nodeWidth + gap);
-            addSlideTextBox(slide, { x: emu(x), y: emu(nodeY), w: emu(nodeWidth), h: emu(nodeHeight), text: step.text });
+            const node = addSlideTextBox(slide, { x: emu(x), y: emu(nodeY), w: emu(nodeWidth), h: emu(nodeHeight), text: step.text });
+            applyRoleTextStyle(presentation, slide, node, 'body', bodyRolePlaceholder ? [bodyRolePlaceholder] : []);
             return { x, centerY: nodeY + Math.floor(nodeHeight / 2) };
           });
           nativeTextShapeCount += nodes.length;
@@ -429,6 +577,85 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       validationIssues.push({ severity: 'warning', message: `No compatible template slot was available to render the requested ${visualType} visual; source-backed text is retained.`, partName: null });
     }
     for (const message of textStyleWarnings) validationIssues.push({ severity: 'warning', message, partName: null });
+    const sourceResidueFindings: Array<NonNullable<PptxRenderResult['qualityEvidence']>['sourceContentResidue']['findings'][number]> = [];
+    const renderedTextObjects: Array<NonNullable<PptxRenderResult['qualityEvidence']>['textObjects'][number]> = [];
+    const qualityEvidence: NonNullable<PptxRenderResult['qualityEvidence']> = {
+      textObjects: renderedTextObjects,
+      sourceContentResidue: { status: exemplarSelections.size ? 'checked' : 'not-applicable', findings: sourceResidueFindings },
+    };
+    const reopenedSlides = getSlides(reopened);
+    for (const [slideIndex, compiled] of input.compiledPresentation.slides.entries()) {
+      const outputSlide = reopenedSlides[slideIndex];
+      if (!outputSlide) continue;
+      const selection = exemplarSelections.get(compiled.id) ?? null;
+      const titleNativeIds = new Set(selection ? [selection.slots.title.nativeId] : []);
+      const bodyNativeIds = new Set(selection
+        ? (selection.slots.bodySlots.length ? selection.slots.bodySlots : [selection.slots.body]).map((slot) => slot.nativeId)
+        : []);
+      const outputShapes = getSlideShapes(outputSlide);
+      for (const shape of outputShapes) {
+        if (!hasShapeText(shape)) continue;
+        const text = getShapeText(shape).trim();
+        if (!text) continue;
+        const shapeId = String(getShapeId(shape));
+        const placeholderType = getShapePlaceholderType(shape)?.toLowerCase() ?? '';
+        const role = titleNativeIds.has(shapeId) || ['title', 'ctrtitle', 'subtitle'].includes(placeholderType)
+          ? 'title' as const
+          : bodyNativeIds.has(shapeId) || ['body', 'obj'].includes(placeholderType) ? 'body' as const : 'other' as const;
+        let format: ReturnType<typeof getShapeRunFormatEffective> | null = null;
+        try { format = getShapeRunFormatEffective(reopened, shape, 0, 0); } catch { /* style remains unknown */ }
+        let rawAutoFit: ReturnType<typeof getShapeTextAutoFitParams> | null = null;
+        try { rawAutoFit = getShapeTextAutoFitParams(shape); } catch { /* autofit remains unknown */ }
+        const scaleValue = rawAutoFit && typeof rawAutoFit === 'object' && 'fontScale' in rawAutoFit
+          ? Number(rawAutoFit.fontScale) : null;
+        const autoFitScale = scaleValue !== null && Number.isFinite(scaleValue)
+          ? Number((scaleValue > 10 ? scaleValue / 100000 : scaleValue).toFixed(4)) : null;
+        const bounds = getShapeBoundsResolved(reopened, shape);
+        renderedTextObjects.push({
+          slideId: compiled.id,
+          shapeId,
+          role,
+          textSha256: createHash('sha256').update(normalizedVisibleText(text)).digest('hex'),
+          textLength: Array.from(text).length,
+          fontSizePt: format?.size !== undefined && Number.isFinite(format.size) && format.size > 0 ? format.size : null,
+          color: format?.color ?? null,
+          autoFitScale,
+          bounds: bounds ? { x: bounds.x, y: bounds.y, width: bounds.w, height: bounds.h } : null,
+        });
+      }
+
+      if (!selection) continue;
+      const sourceSlide = input.templateIR.slides.find((candidate) => candidate.sourcePart === selection.sourcePart);
+      if (!sourceSlide) continue;
+      const replacedNativeIds = new Set([selection.slots.title.nativeId,
+        ...(selection.slots.bodySlots.length ? selection.slots.bodySlots : [selection.slots.body]).map((slot) => slot.nativeId)]);
+      const chromeNativeIds = new Set(selection.preserveChromeNativeIds);
+      const projectedText = new Set([
+        compiled.title, ...compiled.body,
+        ...(compiled.visualization.tableData ?? []).flat(),
+        ...(compiled.visualization.chartData?.categories ?? []),
+        ...(compiled.visualization.chartData?.series.flatMap((series) => [series.name, ...series.values.map(String)]) ?? []),
+        ...(compiled.visualization.processSteps.map((step) => step.text)),
+        ...(compiled.visualization.kpi ? [compiled.visualization.kpi.value, compiled.visualization.kpi.label] : []),
+      ].map(normalizedVisibleText));
+      const visibleOutputText = outputShapes.filter(hasShapeText).map((shape) => ({
+        id: String(getShapeId(shape)), text: normalizedVisibleText(getShapeText(shape)),
+      }));
+      for (const element of sourceSlide.elements) {
+        const oldText = element.text?.trim() ?? '';
+        if (!element.nativeId || !oldText || replacedNativeIds.has(element.nativeId) || chromeNativeIds.has(element.nativeId)) continue;
+        const normalized = normalizedVisibleText(oldText);
+        if (normalized.length < 4 && !/\d/u.test(normalized) || projectedText.has(normalized)) continue;
+        const remaining = visibleOutputText.find((candidate) => candidate.text === normalized);
+        if (remaining) sourceResidueFindings.push({
+          slideId: compiled.id,
+          sourceSlideIndex: selection.sourceSlideIndex,
+          sourceElementId: element.id,
+          textSha256: createHash('sha256').update(normalized).digest('hex'),
+          outputShapeId: remaining.id,
+        });
+      }
+    }
     const outputPath = await writeAtomically(input.outputPath, outputBytes);
     return {
       backend: this.id,
@@ -479,6 +706,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
           selectionReason: `generated fallback used because no safe exemplar rank was selected: ${assessment.evidence.join('; ')}`,
         };
       }),
+      qualityEvidence,
     };
   }
 }

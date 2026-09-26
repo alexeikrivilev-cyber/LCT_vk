@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import type { CompiledSlide } from './slide-compilation.js';
+import type { CompiledSlide, CompatibleLayoutMatchCandidate } from './slide-compilation.js';
 import type { TemplateElement, TemplateGeometry, TemplateIR, TemplateSlide } from '../domain/template-ir.js';
 import { validateTemplateSemanticProfile, type TemplateSemanticProfile, type TemplateSemanticSlideProfile } from './template-semantic-profiler.js';
 
@@ -30,7 +30,15 @@ export interface ExemplarSlideSelection {
     title: { elementId: string; nativeId: string };
     body: { elementId: string; nativeId: string };
     bodySlots: Array<{ elementId: string; nativeId: string }>;
-    visual: null;
+    visual: { elementId: string; nativeId: string; geometry: TemplateGeometry; kind: string } | null;
+  };
+  /** Exclusive, ordered ranges of CompiledSlide.body assigned to matching bodySlots. */
+  bodyContentRanges: Array<{ start: number; end: number }>;
+  textProjection: {
+    preserved: string[];
+    replaced: string[];
+    cleared: string[];
+    blocked: string[];
   };
   clearElementNativeIds: string[];
   preserveChromeNativeIds: string[];
@@ -59,6 +67,10 @@ export interface ExemplarSelectionAssessment {
     bodyElementIds: string[];
     visualElementIds: string[];
     visualClassification: string[];
+    preservedTextElementIds: string[];
+    replacedTextElementIds: string[];
+    clearedTextElementIds: string[];
+    blockedTextElementIds: string[];
     gate: string;
     rejectReason: string | null;
     familyKey: string | null;
@@ -96,6 +108,13 @@ export interface ExemplarArchetypeAssessment {
   evidence: string[];
 }
 
+export interface VariantCompositionAssignment {
+  variantId: CompiledSlide['variantId'];
+  compositionKind: 'exemplar-backed' | 'layout-placeholder-backed' | 'safe-generated-fallback';
+  layoutCandidateIndex: number;
+  projectedCompositionSignature: string;
+}
+
 interface NormalizedGeometry {
   x: number;
   y: number;
@@ -120,9 +139,15 @@ function normalizedText(element: TemplateElement): string {
   return (element.text ?? '').trim().replace(/\s+/g, ' ');
 }
 
+function inheritedStaticText(template: TemplateIR, layoutId: string | null | undefined, masterId?: string | null): TemplateElement[] {
+  const layout = layoutId ? template.layouts.find((item) => item.id === layoutId) : null;
+  const master = template.masters.find((item) => item.id === (layout?.masterId ?? masterId));
+  return [...(layout?.elements ?? []), ...(master?.elements ?? [])]
+    .filter((element) => element.placeholder === null && normalizedText(element).length > 0);
+}
+
 function topLevelTextShapes(slide: TemplateSlide): TemplateElement[] {
-  return slide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
-    && element.parentId === null && Boolean(normalizedText(element)));
+  return slide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && Boolean(normalizedText(element)));
 }
 
 function overlapFraction(box: NonNullable<ReturnType<typeof geometryOf>>, region: { x: number; y: number; width: number; height: number }): number {
@@ -271,11 +296,45 @@ function titleForSlide(slide: TemplateSlide, evidence: NonNullable<CompiledSlide
 }
 
 function visualKinds(slide: TemplateSlide): TemplateElement[] {
-  return slide.elements.filter((element) => ['picture', 'image', 'table', 'chart', 'graphicframe', 'group']
-    .includes(element.kind.toLowerCase().replaceAll('_', '').replaceAll('-', '')));
+  return slide.elements.filter((element) => {
+    const kind = element.kind.toLowerCase().replaceAll('_', '').replaceAll('-', '');
+    const placeholder = `${element.placeholder?.type ?? ''} ${element.placeholder?.role ?? ''}`.toLowerCase();
+    return ['picture', 'image', 'table', 'chart', 'graphicframe', 'group'].includes(kind)
+      || /picture|image|chart|table|graphic/.test(placeholder);
+  });
 }
 
-function visualClassification(slide: TemplateSlide, template: TemplateIR): Array<{ elementId: string; kind: string }> {
+type VisualSafetyKind = 'template-decoration' | 'content-slot' | 'source-specific-content' | 'opaque-unsafe';
+
+interface VisualSafetyClassification {
+  elementId: string;
+  kind: VisualSafetyKind;
+  reason: string;
+}
+
+function supportedNestedElements(slide: TemplateSlide): boolean {
+  const byId = new Map(slide.elements.map((element) => [element.id, element]));
+  const supportedKinds = new Set(['shape', 'connector', 'picture', 'image', 'table', 'chart', 'graphicframe', 'group']);
+  for (const element of slide.elements) {
+    if (!supportedKinds.has(element.kind.toLowerCase().replaceAll('_', '').replaceAll('-', ''))) return false;
+    if (element.parentId === null) continue;
+    let parentId: string | null = element.parentId;
+    let depth = 0;
+    while (parentId) {
+      const parent = byId.get(parentId);
+      if (!parent || parent.kind.toLowerCase().replaceAll('_', '').replaceAll('-', '') !== 'group' || ++depth > 4) return false;
+      parentId = parent.parentId;
+    }
+    if (!element.nativeId || (normalizedText(element) && !geometryOf(element))) return false;
+  }
+  return true;
+}
+
+function visualClassification(
+  slide: TemplateSlide,
+  template: TemplateIR,
+  profileVisualIds: readonly string[] = [],
+): VisualSafetyClassification[] {
   const family = template.slides.filter((candidate) => candidate.layoutId === slide.layoutId);
   const occurrences = (element: TemplateElement): number => {
     const box = geometryOf(element);
@@ -295,17 +354,55 @@ function visualClassification(slide: TemplateSlide, template: TemplateIR): Array
     })).length;
   };
   const canvasArea = Math.max(1, template.slideSize.width * template.slideSize.height);
-  return visualKinds(slide).map((element) => {
+  const visualIds = new Set(profileVisualIds);
+  const candidates = slide.elements.filter((element) => {
+    const kind = element.kind.toLowerCase().replaceAll('_', '').replaceAll('-', '');
+    return visualKinds({ ...slide, elements: [element] }).length > 0
+      || (['shape', 'connector'].includes(kind) && !normalizedText(element));
+  });
+  return candidates.map((element) => {
     const box = geometryOf(element);
     const kind = element.kind.toLowerCase().replaceAll('_', '').replaceAll('-', '');
+    const relationships = element.relationshipIds.length;
+    const placeholderType = `${element.placeholder?.type ?? ''} ${element.placeholder?.role ?? ''}`.toLowerCase();
+    const isVisualPlaceholder = /picture|image|chart|table|graphic/.test(placeholderType);
+    if (kind === 'group') {
+      return supportedNestedElements(slide)
+        ? { elementId: element.id, kind: 'template-decoration', reason: 'recognized Office Kit group is preserved; children are classified separately' }
+        : { elementId: element.id, kind: 'opaque-unsafe', reason: 'group contains unsupported or unresolved child geometry' };
+    }
+    if (isVisualPlaceholder && !relationships) {
+      return { elementId: element.id, kind: 'content-slot', reason: 'native visual placeholder has no source relationship to preserve' };
+    }
+    if (kind === 'picture' || kind === 'image') {
+      if (!box || !relationships) return { elementId: element.id, kind: 'opaque-unsafe', reason: 'picture geometry or package relationship is unresolved' };
+      const smallPicture = area(box) / canvasArea <= 0.04;
+      const repeated = occurrences(element);
+      const minimum = Math.max(2, Math.ceil(family.length * 0.8));
+      if (smallPicture && family.length >= 2 && repeated >= minimum) {
+        return { elementId: element.id, kind: 'template-decoration', reason: 'small picture and its relationship recur at the same geometry across the layout family' };
+      }
+      return { elementId: element.id, kind: 'source-specific-content', reason: 'picture is tied to a source relationship and is not proven recurring template decoration' };
+    }
+    if (['table', 'chart', 'graphicframe'].includes(kind)) {
+      return relationships || !isVisualPlaceholder
+        ? { elementId: element.id, kind: 'source-specific-content', reason: `${kind} carries source data or an unresolved visual relationship` }
+        : { elementId: element.id, kind: 'content-slot', reason: `empty native ${kind} placeholder` };
+    }
     const smallPicture = ['picture', 'image'].includes(kind) && box !== null && area(box) / canvasArea <= 0.04;
     const repeated = occurrences(element);
     const minimum = Math.max(2, Math.ceil(family.length * 0.8));
-    if (smallPicture && family.length >= 2 && repeated >= minimum) return { elementId: element.id, kind: 'preservable-template-visual' };
-    if (element.placeholder && !element.relationshipIds.length && !['picture', 'image', 'table', 'chart', 'graphicframe'].includes(kind)) {
-      return { elementId: element.id, kind: 'replaceable-visual-slot' };
+    if (['shape', 'connector'].includes(kind)) {
+      if (!box || relationships) return { elementId: element.id, kind: 'opaque-unsafe', reason: 'native vector object geometry or relationship is unresolved' };
+      if (family.length >= 2 && repeated >= minimum && area(box) / canvasArea <= 0.04) {
+        return { elementId: element.id, kind: 'template-decoration', reason: 'small native vector decoration recurs with the same geometry and style in the layout family' };
+      }
+      if (element.placeholder || visualIds.has(element.id)) return { elementId: element.id, kind: 'content-slot', reason: 'native placeholder or semantic visual slot has no source relationship' };
+      if (family.length >= 2 && repeated >= minimum) return { elementId: element.id, kind: 'template-decoration', reason: 'native vector decoration recurs with the same geometry and style in the layout family' };
+      return { elementId: element.id, kind: 'opaque-unsafe', reason: 'one-off vector object is not proven to be reusable template decoration' };
     }
-    return { elementId: element.id, kind: 'source-specific-unsafe-visual' };
+    if (smallPicture && family.length >= 2 && repeated >= minimum) return { elementId: element.id, kind: 'template-decoration', reason: 'small visual object recurs in the layout family' };
+    return { elementId: element.id, kind: 'opaque-unsafe', reason: `unrecognized native visual kind ${element.kind}` };
   });
 }
 
@@ -313,23 +410,26 @@ function classifyStructuralArchetype(
   slide: TemplateSlide,
   template: TemplateIR,
   title: TemplateElement,
-  body: TemplateElement,
+  bodyInput: TemplateElement | readonly TemplateElement[],
   preservedChromeIds: ReadonlySet<string>,
 ): ExemplarArchetypeAssessment {
+  const bodies = Array.isArray(bodyInput) ? bodyInput : [bodyInput];
   const titleBox = geometryOf(title)!;
-  const bodyBox = geometryOf(body)!;
+  const bodyBoxes = bodies.map((body) => geometryOf(body)!);
+  const bodyBox = bodyBoxes[0]!;
   const canvasArea = Math.max(1, template.slideSize.width * template.slideSize.height);
   const titleAreaShare = area(titleBox) / canvasArea;
   const titleHeightShare = titleBox.height / template.slideSize.height;
-  const bodyAreaShare = area(bodyBox) / canvasArea;
-  const bodyHeightShare = bodyBox.height / template.slideSize.height;
-  const titleBodyFontRatio = maxFont(title) / Math.max(1, maxFont(body));
+  const bodyAreaShare = Math.min(1, bodyBoxes.reduce((sum, box) => sum + area(box), 0) / canvasArea);
+  const bodyHeightShare = (Math.max(...bodyBoxes.map((box) => box.y + box.height)!) - Math.min(...bodyBoxes.map((box) => box.y))) / template.slideSize.height;
+  const titleBodyFontRatio = maxFont(title) / Math.max(1, ...bodies.map(maxFont));
   const textShapes = topLevelTextShapes(slide);
   const majorText = textShapes.filter((element) => {
     const box = geometryOf(element);
     return Boolean(box && (area(box) / canvasArea >= 0.018 || maxFont(element) >= 20));
   });
-  const secondaryMajor = majorText.filter((element) => element.id !== title.id && element.id !== body.id
+  const bodyIds = new Set(bodies.map((body) => body.id));
+  const secondaryMajor = majorText.filter((element) => element.id !== title.id && !bodyIds.has(element.id)
     && !preservedChromeIds.has(element.id));
   const specialVisuals = visualKinds(slide);
   const unlabelledShapes = slide.elements.filter((element) => element.parentId === null
@@ -340,7 +440,7 @@ function classifyStructuralArchetype(
     .includes(element.kind.toLowerCase().replaceAll('_', '').replaceAll('-', '')));
   const pictureArea = specialVisuals.filter((element) => ['picture', 'image'].includes(element.kind.toLowerCase()))
     .reduce((sum, element) => sum + area(geometryOf(element)), 0) / canvasArea;
-  const mappedBodyCenterX = bodyBox.x + bodyBox.width / 2;
+  const mappedBodyCenterX = bodyBoxes.reduce((sum, box) => sum + box.x + box.width / 2, 0) / bodyBoxes.length;
   const sideBySideMajor = secondaryMajor.some((element) => {
     const box = geometryOf(element);
     if (!box) return false;
@@ -359,7 +459,7 @@ function classifyStructuralArchetype(
   else if (pictureArea >= 0.16 || visualAreaShare >= 0.34) archetype = 'visual-led';
   else if (sideBySideMajor || (pictureArea >= 0.1 && mappedBodyCenterX / template.slideSize.width < 0.55)) archetype = 'content-split';
   else if (largeMetricCount >= 3 && majorText.length >= 5) archetype = 'metric-evidence';
-  else if (heroTypography && titleBodyFontRatio >= 3.6 && maxFont(body) <= 10) archetype = 'hero';
+  else if (heroTypography && titleBodyFontRatio >= 3.6 && Math.max(...bodies.map(maxFont)) <= 10) archetype = 'hero';
   else if (heroTypography && bodyAreaShare < 0.045 && majorText.length <= 2) archetype = 'section-divider';
   else if (heroTypography && (majorTextShare > 0.11 || majorText.length >= 3)) archetype = 'cover';
   else if (heroTypography) archetype = 'hero';
@@ -368,7 +468,7 @@ function classifyStructuralArchetype(
   const evidence = [
     `title occupies ${(titleAreaShare * 100).toFixed(1)}% of the canvas and ${(titleHeightShare * 100).toFixed(1)}% of its height`,
     `mapped body occupies ${(bodyAreaShare * 100).toFixed(1)}% of the canvas and ${(bodyHeightShare * 100).toFixed(1)}% of slide height; title/body font ratio is ${titleBodyFontRatio.toFixed(2)}`,
-    `${majorText.length} major text regions, ${secondaryMajor.length} additional non-chrome text regions, and ${(visualAreaShare * 100).toFixed(1)}% unlabelled/visual object area`,
+    `${bodies.length} mapped body region(s); ${majorText.length} major text regions, ${secondaryMajor.length} additional non-chrome text regions, and ${(visualAreaShare * 100).toFixed(1)}% unlabelled/visual object area`,
   ];
   return { archetype, titleAreaShare, titleHeightShare, bodyAreaShare, bodyHeightShare, titleBodyFontRatio,
     majorTextCount: majorText.length, visualAreaShare, evidence };
@@ -393,11 +493,13 @@ function projectedCompositionSignature(
   bodies: readonly TemplateElement[],
   preservedChromeIds: ReadonlySet<string>,
   template: TemplateIR,
+  visualSlot: TemplateElement | null,
 ): string {
   const bodyIds = new Set(bodies.map((body) => body.id));
+  const mappedVisualId = visualSlot?.id ?? null;
   const keptTextIds = new Set([title.id, ...bodyIds, ...preservedChromeIds]);
   const projectedElements = slide.elements.filter((element) => {
-    if (element.parentId !== null || element.id === title.id || bodyIds.has(element.id)) return false;
+    if (element.id === title.id || bodyIds.has(element.id) || element.id === mappedVisualId) return false;
     if (keptTextIds.has(element.id)) return true;
     if (normalizedText(element)) {
       // Text is cleared from source-specific boxes. Include only any directly styled box/line left visible.
@@ -405,7 +507,7 @@ function projectedCompositionSignature(
     }
     return true;
   });
-  const allProjectedElements = [...projectedElements, title, ...bodies].sort((left, right) => left.order - right.order);
+  const allProjectedElements = [...projectedElements, title, ...bodies, ...(visualSlot ? [visualSlot] : [])].sort((left, right) => left.order - right.order);
   const relativeZOrder = new Map(allProjectedElements.map((element, index) => [element.id, index]));
   const retainedElements = projectedElements.map((element) => elementDescriptor(element, template, relativeZOrder.get(element.id)!));
   return signature({
@@ -413,23 +515,31 @@ function projectedCompositionSignature(
       title: elementDescriptor(title, template, relativeZOrder.get(title.id)!),
       body: bodies.map((body) => elementDescriptor(body, template, relativeZOrder.get(body.id)!)),
     },
+    mappedVisualSlot: visualSlot ? elementDescriptor(visualSlot, template, relativeZOrder.get(visualSlot.id)!) : null,
     retainedNativeElements: retainedElements,
   });
 }
 
+function hasRenderableVisual(compiled: CompiledSlide): boolean {
+  return Boolean(compiled.visualization.tableData || compiled.visualization.chartData || compiled.visualization.kpi
+    || compiled.visualization.processSteps.length >= 2 || compiled.imageRefs.length > 0);
+}
+
 function fallbackCompositionSignature(compiled: CompiledSlide, template: TemplateIR): string {
-  const layout = template.layouts.find((item) => item.id === compiled.layoutId);
+  const layout = template.layouts.find((item) => item.id === compiled.layoutId
+    && item.sourcePart === compiled.layoutSourcePart);
   const master = layout?.masterId ? template.masters.find((item) => item.id === layout.masterId) : null;
   return signature({
+    layoutBackground: layout?.background ?? null,
+    masterBackground: master?.background ?? null,
     nativeLayout: layout?.elements.map((element) => elementDescriptor(element, template)) ?? [],
     nativeMaster: master?.elements.map((element) => elementDescriptor(element, template)) ?? [],
-    generatedText: {
-      title: normalizedGeometry({ ...compiled.placements.title, rotation: 0, unit: 'EMU' }, template),
-      body: normalizedGeometry({ ...compiled.placements.body, rotation: 0, unit: 'EMU' }, template),
-      visual: compiled.placements.visual
-        ? normalizedGeometry({ ...compiled.placements.visual, rotation: 0, unit: 'EMU' }, template)
-        : null,
-    },
+    // Title/body are filled into exact native placeholders. Compiled placement estimates can
+    // differ by a few EMUs across policies even though Office Kit selects the same placeholders;
+    // they must not manufacture a distinct composition signature.
+    generatedVisual: compiled.placements.visual
+      ? normalizedGeometry({ ...compiled.placements.visual, rotation: 0, unit: 'EMU' }, template)
+      : null,
     visualTopology: {
       type: compiled.visualization.type,
       status: compiled.visualization.status,
@@ -461,19 +571,11 @@ function inCanvas(box: TemplateGeometry, template: TemplateIR): boolean {
     && box.x + box.width <= template.slideSize.width && box.y + box.height <= template.slideSize.height;
 }
 
-function bodyChunks(lines: readonly string[], count: number): string[] {
-  return Array.from({ length: count }, (_unused, index) => {
-    const start = Math.floor(index * lines.length / count);
-    const end = Math.floor((index + 1) * lines.length / count);
-    return lines.slice(start, end).join('\n');
-  });
-}
-
 function bodySlotsFor(
   candidates: TemplateElement[],
   compiled: CompiledSlide,
   allowMultiple: boolean,
-): { elements: TemplateElement[]; fits: number[] } | null {
+): { elements: TemplateElement[]; ranges: Array<{ start: number; end: number }>; fits: number[] } | null {
   if (!candidates.length) return null;
   const orderedByArea = [...candidates].sort((left, right) => area(geometryOf(right)) - area(geometryOf(left)) || left.order - right.order);
   const available: TemplateElement[] = [];
@@ -485,14 +587,50 @@ function bodySlotsFor(
         && box.y < other.y + other.height && box.y + box.height > other.y;
     })) continue;
     available.push(element);
-    if (available.length >= (allowMultiple ? Math.min(3, Math.max(1, compiled.body.length)) : 1)) break;
+    if (available.length >= (allowMultiple ? Math.min(4, Math.max(1, compiled.body.length)) : 1)) break;
   }
   const elements = available.sort((left, right) => geometryOf(left)!.y - geometryOf(right)!.y
     || geometryOf(left)!.x - geometryOf(right)!.x || left.order - right.order);
   for (let count = elements.length; count >= 1; count -= 1) {
     const selected = elements.slice(0, count);
-    const fits = bodyChunks(compiled.body, count).map((text, index) => estimatedLineFit(text, selected[index]!));
-    if (fits.every((fit) => fit >= 0.55)) return { elements: selected, fits };
+    const blocks = compiled.body.length ? compiled.body : [''];
+    const capacities = selected.map((element) => {
+      const box = geometryOf(element)!;
+      const font = Math.max(8, maxFont(element));
+      return Math.max(0.25, (box.width / 12700) / (font * 0.52) * (box.height / 12700) / (font * 1.2));
+    });
+    const demandFor = (text: string, element: TemplateElement) => {
+      const box = geometryOf(element)!;
+      const font = Math.max(8, maxFont(element));
+      const charsPerLine = Math.max(6, (box.width / 12700) / (font * 0.52));
+      return Math.max(1, text.split(/\r?\n/).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charsPerLine)), 0));
+    };
+    type Partition = { cost: number; ranges: Array<{ start: number; end: number }>; fits: number[] };
+    const dp: Array<Array<Partition | null>> = Array.from({ length: count + 1 }, () => Array(blocks.length + 1).fill(null));
+    dp[0]![0] = { cost: 0, ranges: [], fits: [] };
+    for (let regionIndex = 0; regionIndex < count; regionIndex += 1) {
+      for (let end = regionIndex + 1; end <= blocks.length; end += 1) {
+        for (let start = regionIndex; start < end; start += 1) {
+          const previous = dp[regionIndex]![start];
+          if (!previous) continue;
+          const text = blocks.slice(start, end).join('\n');
+          const fit = estimatedLineFit(text, selected[regionIndex]!);
+          if (fit < 0.55) continue;
+          const utilization = demandFor(text, selected[regionIndex]!) / capacities[regionIndex]!;
+          const next: Partition = {
+            cost: previous.cost + utilization * utilization,
+            ranges: [...previous.ranges, { start, end }],
+            fits: [...previous.fits, fit],
+          };
+          const current = dp[regionIndex + 1]![end];
+          if (!current || next.cost < current.cost - 1e-9) dp[regionIndex + 1]![end] = next;
+        }
+      }
+    }
+    const assignment = dp[count]![blocks.length];
+    if (assignment && assignment.ranges.every((range) => range.end > range.start)) {
+      return { elements: selected, ranges: assignment.ranges, fits: assignment.fits };
+    }
   }
   return null;
 }
@@ -507,7 +645,7 @@ function candidateFor(
 ): CandidateBuild {
   const trustedProfile = profileSlide && profileSlide.confidence >= 0.6 ? profileSlide : null;
   const preservedChromeIds = chromeIds(template, slide.layoutId ?? '');
-  const visualClasses = visualClassification(slide, template);
+  const visualClasses = visualClassification(slide, template, trustedProfile?.visualElementIds ?? []);
   const visualElementIds = trustedProfile?.visualElementIds ?? visualClasses.map((item) => item.elementId);
   const diagnostic: CandidateDiagnostic = {
     sourceSlideIndex: slide.index,
@@ -517,7 +655,8 @@ function candidateFor(
     titleElementId: trustedProfile?.titleElementId ?? null,
     bodyElementIds: trustedProfile?.bodyElementIds ?? [],
     visualElementIds,
-    visualClassification: visualClasses.map((item) => `${item.elementId}:${item.kind}`),
+    visualClassification: visualClasses.map((item) => `${item.elementId}:${item.kind}:${item.reason}`),
+    preservedTextElementIds: [], replacedTextElementIds: [], clearedTextElementIds: [], blockedTextElementIds: [],
     gate: 'candidate-filter', rejectReason: null, familyKey: null, projectedCompositionSignature: null,
     projectionSafe: null, contentSafe: null, roleCompatible: false,
     titleGeometryNormalized: null, bodyGeometryNormalized: null, titleBodyFontHierarchy: null, evidence: [],
@@ -529,19 +668,22 @@ function candidateFor(
     return { candidate: null, diagnostic };
   };
   if (!slide.sourcePart) return reject('source-part', 'source slide part is missing');
+  const inheritedText = inheritedStaticText(template, slide.layoutId, slide.masterId);
+  if (inheritedText.length) return reject('inherited-source-text',
+    `${inheritedText.length} non-placeholder text element(s) inherited from the layout/master cannot be proven to be template chrome; projection is withheld`);
   if (slide.layoutId !== compiled.layoutId && !trustedProfile) return reject('layout-match', `donor layout ${slide.layoutId ?? 'null'} differs from compiled layout ${compiled.layoutId}; no trusted semantic role mapping`);
-  if (slide.elements.some((element) => element.parentId !== null)) return reject('nested-elements', 'nested/grouped elements are unsupported by the native text projector');
+  if (!supportedNestedElements(slide)) return reject('opaque-unsafe', 'nested/grouped elements contain unsupported kinds, unresolved native IDs, or unsafe ancestry');
   if (slide.relationships.some((relationship) => {
     const type = relationship.type.toLowerCase();
     return type.endsWith('/slide') || type.endsWith('/hyperlink');
   })) return reject('relationships', 'slide/hyperlink relationship is unsafe');
-  const unsafeVisuals = visualClasses.filter((item) => item.kind === 'source-specific-unsafe-visual');
-  if (unsafeVisuals.length) return reject('visual-safety', `source-specific or opaque visual objects are unsafe to preserve: ${unsafeVisuals.map((item) => item.elementId).join(',')}`);
+  const unsafeVisuals = visualClasses.filter((item) => item.kind === 'source-specific-content' || item.kind === 'opaque-unsafe');
+  if (unsafeVisuals.length) return reject('visual-safety', `source-specific content or opaque native visuals are unsafe to preserve: ${unsafeVisuals.map((item) => `${item.elementId} (${item.kind})`).join(',')}`);
 
   const profileTitle = trustedProfile?.titleElementId
     ? slide.elements.find((element) => element.id === trustedProfile.titleElementId) : null;
   const profileTitleUsable = Boolean(profileTitle && profileTitle.nativeId && geometryOf(profileTitle)
-    && profileTitle.parentId === null && profileTitle.kind.toLowerCase() === 'shape' && normalizedText(profileTitle));
+    && profileTitle.kind.toLowerCase() === 'shape' && normalizedText(profileTitle));
   const title = profileTitleUsable ? profileTitle! : titleEvidence ? titleForSlide(slide, titleEvidence) : null;
   if (trustedProfile?.titleElementId && !profileTitleUsable) {
     diagnostic.evidence.push('semantic title mapping conflicts with native text/geometry requirements; structural fallback was attempted');
@@ -549,12 +691,13 @@ function candidateFor(
   const titleBox = title ? geometryOf(title) : null;
   if (!title || !title.nativeId || !titleBox) return reject('title-role', 'no usable mapped title text shape with native ID and geometry');
   const bodySamples = (bodyEvidence?.sourceEvidence ?? []).filter((item) => item.sourcePart === slide.sourcePart && item.slideIndex === slide.index);
+  if (trustedProfile && trustedProfile.bodyElementIds.length > 4) return reject('body-role-fit', `semantic profile mapped ${trustedProfile.bodyElementIds.length} body regions; the bounded projector supports at most four`);
   const semanticBodyCandidates = trustedProfile?.bodyElementIds.map((id) => slide.elements.find((element) => element.id === id))
     .filter((element): element is TemplateElement => Boolean(element));
   const structuralBodyCandidates = bodySamples.map((sample) => slide.elements.find((element) => element.id === sample.elementId));
   const bodyCandidates = (trustedProfile && semanticBodyCandidates?.length ? semanticBodyCandidates : structuralBodyCandidates)
     .filter((element): element is TemplateElement => Boolean(element && element.id !== title.id && element.nativeId
-      && element.kind.toLowerCase() === 'shape' && element.parentId === null && normalizedText(element)
+      && element.kind.toLowerCase() === 'shape' && normalizedText(element)
       && geometryOf(element) && maxFont(element) >= 7.5 && maxFont(element) <= 72))
     .map((element) => ({
       element,
@@ -595,7 +738,7 @@ function candidateFor(
       + 0.16 * geometryFit + 0.12 * styleHierarchy).toFixed(4));
   if (confidence < MIN_EXEMPLAR_CONFIDENCE) return reject('confidence', `candidate confidence ${confidence}<${MIN_EXEMPLAR_CONFIDENCE}`);
 
-  const archetype = classifyStructuralArchetype(slide, template, title, body, preservedChromeIds);
+  const archetype = classifyStructuralArchetype(slide, template, title, bodies, preservedChromeIds);
   const chosenArchetype = trustedProfile ? trustedProfile.archetype as ExemplarArchetype : archetype.archetype;
   const semanticConflict = Boolean(trustedProfile && trustedProfile.archetype !== archetype.archetype);
   const titleAreaShare = archetype.titleAreaShare;
@@ -606,18 +749,28 @@ function candidateFor(
   const bodyHeightShare = (bodyBottom - bodyTop) / template.slideSize.height;
   const fontRatio = archetype.titleBodyFontRatio;
   const titleHeightShare = archetype.titleHeightShare;
-  const mappedBodyIds = new Set(trustedProfile?.bodyElementIds ?? [body.id]);
-  const sourceSpecificText = textShapes.filter((element) => element.id !== title.id && !mappedBodyIds.has(element.id)
-    && !preservedChromeIds.has(element.id));
+  const mappedBodyIds = new Set(trustedProfile?.bodyElementIds ?? bodies.map((item) => item.id));
   const selectedBodyIds = new Set(bodies.map((element) => element.id));
-  const unprojectedMappedBodies = textShapes.filter((element) => mappedBodyIds.has(element.id) && !selectedBodyIds.has(element.id));
-  const isMajorText = (element: TemplateElement) => {
-    const box = geometryOf(element);
-    return Boolean(box && (area(box) / Math.max(1, template.slideSize.width * template.slideSize.height) >= 0.055
-      || (maxFont(element) >= 20 && area(box) / Math.max(1, template.slideSize.width * template.slideSize.height) >= 0.012)));
-  };
-  const majorTextToClear = sourceSpecificText.filter(isMajorText).length;
-  const majorMappedTextToClear = unprojectedMappedBodies.filter(isMajorText).length;
+  // Mapped body roles are validated template-source content. When the current
+  // source has fewer body blocks than the donor has regions, clear the unused
+  // sample regions instead of treating them as unknown text or preserving old facts.
+  const unprojectedMappedBodies = trustedProfile
+    ? textShapes.filter((element) => mappedBodyIds.has(element.id) && !selectedBodyIds.has(element.id))
+    : [];
+  const replacedTextIds = [title.id, ...bodies.map((element) => element.id)];
+  const semanticPreservedIds = new Set(trustedProfile?.preservedElementIds ?? []);
+  const semanticReplaceableIds = new Set(trustedProfile?.replaceableTextElementIds ?? []);
+  const preservedText = textShapes.filter((element) => (preservedChromeIds.has(element.id) || semanticPreservedIds.has(element.id))
+    && !replacedTextIds.includes(element.id));
+  const unusedMappedBodyIds = new Set(unprojectedMappedBodies.map((element) => element.id));
+  const explicitlyReplaceableText = textShapes.filter((element) => (semanticReplaceableIds.has(element.id) || unusedMappedBodyIds.has(element.id))
+    && !replacedTextIds.includes(element.id) && !preservedText.includes(element));
+  const blockedText = textShapes.filter((element) => !replacedTextIds.includes(element.id)
+    && !preservedText.includes(element) && !explicitlyReplaceableText.includes(element));
+  diagnostic.preservedTextElementIds = preservedText.map((element) => element.id);
+  diagnostic.replacedTextElementIds = replacedTextIds;
+  diagnostic.clearedTextElementIds = explicitlyReplaceableText.map((element) => element.id);
+  diagnostic.blockedTextElementIds = blockedText.map((element) => element.id);
   const bodyLineCapacity = Math.max(0.25, bodies.reduce((sum, item) => {
     const box = geometryOf(item)!;
     return sum + (box.width / 12700) / (Math.max(8, maxFont(item)) * 0.52)
@@ -630,10 +783,14 @@ function candidateFor(
   if (titleAreaShare > 0.14) contentGateReasons.push('title occupies excessive canvas area for a content slide');
   if (bodyAreaShare < 0.06 || bodyHeightShare < 0.09) contentGateReasons.push('body donor region is too small to carry content');
   if (fontRatio > 2.2 && bodyAreaShare < 0.12) contentGateReasons.push('title/body typography ratio leaves a small body region visually subordinate');
-  if (majorTextToClear > 0) contentGateReasons.push(`${majorTextToClear} major source-specific text region(s) would be erased outside the mapped body`);
-  if (majorMappedTextToClear > 0) contentGateReasons.push(`${majorMappedTextToClear} major semantic body region(s) are mapped but not projected and would be erased`);
+  if (blockedText.length > 0) contentGateReasons.push(`${blockedText.length} ambiguous meaningful text region(s) lack validated preserve/replaceable evidence`);
   if (textDensity < 0.08 && bodyAreaShare > 0.3) contentGateReasons.push('projected text is sparse for the large donor body region');
-  const projectionSafe = majorTextToClear === 0 && majorMappedTextToClear === 0;
+  const projectionSafe = blockedText.length === 0;
+  if (!projectionSafe) {
+    diagnostic.projectionSafe = false;
+    diagnostic.contentSafe = false;
+    return reject('ambiguous-text', contentGateReasons.filter((reason) => /ambiguous meaningful|mapped body region/.test(reason)).join('; '));
+  }
   const structuralContentRole = ['content', 'content-dense'].includes(archetype.archetype);
   const contentSafe = projectionSafe && contentGateReasons.length === 0 && (trustedProfile !== null || structuralContentRole);
 
@@ -657,12 +814,29 @@ function candidateFor(
         : ['content', 'content-dense'].includes(archetype.archetype) ? 0.12 : -0.12;
   const score = confidenceScore + semanticBoost - Math.min(0.25, contentGateReasons.length * 0.1)
     - (textDensity < 0.08 && bodyAreaShare > 0.3 ? 0.12 : 0);
-  const additionalMappedBodies = (trustedProfile?.bodyElementIds ?? []).map((id) => slide.elements.find((element) => element.id === id))
-    .filter((element): element is TemplateElement => Boolean(element && !selectedBodyIds.has(element.id)
-      && element.id !== title.id && element.nativeId && normalizedText(element)));
-  const clearElementNativeIds = [...new Set([...sourceSpecificText, ...additionalMappedBodies])].map((element) => element.nativeId!);
+  const clearElementNativeIds = [...new Set(explicitlyReplaceableText)].map((element) => element.nativeId!);
+  const renderableVisual = hasRenderableVisual(compiled);
+  const visualSlots = renderableVisual ? visualClasses.filter((item) => item.kind === 'content-slot'
+    && (visualElementIds.includes(item.elementId) || /picture|image|chart|table|graphic/i.test(
+      `${slide.elements.find((element) => element.id === item.elementId)?.placeholder?.type ?? ''} ${slide.elements.find((element) => element.id === item.elementId)?.placeholder?.role ?? ''}`)))
+    .map((item) => slide.elements.find((element) => element.id === item.elementId))
+    .filter((element): element is TemplateElement => Boolean(element?.nativeId && geometryOf(element)
+      && !element.relationshipIds.length && inCanvas(geometryOf(element)!, template)))
+    .filter((element) => {
+      const box = geometryOf(element)!;
+      return !allBoxes.some((textBox) => textBox.x < box.x + box.width && textBox.x + textBox.width > box.x
+        && textBox.y < box.y + box.height && textBox.y + textBox.height > box.y);
+    }) : [];
+  const visualSlot = visualSlots.length === 1 ? visualSlots[0]! : null;
+  if (renderableVisual && !visualSlot) return reject('visual-slot-fit', visualSlots.length
+    ? `${visualSlots.length} replaceable visual regions remain ambiguous after semantic and geometry checks`
+    : 'no single source-free native visual slot is available for the requested chart, table, process, KPI, or image');
   const preserveChromeNativeIds = textShapes.filter((element) => preservedChromeIds.has(element.id)
     && element.id !== title.id && element.id !== body.id).map((element) => element.nativeId!);
+  const visualClassCounts = visualClasses.reduce<Record<string, number>>((counts, item) => {
+    counts[item.kind] = (counts[item.kind] ?? 0) + 1;
+    return counts;
+  }, {});
   const evidence = [
     trustedProfile ? `semantic profile confidence ${trustedProfile.confidence} mapped ${bodies.length} body region(s)` : `title donor repeats across ${titleEvidence?.sampleCount ?? 0} slides in the selected layout`,
     trustedProfile ? `profile mapped ${trustedProfile.bodyElementIds.length} source body element(s)` : `body donor region repeats across ${bodyEvidence?.sampleCount ?? 0} slides in the selected layout`,
@@ -673,7 +847,8 @@ function candidateFor(
     ...(semanticConflict ? [`semantic/structural conflict: profile=${trustedProfile!.archetype}, structural=${archetype.archetype}; structural safety remains authoritative`] : []),
     `projected body density estimate ${textDensity.toFixed(3)}`,
     ...contentGateReasons.map((reason) => `content-sanity gate: ${reason}`),
-    `${textShapes.length} text shapes inspected; ${clearElementNativeIds.length} source-specific shapes will be cleared`,
+    `${textShapes.length} text shapes classified: ${preservedText.length} preserved, ${replacedTextIds.length} replaced, ${clearElementNativeIds.length} cleared, ${blockedText.length} blocked`,
+    `${visualClasses.length} visual object(s) classified as ${Object.entries(visualClassCounts).map(([kind, count]) => `${kind}=${count}`).join(', ') || 'none'}`,
     `${slide.elements.filter((element) => element.kind.toLowerCase() === 'connector').length} native connectors and ${slide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && !normalizedText(element)).length} unlabelled shapes retained`,
     `${titleSupport} title evidence records and ${bodySupport} body evidence records refer to this source slide`,
   ];
@@ -691,21 +866,29 @@ function candidateFor(
       confidence,
       slots: {
         title: { elementId: title.id, nativeId: title.nativeId },
-        body: { elementId: body.id, nativeId: body.nativeId! },
-        bodySlots: bodies.map((element) => ({ elementId: element.id, nativeId: element.nativeId! })),
-        visual: null,
+      body: { elementId: body.id, nativeId: body.nativeId! },
+      bodySlots: bodies.map((element) => ({ elementId: element.id, nativeId: element.nativeId! })),
+      visual: visualSlot ? { elementId: visualSlot.id, nativeId: visualSlot.nativeId!, geometry: geometryOf(visualSlot)!, kind: visualSlot.kind } : null,
+    },
+      bodyContentRanges: bodyChoice.ranges,
+      textProjection: {
+        preserved: preservedText.map((element) => element.nativeId!).filter(Boolean),
+        replaced: replacedTextIds.map((id) => slide.elements.find((element) => element.id === id)?.nativeId).filter((id): id is string => Boolean(id)),
+        cleared: clearElementNativeIds,
+        blocked: blockedText.map((element) => element.nativeId!).filter(Boolean),
       },
       clearElementNativeIds,
       preserveChromeNativeIds,
       familyKey: familyKey(slide, title, body, template),
-      projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies, preservedChromeIds, template),
+      projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies,
+        new Set([...preservedChromeIds, ...preservedText.map((element) => element.id)]), template, visualSlot),
       titleGeometryNormalized: titleNormalized,
       bodyGeometryNormalized: bodyNormalized,
       titleBodyFontHierarchy: { titlePt: maxFont(title), bodyPt: maxFont(body), ratio: Number(fontRatio.toFixed(3)) },
       selectionReason: '',
       evidence,
       limitations: trustedProfile ? ['Semantic body regions are mapped in reading order; unsupported visual/data structures remain fail-closed.']
-        : ['The compiled text body uses the structural selector evidence for a single compatible donor region.'],
+        : ['The structural selector can project one compatible body region; ambiguous unmapped text blocks donor reuse.'],
     };
   diagnostic.structuralArchetype = archetype.archetype;
   diagnostic.semanticArchetype = trustedProfile?.archetype ?? archetype.archetype;
@@ -743,17 +926,66 @@ function semanticCandidates(candidates: Candidate[], intent: CompiledSlide['inte
   return candidates.filter((candidate) => candidate.projectionSafe && candidate.contentSafe);
 }
 
-function nativePlaceholderFallbackSupported(compiled: CompiledSlide, template: TemplateIR): boolean {
-  const layout = compiled.layoutCandidates.find((candidate) => candidate.layoutId === compiled.layoutId
-    && candidate.sourcePart === compiled.layoutSourcePart);
-  const sourceLayout = template.layouts.find((candidate) => candidate.id === compiled.layoutId);
-  if (!layout || !sourceLayout || layout.slotEvidence.title?.provenance !== 'explicit_placeholder'
-      || layout.slotEvidence.body?.provenance !== 'explicit_placeholder') return false;
-  const placeholders = sourceLayout.elements.filter((element) => element.placeholder !== null);
-  return placeholders.some((element) => element.id === layout.slotEvidence.title?.sourceEvidence[0]?.elementId
-      && /title|subtitle/i.test(`${element.placeholder?.type ?? ''} ${element.placeholder?.role ?? ''}`))
-    && placeholders.some((element) => element.id === layout.slotEvidence.body?.sourceEvidence[0]?.elementId
-      && /body|obj|content|subtitle/i.test(`${element.placeholder?.type ?? ''} ${element.placeholder?.role ?? ''}`));
+function nativePlaceholderFallbackSupported(
+  compiled: CompiledSlide,
+  template: TemplateIR,
+  candidate: CompatibleLayoutMatchCandidate,
+): boolean {
+  if (candidate.slotEvidence.title.provenance !== 'explicit_placeholder'
+      || candidate.slotEvidence.body.provenance !== 'explicit_placeholder') return false;
+  const sourceLayout = template.layouts.find((item) => item.id === candidate.layoutId && item.sourcePart === candidate.sourcePart);
+  if (!sourceLayout) return false;
+  const titleId = candidate.slotEvidence.title.sourceEvidence[0]?.elementId;
+  const bodyId = candidate.slotEvidence.body.sourceEvidence[0]?.elementId;
+  const title = sourceLayout.elements.find((element) => element.id === titleId && element.placeholder !== null);
+  const body = sourceLayout.elements.find((element) => element.id === bodyId && element.placeholder !== null);
+  if (!title || !body || !/title|subtitle/i.test(`${title.placeholder?.type ?? ''} ${title.placeholder?.role ?? ''}`)
+      || !/body|obj|content|subtitle/i.test(`${body.placeholder?.type ?? ''} ${body.placeholder?.role ?? ''}`)) return false;
+  const titleBox = geometryOf(title);
+  const bodyBox = geometryOf(body);
+  if (!titleBox || !bodyBox || !inCanvas(titleBox, template) || !inCanvas(bodyBox, template)
+      || (titleBox.x < bodyBox.x + bodyBox.width && titleBox.x + titleBox.width > bodyBox.x
+        && titleBox.y < bodyBox.y + bodyBox.height && titleBox.y + titleBox.height > bodyBox.y)
+      || estimatedLineFit(compiled.title, title) < 0.55
+      || compiled.body.length > 0 && estimatedLineFit(compiled.body.join('\n'), body) < 0.55) return false;
+  const master = sourceLayout.masterId ? template.masters.find((candidate) => candidate.id === sourceLayout.masterId) : null;
+  // Static inherited text is not editable through the generated slide. Repetition
+  // across sibling layouts is insufficient evidence that sample copy is chrome.
+  if (inheritedStaticText(template, sourceLayout.id, sourceLayout.masterId).length) return false;
+  const designElements = [...sourceLayout.elements, ...(master?.elements ?? [])].filter((element) => element.placeholder === null);
+  const hasNativeChrome = designElements.some((element) => geometryOf(element)
+      && (element.relationshipIds.length > 0 || element.kind.toLowerCase() !== 'shape'
+        || hasVisibleDirectStyle(element) || Boolean(normalizedText(element))))
+    || Boolean(sourceLayout.background?.kind === 'explicit' || master?.background?.kind === 'explicit');
+  return hasNativeChrome;
+}
+
+function withLayoutCandidate(compiled: CompiledSlide, candidate: CompatibleLayoutMatchCandidate, index: number): CompiledSlide {
+  return {
+    ...compiled,
+    layoutId: candidate.layoutId,
+    layoutSourcePart: candidate.sourcePart,
+    placements: { title: candidate.titleBox, body: candidate.bodyBox, visual: candidate.visualBox },
+    selectedCandidateIndex: index,
+  };
+}
+
+/** Apply the exact composition assignment that the A/B/C gate qualified. */
+export function applyVariantCompositionAssignment(
+  compiled: CompiledSlide,
+  assignment: VariantCompositionAssignment,
+  template: TemplateIR,
+): CompiledSlide {
+  if (compiled.variantId !== assignment.variantId) throw new TypeError('Composition assignment does not match the compiled variant');
+  if (assignment.compositionKind !== 'layout-placeholder-backed') {
+    const { nativeLayoutFallback: _fallback, ...automatic } = compiled;
+    return automatic;
+  }
+  const candidate = compiled.layoutCandidates[assignment.layoutCandidateIndex];
+  if (!candidate || !nativePlaceholderFallbackSupported(compiled, template, candidate)) {
+    throw new TypeError('Qualified native layout composition is no longer safe for the compiled slide');
+  }
+  return { ...withLayoutCandidate(compiled, candidate, assignment.layoutCandidateIndex), nativeLayoutFallback: true };
 }
 
 /**
@@ -765,45 +997,15 @@ export function assessExemplarSelection(
   template: TemplateIR,
   semanticProfileInput?: TemplateSemanticProfile,
 ): ExemplarSelectionAssessment {
+  if (compiled.nativeLayoutFallback) return {
+    selection: null,
+    availableDistinctFamilies: 0,
+    distinctSourceFamilyKeys: [],
+    candidateDiagnostics: [],
+    supportedCandidateCount: 0,
+    evidence: ['the qualified composition assignment requires the measured native layout placeholders'],
+  };
   const semanticProfile = semanticProfileInput ? validateTemplateSemanticProfile(semanticProfileInput, template) : undefined;
-  if (compiled.visualization.type !== 'none' || compiled.visualization.status !== 'none' || compiled.imageRefs.length) {
-    const profileByIndex = new Map(semanticProfile?.slides.map((slide) => [slide.sourceSlideIndex, slide]) ?? []);
-    const candidateDiagnostics = template.slides.map((slide): CandidateDiagnostic => {
-      const profileSlide = profileByIndex.get(slide.index);
-      const title = profileSlide?.titleElementId ? slide.elements.find((element) => element.id === profileSlide.titleElementId) : null;
-      const body = profileSlide?.bodyElementIds.map((id) => slide.elements.find((element) => element.id === id)).find((element) => element !== undefined) ?? null;
-      let structuralArchetype: ExemplarArchetype | null = null;
-      if (title && body && geometryOf(title) && geometryOf(body)) {
-        structuralArchetype = classifyStructuralArchetype(slide, template, title, body, chromeIds(template, slide.layoutId ?? '')).archetype;
-      }
-      const visualClasses = visualClassification(slide, template);
-      return {
-        sourceSlideIndex: slide.index,
-        structuralArchetype,
-        semanticArchetype: profileSlide?.archetype ?? null,
-        semanticConfidence: profileSlide?.confidence ?? null,
-        titleElementId: profileSlide?.titleElementId ?? null,
-        bodyElementIds: profileSlide?.bodyElementIds ?? [],
-        visualElementIds: profileSlide?.visualElementIds ?? visualClasses.map((item) => item.elementId),
-        visualClassification: visualClasses.map((item) => `${item.elementId}:${item.kind}`),
-        gate: 'compiled-visual-projection',
-        rejectReason: 'compiled slide requests a visual or image; the text-only exemplar projector cannot safely combine it with the generated visual',
-        familyKey: null,
-        projectedCompositionSignature: null,
-        projectionSafe: null,
-        contentSafe: null,
-        roleCompatible: false,
-        titleGeometryNormalized: title && geometryOf(title) ? normalizedGeometry(geometryOf(title)!, template) : null,
-        bodyGeometryNormalized: body && geometryOf(body) ? normalizedGeometry(geometryOf(body)!, template) : null,
-        titleBodyFontHierarchy: title && body ? {
-          titlePt: maxFont(title), bodyPt: maxFont(body), ratio: Number((maxFont(title) / Math.max(1, maxFont(body))).toFixed(3)),
-        } : null,
-        evidence: [`${visualClasses.length} source visual object(s) classified without projection`, 'active visual payload remains fail-closed'],
-      };
-    });
-    return { selection: null, availableDistinctFamilies: 0, distinctSourceFamilyKeys: [], candidateDiagnostics, supportedCandidateCount: 0,
-      evidence: ['compiled slide has a requested visual or image; this one-body exemplar selector is not compatible'] };
-  }
   const layout = compiled.layoutCandidates.find((candidate) => candidate.layoutId === compiled.layoutId
     && candidate.sourcePart === compiled.layoutSourcePart);
   const titleEvidence = layout?.slotEvidence.title;
@@ -885,6 +1087,7 @@ export interface VariantCompositionDistinctness {
   distinct: boolean;
   availableDistinctFamilies: number;
   signatures: string[];
+  assignments: VariantCompositionAssignment[];
   evidence: string[];
 }
 
@@ -907,35 +1110,97 @@ export function assessVariantCompositionDistinctness(
   let signatures: string[];
   if (backend === 'custom') {
     signatures = ordered.map((slide) => generatedFallbackCompositionSignature(slide, template));
+    const assignments = ordered.map((slide, index): VariantCompositionAssignment => ({
+      variantId: slide.variantId,
+      compositionKind: 'safe-generated-fallback',
+      layoutCandidateIndex: slide.selectedCandidateIndex,
+      projectedCompositionSignature: signatures[index]!,
+    }));
+    const availableDistinctFamilies = new Set(signatures).size;
+    const distinct = signatures.length === variants.length && availableDistinctFamilies === variants.length;
+    return {
+      distinct, availableDistinctFamilies, signatures, assignments,
+      evidence: distinct ? ['A/B/C have three distinct projected composition signatures']
+        : [`availableDistinctFamilies=${availableDistinctFamilies}; duplicate projected compositions are withheld`],
+    };
   } else {
     const assessments = ordered.map((slide) => assessExemplarSelection(slide, template, semanticProfile));
-    const projected = ordered.map((slide, index) => {
+    type Option = VariantCompositionAssignment;
+    const optionsByVariant = ordered.map((slide, index) => {
+      const options: Option[] = [];
       const selection = assessments[index]!.selection;
-      if (selection) return selection.projectedCompositionSignature;
-      if (nativePlaceholderFallbackSupported(slide, template)) return generatedFallbackCompositionSignature(slide, template);
-      return null;
+      if (selection) options.push({
+        variantId: slide.variantId,
+        compositionKind: 'exemplar-backed',
+        layoutCandidateIndex: slide.selectedCandidateIndex,
+        projectedCompositionSignature: selection.projectedCompositionSignature,
+      });
+      slide.layoutCandidates.forEach((candidate, candidateIndex) => {
+        if (!nativePlaceholderFallbackSupported(slide, template, candidate)) return;
+        const nativeSlide = withLayoutCandidate(slide, candidate, candidateIndex);
+        options.push({
+          variantId: slide.variantId,
+          compositionKind: 'layout-placeholder-backed',
+          layoutCandidateIndex: candidateIndex,
+          projectedCompositionSignature: generatedFallbackCompositionSignature(nativeSlide, template),
+        });
+      });
+      const signaturesSeen = new Set<string>();
+      return options.filter((option) => {
+        if (signaturesSeen.has(option.projectedCompositionSignature)) return false;
+        signaturesSeen.add(option.projectedCompositionSignature);
+        return true;
+      });
     });
-    if (projected.some((item) => item === null)) return {
-      distinct: false,
-      availableDistinctFamilies: new Set(projected.filter((item): item is string => item !== null)).size,
-      signatures: [],
-      evidence: [
-        `availableDistinctFamilies=${new Set(projected.filter((item): item is string => item !== null)).size}`,
-        ...assessments.flatMap((assessment) => assessment.evidence).slice(0, 8),
-        'A/B/C have duplicate projected compositions or no safe native title/body placeholder fallback for at least one variant.',
-      ],
+    let best: Option[] = [];
+    let bestExemplarCount = -1;
+    let bestRankCost = Number.POSITIVE_INFINITY;
+    const chosen: Option[] = [];
+    const usedSignatures = new Set<string>();
+    const visit = (variantIndex: number, exemplarCount: number, rankCost: number): void => {
+      if (variantIndex === ordered.length) {
+        if (chosen.length > best.length || chosen.length === best.length
+            && (exemplarCount > bestExemplarCount || exemplarCount === bestExemplarCount && rankCost < bestRankCost)) {
+          best = [...chosen];
+          bestExemplarCount = exemplarCount;
+          bestRankCost = rankCost;
+        }
+        return;
+      }
+      if (chosen.length + ordered.length - variantIndex < best.length) return;
+      for (const [optionIndex, option] of optionsByVariant[variantIndex]!.entries()) {
+        if (usedSignatures.has(option.projectedCompositionSignature)) continue;
+        usedSignatures.add(option.projectedCompositionSignature);
+        chosen.push(option);
+        visit(variantIndex + 1, exemplarCount + Number(option.compositionKind === 'exemplar-backed'), rankCost + optionIndex);
+        chosen.pop();
+        usedSignatures.delete(option.projectedCompositionSignature);
+      }
+      visit(variantIndex + 1, exemplarCount, rankCost + optionsByVariant[variantIndex]!.length + 1);
     };
-    signatures = projected as string[];
+    visit(0, 0, 0);
+    const distinct = best.length === variants.length;
+    const proposedAssignments = distinct ? best
+      : optionsByVariant.every((options) => options.length > 0)
+        ? optionsByVariant.map((options) => options[0]!)
+        : best;
+    signatures = distinct ? best.map((option) => option.projectedCompositionSignature)
+      : optionsByVariant.every((options) => options.length > 0)
+        ? optionsByVariant.map((options) => options[0]!.projectedCompositionSignature)
+        : [];
+    const assignments = proposedAssignments;
+    return {
+      distinct,
+      availableDistinctFamilies: best.length,
+      signatures,
+      assignments,
+      evidence: distinct
+        ? ['A/B/C have three distinct post-projection compositions', ...assignments.map((assignment) => `${assignment.variantId}=${assignment.compositionKind}`)]
+        : [
+          `availableDistinctFamilies=${best.length}`,
+          ...assessments.flatMap((assessment) => assessment.evidence).slice(0, 8),
+          'A/B/C could not be assigned three distinct safe exemplar/native-layout compositions.',
+        ],
+    };
   }
-
-  const availableDistinctFamilies = new Set(signatures).size;
-  const distinct = signatures.length === variants.length && availableDistinctFamilies === variants.length;
-  return {
-    distinct,
-    availableDistinctFamilies,
-    signatures,
-    evidence: distinct
-      ? ['A/B/C have three distinct projected composition signatures']
-      : [`availableDistinctFamilies=${availableDistinctFamilies}; duplicate projected compositions are withheld`],
-  };
 }

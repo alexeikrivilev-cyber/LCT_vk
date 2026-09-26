@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, rm, writeFile, lstat } from 'node:fs/promises';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
+import { PDFDocument } from 'pdf-lib';
 
 import { assertSafeProjectId } from '../../presentation-files.js';
 import {
@@ -15,10 +16,12 @@ import type { PlanningResponse, PlanningService } from './planning-service.js';
 import { getTemplateCompilation, type TemplateCompilationResponse } from './template-compiler.js';
 import { compilePresentation, UnsupportedTemplateLayoutError, VARIANT_POLICIES, type CompiledPresentation, type CompiledSlide, type PresentationVariantId } from './slide-compilation.js';
 import { auditCompiledPresentation, type DeterministicAuditReport } from './deterministic-audit.js';
-import { assessVariantCompositionDistinctness } from './exemplar-slide-selector.js';
+import { applyVariantCompositionAssignment, assessVariantCompositionDistinctness } from './exemplar-slide-selector.js';
 import { renderPresentation } from '../adapters/pptx-renderer-factory.js';
 import { OfficeKitPreviewAdapter } from '../adapters/office-kit-preview-adapter.js';
 import { inspectOfficeKitPackage } from '../adapters/office-kit-package-inspector.js';
+import { OfficeKitPdfExportAdapter } from '../adapters/office-kit-pdf-export-adapter.js';
+import { SemanticHtmlExportAdapter } from '../adapters/semantic-html-export-adapter.js';
 import type { PptxBackendId, PptxRendererPort, PptxRenderResult } from './pptx-backend-port.js';
 import type { PptxPreviewPort } from './pptx-preview-port.js';
 import type { ContentIR } from '../domain/content-ir.js';
@@ -30,11 +33,14 @@ export type GenerationStatus = 'preparing' | 'generating' | 'completed' | 'faile
 export type SlideGenerationStatus = 'pending' | 'rendering' | 'ready' | 'failed';
 export type VisualSlotStatus = 'not-applicable' | 'ready' | 'unresolved';
 export type GenerationExportMode = 'selected' | PresentationVariantId;
+export type GenerationExportFormat = 'pptx' | 'pdf' | 'html';
 
 export interface GeneratedVariantState {
   status: 'pending' | 'ready' | 'failed';
   version: number;
   layoutCandidateIndex: number;
+  /** Persisted internal renderer choice; intentionally omitted from the public generation API. */
+  nativeLayoutFallback: boolean;
   previewRef: string | null;
   layoutIssueCount: number;
   visualSlotStatus: VisualSlotStatus;
@@ -58,6 +64,7 @@ export interface GeneratedSlidePack {
 export interface GeneratedExport {
   id: string;
   mode: GenerationExportMode;
+  format: GenerationExportFormat;
   fileRef: string;
   sha256: string;
   slideCount: number;
@@ -94,7 +101,7 @@ export interface PresentationGenerationState {
   updatedAt: string;
 }
 
-export interface PublicGeneratedVariant extends Omit<GeneratedVariantState, 'previewRef'> {
+export interface PublicGeneratedVariant extends Omit<GeneratedVariantState, 'previewRef' | 'nativeLayoutFallback'> {
   previewUrl: string | null;
 }
 export interface PublicGeneratedSlidePack extends Omit<GeneratedSlidePack, 'variants'> {
@@ -124,6 +131,8 @@ export interface PresentationGenerationServiceOptions {
   backend: PptxBackendId;
   renderer?: PptxRendererPort;
   preview?: PptxPreviewPort;
+  pdfExporter?: Pick<OfficeKitPdfExportAdapter, 'export'>;
+  htmlExporter?: Pick<SemanticHtmlExportAdapter, 'export'>;
   /** Replaceable dependency seams for offline API tests. */
   inspectPackage?: typeof inspectOfficeKitPackage;
   profileTemplate?: (projectId: string, template: TemplateCompilationResponse) => Promise<TemplateSemanticProfile>;
@@ -164,6 +173,12 @@ function sha256(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function deterministicUuid(seed: string): string {
+  const hex = seed.slice(0, 32);
+  const variant = (8 + (Number.parseInt(hex[16]!, 16) % 4)).toString(16);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
 function sourceContextFingerprint(input: {
   inputFingerprint: string;
   planHash: string;
@@ -175,7 +190,7 @@ function sourceContextFingerprint(input: {
 
 function emptyVariant(): GeneratedVariantState {
   return {
-    status: 'pending', version: 0, layoutCandidateIndex: 0, previewRef: null, layoutIssueCount: 0,
+    status: 'pending', version: 0, layoutCandidateIndex: 0, nativeLayoutFallback: false, previewRef: null, layoutIssueCount: 0,
     visualSlotStatus: 'unresolved', audit: null, renderCheck: null,
   };
 }
@@ -221,6 +236,7 @@ function validateStoredGeneration(value: unknown): PresentationGenerationState {
       if (!isRecord(generated) || !['pending', 'ready', 'failed'].includes(String(generated.status))
           || !Number.isSafeInteger(generated.version) || generated.version < 0
           || !Number.isSafeInteger(generated.layoutCandidateIndex) || generated.layoutCandidateIndex < 0
+          || !(generated.nativeLayoutFallback === undefined || typeof generated.nativeLayoutFallback === 'boolean')
           || !(generated.previewRef === null || typeof generated.previewRef === 'string'
             && generated.previewRef.startsWith(`${state.generationId}/slides/`)
             && !generated.previewRef.includes('..') && !path.isAbsolute(generated.previewRef))
@@ -245,6 +261,7 @@ function validateStoredGeneration(value: unknown): PresentationGenerationState {
   for (const artifact of state.exports) {
     if (!isRecord(artifact) || typeof artifact.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(artifact.id)
         || !(artifact.mode === 'selected' || isVariantId(artifact.mode))
+        || !(artifact.format === undefined || artifact.format === 'pptx' || artifact.format === 'pdf' || artifact.format === 'html')
         || typeof artifact.fileRef !== 'string' || !artifact.fileRef.startsWith(`${state.generationId}/exports/`)
         || artifact.fileRef.includes('..') || path.isAbsolute(artifact.fileRef)
         || typeof artifact.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(artifact.sha256)
@@ -252,6 +269,12 @@ function validateStoredGeneration(value: unknown): PresentationGenerationState {
         || artifact.nativeOfficeStatus !== 'unknown' || !Array.isArray(artifact.unresolvedVisualTypes)
         || typeof artifact.createdAt !== 'string' || !Number.isFinite(Date.parse(artifact.createdAt))) {
       throw new PresentationGenerationError('GENERATION_STATE_INVALID', 'Saved PowerPoint export metadata is invalid.', 500);
+    }
+    // Older persisted state predates the format field; those artifacts were always PPTX.
+    if (artifact.format === undefined) artifact.format = 'pptx';
+    const extension = artifact.format === 'pptx' ? '.pptx' : artifact.format === 'pdf' ? '.pdf' : '.html';
+    if (!artifact.fileRef.endsWith(extension)) {
+      throw new PresentationGenerationError('GENERATION_STATE_INVALID', 'Saved export format does not match its artifact file.', 500);
     }
   }
   return state;
@@ -287,6 +310,15 @@ function auditSummary(reports: Array<DeterministicAuditReport | null>): Generate
   };
 }
 
+async function applicationVersion(): Promise<string | null> {
+  try {
+    const metadata = JSON.parse(await readFile(new URL('../../../../../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+    return typeof metadata.version === 'string' && metadata.version.length <= 64 ? metadata.version : null;
+  } catch {
+    return null;
+  }
+}
+
 function selectedVariant(state: PresentationGenerationState, slideId: string): PresentationVariantId {
   return state.selectionOverrides[slideId] ?? state.defaultTrack;
 }
@@ -297,7 +329,7 @@ function publicSnapshot(stateValue: PresentationGenerationState): PublicPresenta
     ...pack,
     selectedVariant: selectedVariant(state, pack.slideId),
     variants: Object.fromEntries(VARIANT_IDS.map((variant) => {
-      const { previewRef, ...metadata } = pack.variants[variant];
+      const { previewRef, nativeLayoutFallback: _nativeLayoutFallback, ...metadata } = pack.variants[variant];
       return [variant, {
         ...metadata,
         previewUrl: previewRef ? `/api/projects/${encodeURIComponent(state.projectId)}/generation/previews/${encodeURIComponent(pack.slideId)}/${variant}` : null,
@@ -314,16 +346,22 @@ function publicSnapshot(stateValue: PresentationGenerationState): PublicPresenta
 
 export class PresentationGenerationService {
   private readonly tasks = new Map<string, { promise: Promise<void>; controller: AbortController }>();
+  private readonly repairTasks = new Map<string, Promise<PublicPresentationGeneration>>();
+  private readonly exportTasks = new Map<string, Promise<{ state: PublicPresentationGeneration; artifact: Omit<GeneratedExport, 'fileRef'> & { downloadUrl: string } }>>();
   private readonly now: () => Date;
   private readonly renderer: PptxRendererPort;
   private readonly preview: PptxPreviewPort;
   private readonly inspectPackage: typeof inspectOfficeKitPackage;
+  private readonly pdfExporter: Pick<OfficeKitPdfExportAdapter, 'export'>;
+  private readonly htmlExporter: Pick<SemanticHtmlExportAdapter, 'export'>;
 
   constructor(private readonly options: PresentationGenerationServiceOptions) {
     this.now = options.now ?? (() => new Date());
     this.renderer = options.renderer ?? { id: options.backend, render: (input) => renderPresentation(input, options.backend) };
     this.preview = options.preview ?? new OfficeKitPreviewAdapter();
     this.inspectPackage = options.inspectPackage ?? inspectOfficeKitPackage;
+    this.pdfExporter = options.pdfExporter ?? new OfficeKitPdfExportAdapter();
+    this.htmlExporter = options.htmlExporter ?? new SemanticHtmlExportAdapter();
   }
 
   async context(projectIdValue: string): Promise<GenerationContext> {
@@ -370,6 +408,9 @@ export class PresentationGenerationService {
     const projectId = assertSafeProjectId(projectIdValue);
     if (typeof keyValue !== 'string' || !IDEMPOTENCY_KEY.test(keyValue)) {
       throw new PresentationGenerationError('INVALID_IDEMPOTENCY_KEY', 'Send an Idempotency-Key containing 8 to 128 safe characters.', 400);
+    }
+    if (!this.tasks.has(projectId) && this.tasks.size >= 2) {
+      throw new PresentationGenerationError('GENERATION_CAPACITY', 'Generation capacity is full. Wait for another presentation to finish and retry.', 429);
     }
     const context = await this.context(projectId);
     const now = this.now().toISOString();
@@ -483,8 +524,9 @@ export class PresentationGenerationService {
     }
   }
 
-  async shutdown(): Promise<void> {
-    for (const [projectId, task] of this.tasks) {
+  async shutdown(): Promise<boolean> {
+    const tasks = [...this.tasks.entries()];
+    for (const [projectId, task] of tasks) {
       const stored = getPresentationGeneration<PresentationGenerationState>(this.options.db, projectId);
       if (stored && ['preparing', 'generating'].includes(stored.state.status)) {
         this.update(projectId, stored.generationId, (current) => ['preparing', 'generating'].includes(current.status) ? ({
@@ -497,7 +539,57 @@ export class PresentationGenerationService {
       }
       task.controller.abort();
     }
-    await Promise.allSettled([...this.tasks.values()].map((task) => task.promise));
+    const outstanding = [
+      ...tasks.map(([, task]) => task.promise),
+      ...this.repairTasks.values(),
+      ...this.exportTasks.values(),
+    ];
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([Promise.allSettled(outstanding).then(() => true), new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), 5_000);
+        timer.unref?.();
+      })]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async waitForIdle(): Promise<void> {
+    while (this.tasks.size || this.repairTasks.size || this.exportTasks.size) {
+      const pending = [
+        ...[...this.tasks.values()].map((task) => task.promise),
+        ...this.repairTasks.values(),
+        ...this.exportTasks.values(),
+      ];
+      await Promise.allSettled(pending);
+    }
+  }
+
+  async drainProject(projectIdValue: string): Promise<boolean> {
+    const projectId = assertSafeProjectId(projectIdValue);
+    const matching = () => [
+      ...(this.tasks.has(projectId) ? [this.tasks.get(projectId)!.promise] : []),
+      ...[...this.repairTasks.entries()].filter(([key]) => key.startsWith(`${projectId}:`)).map(([, task]) => task),
+      ...[...this.exportTasks.entries()].filter(([key]) => key.startsWith(`${projectId}:`)).map(([, task]) => task),
+    ];
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      const pending = matching();
+      if (!pending.length) return true;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        const drained = await Promise.race([Promise.allSettled(pending).then(() => true), new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), remaining);
+          timer.unref?.();
+        })]);
+        if (!drained) return false;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
   }
 
   async cancel(projectIdValue: string): Promise<PublicPresentationGeneration> {
@@ -514,7 +606,19 @@ export class PresentationGenerationService {
     }));
     const task = this.tasks.get(projectId);
     task?.controller.abort();
-    if (task) await task.promise;
+    if (task) {
+      let timer: NodeJS.Timeout | undefined;
+      let completed: boolean;
+      try {
+        completed = await Promise.race([task.promise.then(() => true), new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), 5_000);
+          timer.unref?.();
+        })]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (!completed) throw new PresentationGenerationError('CANCELLATION_TIMEOUT', 'Generation cancellation is still draining. Retry the operation shortly.', 503);
+    }
     const latest = getPresentationGeneration<PresentationGenerationState>(this.options.db, projectId);
     return publicSnapshot(latest ? validateStoredGeneration(latest.state) : updated?.state ?? state);
   }
@@ -607,6 +711,22 @@ export class PresentationGenerationService {
     const variant = this.variant(input.variant);
     if (typeof input.findingId !== 'string' || input.findingId.length > 240) throw new PresentationGenerationError('INVALID_FINDING_ID', 'findingId is invalid.', 400);
     this.expectedVersion(input.expectedVersion);
+    const taskKey = `${projectId}:${slideId}:${variant}:${input.findingId}:${String(input.expectedVersion)}`;
+    const pending = this.repairTasks.get(taskKey);
+    if (pending) return pending;
+    if (this.repairTasks.size >= 2) throw new PresentationGenerationError('REPAIR_CAPACITY', 'Repair capacity is full. Wait for an active repair to finish and retry.', 429);
+    const task = Promise.resolve().then(() => this.performRepair(projectId, input));
+    this.repairTasks.set(taskKey, task);
+    try { return await task; }
+    finally { if (this.repairTasks.get(taskKey) === task) this.repairTasks.delete(taskKey); }
+  }
+
+  private async performRepair(projectIdValue: string, input: { slideId: unknown; variant: unknown; findingId: unknown; expectedVersion: unknown }): Promise<PublicPresentationGeneration> {
+    const projectId = assertSafeProjectId(projectIdValue);
+    const slideId = this.slideId(input.slideId);
+    const variant = this.variant(input.variant);
+    if (typeof input.findingId !== 'string' || input.findingId.length > 240) throw new PresentationGenerationError('INVALID_FINDING_ID', 'findingId is invalid.', 400);
+    this.expectedVersion(input.expectedVersion);
     const initial = this.current(projectId);
     const pack = this.ensureVersion(initial, input.expectedVersion, slideId);
     this.ensureReady(pack);
@@ -637,6 +757,7 @@ export class PresentationGenerationService {
       layoutSourcePart: candidate.sourcePart,
       placements: { title: candidate.titleBox, body: candidate.bodyBox, visual: candidate.visualBox },
       selectedCandidateIndex: candidateIndex,
+      nativeLayoutFallback: true,
     };
     const repairedPresentation = { ...presentation, slides: presentation.slides.map((slide) => slide.id === repairedSlide.id ? repairedSlide : slide) };
     const repairedAudit = auditForSlide(repairedPresentation, context.contentIR, context.templateIR, repairedSlide);
@@ -657,16 +778,58 @@ export class PresentationGenerationService {
       };
     });
     if (!updated) throw new PresentationGenerationError('GENERATION_NOT_FOUND', 'Generation state changed while repairing. Reload the project.', 409);
+    await this.writeRunManifest(projectId, updated.state, context);
     return publicSnapshot(updated.state);
   }
 
-  async export(projectIdValue: string, modeValue: unknown): Promise<{ state: PublicPresentationGeneration; artifact: Omit<GeneratedExport, 'fileRef'> & { downloadUrl: string } }> {
+  async export(projectIdValue: string, modeValue: unknown, formatValue: unknown = 'pptx'): Promise<{ state: PublicPresentationGeneration; artifact: Omit<GeneratedExport, 'fileRef'> & { downloadUrl: string } }> {
     const projectId = assertSafeProjectId(projectIdValue);
     const mode = this.exportMode(modeValue);
+    const format = this.exportFormat(formatValue);
     const initial = this.current(projectId);
     if (initial.status !== 'completed' || initial.slides.some((pack) => pack.status !== 'ready')) {
       throw new PresentationGenerationError('GENERATION_INCOMPLETE', 'Wait until every slide pack is ready before exporting.', 409);
     }
+    const selection = initial.slides.map((pack) => {
+      const variant = mode === 'selected' ? selectedVariant(initial, pack.slideId) : mode;
+      return { slideId: pack.slideId, variant, version: pack.variants[variant].version };
+    });
+    const exportId = deterministicUuid(sha256(JSON.stringify({
+      generationId: initial.generationId, mode, format, selection,
+      selectionVersion: mode === 'selected' ? initial.selectionVersion : null,
+    })));
+    const taskKey = `${projectId}:${exportId}`;
+    const pending = this.exportTasks.get(taskKey);
+    if (pending) return pending;
+    const existing = initial.exports.find((item) => item.id === exportId);
+    if (existing) {
+      try {
+        const file = await readFile(await this.resolveGeneratedRef(projectId, existing.fileRef));
+        if (sha256(file) !== existing.sha256) throw new PresentationGenerationError('EXPORT_ARTIFACT_CORRUPT', 'The saved export failed its integrity check.', 500);
+        const state = publicSnapshot(initial);
+        const artifact = state.exports.find((item) => item.id === exportId);
+        if (artifact) return { state, artifact };
+      } catch (error) {
+        if (error instanceof PresentationGenerationError) throw error;
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    if (this.exportTasks.size >= 2) {
+      throw new PresentationGenerationError('EXPORT_CAPACITY', 'Export capacity is full. Wait for an export to finish and retry.', 429);
+    }
+    const task = Promise.resolve().then(() => this.performExport(initial, projectId, mode, format, exportId));
+    this.exportTasks.set(taskKey, task);
+    try { return await task; }
+    finally { if (this.exportTasks.get(taskKey) === task) this.exportTasks.delete(taskKey); }
+  }
+
+  private async performExport(
+    initial: PresentationGenerationState,
+    projectId: string,
+    mode: GenerationExportMode,
+    format: GenerationExportFormat,
+    exportId: string,
+  ): Promise<{ state: PublicPresentationGeneration; artifact: Omit<GeneratedExport, 'fileRef'> & { downloadUrl: string } }> {
     const context = await this.context(projectId);
     this.assertSameContext(initial, context);
     const tracks = this.applyPersistedRepairs(this.compileTracks(context), initial);
@@ -686,31 +849,62 @@ export class PresentationGenerationService {
       variantId: firstVariant,
       slides,
     };
-    const exportId = randomUUID();
-    const output = await this.generatedFile(projectId, [initial.generationId, 'exports', `${exportId}.pptx`], true);
+    const extension = format === 'pptx' ? '.pptx' : format === 'pdf' ? '.pdf' : '.html';
+    const output = await this.generatedFile(projectId, [initial.generationId, 'exports', `${exportId}${extension}`], true);
+    const pptxOutput = format === 'pptx' ? output : await this.generatedFile(projectId, [initial.generationId, 'exports', `${exportId}.source.pptx`], true);
     let renderResult: PptxRenderResult;
     try {
+      await rm(output.absolute, { force: true });
+      if (pptxOutput.absolute !== output.absolute) await rm(pptxOutput.absolute, { force: true });
       renderResult = await this.renderer.render({
         compiledPresentation: selectedPresentation,
         contentIR: context.contentIR,
         templateIR: context.templateIR,
         ...(context.semanticProfile ? { semanticProfile: context.semanticProfile } : {}),
         templatePath: context.templatePath,
-        outputPath: output.absolute,
+        outputPath: pptxOutput.absolute,
         contentRoot: path.join(this.options.projectsRoot, projectId),
       });
-      const bytes = await readFile(output.absolute);
-      const inspected = await this.inspectPackage(bytes);
+      const pptxBytes = await readFile(pptxOutput.absolute);
+      const inspected = await this.inspectPackage(pptxBytes);
       if (inspected.slideCount !== slides.length || inspected.validationIssues.some((issue) => issue.severity === 'error')) {
         throw new PresentationGenerationError('EXPORT_VALIDATION_FAILED', 'The generated PowerPoint did not pass package reopen validation.', 422);
       }
       if (renderResult.validationStatus === 'failed' || renderResult.reopenStatus === 'failed') {
         throw new PresentationGenerationError('EXPORT_VALIDATION_FAILED', 'The selected PowerPoint backend reported a validation failure.', 422);
       }
+      let bytes: Buffer;
+      if (format === 'pptx') bytes = pptxBytes;
+      else if (format === 'pdf') {
+        try { bytes = await this.pdfExporter.export(pptxBytes, slides.length, context.templateIR.slideSize); }
+        catch (error) { throw new PresentationGenerationError('PDF_EXPORT_UNAVAILABLE', 'PDF export could not render and reopen every slide.', 503, { cause: error }); }
+        const reopenedPdf = await PDFDocument.load(bytes, { updateMetadata: false });
+        if (reopenedPdf.getPageCount() !== slides.length) throw new PresentationGenerationError('PDF_EXPORT_VALIDATION_FAILED', 'The PDF page count does not match the presentation.', 422);
+      } else {
+        try {
+          bytes = await this.htmlExporter.export({
+            compiledPresentation: selectedPresentation,
+            contentIR: context.contentIR,
+            templateIR: context.templateIR,
+            ...(context.template.presentationDesignSystem ? { designSystem: context.template.presentationDesignSystem } : {}),
+            contentRoot: path.join(this.options.projectsRoot, projectId),
+          });
+        } catch (error) {
+          throw new PresentationGenerationError('HTML_EXPORT_FAILED', 'The semantic HTML deck could not be assembled safely.', 500, { cause: error });
+        }
+        const html = bytes.toString('utf8');
+        if (!html.startsWith('<!doctype html>') || (html.match(/<section class="slide"/g) ?? []).length !== slides.length
+            || !html.includes('<main>') || !html.includes('</main>')) {
+          throw new PresentationGenerationError('HTML_EXPORT_VALIDATION_FAILED', 'The HTML deck structure or slide count is invalid.', 422);
+        }
+      }
+      if (format !== 'pptx') await writeFile(output.absolute, bytes, { flag: 'wx' });
+      if (pptxOutput.absolute !== output.absolute) await rm(pptxOutput.absolute, { force: true });
       const artifact: GeneratedExport = {
         id: exportId,
         mode,
-        fileRef: `${initial.generationId}/exports/${exportId}.pptx`,
+        format,
+        fileRef: `${initial.generationId}/exports/${exportId}${extension}`,
         sha256: sha256(bytes),
         slideCount: inspected.slideCount,
         validationStatus: 'passed',
@@ -723,13 +917,15 @@ export class PresentationGenerationService {
           throw new PresentationGenerationError('SELECTION_CHANGED', 'Slide selections changed during export. Export again to include the latest choices.', 409);
         }
         this.assertSameContext(fresh, context);
-        return { ...fresh, exports: [...fresh.exports, artifact], updatedAt: this.now().toISOString() };
+        return { ...fresh, exports: [...fresh.exports.filter((item) => item.id !== artifact.id), artifact], updatedAt: this.now().toISOString() };
       });
       if (!updated) throw new PresentationGenerationError('GENERATION_NOT_FOUND', 'Generation state changed while exporting.', 409);
+      await this.writeRunManifest(projectId, updated.state, context);
       const publicArtifact = publicSnapshot(updated.state).exports.find((item) => item.id === exportId)!;
       return { state: publicSnapshot(updated.state), artifact: publicArtifact };
     } catch (error) {
       await rm(output.absolute, { force: true }).catch(() => undefined);
+      if (pptxOutput.absolute !== output.absolute) await rm(pptxOutput.absolute, { force: true }).catch(() => undefined);
       if (error instanceof PresentationGenerationError) throw error;
       throw new PresentationGenerationError('EXPORT_FAILED', 'PowerPoint assembly failed. Ready slide packs remain available.', 500, { cause: error });
     }
@@ -756,10 +952,10 @@ export class PresentationGenerationService {
     }
     const state = this.current(projectId);
     const artifact = state.exports.find((item) => item.id === exportIdValue);
-    if (!artifact) throw new PresentationGenerationError('EXPORT_NOT_FOUND', 'The validated PowerPoint export was not found.', 404);
+    if (!artifact) throw new PresentationGenerationError('EXPORT_NOT_FOUND', 'The validated presentation export was not found.', 404);
     const absolute = await this.resolveGeneratedRef(projectId, artifact.fileRef);
     try { return { bytes: await readFile(absolute), artifact }; }
-    catch { throw new PresentationGenerationError('EXPORT_NOT_FOUND', 'The validated PowerPoint artifact is missing.', 404); }
+    catch { throw new PresentationGenerationError('EXPORT_NOT_FOUND', 'The validated presentation artifact is missing.', 404); }
   }
 
   private schedule(projectId: string, generationId: string): void {
@@ -819,20 +1015,27 @@ export class PresentationGenerationService {
             422,
           );
         }
-        const pendingResults = {} as Record<PresentationVariantId, Omit<GeneratedVariantState, 'status' | 'version'>>;
+        const assignedVariantSlides = variantSlides.map((slide) => {
+          const assignment = compositionDistinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
+          if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
+          return applyVariantCompositionAssignment(slide, assignment, context.templateIR);
+        });
+        const audits = {} as Record<PresentationVariantId, DeterministicAuditReport>;
         for (const variant of VARIANT_IDS) {
           if (signal.aborted || this.current(projectId).status === 'cancelled') return;
           const presentation = variantsById(tracks, variant);
-          const slide = presentation.slides.find((candidate) => candidate.sourceDeckPlanSlideId === currentSlideId);
+          const slide = assignedVariantSlides.find((candidate) => candidate.variantId === variant);
           if (!slide) throw new PresentationGenerationError('PLAN_CHANGED', 'A planned slide is missing from the compiled output.', 409);
           const audit = auditForSlide(presentation, context.contentIR, context.templateIR, slide);
           if (audit.findings.some((finding) => finding.severity === 'error')) {
             throw new PresentationGenerationError('AUDIT_BLOCKED', 'A deterministic audit error prevents publishing this slide pack.', 422);
           }
-          const currentPack = this.current(projectId).slides.find((item) => item.slideId === currentSlideId)!;
-          const variantState = await this.renderVariant(projectId, this.current(projectId), currentPack, variant, presentation, slide, context, 1);
-          pendingResults[variant] = { ...variantState, audit };
+          audits[variant] = audit;
         }
+        const currentPack = this.current(projectId).slides.find((item) => item.slideId === currentSlideId)!;
+        const pendingResults = await this.renderVariantPack(
+          projectId, this.current(projectId), currentPack, variantsById(tracks, 'A'), assignedVariantSlides, audits, context,
+        );
         if (signal.aborted || this.current(projectId).status === 'cancelled') return;
         const committed = this.update(projectId, generationId, (state) => {
           if (state.status === 'cancelled') return state;
@@ -865,7 +1068,7 @@ export class PresentationGenerationService {
       if (signal.aborted) return;
       const latest = this.current(projectId);
       if (latest.generationId !== generationId || latest.status === 'cancelled') return;
-      this.update(projectId, generationId, (state) => ({
+      const completed = this.update(projectId, generationId, (state) => ({
         ...state,
         status: 'completed',
         currentSlideId: null,
@@ -873,6 +1076,7 @@ export class PresentationGenerationService {
         failure: null,
         updatedAt: this.now().toISOString(),
       }));
+      if (completed) await this.writeRunManifest(projectId, completed.state, context);
     } catch (error) {
       if (signal.aborted) return;
       const stored = getPresentationGeneration<PresentationGenerationState>(this.options.db, projectId);
@@ -941,6 +1145,7 @@ export class PresentationGenerationService {
       return {
         previewRef,
         layoutCandidateIndex,
+        nativeLayoutFallback: slide.nativeLayoutFallback === true,
         layoutIssueCount: preview.textLayoutIssues.length,
         visualSlotStatus: slide.visualization.type === 'none' ? 'not-applicable' : unresolved ? 'unresolved' : 'ready',
         audit: auditForSlide(sourcePresentation, context.contentIR, context.templateIR, slide),
@@ -953,6 +1158,80 @@ export class PresentationGenerationService {
           unresolvedVisualTypes: [...rendered.unresolvedVisualTypes],
         },
       };
+    } finally {
+      await rm(temp.absolute, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async renderVariantPack(
+    projectId: string,
+    state: PresentationGenerationState,
+    pack: GeneratedSlidePack,
+    basePresentation: CompiledPresentation,
+    slides: readonly CompiledSlide[],
+    audits: Record<PresentationVariantId, DeterministicAuditReport>,
+    context: GenerationContext,
+  ): Promise<Record<PresentationVariantId, Omit<GeneratedVariantState, 'status' | 'version'>>> {
+    if (slides.length !== VARIANT_IDS.length || slides.some((slide, index) => slide.variantId !== VARIANT_IDS[index])) {
+      throw new PresentationGenerationError('VARIANT_PACK_INVALID', 'The A/B/C slide pack is incomplete or out of order.', 500);
+    }
+    const groupedPresentation: CompiledPresentation = {
+      ...basePresentation,
+      id: `compiled_${sha256(`${state.generationId}/${pack.slideId}/${VARIANT_IDS.join('')}`).slice(0, 24)}`,
+      slides: slides.map((slide) => structuredClone(slide)),
+    };
+    const workId = randomUUID();
+    const temp = await this.generatedFile(projectId, [state.generationId, 'work', `${workId}.pptx`], true);
+    try {
+      const rendered = await this.renderer.render({
+        compiledPresentation: groupedPresentation,
+        contentIR: context.contentIR,
+        templateIR: context.templateIR,
+        ...(context.semanticProfile ? { semanticProfile: context.semanticProfile } : {}),
+        templatePath: context.templatePath,
+        outputPath: temp.absolute,
+        contentRoot: path.join(this.options.projectsRoot, projectId),
+      });
+      if (rendered.slideCount !== VARIANT_IDS.length || rendered.validationStatus === 'failed' || rendered.reopenStatus === 'failed') {
+        throw new PresentationGenerationError('RENDER_VALIDATION_FAILED', 'Renderer output did not pass its A/B/C slide and validation checks.', 422);
+      }
+      const bytes = await readFile(temp.absolute);
+      const inspected = await this.inspectPackage(bytes);
+      if (inspected.slideCount !== VARIANT_IDS.length || inspected.validationIssues.some((issue) => issue.severity === 'error')) {
+        throw new PresentationGenerationError('RENDER_REOPEN_FAILED', 'Rendered A/B/C slide pack could not be reopened and structurally validated.', 422);
+      }
+      const results = {} as Record<PresentationVariantId, Omit<GeneratedVariantState, 'status' | 'version'>>;
+      for (const [index, variant] of VARIANT_IDS.entries()) {
+        const slide = slides[index]!;
+        const previewRef = `${state.generationId}/slides/${String(pack.index).padStart(2, '0')}/${variant}-v1.png`;
+        const previewPath = await this.generatedFile(projectId, previewRef.split('/'), true);
+        const preview = await this.preview.preview(bytes, index, 1280);
+        if (preview.slideCount !== VARIANT_IDS.length || !preview.png.length) {
+          throw new PresentationGenerationError('PREVIEW_FAILED', `The ${variant} slide preview could not be rendered.`, 422);
+        }
+        await this.writeArtifact(previewPath.absolute, preview.png);
+        const unresolvedVisualTypes = rendered.unresolvedVisualTypes.filter((type) => type === slide.visualization.type);
+        const unresolved = unresolvedVisualTypes.length > 0 || slide.visualization.status === 'unresolved';
+        results[variant] = {
+          previewRef,
+          layoutCandidateIndex: slide.selectedCandidateIndex,
+          nativeLayoutFallback: slide.nativeLayoutFallback === true,
+          layoutIssueCount: preview.textLayoutIssues.length,
+          visualSlotStatus: slide.visualization.type === 'none' ? 'not-applicable' : unresolved ? 'unresolved' : 'ready',
+          audit: audits[variant],
+          renderCheck: {
+            backend: rendered.backend,
+            // This public field describes the individual variant in the pack, even though
+            // validation used one temporary package containing all three sibling variants.
+            slideCount: 1,
+            reopenStatus: rendered.reopenStatus === 'not-run' ? 'passed' : rendered.reopenStatus,
+            validationStatus: 'passed',
+            templatePreservationStatus: rendered.templatePreservationStatus,
+            unresolvedVisualTypes,
+          },
+        };
+      }
+      return results;
     } finally {
       await rm(temp.absolute, { force: true }).catch(() => undefined);
     }
@@ -981,16 +1260,20 @@ export class PresentationGenerationService {
       const base = variantsById(tracks, variant);
       const slides = base.slides.map((slide) => {
         const pack = state.slides.find((item) => item.slideId === slide.sourceDeckPlanSlideId);
-        const candidateIndex = pack?.variants[variant].layoutCandidateIndex ?? 0;
+        const generated = pack?.variants[variant];
+        const candidateIndex = generated?.layoutCandidateIndex ?? slide.selectedCandidateIndex;
         const candidate = slide.layoutCandidates[candidateIndex];
-        if (!candidate || candidateIndex === slide.selectedCandidateIndex) return slide;
-        return {
+        if (!candidate) return slide;
+        const selected = candidateIndex === slide.selectedCandidateIndex ? slide : {
           ...slide,
           layoutId: candidate.layoutId,
           layoutSourcePart: candidate.sourcePart,
           placements: { title: candidate.titleBox, body: candidate.bodyBox, visual: candidate.visualBox },
           selectedCandidateIndex: candidateIndex,
         };
+        return generated?.nativeLayoutFallback === true || candidateIndex !== slide.selectedCandidateIndex
+          ? { ...selected, nativeLayoutFallback: true as const }
+          : selected;
       });
       repaired.set(variant, { ...base, slides });
     }
@@ -1054,6 +1337,11 @@ export class PresentationGenerationService {
     throw new PresentationGenerationError('INVALID_EXPORT_MODE', 'Export mode must be selected, A, B, or C.', 400);
   }
 
+  private exportFormat(value: unknown): GenerationExportFormat {
+    if (value === 'pptx' || value === 'pdf' || value === 'html') return value;
+    throw new PresentationGenerationError('INVALID_EXPORT_FORMAT', 'Export format must be pptx, pdf, or html.', 400);
+  }
+
   private async generatedFile(projectId: string, parts: string[], createParent: boolean): Promise<{ absolute: string }> {
     if (parts.length < 2 || parts.length > 8 || parts.some((part) => !/^[A-Za-z0-9._-]{1,128}$/.test(part) || part === '.' || part === '..')) {
       throw new PresentationGenerationError('INVALID_ARTIFACT_REF', 'Generated artifact reference is invalid.', 500);
@@ -1061,6 +1349,10 @@ export class PresentationGenerationService {
     const projectDir = path.join(this.options.projectsRoot, projectId);
     await mkdir(projectDir, { recursive: true });
     const canonicalProject = await realpath(projectDir);
+    const canonicalProjectsRoot = await realpath(this.options.projectsRoot);
+    if (path.dirname(canonicalProject) !== canonicalProjectsRoot) {
+      throw new PresentationGenerationError('ARTIFACT_PATH_UNSAFE', 'Generated artifact project directory escapes project storage.', 500);
+    }
     const generationRoot = path.join(projectDir, '.generation');
     if (createParent) await mkdir(generationRoot, { recursive: true });
     const rootInfo = await lstat(generationRoot).catch(() => null);
@@ -1104,6 +1396,74 @@ export class PresentationGenerationService {
     } catch (error) {
       await rm(temp, { force: true }).catch(() => undefined);
       throw error;
+    }
+  }
+
+  private async writeRunManifest(projectId: string, state: PresentationGenerationState, context: GenerationContext): Promise<void> {
+    const target = await this.generatedFile(projectId, [state.generationId, 'run-manifest.json'], true);
+    const audits = state.slides.flatMap((slide) => VARIANT_IDS.flatMap((variant) => slide.variants[variant].audit?.findings ?? []));
+    const telemetry = context.planning.telemetry;
+    const manifest = {
+      schemaVersion: 1,
+      applicationVersion: await applicationVersion(),
+      runtime: { node: process.version, platform: process.platform, architecture: process.arch, renderer: state.backend },
+      workflowVersions: context.planning.agentWorkflowVersions,
+      promptVersions: context.planning.promptVersions,
+      schemaVersions: {
+        deckPlan: context.deckPlan.schemaVersion,
+        contentIR: context.contentIR.schemaVersion,
+        templateIR: context.templateIR.schemaVersion,
+      },
+      run: {
+        generationId: state.generationId,
+        status: state.status,
+        startedAt: state.createdAt,
+        updatedAt: state.updatedAt,
+        durationMs: Math.max(0, Date.parse(state.updatedAt) - Date.parse(state.createdAt)),
+        modelAlias: telemetry?.worker.model ?? null,
+        timingsMs: telemetry ? {
+          planning: telemetry.totalWallTimeMs,
+          worker: telemetry.worker.wallTimeMs,
+          supervisor: telemetry.supervisor.wallTimeMs,
+          revisionWorker: telemetry.revisionWorker?.wallTimeMs ?? null,
+        } : null,
+      },
+      inputHashes: {
+        inputFingerprint: state.inputFingerprint,
+        template: state.templateIRHash,
+        contentIR: state.contentIRHash,
+        sources: context.contentIR.sources.map((source) => source.sha256),
+        plan: state.planHash,
+      },
+      selections: state.slides.map((slide) => ({
+        slideId: slide.slideId,
+        index: slide.index,
+        selectedVariant: selectedVariant(state, slide.slideId),
+        lockedVariant: slide.lockedVariant,
+      })),
+      auditSummary: {
+        errors: audits.filter((finding) => finding.severity === 'error').length,
+        warnings: audits.filter((finding) => finding.severity === 'warning').length,
+        infos: audits.filter((finding) => finding.severity === 'info').length,
+      },
+      exports: state.exports.map((artifact) => ({
+        id: artifact.id,
+        mode: artifact.mode,
+        format: artifact.format,
+        sha256: artifact.sha256,
+        slideCount: artifact.slideCount,
+        createdAt: artifact.createdAt,
+      })),
+      contentExcluded: true,
+      secretsExcluded: true,
+    };
+    try {
+      await this.writeArtifact(target.absolute, Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'));
+    } catch {
+      console.error(JSON.stringify({
+        event: 'run.manifest', projectId, generationId: state.generationId,
+        operation: 'write', status: 'error', errorCode: 'RUN_MANIFEST_WRITE_FAILED',
+      }));
     }
   }
 }

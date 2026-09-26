@@ -84,6 +84,31 @@ test('environment config requires an endpoint, pins a fixed model by default, an
   }), errorCode('CONFIGURATION_ERROR'));
 });
 
+test('semantic telemetry logs role, operation, latency, and finish reason without request content or endpoint secrets', async (t) => {
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    reply.writeHead(200, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify(openAIResponse(JSON.stringify({
+      status: 'ok', summary: WORKER_SENTINEL, nextAction: 'continue',
+    }))));
+  });
+  const secret = 'semantic-test-secret-do-not-log';
+  const client = new OpenAICompatibleSemanticInferenceAdapter({ baseUrl, model, apiKey: secret, requestTimeoutMs: 500 });
+  const logs = [];
+  const previous = console.log;
+  console.log = (...values) => logs.push(values);
+  try { await client.infer(workerSmokeRequest()); }
+  finally { console.log = previous; }
+  const record = JSON.parse(logs[0][0]);
+  assert.equal(record.event, 'semantic.request');
+  assert.equal(record.role, 'worker');
+  assert.equal(record.operation, 'smoke.worker');
+  assert.equal(record.model, model);
+  assert.equal(record.finishReason, 'stop');
+  assert.equal(record.status, 'success');
+  assert.ok(Number.isInteger(record.latencyMs));
+  assert.doesNotMatch(JSON.stringify(record), new RegExp(`${secret}|${baseUrl}|${WORKER_SENTINEL}`));
+});
+
 test('validates structured output and keeps Worker and Supervisor evidence in separate requests', async (t) => {
   const received = [];
   const { baseUrl } = await startServer(t, async (request, reply) => {

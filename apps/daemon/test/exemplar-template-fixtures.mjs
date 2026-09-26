@@ -43,13 +43,16 @@ export async function createExemplarTemplate(filePath, { masterName = 'Unnamed d
 }
 
 /** Three repeated but structurally distinct vector compositions for selector/render tests. */
-export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unlabelled composition families', mixedStyleBody = false, hyperlinkBody = false, varyingFooter = false } = {}) {
+export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unlabelled composition families', mixedStyleBody = false, hyperlinkBody = false, varyingFooter = false, masterStaticText = null } = {}) {
   const deck = new pptxgen();
   deck.layout = 'LAYOUT_WIDE';
-  deck.defineSlideMaster({ title: masterName, objects: [] });
+  const familyMasters = Array.from({ length: 3 }, (_, family) => `${masterName} ${family + 1}`);
+  for (const title of familyMasters) deck.defineSlideMaster({ title, objects: masterStaticText
+    ? [{ text: { text: masterStaticText, options: { x: 0.7, y: 0.95, w: 5.5, h: 0.35, fontFace: 'Aptos', fontSize: 18 } } }]
+    : [] });
   for (let index = 0; index < 12; index += 1) {
     const family = Math.floor(index / 4);
-    const slide = deck.addSlide({ masterName });
+    const slide = deck.addSlide({ masterName: familyMasters[family] });
     slide.addText(`Original source headline ${index + 1}`, {
       x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
     });
@@ -102,15 +105,80 @@ export async function createRoleExemplarTemplate(filePath, { masterName = 'Struc
       x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: item.titleSize, bold: true, margin: 0,
     });
     slide.addText(`Source body ${index + 1}. Supporting evidence remains available in the larger body region.`, {
-      x: 0.68, y: 1.35, w: 4.7, h: 5.45, fontFace: 'Aptos', fontSize: item.bodySize, margin: 0,
+      x: 0.68, y: 1.35, w: 4.7, h: item.role === 'split' ? 1.0 : 5.45, fontFace: 'Aptos', fontSize: item.bodySize, margin: 0,
     });
     if (item.role === 'split') slide.addText(`Second source column ${index + 1}. Additional evidence occupies a parallel region.`, {
-      x: 6.0, y: 1.35, w: 5.8, h: 5.45, fontFace: 'Aptos', fontSize: item.bodySize, margin: 0,
+      x: 6.0, y: 1.35, w: 5.8, h: 1.0, fontFace: 'Aptos', fontSize: item.bodySize, margin: 0,
     });
     slide.addText('REPEATED BRAND', {
       x: 0.62, y: 7.08, w: 2.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
     });
   }
+  await deck.writeFile({ fileName: filePath });
+}
+
+/** A repeated native two-region layout with compact, non-overlapping text slots. */
+export async function createTwoRegionExemplarTemplate(filePath, { masterName = 'Two-region layout' } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({ title: masterName, objects: [] });
+  for (let index = 0; index < 4; index += 1) {
+    const slide = deck.addSlide({ masterName });
+    slide.addText(`Source headline ${index + 1}`, {
+      x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
+    });
+    slide.addText(`Left source region ${index + 1}`, {
+      x: 0.68, y: 1.4, w: 5.35, h: 1.2, fontFace: 'Aptos', fontSize: 16, margin: 0,
+    });
+    slide.addText(`Right source region ${index + 1}`, {
+      x: 6.55, y: 1.4, w: 5.85, h: 1.2, fontFace: 'Aptos', fontSize: 16, margin: 0,
+    });
+    slide.addText('REPEATED TWO-REGION BRAND', {
+      x: 0.62, y: 7.08, w: 3.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+    });
+  }
+  await deck.writeFile({ fileName: filePath });
+}
+
+/** Two repeated exemplar families plus a third, separately styled native-placeholder layout. */
+export async function createHybridExemplarTemplate(filePath, { masterName = 'Hybrid qualification' } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  const familyMasters = [`${masterName} A`, `${masterName} B`];
+  for (const title of familyMasters) deck.defineSlideMaster({ title, objects: [] });
+  const nativeMaster = `${masterName} native`;
+  deck.defineSlideMaster({
+    title: nativeMaster,
+    background: { color: 'F3F7FB' },
+    objects: [
+      { placeholder: { options: { name: 'Hybrid native title', type: 'title', x: 0.55, y: 0.35, w: 11.9, h: 0.8, fontFace: 'Aptos Display', fontSize: 30, bold: true, color: '183B56', margin: 0 } } },
+      { placeholder: { options: { name: 'Hybrid native body', type: 'body', x: 0.65, y: 1.45, w: 7.4, h: 3.8, fontFace: 'Aptos', fontSize: 18, color: '243B53', margin: 0.05 } } },
+      { rect: { x: 0.55, y: 7.08, w: 2.7, h: 0.12, line: { color: '1687C9', transparency: 100 }, fill: { color: '1687C9' } } },
+    ],
+  });
+  for (let family = 0; family < 2; family += 1) {
+    for (let index = 0; index < 4; index += 1) {
+      const slide = deck.addSlide({ masterName: familyMasters[family] });
+      slide.addText(`Hybrid source headline ${family}-${index}`, {
+        x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
+      });
+      slide.addText(`Hybrid source body ${family}-${index}. Supporting evidence is retained in this measured region.`, {
+        x: 0.68, y: 1.35, w: 4.7, h: 5.2, fontFace: 'Aptos', fontSize: 16, margin: 0,
+      });
+      slide.addText('SYNTHETIC BRAND', {
+        x: 0.62, y: 7.08, w: 2.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+      });
+      for (let decoration = 0; decoration < family + 1; decoration += 1) {
+        slide.addShape('rect', {
+          x: 6.2 + decoration * 0.42, y: 1.45, w: 0.24, h: 0.18,
+          line: { color: '274C77', transparency: 100 }, fill: { color: family ? 'A9C5DF' : 'D9E3F0' },
+        });
+      }
+    }
+  }
+  const nativeSlide = deck.addSlide({ masterName: nativeMaster });
+  nativeSlide.addText('Native source title sample', { placeholder: 'Hybrid native title' });
+  nativeSlide.addText('Native source body sample', { placeholder: 'Hybrid native body' });
   await deck.writeFile({ fileName: filePath });
 }
 

@@ -5,7 +5,8 @@ export interface PptxPreviewPort {
     svg: string;
     png: Uint8Array;
     textLayoutIssues: readonly unknown[];
-    status: 'passed' | 'failed';
+    geometryIssues: readonly unknown[];
+    status: 'passed' | 'warning' | 'failed';
     limitations: readonly string[];
   }>;
 }

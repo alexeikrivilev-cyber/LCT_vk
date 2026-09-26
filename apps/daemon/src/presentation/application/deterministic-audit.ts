@@ -68,6 +68,17 @@ export function auditCompiledPresentation(
   for (const slide of presentation.slides) {
     const hasRenderableVisual = slide.imageRefs.length > 0 || Boolean(slide.visualization.tableData || slide.visualization.chartData
       || slide.visualization.kpi || slide.visualization.processSteps.length >= 2);
+    if (slide.intent !== 'title' && slide.title.trim() && slide.body.every((line) => !line.trim()) && !hasRenderableVisual) {
+      addFinding(findings, {
+        slideId: slide.id,
+        ruleId: 'integrity.title-only-slide',
+        severity: 'warning',
+        message: 'Non-cover slide contains only a title and has no body or visual evidence.',
+        evidence: { intent: slide.intent },
+        autofixAvailable: false,
+        suggestedRepair: null,
+      });
+    }
     const boxes: Array<[string, PlacementBox]> = [
       ['title', slide.placements.title],
       ['body', slide.placements.body],
@@ -175,12 +186,12 @@ export function auditCompiledPresentation(
     for (const bullet of bullets) {
       const text = bullet.replace(/^\s*(?:[-*•]|\d+[.)])\s+/u, '').trim();
       const wordCount = text ? text.split(/\s+/u).length : 0;
-      if (wordCount >= 20) {
+      if (wordCount > 15) {
         addFinding(findings, {
           slideId: slide.id,
           ruleId: 'density.long-bullet-copy',
           severity: 'warning',
-          message: 'A bullet contains twenty or more words; visual overflow still requires rendered-slide review.',
+          message: 'A bullet exceeds fifteen words; visual overflow still requires rendered-slide review.',
           evidence: { wordCount },
           autofixAvailable: false,
           suggestedRepair: null,
@@ -243,6 +254,30 @@ export function auditCompiledPresentation(
     }
     if (slide.visualization.chartData) {
       const chart = slide.visualization.chartData;
+      const missingLabelCount = Number(!chart.title.trim()) + Number(!chart.categories.length)
+        + Number(!chart.series.length) + chart.series.filter((series) => !series.name.trim()).length;
+      if (missingLabelCount) {
+        addFinding(findings, {
+          slideId: slide.id,
+          ruleId: 'integrity.chart-labels-legend',
+          severity: 'error',
+          message: 'Chart title, categories, and series names are required to identify its data and legend.',
+          evidence: { missingLabelCount },
+          autofixAvailable: false,
+          suggestedRepair: null,
+        });
+      }
+      if (!chart.unit?.trim()) {
+        addFinding(findings, {
+          slideId: slide.id,
+          ruleId: 'integrity.chart-unit-unknown',
+          severity: 'warning',
+          message: 'Chart units are not declared; confirm that source values are dimensionless or add a source-backed unit.',
+          evidence: { unitDeclared: false },
+          autofixAvailable: false,
+          suggestedRepair: null,
+        });
+      }
       const chartUnits = new Map(contentIR.units.map((unit) => [unit.id, unit]));
       const allRefs = [...chart.categorySourceRefs, ...chart.provenanceRefs, ...chart.series.flatMap((series) => [series.nameSourceRef, ...series.sourceRefs])];
       const missingRefs = [...new Set(allRefs.filter((id) => !chartUnits.has(id)))];
@@ -399,10 +434,12 @@ export function auditCompiledPresentation(
       { ruleId: 'fidelity.semantic', status: 'unknown', reason: 'Semantic entailment is not deterministically inferred.' },
       { ruleId: 'template.font-color-contrast', status: 'unknown', reason: 'The current compiler does not resolve inherited render styles or text contrast.' },
       { ruleId: 'density.table', status: 'checked', reason: 'Checks row and column counts when referenced CSV cells form a rectangular native table.' },
-      { ruleId: 'density.long-bullet-copy', status: 'checked', reason: 'Counts words in explicit bullets; this is a copy-length heuristic, not a visual-overflow measurement.' },
       { ruleId: 'density.chart-series', status: 'checked', reason: 'Checks series count for source-backed chart grids that compile to a native chart.' },
       { ruleId: 'fidelity.chart-numeric-provenance', status: 'checked', reason: 'Chart values compile only from complete numeric source cells and every emitted value is rechecked against its cited ContentIR cell.' },
       { ruleId: 'integrity.visual-asset-reference', status: 'checked', reason: 'Visual media refs are separate from factual citations and must match an inventoried ContentIR image source.' },
+      { ruleId: 'integrity.title-only-slide', status: 'checked', reason: 'Non-cover slides with a title but no body or compiled visual evidence are reported; intentional title covers are exempt.' },
+      { ruleId: 'integrity.chart-labels-legend', status: 'checked', reason: 'Compiled charts require a title, categories, and named series; missing declared units are reported as warnings because dimensionless data can be valid.' },
+      { ruleId: 'density.long-bullet-copy', status: 'checked', reason: 'Warns when an explicit bullet exceeds fifteen words; this is a copy-length heuristic, not a visual-overflow measurement.' },
       { ruleId: 'rendered-overflow', status: 'unknown', reason: 'Text layout and clipping require a presentation renderer.' },
     ],
   };

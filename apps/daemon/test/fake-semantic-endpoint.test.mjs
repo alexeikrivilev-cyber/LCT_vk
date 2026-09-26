@@ -34,7 +34,8 @@ test('local fake plans a contentful three-slide deck from source sections and pa
   const unitsById = new Map(units.map((unit) => [unit.id, unit]));
   for (const slide of draft.slides) {
     assert.ok(slide.contentRefs.length > 0);
-    assert.ok(slide.contentRefs.every((id) => unitsById.get(id)?.kind === 'text'));
+    assert.ok(slide.contentRefs.every((id) => ['text', 'heading'].includes(unitsById.get(id)?.kind)));
+    assert.ok(slide.contentRefs.some((id) => unitsById.get(id)?.kind === 'heading'));
     assert.ok(slide.contentRefs.some((id) => unitsById.get(id)?.text.trim().length > 20));
     assert.ok(slide.takeaway.length > 0);
   }

@@ -4,9 +4,10 @@
 
 import express from 'express';
 import multer from 'multer';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import { mkdir } from 'node:fs/promises';
-import { assertLoopbackDaemonBindHost } from './daemon-bind-host.js';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { assertLoopbackDaemonBindHost, DEFAULT_DAEMON_PORT, parseDaemonPort } from './daemon-bind-host.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Server } from 'node:http';
@@ -40,6 +41,7 @@ import { generatePresentationImage } from './media/index.js';
 import { presentationImageModels } from './media/models.js';
 import {
   OpenAICompatibleSemanticInferenceAdapter,
+  probeSemanticEndpoint,
   semanticInferenceConfigFromEnvironment,
 } from './presentation/adapters/openai-compatible-semantic-inference.js';
 import type { SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
@@ -51,7 +53,7 @@ import {
 } from './presentation/application/generation-service.js';
 import type { PptxRendererPort } from './presentation/application/pptx-backend-port.js';
 import type { PptxPreviewPort } from './presentation/application/pptx-preview-port.js';
-import { resolvePptxBackend } from './presentation/adapters/pptx-renderer-factory.js';
+import { createPptxRenderer, resolvePptxBackend } from './presentation/adapters/pptx-renderer-factory.js';
 import {
   compileTemplate,
   getTemplateCompilation,
@@ -100,34 +102,65 @@ function apiError(res: express.Response, status: number, error: unknown): void {
   const message = status >= 500 || typeof errorCode === 'string' || containsFilesystemPath
     ? 'The request could not be completed.'
     : rawMessage.slice(0, 240);
-  res.status(status).json({ error: { code: status === 404 ? 'NOT_FOUND' : 'PRESENTATION_CORE_ERROR', message } });
+  const code = status === 404 ? 'NOT_FOUND' : 'PRESENTATION_CORE_ERROR';
+  res.locals.errorCode = code;
+  res.status(status).json({ error: { code, message } });
 }
 
-function logRequestFailure(req: express.Request, error: unknown, status: number): void {
-  const diagnostic = error instanceof Error
-    ? { name: error.name, message: error.message, stack: error.stack }
-    : { name: 'UnknownError', message: String(error) };
-  console.error('Presentation API request failed', {
-    method: req.method,
-    path: req.path,
-    status,
-    ...diagnostic,
+function safeProjectId(value: unknown): string | null {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) ? value : null;
+}
+
+function operationLabel(req: express.Request): string {
+  if (typeof req.route?.path !== 'string') return `${req.method} request-body-or-unmatched`;
+  let route = `${req.baseUrl}${req.route.path}`;
+  const projectId = safeProjectId(req.params?.id);
+  if (projectId) route = route.replace(`/${projectId}/`, '/:id/').replace(`/${projectId}`, '/:id');
+  return `${req.method} ${route}`.slice(0, 160);
+}
+
+function requestLoggingMiddleware(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  const requestId = randomUUID();
+  const startedAt = performance.now();
+  res.locals.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  res.once('finish', () => {
+    console.log(JSON.stringify({
+      event: 'http.request', requestId, projectId: safeProjectId(req.params?.id),
+      operation: operationLabel(req), durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      status: res.statusCode, errorCode: typeof res.locals.errorCode === 'string' ? res.locals.errorCode : null,
+    }));
   });
+  next();
+}
+
+function logRequestFailure(res: express.Response, error: unknown, status: number): void {
+  const code = error instanceof multer.MulterError ? 'UPLOAD_LIMIT_EXCEEDED'
+    : status === 400 ? 'INVALID_REQUEST' : 'REQUEST_FAILED';
+  res.locals.errorCode = code;
+  console.error(JSON.stringify({
+    event: 'http.error', requestId: typeof res.locals.requestId === 'string' ? res.locals.requestId : null,
+    status, errorCode: code, errorType: error instanceof Error ? error.name.slice(0, 80) : 'UnknownError',
+  }));
 }
 
 function projectNotFound(res: express.Response): void {
+  res.locals.errorCode = 'PROJECT_NOT_FOUND';
   res.status(404).json({ error: { code: 'PROJECT_NOT_FOUND', message: 'Presentation project not found.' } });
 }
 
 function generationError(res: express.Response, error: unknown): void {
   if (error instanceof PresentationGenerationError) {
+    res.locals.errorCode = error.code;
     res.status(error.status).json({ error: { code: error.code, message: error.message } });
     return;
   }
   if (error instanceof Error && error.message === 'invalid project id') {
+    res.locals.errorCode = 'INVALID_PROJECT_ID';
     res.status(400).json({ error: { code: 'INVALID_PROJECT_ID', message: 'Project id is invalid.' } });
     return;
   }
+  res.locals.errorCode = 'GENERATION_FAILED';
   res.status(500).json({ error: { code: 'GENERATION_FAILED', message: 'The slide generation request failed.' } });
 }
 
@@ -143,17 +176,27 @@ function encodedRawUrl(projectId: string, name: string): string {
 
 export async function startServer(options: StartServerOptions = {}): Promise<string | StartedPresentationServer> {
   const host = assertLoopbackDaemonBindHost(options.host?.trim() || process.env.LCT_BIND_HOST || '127.0.0.1');
+  const envPort = parseDaemonPort(process.env.LCT_PORT, DEFAULT_DAEMON_PORT);
+  const port = options.port === undefined ? envPort : Number(options.port);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new TypeError('LCT_PORT must be an integer between 1 and 65535.');
   const projectRoot = path.resolve(options.projectRoot ?? repoRootFromModule());
+  const hasInjectedSemanticAdapter = Boolean(options.semanticInferenceAdapter || options.semanticInferenceAdapterFactory);
+  const configuredSemanticBaseUrl = process.env.LCT_SEMANTIC_BASE_URL?.trim();
+  const semanticConfig = !hasInjectedSemanticAdapter && configuredSemanticBaseUrl
+    ? semanticInferenceConfigFromEnvironment()
+    : null;
+  const backend = resolvePptxBackend();
+  const renderer = options.presentationRenderer ?? createPptxRenderer(backend);
   const dataDir = resolveDataDir(projectRoot, options.dataDir);
   const projectsRoot = path.join(dataDir, 'projects');
   await mkdir(projectsRoot, { recursive: true });
 
   const db = openPresentationStore(dataDir);
-  let semanticAdapter: SemanticInferenceAdapter | undefined;
-  const getSemanticAdapter = () => semanticAdapter ??= options.semanticInferenceAdapter
-    ?? options.semanticInferenceAdapterFactory?.()
-    ?? new OpenAICompatibleSemanticInferenceAdapter(semanticInferenceConfigFromEnvironment());
-  const semanticProfilingEnabled = Boolean(process.env.LCT_SEMANTIC_BASE_URL?.trim());
+  let semanticAdapter: SemanticInferenceAdapter | undefined = options.semanticInferenceAdapter;
+  if (!hasInjectedSemanticAdapter && semanticConfig) semanticAdapter = new OpenAICompatibleSemanticInferenceAdapter(semanticConfig);
+  const getSemanticAdapter = () => semanticAdapter ??= options.semanticInferenceAdapterFactory?.()
+    ?? new OpenAICompatibleSemanticInferenceAdapter(semanticConfig ?? semanticInferenceConfigFromEnvironment());
+  const semanticProfilingEnabled = Boolean(semanticConfig);
   const templateProfilers = new Map<string, TemplateSemanticProfiler>();
   const profileTemplate = semanticProfilingEnabled ? async (projectId: string, snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>) => {
     if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
@@ -175,14 +218,25 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     db,
     projectsRoot,
     planningService,
-    backend: resolvePptxBackend(),
+    backend,
+    renderer,
     ...(profileTemplate ? { profileTemplate } : {}),
     ...(options.presentationRenderer ? { renderer: options.presentationRenderer } : {}),
     ...(options.presentationPreview ? { preview: options.presentationPreview } : {}),
   });
   const app = express();
+  const deletingProjects = new Set<string>();
   app.disable('x-powered-by');
+  app.use(requestLoggingMiddleware);
   app.use(express.json({ limit: '32mb' }));
+  app.use('/api/projects/:id', (req, res, next) => {
+    const projectId = safeProjectId(req.params.id);
+    if (projectId && deletingProjects.has(projectId)) {
+      res.locals.errorCode = 'PROJECT_DELETING';
+      return res.status(409).json({ error: { code: 'PROJECT_DELETING', message: 'This project is being deleted. Retry after the operation completes.' } });
+    }
+    next();
+  });
 
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -206,9 +260,49 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     next();
   };
 
-  app.get('/api/health', (_req, res) => {
+  const healthHandler: express.RequestHandler = (_req, res) => {
     res.json({ ok: true, product: 'lct-presentation-core', runtime: 'presentation-only' });
-  });
+  };
+  const readinessHandler: express.RequestHandler = async (_req, res) => {
+    let storeAvailable = false;
+    let requiredDirsWritable = false;
+    try {
+      db.prepare('SELECT 1 AS ready').get();
+      storeAvailable = true;
+    } catch { /* readiness reports status without exposing store diagnostics */ }
+    const probes: string[] = [];
+    try {
+      for (const directory of [dataDir, projectsRoot]) {
+        const probe = path.join(directory, `.lct-readiness-${randomUUID()}`);
+        await writeFile(probe, '', { flag: 'wx' });
+        probes.push(probe);
+      }
+      requiredDirsWritable = true;
+    } catch {
+      requiredDirsWritable = false;
+    } finally {
+      await Promise.all(probes.map((probe) => rm(probe, { force: true }).catch(() => undefined)));
+    }
+    const semanticRequired = Boolean(semanticConfig);
+    const semanticReachable = semanticConfig ? await probeSemanticEndpoint(semanticConfig) : null;
+    const ready = storeAvailable && requiredDirsWritable && Boolean(renderer)
+      && (!semanticRequired || semanticReachable === true);
+    const semanticStatus = semanticRequired ? semanticReachable ? 'reachable' : 'unreachable'
+      : hasInjectedSemanticAdapter ? 'injected-unprobed' : 'not-required';
+    res.status(ready ? 200 : 503).json({
+      ok: ready,
+      checks: {
+        store: storeAvailable ? 'available' : 'unavailable',
+        writableDirectories: requiredDirsWritable ? 'writable' : 'unavailable',
+        renderer: renderer ? 'initialized' : 'unavailable',
+        semantic: { required: semanticRequired, status: semanticStatus },
+      },
+    });
+  };
+  app.get('/health', healthHandler);
+  app.get('/api/health', healthHandler);
+  app.get('/readiness', readinessHandler);
+  app.get('/api/readiness', readinessHandler);
 
   app.get('/api/projects', (_req, res) => {
     res.json({ projects: listPresentationProjects(db) });
@@ -268,15 +362,37 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   });
 
   app.delete('/api/projects/:id', async (req, res) => {
+    let projectId: string | null = null;
     try {
-      if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
-      const generation = await generationService.getSnapshot(req.params.id);
-      if (generation && ['preparing', 'generating'].includes(generation.status)) await generationService.cancel(req.params.id);
-      deletePresentationProject(db, req.params.id);
-      await removePresentationProjectDir(projectsRoot, req.params.id);
+      projectId = assertSafeProjectId(req.params.id);
+      if (!getPresentationProject(db, projectId)) return projectNotFound(res);
+      if (deletingProjects.has(projectId)) {
+        res.locals.errorCode = 'PROJECT_DELETING';
+        return res.status(409).json({ error: { code: 'PROJECT_DELETING', message: 'This project is already being deleted.' } });
+      }
+      deletingProjects.add(projectId);
+      if (!await planningService.cancel(projectId)) {
+        res.locals.errorCode = 'PLANNING_CANCELLATION_TIMEOUT';
+        return res.status(503).json({ error: { code: 'PLANNING_CANCELLATION_TIMEOUT', message: 'Planning is still stopping. Retry project deletion shortly.' } });
+      }
+      const generation = await generationService.getSnapshot(projectId);
+      if (generation && ['preparing', 'generating'].includes(generation.status)) await generationService.cancel(projectId);
+      if (!await generationService.drainProject(projectId)) {
+        res.locals.errorCode = 'GENERATION_DRAIN_TIMEOUT';
+        return res.status(503).json({ error: { code: 'GENERATION_DRAIN_TIMEOUT', message: 'Project operations are still stopping. Retry project deletion shortly.' } });
+      }
+      deletePresentationProject(db, projectId);
+      await removePresentationProjectDir(projectsRoot, projectId);
       res.json({ ok: true });
     } catch (error) {
-      apiError(res, 400, error);
+      if (error instanceof PresentationGenerationError) return generationError(res, error);
+      const reportedStatus = error && typeof error === 'object' && 'status' in error
+        && typeof (error as { status?: unknown }).status === 'number'
+        ? Number((error as { status: number }).status)
+        : error instanceof Error && error.message === 'invalid project id' ? 400 : 500;
+      apiError(res, reportedStatus, error);
+    } finally {
+      if (projectId) deletingProjects.delete(projectId);
     }
   });
 
@@ -322,7 +438,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       const message = error instanceof Error ? error.message : '';
       const invalidInput = new Set(['invalid project id', 'invalid project file path', 'project file escapes project root']);
       const status = invalidInput.has(message) ? 400 : 500;
-      if (status >= 500) logRequestFailure(req, error, status);
+      if (status >= 500) logRequestFailure(res, error, status);
       apiError(res, status, error);
     }
   });
@@ -376,12 +492,16 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
 
   app.post('/api/projects/:id/planning/generate', async (req, res) => {
     if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
+    const controller = new AbortController();
+    res.once('close', () => { if (!res.writableEnded) controller.abort(); });
     try {
-      res.json(await planningService.generate(req.params.id, req.body));
+      res.json(await planningService.generate(req.params.id, req.body, controller.signal));
     } catch (error) {
       if (error instanceof PlanningServiceError) {
+        res.locals.errorCode = error.code;
         return res.status(error.status).json({ error: { code: error.code, message: error.message } });
       }
+      res.locals.errorCode = 'PLANNING_FAILED';
       return res.status(500).json({
         error: { code: 'PLANNING_FAILED', message: 'Planning failed. Check the project sources and retry.' },
       });
@@ -497,10 +617,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     try {
       const projectId = assertSafeProjectId(req.params.id);
       if (!getPresentationProject(db, projectId)) return projectNotFound(res);
-      if (!smallGenerationBody(req) || Object.keys(req.body as Record<string, unknown>).join(',') !== 'mode') {
-        return apiError(res, 400, new Error('export request must contain only mode'));
+      if (!smallGenerationBody(req) || !Object.hasOwn(req.body as object, 'mode')
+          || !['mode', 'format'].includes(Object.keys(req.body as Record<string, unknown>).sort()[0] ?? '')
+          || Object.keys(req.body as Record<string, unknown>).some((key) => !['mode', 'format'].includes(key))) {
+        return apiError(res, 400, new Error('export request must contain mode and optional format'));
       }
-      res.status(201).json(await generationService.export(projectId, req.body.mode));
+      res.status(201).json(await generationService.export(projectId, req.body.mode, req.body.format ?? 'pptx'));
     } catch (error) { generationError(res, error); }
   });
 
@@ -509,9 +631,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       const projectId = assertSafeProjectId(req.params.id);
       if (!getPresentationProject(db, projectId)) return projectNotFound(res);
       const { bytes, artifact } = await generationService.readExport(projectId, req.params.exportId);
-      const name = `LCT-${artifact.mode}-${artifact.id.slice(0, 8)}.pptx`;
+      const extension = artifact.format === 'pdf' ? 'pdf' : artifact.format === 'html' ? 'html' : 'pptx';
+      const name = `LCT-${artifact.mode}-${artifact.id.slice(0, 8)}.${extension}`;
       res.status(200)
-        .type('application/vnd.openxmlformats-officedocument.presentationml.presentation')
+        .setHeader('Content-Type', mimeForPresentationFile(name))
         .setHeader('Content-Disposition', `attachment; filename="${name}"`)
         .setHeader('Cache-Control', 'no-store')
         .send(bytes);
@@ -542,7 +665,11 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       }
       const target = await resolvePresentationFilePath(projectsRoot, req.params.id, name, { requireExisting: true });
       res.type(mimeForPresentationFile(name));
+      res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Cache-Control', 'no-store');
+      if (['.html', '.htm', '.svg', '.js', '.mjs'].includes(path.extname(name).toLowerCase())) {
+        res.setHeader('Content-Disposition', 'attachment');
+      }
       return res.sendFile(target.absolute);
     } catch (error) {
       return apiError(res, 404, error);
@@ -631,10 +758,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     const status = typeof (error as { status?: unknown })?.status === 'number'
       ? Number((error as { status: number }).status)
       : error instanceof multer.MulterError ? 413 : 500;
-    logRequestFailure(req, error, status);
+    logRequestFailure(res, error, status);
+    const code = error instanceof multer.MulterError ? 'UPLOAD_LIMIT_EXCEEDED'
+      : status === 400 ? 'INVALID_REQUEST' : 'REQUEST_FAILED';
     res.status(status).json({
       error: {
-        code: error instanceof multer.MulterError ? 'UPLOAD_LIMIT_EXCEEDED' : status === 400 ? 'INVALID_REQUEST' : 'REQUEST_FAILED',
+        code,
         message: error instanceof multer.MulterError
           ? 'Upload limits were exceeded. Upload at most two files per request, each no larger than 64 MiB.'
           : status === 400 ? 'The request body could not be parsed.' : 'The request could not be completed.',
@@ -642,7 +771,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     });
   });
 
-  const port = Number.isInteger(options.port) ? Number(options.port) : (Number(process.env.LCT_PORT) || 7456);
   await generationService.recover();
   const server = await new Promise<Server>((resolve, reject) => {
     const listening = app.listen(port, host, () => resolve(listening));
@@ -654,8 +782,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   const url = `http://${urlHost}:${boundPort}`;
 
   const shutdown = async () => {
-    try { await generationService.shutdown(); } catch { /* persisted generation can recover on next start */ }
-    try { db.close(); } catch { /* already closed */ }
+    const [planningDrained, generationDrained] = await Promise.all([
+      planningService.shutdown().catch(() => false),
+      generationService.shutdown().catch(() => false),
+    ]);
+    const closeStore = () => { try { db.close(); } catch { /* already closed */ } };
+    if (planningDrained && generationDrained) closeStore();
+    else void Promise.all([planningService.waitForIdle(), generationService.waitForIdle()]).finally(closeStore);
   };
 
   if (options.returnServer) return { server, url, shutdown };

@@ -7,7 +7,7 @@ import test from 'node:test';
 import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 import { inspectPptx } from '../src/presentation/adapters/python-inspector.ts';
 import { OpenAICompatibleSemanticInferenceAdapter } from '../src/presentation/adapters/openai-compatible-semantic-inference.ts';
-import { projectTemplateSemanticProfileCache, TemplateSemanticProfiler } from '../src/presentation/application/template-semantic-profiler.ts';
+import { projectTemplateSemanticProfileCache, templateSemanticProfileCacheKey, TemplateSemanticProfiler } from '../src/presentation/application/template-semantic-profiler.ts';
 import { createTemplateIR, derivePresentationDesignSystem } from '../src/presentation/application/template-mapper.ts';
 import { sha256Json, templateIRHashPayload } from '../src/presentation/domain/template-ir.ts';
 import { startFakeSemanticEndpoint, deterministicPlanningResponse } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
@@ -39,7 +39,7 @@ function completion(value) {
   };
 }
 
-test('semantic template profile uses strict HTTP adapter output, validates all references, and caches by TemplateIR hash', async (t) => {
+test('semantic template profile loads its versioned prompt, validates references, and caches by TemplateIR plus prompt fingerprint', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root);
@@ -52,11 +52,21 @@ test('semantic template profile uses strict HTTP adapter output, validates all r
   assert.equal(first.templateIRHash, templateIR.hash);
   assert.equal(first.slides.length, templateIR.slides.length);
   assert.ok(first.slides.every((slide) => templateIR.slides.some((source) => source.index === slide.sourceSlideIndex)));
+  assert.ok(first.slides.every((profileSlide) => Array.isArray(profileSlide.preservedElementIds)
+    && Array.isArray(profileSlide.replaceableTextElementIds)));
+  for (const profileSlide of first.slides) {
+    const sourceSlide = templateIR.slides.find((slide) => slide.index === profileSlide.sourceSlideIndex);
+    const classified = [...profileSlide.preservedElementIds, ...profileSlide.replaceableTextElementIds];
+    assert.equal(new Set(classified).size, classified.length, 'a text element cannot be simultaneously preserved and cleared');
+    assert.ok(classified.every((id) => sourceSlide.elements.some((element) => element.id === id)));
+  }
   assert.equal(endpoint.state.inference.length, 1);
   const request = endpoint.state.inference[0].request;
   assert.equal(request.response_format.type, 'json_schema');
   assert.equal(request.response_format.json_schema.strict, true);
   assert.equal(request.response_format.json_schema.name, 'template_semantic_profile_v1');
+  const configuredPrompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v1.md'), 'utf8')).replace(/\s+/g, ' ').trim();
+  assert.equal(request.messages[0].content, configuredPrompt, 'the runtime sends the versioned Markdown prompt without rewriting its content');
   const evidence = JSON.parse(request.messages.at(-1).content);
   assert.ok(evidence.slides[0].elements.some((element) => element.id));
   assert.ok(!JSON.stringify(evidence).includes('private-template-name'));
@@ -67,7 +77,9 @@ test('semantic template profile uses strict HTTP adapter output, validates all r
   assert.ok(!cached.slides[0].reasonCodes.includes('caller_mutation'));
   assert.equal(endpoint.state.inference.length, 1, 'same TemplateIR hash uses the cached profile');
 
-  const persistedPath = path.join(root, 'projects', 'project-profile', '.template-compiler', 'semantic-profiles', `${templateIR.hash}.json`);
+  const promptSha256 = createHash('sha256').update(configuredPrompt, 'utf8').digest('hex');
+  const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, promptSha256);
+  const persistedPath = path.join(root, 'projects', 'project-profile', '.template-compiler', 'semantic-profiles', `${cacheKey}.json`);
   const persisted = JSON.parse(await readFile(persistedPath, 'utf8'));
   assert.equal(persisted.templateIRHash, templateIR.hash);
   const reloadedProfiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile'));
@@ -115,7 +127,10 @@ test('corrupt or invalid persisted semantic profiles are discarded and reprofile
   t.after(() => endpoint.close());
   const cache = projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile');
   const profiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache);
-  const profilePath = path.join(root, 'projects', 'project-profile', '.template-compiler', 'semantic-profiles', `${templateIR.hash}.json`);
+  const promptText = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v1.md'), 'utf8')).replace(/\s+/g, ' ').trim();
+  const promptSha256 = createHash('sha256').update(promptText, 'utf8').digest('hex');
+  const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, promptSha256);
+  const profilePath = path.join(root, 'projects', 'project-profile', '.template-compiler', 'semantic-profiles', `${cacheKey}.json`);
   await mkdir(path.dirname(profilePath), { recursive: true });
 
   await writeFile(profilePath, '{broken-json', 'utf8');
@@ -128,4 +143,27 @@ test('corrupt or invalid persisted semantic profiles are discarded and reprofile
   await profiler.profile(templateIR, presentationDesignSystem);
   assert.equal(endpoint.state.inference.length, 2, 'a parsed cache with invalid slide coverage is also discarded');
   assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).slides.length, templateIR.slides.length);
+});
+
+test('changing the versioned template-profiler prompt invalidates its project profile cache', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-prompt-version-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root);
+  const promptDirectory = path.join(root, 'prompts');
+  await mkdir(promptDirectory, { recursive: true });
+  const sourcePrompt = await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v1.md'), 'utf8');
+  const promptPath = path.join(promptDirectory, 'template-profiler.v1.md');
+  await writeFile(promptPath, sourcePrompt, 'utf8');
+  const endpoint = await startFakeSemanticEndpoint({ model });
+  t.after(() => endpoint.close());
+  const cache = projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile');
+
+  const first = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache, { promptDirectory });
+  await first.profile(templateIR, presentationDesignSystem);
+  assert.equal(endpoint.state.inference.length, 1);
+  await writeFile(promptPath, `${sourcePrompt}\nUse no inferred template identity.\n`, 'utf8');
+
+  const changedPrompt = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache, { promptDirectory });
+  await changedPrompt.profile(templateIR, presentationDesignSystem);
+  assert.equal(endpoint.state.inference.length, 2, 'prompt contents contribute to the persistent cache key');
 });

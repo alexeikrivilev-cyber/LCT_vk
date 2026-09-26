@@ -8,6 +8,7 @@ const preflightUrl = new URL('./tokenizer_preflight.py', import.meta.url);
 const dockerfileUrl = new URL('./Dockerfile', import.meta.url);
 const readmeUrl = new URL('./README.md', import.meta.url);
 const inferenceUrl = new URL('../../INFERENCE.md', import.meta.url);
+const runbookUrl = new URL('../../docs/RUNPOD_STARTUP_RUNBOOK.md', import.meta.url);
 
 async function source(url) {
   return readFile(url, 'utf8');
@@ -60,7 +61,7 @@ test('one server exposes the configured port, serves the public alias, and uses 
   assert.match(script, /--host 0\.0\.0\.0/);
   assert.match(script, /--port "\$PORT"/);
   assert.match(script, /--reasoning-parser qwen3/);
-  assert.match(readme, /readiness[^\n]*\/health|readiness[\s\S]{0,160}\/health/i);
+  assert.match(readme, /\/health/);
   assert.match(readme, /\/v1\/models/);
   assert.doesNotMatch(dockerfile, /^HEALTHCHECK\b/m);
 });
@@ -77,12 +78,12 @@ test('Docker build checks the existing snapshot dependency without fetching mode
   assert.match(dockerfile, /metadata\.version\("tiktoken"\) == "0\.13\.0"/);
   assert.doesNotMatch(dockerfile, /sentencepiece|from_pretrained|hf download|safetensors/i);
   assert.match(dockerfile, /py_compile \/opt\/lct-inference\/model_snapshot\.py \/opt\/lct-inference\/tokenizer_preflight\.py/);
-  assert.match(readme, /sentencepiece is not[\s\S]{0,30}required/i);
-  assert.match(readme, /tiktoken[^\n]*pinned/i);
-  assert.match(readme, /huggingface_hub[^\n]*1\.27\.0/i);
+  assert.match(readme, /sentencepiece[^\n]*намеренно не добавлен/i);
+  assert.match(readme, /tiktoken==0\.13\.0/);
+  assert.match(readme, /huggingface-hub==1\.27\.0/i);
 });
 
-test('snapshot materialization pins the profile revision and preflight-only excludes weights', async () => {
+test('snapshot materialization pins the profile revision and lightweight preflight excludes weight assets', async () => {
   const snapshot = await source(snapshotUrl);
   const script = await source(entrypointUrl);
 
@@ -93,7 +94,10 @@ test('snapshot materialization pins the profile revision and preflight-only excl
   assert.match(snapshot, /allow_patterns=allow_patterns/);
   assert.match(snapshot, /PREFLIGHT_FILES = \(/);
   assert.match(snapshot, /REQUIRED_PREFLIGHT_FILES = \("config\.json", "tokenizer_config\.json", "tokenizer\.json"\)/);
-  assert.doesNotMatch(snapshot, /safetensors|\.bin|model-\*|layers-\*/i);
+  const preflightFileList = snapshot.slice(snapshot.indexOf('PREFLIGHT_FILES = ('), snapshot.indexOf('REQUIRED_PREFLIGHT_FILES ='));
+  assert.doesNotMatch(preflightFileList, /safetensors|\.bin|model-\*|layers-\*/i);
+  assert.match(snapshot, /weight_inventory\(snapshot_path\)/);
+  assert.match(snapshot, /WEIGHT_INDEX_FILES = \("model\.safetensors\.index\.json"/);
   assert.match(script, /MODEL_REVISION.*\$PROFILE_MODEL_REVISION/);
   assert.match(script, /env CUDA_VISIBLE_DEVICES= python3 \/opt\/lct-inference\/model_snapshot\.py "\$MODEL_ID" "\$MODEL_REVISION" "\$LCT_MODEL_STORAGE_ROOT" "\$SNAPSHOT_MODE"/);
   assert.match(script, /--revision "\$MODEL_REVISION"/);
@@ -114,8 +118,8 @@ test('configured model storage is absolute, persistent by default, and owns the 
   assert.match(dockerfile, /LCT_MODEL_STORAGE_ROOT=\/tmp\/lct-model-storage/);
   assert.doesNotMatch(dockerfile, /HF_HOME=/);
   assert.match(readme, /LCT_MODEL_STORAGE_ROOT=\/workspace\/lct-models/);
-  assert.match(readme, /persistent[ -]volume/i);
-  assert.match(readme, /default model root[\s\S]{0,120}disposable/i);
+  assert.match(readme, /persistent mount/i);
+  assert.match(readme, /По умолчанию `LCT_MODEL_STORAGE_ROOT=\/tmp\/lct-model-storage`[\s\S]{0,140}disposable/i);
   assert.match(readme, /HF_TOKEN/);
 
   const rootValidation = script.indexOf('if [[ "$LCT_MODEL_STORAGE_ROOT" != /* ]]');
@@ -130,33 +134,72 @@ test('self-hosted storage stays behind the provider-neutral application inferenc
   const [readme, inference] = await Promise.all([source(readmeUrl), source(inferenceUrl)]);
 
   for (const document of [readme, inference]) {
-    assert.match(document, /RunPod is one self-hosted\s+(inference\s+)?runtime option/i);
-    assert.match(document, /LCT_MODEL_STORAGE_ROOT[\s\S]{0,100}self-hosted inference container/i);
-    assert.match(document, /\/workspace[\s\S]{0,180}(example|optional)/i);
-    assert.match(document, /not read or required by application or domain\s+code/i);
-    assert.match(document, /SemanticInferenceAdapter`?\s+remains provider-neutral/i);
-    assert.match(document, /top-10\s+hackathon deployment[\s\S]{0,400}organizer-provided VK inference[\s\S]{0,100}Qwen 3\.8 27B/i);
-    assert.match(document, /Worker, Supervisor, and application\/domain logic do not\s+change/i);
-    assert.match(document, /remote VK inference does not require local model storage/i);
+    assert.match(document, /RunPod[^\n]{0,120}необязательн[а-я]+[^\n]{0,50}self-hosted/i);
+    assert.match(document, /(?:`LCT_MODEL_STORAGE_ROOT`[^\n]{0,100}только[^\n]*container|только этот inference container[^\n]{0,100}`LCT_MODEL_STORAGE_ROOT`)/i);
+    assert.match(document, /`\/workspace`[^\n]{0,100}необязательн/i);
+    assert.match(document, /application\/domain code[^\n]{0,100}(не зависит|его не использует)/i);
+    assert.match(document, /provider-neutral `SemanticInferenceAdapter`/i);
+    assert.match(document, /top-10[^\n]{0,100}VK inference[^\n]{0,80}Qwen 3\.8 27B/i);
+    assert.match(document, /Worker, Supervisor и application\/domain logic[^\n]{0,120}(provider-neutral|не меня)/i);
+    assert.match(document, /remote VK inference[^\n]{0,100}не требует локальн[^\n]{0,50}storage/i);
   }
 });
 
-test('full snapshot startup checks disk, reuses the pinned cache, and keeps tokenizer preflight weight-free', async () => {
+test('snapshot startup validates the exact local revision before any Hub request', async () => {
   const snapshot = await source(snapshotUrl);
 
   assert.match(snapshot, /hf_home = storage_root \/ "huggingface"/);
   assert.match(snapshot, /hf_cache = hf_home \/ "hub"/);
+  assert.match(snapshot, /expected_snapshot_path\(hf_cache, model_id, revision\)/);
+  assert.match(snapshot, /inspect_local_snapshot\(exact_snapshot, include_weights=include_weights\)/);
+  assert.match(snapshot, /use_exact_local_snapshot_no_hub_request/);
+  assert.match(snapshot, /download_missing_pinned_files/);
   assert.match(snapshot, /snapshot_download\([\s\S]{0,180}dry_run=True/);
   assert.match(snapshot, /shutil\.disk_usage\(storage_root\)\.free/);
   assert.match(snapshot, /required_bytes > available_bytes/);
   assert.match(snapshot, /reusing_cached_snapshot/);
   assert.match(snapshot, /reusing_preflight_assets/);
-  assert.match(snapshot, /resuming_partial_snapshot/);
   assert.match(snapshot, /force_download": False/);
   assert.match(snapshot, /revision": revision/);
   assert.match(snapshot, /cache_dir": hf_cache/);
   assert.match(snapshot, /allow_patterns = list\(PREFLIGHT_FILES\) if mode == "preflight" else None/);
-  assert.doesNotMatch(snapshot, /safetensors|\.bin|model-\*|layers-\*/i);
+  assert.match(snapshot, /model\.safetensors\.index\.json/);
+  assert.match(snapshot, /weight_map/);
+  assert.match(snapshot, /\.safetensors/);
+  assert.match(snapshot, /HF_HUB_OFFLINE/);
+  assert.match(snapshot, /fail_if_incomplete_no_network/);
+  assert.doesNotMatch(snapshot, /force_download=True|\.unlink\(|shutil\.rmtree/);
+});
+
+test('offline preflight validates local files and shard inventory without starting vLLM', async () => {
+  const script = await source(entrypointUrl);
+  const snapshot = await source(snapshotUrl);
+  assert.match(script, /OFFLINE_PREFLIGHT="\$\{LCT_INFERENCE_OFFLINE_PREFLIGHT:-0\}"/);
+  assert.match(script, /SNAPSHOT_MODE="offline"/);
+  assert.match(script, /export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1/);
+  assert.match(snapshot, /if mode == "offline":/);
+  assert.match(snapshot, /prepare_storage\(storage_root, hf_cache, create=mode != "offline"\)/);
+  assert.match(snapshot, /inspect_local_snapshot\(exact_snapshot, include_weights=True\)/);
+  assert.match(snapshot, /snapshot\.status=ready_offline/);
+  const offlineBranch = script.indexOf('if [[ "$OFFLINE_PREFLIGHT" == "1" ]]');
+  const vllmExec = script.indexOf('exec vllm');
+  assert.ok(offlineBranch >= 0 && offlineBranch < vllmExec);
+  assert.match(script.slice(offlineBranch, vllmExec), /exit 0/);
+});
+
+test('RunPod startup runbook covers mount, offline preflight, API, restart-download signs, and safe stop', async () => {
+  const runbook = await source(runbookUrl);
+  for (const expected of [
+    /Перед запуском/i,
+    /\/workspace\/lct-models/,
+    /LCT_INFERENCE_OFFLINE_PREFLIGHT=1/,
+    /\/health/,
+    /\/v1\/models/,
+    /LCT_SEMANTIC_BASE_URL/,
+    /snapshot\.download_decision/,
+    /безопасная остановка/i,
+  ]) assert.match(runbook, expected);
+  assert.doesNotMatch(runbook, /proxy\.runpod\.net|kqt60r2of71hr2/);
 });
 
 test('preflight-only downloads a tokenizer snapshot, validates it locally, and exits before vLLM', async () => {

@@ -1,0 +1,20 @@
+{
+  "configVersion": "template-profiler-config.v1",
+  "agentId": "template-profiler",
+  "agentVersion": "template-profiler.v1",
+  "skillId": "template-semantics",
+  "skillVersion": "template-semantics.v1",
+  "promptVersion": "template-profiler.v1",
+  "promptFile": "template-profiler.v1.md",
+  "purpose": "Классифицировать слайды по детерминированным данным TemplateIR без выбора или изменения макета.",
+  "schemaCompatibility": "template_semantic_profile_v1",
+  "modelRole": "worker",
+  "maxSlides": 500,
+  "maxElementsPerSlide": 120,
+  "maxPromptBytes": 16384,
+  "minOutputTokens": 1024,
+  "maxOutputTokens": 8192,
+  "outputTokensPerSlide": 96,
+  "temperature": 0,
+  "timeoutMs": 90000
+}

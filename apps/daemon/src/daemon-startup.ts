@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process';
 import type { Server } from 'node:http';
 import type { StartServerOptions } from './server.js';
-import { assertLoopbackDaemonBindHost, DEFAULT_DAEMON_BIND_HOST, normalizeDaemonBindHost } from './daemon-bind-host.js';
+import { assertLoopbackDaemonBindHost, DEFAULT_DAEMON_BIND_HOST, DEFAULT_DAEMON_PORT, normalizeDaemonBindHost, parseDaemonPort } from './daemon-bind-host.js';
 
-export { DEFAULT_DAEMON_BIND_HOST, normalizeDaemonBindHost } from './daemon-bind-host.js';
+export { DEFAULT_DAEMON_BIND_HOST, DEFAULT_DAEMON_PORT, normalizeDaemonBindHost, parseDaemonPort } from './daemon-bind-host.js';
 
 export type StartedDaemonRuntime = {
   server: Server;
@@ -35,7 +35,9 @@ export function parseDaemonCliStartupArgs(argv: string[]):
   | { ok: true; config: { host: string; port: number; open: boolean } }
   | { ok: false; kind: 'help' | 'error'; message?: string } {
   let host = normalizeDaemonBindHost(process.env.LCT_BIND_HOST);
-  let port = Number(process.env.LCT_PORT) || 7456;
+  let port: number;
+  try { port = parseDaemonPort(process.env.LCT_PORT, DEFAULT_DAEMON_PORT); }
+  catch (error) { return { ok: false, kind: 'error', message: error instanceof Error ? error.message : 'invalid port' }; }
   let open = true;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -46,11 +48,10 @@ export function parseDaemonCliStartupArgs(argv: string[]):
       if (!value) return { ok: false, kind: 'error', message: '--host requires an address' };
       host = normalizeDaemonBindHost(value);
     } else if (arg === '-p' || arg === '--port') {
-      const value = Number(argv[++index]);
-      if (!Number.isInteger(value) || value <= 0 || value > 65535) {
-        return { ok: false, kind: 'error', message: 'invalid port' };
-      }
-      port = value;
+      const rawPort = argv[++index];
+      if (rawPort === undefined) return { ok: false, kind: 'error', message: '--port requires an address between 1 and 65535' };
+      try { port = parseDaemonPort(rawPort); }
+      catch (error) { return { ok: false, kind: 'error', message: error instanceof Error ? error.message : 'invalid port' }; }
     } else if (arg === 'daemon' || arg === 'serve') {
       continue;
     } else {
@@ -64,15 +65,13 @@ export function parseDaemonCliStartupArgs(argv: string[]):
 
 export async function closeHttpServer(server: Server): Promise<void> {
   if (!server.listening) return;
-  await new Promise<void>((resolve) => {
-    const hardStop = setTimeout(() => {
-      server.closeAllConnections?.();
-      resolve();
-    }, 5000);
+  await new Promise<void>((resolve, reject) => {
+    const hardStop = setTimeout(() => server.closeAllConnections?.(), 5000);
     hardStop.unref?.();
-    server.close(() => {
+    server.close((error) => {
       clearTimeout(hardStop);
-      resolve();
+      if (error) reject(error);
+      else resolve();
     });
     setTimeout(() => server.closeIdleConnections?.(), 500).unref?.();
   });
@@ -84,7 +83,8 @@ export async function startDaemonRuntime(options: DaemonRuntimeOptions = {}): Pr
   const started = await startServer({ ...serverOptions, returnServer: true });
   if (typeof started === 'string') throw new Error('presentation server did not return a server handle');
   const stop = async () => {
-    await Promise.allSettled([closeHttpServer(started.server), started.shutdown?.() ?? Promise.resolve()]);
+    await closeHttpServer(started.server);
+    await started.shutdown?.();
   };
   if (logListening) console.log(`[lct] presentation core listening on ${started.url}`);
   if (openBrowser) openUrl(started.url);
@@ -112,7 +112,7 @@ export async function runDaemonCliStartup(argv: string[]): Promise<void> {
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    void runtime.stop().finally(() => process.exit(0));
+    void runtime.stop().then(() => { process.exitCode = 0; }, () => { process.exitCode = 1; });
   };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);

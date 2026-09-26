@@ -44,18 +44,33 @@ export async function resolvePresentationFilePath(
   options: { createParent?: boolean; requireExisting?: boolean } = {},
 ): Promise<{ projectDir: string; name: string; absolute: string }> {
   const projectDir = await ensurePresentationProjectDir(projectsRoot, projectId);
+  const canonicalProjectsRoot = await realpath(projectsRoot);
+  const canonicalProjectDir = await realpath(projectDir);
+  if (path.dirname(canonicalProjectDir) !== canonicalProjectsRoot) {
+    throw new Error('project directory escapes projects root');
+  }
   const safeName = normalizeRelativeFile(name);
   const absolute = path.resolve(projectDir, safeName);
   const relative = path.relative(projectDir, absolute);
   if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('project file escapes project root');
 
   if (options.createParent) await mkdir(path.dirname(absolute), { recursive: true });
-  if (options.requireExisting) {
-    const canonicalRoot = await realpath(projectDir).catch(() => projectDir);
-    const canonicalFile = await realpath(absolute);
-    const canonicalRelative = path.relative(canonicalRoot, canonicalFile);
-    if (canonicalRelative.startsWith('..') || path.isAbsolute(canonicalRelative)) {
+  if (options.createParent || options.requireExisting) {
+    const canonicalParent = await realpath(path.dirname(absolute));
+    const parentRelative = path.relative(canonicalProjectDir, canonicalParent);
+    if (parentRelative === '..' || parentRelative.startsWith(`..${path.sep}`) || path.isAbsolute(parentRelative)) {
       throw new Error('project file symlink escapes project root');
+    }
+  }
+  if (options.requireExisting || options.createParent) {
+    try {
+      const canonicalFile = await realpath(absolute);
+      const canonicalRelative = path.relative(canonicalProjectDir, canonicalFile);
+      if (canonicalRelative === '..' || canonicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(canonicalRelative)) {
+        throw new Error('project file symlink escapes project root');
+      }
+    } catch (error) {
+      if (options.requireExisting || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
   return { projectDir, name: safeName, absolute };

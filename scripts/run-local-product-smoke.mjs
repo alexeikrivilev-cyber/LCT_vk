@@ -12,16 +12,24 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const daemonRequire = createRequire(path.join(repoRoot, 'apps/daemon/package.json'));
 
 function parseArgs(argv) {
-  const result = {};
+  const result = { slideCount: 3 };
   for (let index = 0; index < argv.length; index += 1) {
     const item = argv[index];
+    if (item === '--slides') {
+      const value = Number(argv[++index]);
+      if (!Number.isSafeInteger(value) || value < 3 || value > 15) {
+        throw new TypeError('--slides must be an integer between 3 and 15');
+      }
+      result.slideCount = value;
+      continue;
+    }
     if (item !== '--template' && item !== '--source') throw new TypeError(`Unknown option: ${item}`);
     const value = argv[++index];
     if (!value) throw new TypeError(`${item} requires a path`);
     result[item === '--template' ? 'templatePath' : 'sourcePath'] = value;
   }
   if (!result.templatePath || !result.sourcePath) {
-    throw new TypeError('Usage: node --import tsx scripts/run-local-product-smoke.mjs --template <organizer.pptx> --source <source.md>');
+    throw new TypeError('Usage: node --import tsx scripts/run-local-product-smoke.mjs --template <template.pptx> --source <synthetic.md> [--slides 3..15]');
   }
   return result;
 }
@@ -53,8 +61,8 @@ async function upload(baseUrl, projectId, name, bytes) {
   return requestJson(baseUrl, `/api/projects/${projectId}/upload`, { method: 'POST', body: form });
 }
 
-async function waitForGeneration(baseUrl, projectId) {
-  const deadline = Date.now() + 180_000;
+async function waitForGeneration(baseUrl, projectId, timeoutMs = 600_000) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const { generation } = await requestJson(baseUrl, `/api/projects/${projectId}/generation`);
     if (generation?.status === 'completed') return generation;
@@ -63,11 +71,12 @@ async function waitForGeneration(baseUrl, projectId) {
     }
     await new Promise((resolve) => setTimeout(resolve, 400));
   }
-  throw new Error('generation did not finish within three minutes');
+  throw new Error(`generation did not finish within ${Math.round(timeoutMs / 1000)} seconds`);
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const runStartedAt = performance.now();
   const templatePath = await realpath(args.templatePath);
   const sourcePath = await realpath(args.sourcePath);
   const templateName = path.basename(templatePath);
@@ -80,7 +89,7 @@ async function main() {
   const dataDir = path.join(runDir, 'data');
   await mkdir(dataDir, { recursive: true });
 
-  const envKeys = ['LCT_SEMANTIC_BASE_URL', 'LCT_SEMANTIC_MODEL', 'LCT_SEMANTIC_API_KEY', 'LCT_SEMANTIC_ENABLE_THINKING', 'LCT_PPTX_BACKEND', 'LCT_DATA_DIR'];
+  const envKeys = ['LCT_SEMANTIC_BASE_URL', 'LCT_SEMANTIC_MODEL', 'LCT_SEMANTIC_API_KEY', 'LCT_SEMANTIC_ENABLE_THINKING', 'LCT_PPTX_BACKEND', 'LCT_DATA_DIR', 'LCT_SMOKE_RESULT_FILE'];
   const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   const fake = await startFakeSemanticEndpoint({ model: 'offline-fake-planner' });
   process.env.LCT_SEMANTIC_BASE_URL = fake.baseUrl;
@@ -101,6 +110,7 @@ async function main() {
     template: { path: templatePath, sha256: sourceHashBefore, originalName: templateName },
     source: { path: sourcePath, sha256: sha256(sourceBytes), originalName: sourceName },
     gates: {},
+    timingsMs: {},
   };
   const start = () => startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
   const ensure = async (body) => writeFile(path.join(runDir, 'smoke-report.json'), JSON.stringify(body, null, 2));
@@ -115,6 +125,7 @@ async function main() {
     }, 201);
     report.gates.project = 'passed';
 
+    let stageStartedAt = performance.now();
     const templateUpload = await upload(daemon.url, projectId, templateName, templateBytes);
     const sourceUpload = await upload(daemon.url, projectId, sourceName, sourceBytes);
     const uploadedFiles = await requestJson(daemon.url, `/api/projects/${projectId}/files`);
@@ -122,7 +133,9 @@ async function main() {
     assert.ok(uploadedFiles.files.some((file) => file.path === sourceName), `source file was not uploaded: ${JSON.stringify(sourceUpload.files)}`);
     report.gates.upload = 'passed';
     report.gates.uploadedNames = uploadedFiles.files.map((file) => file.path);
+    report.timingsMs.uploadAndList = Math.round(performance.now() - stageStartedAt);
 
+    stageStartedAt = performance.now();
     const templateResponse = await requestJson(daemon.url, `/api/projects/${projectId}/template/compile`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ filePath: templateName }),
@@ -137,28 +150,43 @@ async function main() {
       layouts: templateResponse.templateIR.layouts.length,
       packageParts: templateResponse.templateIR.packageInventory?.length ?? null,
     };
+    report.timingsMs.templateAnalysis = Math.round(performance.now() - stageStartedAt);
 
     const brief = {
       audience: 'Hackathon jury and technical reviewers',
       purpose: 'Explain the presentation compiler product and its generation pipeline.',
       expectedOutcome: 'Understand the problem, pipeline, and product value.',
       preferences: ['Use uploaded template', 'Concise slides', 'Clear hierarchy', 'Do not invent unsupported facts'],
-      requestedSlideCount: 3,
+      requestedSlideCount: args.slideCount,
     };
+    stageStartedAt = performance.now();
     const planning = await requestJson(daemon.url, `/api/projects/${projectId}/planning/generate`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ contentFiles: [sourceName], brief }),
     });
     assert.equal(planning.status, 'ready', JSON.stringify(planning.failure));
-    assert.equal(planning.deckPlan.slides.length, 3);
+    assert.equal(planning.deckPlan.slides.length, args.slideCount);
     assert.equal(planning.review.outcome, 'pass');
     assert.ok(planning.contentIR.units.length > 0);
+    const { reviewDeckLevel } = await import('../apps/daemon/src/presentation/application/deck-level-review.ts');
+    const planDeckReview = reviewDeckLevel({ deckPlan: planning.deckPlan, contentIR: planning.contentIR });
+    const planDeckRules = planDeckReview.findings.map((finding) => finding.ruleId);
+    assert.ok(!planDeckReview.findings.some((finding) => finding.severity === 'error'));
+    for (const ruleId of ['deck.repeated-title', 'deck.repeated-content-ref', 'deck.repeated-message', 'deck.cover-role-missing', 'deck.cover-not-first', 'deck.closing-in-middle']) {
+      assert.ok(!planDeckRules.includes(ruleId), `synthetic plan deck review found ${ruleId}`);
+    }
+    report.deckLevelPlanReview = planDeckReview;
+    report.gates.planDeckReview = 'passed';
     const contentUnitsById = new Map(planning.contentIR.units.map((unit) => [unit.id, unit]));
     assert.ok(planning.deckPlan.slides.every((slide) => slide.contentRefs.length > 0
       && slide.contentRefs.every((id) => {
         const unit = contentUnitsById.get(id);
         return unit && unit.kind !== 'media-reference' && typeof unit.text === 'string' && unit.text.trim().length > 0;
       })), 'every synthetic plan slide must cite non-empty source text');
+    assert.equal(new Set(planning.deckPlan.slides.map((slide) => slide.takeaway.trim().toLocaleLowerCase())).size,
+      planning.deckPlan.slides.length, 'synthetic long-deck plan must not repeat takeaways');
+    assert.equal(new Set(planning.deckPlan.slides.map((slide) => [...slide.contentRefs].sort().join('|'))).size,
+      planning.deckPlan.slides.length, 'synthetic long-deck plan must not repeat its source claims');
     report.gates.content = 'passed';
     report.gates.plan = 'passed';
     report.plan = { id: planning.deckPlan.id, hash: planning.deckPlan.hash, slides: planning.deckPlan.slides.length };
@@ -169,6 +197,8 @@ async function main() {
     }));
     assert.deepEqual(report.fakeInferenceRequests.map((item) => item.operation), ['template-semantic-profile', 'deck-plan', 'plan-review']);
     assert.ok(report.fakeInferenceRequests.every((item) => item.strictJsonSchema));
+    report.timingsMs.planningIncludingFakeInference = Math.round(performance.now() - stageStartedAt);
+    report.timingsMs.workerAndSupervisorReportedMs = planning.telemetry?.totalWallTimeMs ?? null;
     await ensure(report);
 
     await closeDaemon(daemon);
@@ -178,13 +208,14 @@ async function main() {
     assert.equal(persistedPlanning.deckPlan.hash, planning.deckPlan.hash);
     report.gates.planningReload = 'passed';
 
+    stageStartedAt = performance.now();
     const generationStart = await requestJson(daemon.url, `/api/projects/${projectId}/generation`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'Idempotency-Key': 'local-product-smoke-v1' }, body: '{}',
     }, 202);
-    assert.equal(generationStart.generation.totalSlides, 3);
+    assert.equal(generationStart.generation.totalSlides, args.slideCount);
     const generation = await waitForGeneration(daemon.url, projectId);
-    assert.equal(generation.readySlides, 3);
-    assert.deepEqual(generation.slides.map((pack) => pack.index), [1, 2, 3]);
+    assert.equal(generation.readySlides, args.slideCount);
+    assert.deepEqual(generation.slides.map((pack) => pack.index), Array.from({ length: args.slideCount }, (_, index) => index + 1));
     report.gates.generation = 'passed';
     report.generation = {
       status: generation.status,
@@ -194,6 +225,7 @@ async function main() {
       recommended: generation.slides.map((pack) => pack.recommendedVariant),
     };
     assert.ok(generation.slides.every((pack) => ['A', 'B', 'C'].every((variant) => pack.variants[variant].status === 'ready')));
+    report.timingsMs.generationRenderAndPreview = Math.round(performance.now() - stageStartedAt);
 
     const defaultResponse = await requestJson(daemon.url, `/api/projects/${projectId}/generation/selection`, {
       method: 'PUT', headers: { 'content-type': 'application/json' },
@@ -217,6 +249,7 @@ async function main() {
     assert.equal(currentGeneration.slides[0].lockedVariant, 'C');
     report.gates.variantsSelectionAndLock = 'passed';
 
+    stageStartedAt = performance.now();
     const previewChecks = [];
     for (const pack of currentGeneration.slides) {
       for (const variant of ['A', 'B', 'C']) {
@@ -233,11 +266,22 @@ async function main() {
     report.gates.preview = 'passed';
     report.previews = previewChecks;
 
-    const audit = await requestJson(daemon.url, `/api/projects/${projectId}/generation/slides/${selectedFirst.slideId}/audit?variant=A`);
-    assert.ok(Array.isArray(audit.audit.findings));
+    const auditChecks = [];
+    let selectedAudit = null;
+    for (const pack of currentGeneration.slides) {
+      for (const variant of ['A', 'B', 'C']) {
+        const audit = await requestJson(daemon.url,
+          `/api/projects/${projectId}/generation/slides/${pack.slideId}/audit?variant=${variant}`);
+        assert.ok(Array.isArray(audit.audit.findings));
+        const errors = audit.audit.findings.filter((item) => item.severity === 'error');
+        assert.equal(errors.length, 0, `${pack.slideId}/${variant} audit errors: ${JSON.stringify(errors)}`);
+        auditChecks.push({ slide: pack.index, variant, findings: audit.audit.findings.length, errors: errors.length });
+        if (pack.slideId === selectedFirst.slideId && variant === 'A') selectedAudit = audit;
+      }
+    }
     report.gates.audit = 'passed';
-    report.audit = { findings: audit.audit.findings.length, errors: audit.audit.findings.filter((item) => item.severity === 'error').length };
-    const repairFinding = audit.audit.findings.find((item) => item.autofixAvailable);
+    report.audit = { variantsChecked: auditChecks.length, findings: auditChecks.reduce((sum, item) => sum + item.findings, 0), errors: 0, checks: auditChecks };
+    const repairFinding = selectedAudit?.audit.findings.find((item) => item.autofixAvailable);
     if (repairFinding) {
       const repair = await requestJson(daemon.url, `/api/projects/${projectId}/generation/repair`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -249,7 +293,9 @@ async function main() {
     } else {
       report.gates.safeRepair = 'not-available';
     }
+    report.timingsMs.previewAuditAndRepair = Math.round(performance.now() - stageStartedAt);
 
+    stageStartedAt = performance.now();
     const exported = await requestJson(daemon.url, `/api/projects/${projectId}/generation/export`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'selected' }),
     }, 201);
@@ -259,7 +305,7 @@ async function main() {
     const pptx = Buffer.from(await download.arrayBuffer());
     assert.ok(pptx.length > 100_000, `export unexpectedly small (${pptx.length} bytes)`);
     const { slideCount, notesSlideCount, validationIssues } = await inspectOfficeKitPackage(pptx);
-    assert.equal(slideCount, 3);
+    assert.equal(slideCount, args.slideCount);
     assert.equal(notesSlideCount, 0);
     assert.ok(!validationIssues.some((issue) => issue.severity === 'error'), JSON.stringify(validationIssues));
     const reopened = await loadPresentation(pptx);
@@ -269,6 +315,30 @@ async function main() {
     assert.ok(nativeTextShapes.every((shape) => getShapeKind(shape) === 'shape'));
     report.gates.exportAndReopen = 'passed';
     report.export = { bytes: pptx.length, sha256: sha256(pptx), slides: slideCount, nativeTextShapes: nativeTextShapes.length, notesSlides: notesSlideCount, nativeOfficeStatus: exported.artifact.nativeOfficeStatus };
+    report.timingsMs.selectedExportAndReopen = Math.round(performance.now() - stageStartedAt);
+
+    stageStartedAt = performance.now();
+    const trackExports = [];
+    for (const mode of ['A', 'B', 'C']) {
+      const trackExport = await requestJson(daemon.url, `/api/projects/${projectId}/generation/export`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode }),
+      }, 201);
+      assert.equal(trackExport.artifact.mode, mode);
+      assert.equal(trackExport.artifact.validationStatus, 'passed');
+      const trackDownload = await fetch(`${daemon.url}${trackExport.artifact.downloadUrl}`);
+      assert.equal(trackDownload.status, 200);
+      const trackPptx = Buffer.from(await trackDownload.arrayBuffer());
+      const inspectedTrack = await inspectOfficeKitPackage(trackPptx);
+      assert.equal(inspectedTrack.slideCount, args.slideCount, `${mode} track export slide count`);
+      assert.equal(inspectedTrack.notesSlideCount, 0, `${mode} track export should not add notes`);
+      assert.ok(!inspectedTrack.validationIssues.some((issue) => issue.severity === 'error'), `${mode} track package errors`);
+      const reopenedTrack = await loadPresentation(trackPptx);
+      assert.equal(getSlides(reopenedTrack).length, args.slideCount, `${mode} track should reopen`);
+      trackExports.push({ mode, bytes: trackPptx.length, sha256: sha256(trackPptx), slides: inspectedTrack.slideCount, reopened: true });
+    }
+    report.gates.trackExportsAndReopen = 'passed';
+    report.trackExports = trackExports;
+    report.timingsMs.trackExportsAndReopen = Math.round(performance.now() - stageStartedAt);
 
     await closeDaemon(daemon);
     daemon = await start();
@@ -276,7 +346,8 @@ async function main() {
     assert.equal(persistedGeneration.status, 'completed');
     assert.equal(persistedGeneration.generationId, generation.generationId);
     assert.equal(persistedGeneration.slides[0].lockedVariant, 'C');
-    assert.equal(persistedGeneration.exports[0].sha256, exported.artifact.sha256);
+    assert.ok(persistedGeneration.exports.some((artifact) => artifact.sha256 === exported.artifact.sha256));
+    assert.deepEqual(new Set(persistedGeneration.exports.map((artifact) => artifact.mode)), new Set(['selected', 'A', 'B', 'C']));
     const persistedPreview = await fetch(`${daemon.url}${persistedGeneration.slides[0].variants.A.previewUrl}`);
     assert.equal(persistedPreview.status, 200);
     report.gates.generationReload = 'passed';
@@ -287,6 +358,7 @@ async function main() {
       'template profiling happens once during compile and remains cached after daemon reload');
     assert.equal(fake.state.inference.length, 3, 'generation, selection, repair, and export must not call semantic inference');
     report.fakeInferenceCallCount = fake.state.inference.length;
+    report.timingsMs.total = Math.round(performance.now() - runStartedAt);
     report.status = 'passed';
   } catch (error) {
     report.status = 'failed';
@@ -295,6 +367,13 @@ async function main() {
   } finally {
     report.completedAt = new Date().toISOString();
     await ensure(report).catch(() => undefined);
+    if (process.env.LCT_SMOKE_RESULT_FILE) {
+      const allowedRoot = `${path.resolve(repoRoot, '.lct')}${path.sep}`.toLocaleLowerCase('en-US');
+      const requestedPath = path.resolve(process.env.LCT_SMOKE_RESULT_FILE);
+      if (requestedPath.toLocaleLowerCase('en-US').startsWith(allowedRoot)) {
+        await writeFile(requestedPath, JSON.stringify(report, null, 2), 'utf8').catch(() => undefined);
+      }
+    }
     await closeDaemon(daemon).catch(() => undefined);
     await fake.close();
     for (const key of envKeys) {

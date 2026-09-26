@@ -16,11 +16,12 @@ import { validatePlanReview } from '../apps/daemon/src/presentation/application/
 import { OpenAICompatibleSemanticInferenceAdapter } from '../apps/daemon/src/presentation/adapters/openai-compatible-semantic-inference.js';
 import { derivePresentationDesignSystem } from '../apps/daemon/src/presentation/application/template-mapper.js';
 import { TemplateSemanticProfiler } from '../apps/daemon/src/presentation/application/template-semantic-profiler.js';
+import { AGENT_WORKFLOW_VERSIONS, LEGACY_UNRECORDED_WORKFLOW_VERSIONS } from '../apps/daemon/src/presentation/application/workflow-versions.ts';
 import { OfficeKitPreviewAdapter } from '../apps/daemon/src/presentation/adapters/office-kit-preview-adapter.js';
 import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
 
-const WORKER_REQUEST_SCHEMA = 'deck_plan_draft_v1';
-const SUPERVISOR_REQUEST_SCHEMA = 'supervisor_plan_review_v1';
+const WORKER_REQUEST_SCHEMA = AGENT_WORKFLOW_VERSIONS.worker.schemaVersion;
+const SUPERVISOR_REQUEST_SCHEMA = AGENT_WORKFLOW_VERSIONS.supervisor.schemaVersion;
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -81,6 +82,7 @@ export function createOfflineReplayManifest(state, templates, matrix, runMetadat
       templates: templates.map((template) => template.templateIR.hash),
     },
     requestSchema: { worker: WORKER_REQUEST_SCHEMA, supervisor: SUPERVISOR_REQUEST_SCHEMA },
+    agentWorkflows: saved.agentWorkflowVersions ?? LEGACY_UNRECORDED_WORKFLOW_VERSIONS,
     worker: {
       structuredResultKind: 'canonicalized-worker-checkpoint',
       structuredResult: saved.checkpoint,
@@ -228,31 +230,35 @@ export async function runOfflineMatrixFromState(args) {
     } : { planningWorker: 0, planningSupervisor: 0, templateProfiler: 0, generation: 0, total: 0 },
     stageMs: {
       templateInspection: Number(templateInspectionMs.toFixed(3)),
+      semanticProfile: matrix.timingsMs.semanticProfile,
       contentParsing: null,
       worker: safeLatency(saved.telemetry?.worker?.wallTimeMs),
       supervisor: safeLatency(saved.telemetry?.supervisor?.wallTimeMs),
       planning: safeLatency(saved.telemetry?.totalWallTimeMs),
       slideCompilation: matrix.timingsMs.compile,
       render: matrix.timingsMs.render,
+      generation: Number((matrix.timingsMs.compile + matrix.timingsMs.render).toFixed(3)),
       preview: matrix.timingsMs.preview,
       deterministicAudit: matrix.timingsMs.audit,
       repair: null,
-      export: null,
+      export: matrix.timingsMs.render,
       offlineTotal: Number((templateInspectionMs + matrix.timingsMs.total).toFixed(3)),
       productEndToEndTotal: null,
     },
     stageStatus: {
       templateInspection: 'measured during this run',
+      semanticProfile: args.localSemantic ? 'measured local fake endpoint wall time' : 'not requested',
       contentParsing: 'not rerun; ContentIR was loaded from the persisted planning snapshot',
       worker: 'loaded from persisted inference telemetry; no inference request was made during this replay',
       supervisor: 'loaded from persisted inference telemetry; no inference request was made during this replay',
       planning: 'loaded from persisted Worker/Supervisor telemetry; no inference request was made',
       slideCompilation: 'measured during this run',
       render: 'measured during this run',
+      generation: 'measured as slide compilation plus PPTX rendering, assembly, and reopen',
       preview: matrix.timingsMs.preview === null ? 'not run; no preview adapter was supplied' : 'measured during this run',
       deterministicAudit: 'measured during this run',
       repair: 'not run by this offline matrix command',
-      export: 'not run separately; PPTX package assembly and reopen are included in render',
+      export: 'measured as part of render; PPTX package assembly and reopen are not a separate stage',
       offlineTotal: args.localSemantic ? 'measured for template inspection, one local fake profile call per unique template, and matrix rendering; excludes planning requests'
         : 'measured for template inspection and offline matrix stages; excludes content parsing and inference reruns',
       productEndToEndTotal: args.localSemantic ? 'not measured; Worker/Supervisor planning was loaded from persisted state'

@@ -10,6 +10,7 @@ tsconfig.tsbuildinfo
 
 # Presentation runtime data.
 .lct/
+.lct.zip
 
 # Local credentials and editor state.
 .env

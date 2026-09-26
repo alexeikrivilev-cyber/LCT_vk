@@ -79,6 +79,7 @@ async function runAgainst(endpoint, mode, runId, overrides = {}) {
     backend: 'office-kit',
     providerKind: 'local',
     profile: 'OFFLINE_FAKE',
+    localSemanticMatrix: true,
     previewAdapter: {
       async preview(_pptx, index) {
         return { slideCount: 5, png: new Uint8Array([index, 1]), svg: `<svg>${index}</svg>`, textLayoutIssues: [], status: 'passed', limitations: [] };
@@ -120,7 +121,7 @@ test('smoke performs health/models, one strict request, Worker/Supervisor, persi
   assert.equal(result.summary.scenarios[0].references_valid, true);
   assert.equal(result.summary.scenarios[0].pptx_validation, 'passed');
   const matrix = JSON.parse(await readFile(path.join(result.outDir, 'retention-growth', 'matrix', 'matrix.json'), 'utf8'));
-  assert.equal(matrix.inferenceRequests, 0);
+  assert.equal(matrix.inferenceRequests, 1, 'the matrix uses one local fake template-profile request');
   assert.equal(matrix.outputCount, 3);
   assert.ok(matrix.outputs.every((item) => item.previewStatus === 'passed'));
   assert.ok(await readFile(path.join(result.outDir, 'retention-growth', 'previews', 'variant-a', 'slide-01.png')));
@@ -144,7 +145,7 @@ test('suite is sequential, stops at five scenarios, and caps remote calls at Wor
   assert.deepEqual(endpoint.state.inference.map((item) => item.operation), Array.from({ length: 5 }, () => ['deck-plan', 'plan-review']).flat());
   for (const scenario of result.summary.scenarios) {
     const matrix = JSON.parse(await readFile(path.join(result.outDir, scenario.scenario, 'matrix', 'matrix.json'), 'utf8'));
-    assert.equal(matrix.inferenceRequests, 0);
+    assert.equal(matrix.inferenceRequests, 1, 'each scenario profiles its template through the local fake endpoint');
     assert.equal(matrix.outputCount, 3);
     assert.ok(matrix.outputs.every((item) => item.previewStatus === 'passed'));
   }

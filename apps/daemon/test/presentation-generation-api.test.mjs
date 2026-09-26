@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -12,6 +12,7 @@ register();
 const require = createRequire(import.meta.url);
 const PptxGenJS = require('pptxgenjs');
 const { startServer } = await import('../src/server.ts');
+const { PDFDocument } = await import('pdf-lib');
 const { compileContentIR } = await import('../src/presentation/application/content-compiler.ts');
 const { planningInputFingerprint, validatePlanReview } = await import('../src/presentation/application/planning-service.ts');
 const { canonicalizeDeckPlan } = await import('../src/presentation/domain/deck-plan.ts');
@@ -190,13 +191,16 @@ function gateRenderer(targetSlideId) {
   const gate = new Promise((resolve) => { release = resolve; });
   let blocked = false;
   const errors = [];
+  const renderSlideCounts = [];
   return {
     entered,
     errors,
+    renderSlideCounts,
     release: () => release(),
     renderer: {
       id: 'office-kit',
       async render(input) {
+        renderSlideCounts.push(input.compiledPresentation.slides.length);
         if (!blocked && input.compiledPresentation.slides[0]?.sourceDeckPlanSlideId === targetSlideId) {
           blocked = true;
           enter();
@@ -324,6 +328,10 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     assert.equal(completed.slides[0].selectedVariant, 'B');
     assert.equal(completed.slides[1].lockedVariant, 'C');
     assert.deepEqual(progress, progress.slice().sort((a, b) => a - b));
+    assert.equal(gate.renderSlideCounts.filter((count) => count === 3).length, 3,
+      'each slide pack validates A/B/C through one renderer pass');
+    assert.equal(gate.renderSlideCounts.filter((count) => count === 1).length, 1,
+      'a local single-variant repair still uses a one-slide renderer pass');
     assert.equal(inferenceCalls.length, 0, 'variants, repair, and export must not call semantic inference');
     assert.ok(completed.slides.every((pack) => pack.status === 'ready' && variants.every((variant) => pack.variants[variant].previewUrl)));
 
@@ -332,11 +340,12 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     assert.match(previewResponse.headers.get('content-type') ?? '', /image\/png/);
     assert.ok((await previewResponse.arrayBuffer()).byteLength > 100);
 
-    const exportResponse = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
+    const duplicateExports = await Promise.all(Array.from({ length: 2 }, () => fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'selected' }),
-    });
-    assert.equal(exportResponse.status, 201, await exportResponse.clone().text());
-    const exportBody = await json(exportResponse);
+    })));
+    for (const response of duplicateExports) assert.equal(response.status, 201, await response.clone().text());
+    const [exportBody, duplicateExportBody] = await Promise.all(duplicateExports.map(json));
+    assert.equal(duplicateExportBody.artifact.id, exportBody.artifact.id, 'concurrent duplicate exports share one persisted artifact');
     assert.equal(exportBody.artifact.validationStatus, 'passed');
     assert.equal(exportBody.artifact.nativeOfficeStatus, 'unknown');
     const downloaded = await fetch(`${started.url}${exportBody.artifact.downloadUrl}`);
@@ -345,6 +354,32 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     assert.ok(outputBytes.length > 100);
     const inspection = await inspectOfficeKitPackage(outputBytes);
     assert.equal(inspection.slideCount, 3);
+    assert.equal(exportBody.artifact.format, 'pptx');
+
+    for (const format of ['pdf', 'html']) {
+      const alternateExport = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'selected', format }),
+      });
+      assert.equal(alternateExport.status, 201, await alternateExport.clone().text());
+      const alternateBody = await json(alternateExport);
+      assert.equal(alternateBody.artifact.format, format);
+      const alternateDownload = await fetch(`${started.url}${alternateBody.artifact.downloadUrl}`);
+      assert.equal(alternateDownload.status, 200);
+      const mime = alternateDownload.headers.get('content-type') ?? '';
+      const alternateBytes = Buffer.from(await alternateDownload.arrayBuffer());
+      assert.ok(alternateBytes.length > 100);
+      if (format === 'pdf') {
+        assert.match(mime, /application\/pdf/);
+        const reopenedPdf = await PDFDocument.load(alternateBytes, { updateMetadata: false });
+        assert.equal(reopenedPdf.getPageCount(), 3);
+      } else {
+        assert.match(mime, /text\/html/);
+        const html = alternateBytes.toString('utf8');
+        assert.match(html, /<main>/);
+        assert.equal((html.match(/<section class="slide"/g) ?? []).length, 3);
+        assert.match(html, /<h1 class="slide-title"/);
+      }
+    }
     assert.equal(inferenceCalls.length, 0);
 
     const stateDb = new Database(path.join(dataDir, 'app.sqlite'), { readonly: true });
@@ -360,6 +395,21 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     assert.equal(reloaded.slides[0].selectedVariant, 'B');
     assert.equal(reloaded.slides[1].lockedVariant, 'C');
     assert.equal(reloaded.exports[0].id, exportBody.artifact.id);
+    assert.deepEqual(reloaded.exports.map((item) => item.format), ['pptx', 'pdf', 'html']);
+    const runManifestPath = path.join(dataDir, 'projects', projectId, '.generation', initial.generationId, 'run-manifest.json');
+    const runManifest = JSON.parse(await readFile(runManifestPath, 'utf8'));
+    assert.equal(runManifest.schemaVersion, 1);
+    assert.equal(runManifest.run.generationId, initial.generationId);
+    assert.equal(runManifest.inputHashes.template, reloaded.templateIRHash);
+    assert.equal(runManifest.exports.length, 3);
+    assert.equal(runManifest.contentExcluded, true);
+    assert.equal(runManifest.secretsExcluded, true);
+    assert.doesNotMatch(JSON.stringify(runManifest), /Evidence points to a retention constraint/);
+    const repeatedExport = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'selected' }),
+    });
+    assert.equal(repeatedExport.status, 201);
+    assert.equal((await json(repeatedExport)).artifact.id, exportBody.artifact.id, 'the same export request stays idempotent after daemon restart');
     assert.equal((await fetch(`${started.url}${reloaded.slides[0].variants.B.previewUrl}`)).status, 200);
     assert.equal(inferenceCalls.length, 0);
   } finally {
@@ -583,4 +633,59 @@ test('shutdown preserves every terminal generation when its task is still settli
 
   for (const status of statuses) assert.equal(getPresentationGeneration(db, `shutdown-${status}`).state.status, status);
   assert.ok(controllers.every((controller) => controller.signal.aborted));
+});
+
+test('project drain and daemon shutdown wait for in-flight repair and export work', async () => {
+  const service = new PresentationGenerationService({ db: {}, projectsRoot: '.', planningService: {}, backend: 'custom' });
+  let resolveExport;
+  let resolveRepair;
+  let resolveOtherProject;
+  const exportTask = new Promise((resolve) => { resolveExport = resolve; });
+  const repairTask = new Promise((resolve) => { resolveRepair = resolve; });
+  const otherProjectTask = new Promise((resolve) => { resolveOtherProject = resolve; });
+  service.exportTasks.set('drain-target:export', exportTask);
+  service.repairTasks.set('drain-target:repair', repairTask);
+  service.exportTasks.set('other-project:export', otherProjectTask);
+
+  let drained = false;
+  const projectDrain = service.drainProject('drain-target').then((result) => { drained = result; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(drained, false);
+  resolveExport();
+  resolveRepair();
+  // Real task wrappers remove their entries in finally; mirror that cleanup here.
+  service.exportTasks.delete('drain-target:export');
+  service.repairTasks.delete('drain-target:repair');
+  await projectDrain;
+  assert.equal(drained, true, 'deletion waits for this project but not unrelated projects');
+
+  let shutdownFinished = false;
+  const shutdown = service.shutdown().then((result) => { shutdownFinished = result; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(shutdownFinished, false, 'daemon shutdown waits for exports not cancellable as generation tasks');
+  resolveOtherProject();
+  await shutdown;
+  assert.equal(shutdownFinished, true);
+});
+
+test('generation artifact writes reject a project directory symlink outside storage', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-generation-path-'));
+  const projectsRoot = path.join(temp, 'projects');
+  const outside = path.join(temp, 'outside');
+  await mkdir(projectsRoot);
+  await mkdir(outside);
+  t.after(() => removeTempDirectory(temp));
+  try {
+    await symlink(outside, path.join(projectsRoot, 'project-escape'), process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOTSUP'].includes(error?.code)) {
+      t.skip('directory symlinks are not available in this environment');
+      return;
+    }
+    throw error;
+  }
+  const service = new PresentationGenerationService({ db: {}, projectsRoot, planningService: {}, backend: 'custom' });
+  await assert.rejects(service.generatedFile('project-escape', ['generation-id', 'artifact.png'], true), /escapes project storage/);
+  assert.deepEqual(await readdir(outside), []);
+  await assert.rejects(access(path.join(outside, '.generation')), { code: 'ENOENT' });
 });

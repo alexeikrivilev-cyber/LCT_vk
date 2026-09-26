@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, readFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,6 +11,7 @@ register();
 const { startServer } = await import('../src/server.ts');
 const { SemanticInferenceError } = await import('../src/presentation/application/semantic-inference-port.ts');
 const { planningInputFingerprint } = await import('../src/presentation/application/planning-service.ts');
+const { AGENT_WORKFLOW_CONTRACT_SHA256, AGENT_WORKFLOW_VERSIONS } = await import('../src/presentation/application/workflow-versions.ts');
 
 const repoRoot = path.resolve(import.meta.dirname, '../../..');
 
@@ -187,6 +188,8 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     assert.equal(first.status, 'ready');
     assert.equal(first.review.outcome, 'pass');
     assert.equal(first.deckPlan.slides.length, 2);
+    assert.equal(first.agentWorkflowVersions.worker.skillId, 'presentation-planning');
+    assert.equal(first.agentWorkflowVersions.supervisor.agentVersion, 'plan-review-supervisor.v1');
     assert.deepEqual(first.deckPlan.slides.map((slide) => slide.order), [1, 2]);
     assert.ok(first.contentIR.units.some((unit) => first.deckPlan.slides[1].contentRefs.includes(unit.id)));
     assert.equal(Object.hasOwn(first.deckPlan.slides[1], 'geometry'), false);
@@ -197,6 +200,7 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     assert.equal(saved.lastSuccessful.telemetry.worker.model, 'fake-planner-v1');
     assert.equal(saved.lastSuccessful.telemetry.worker.finishReason, 'stop');
     assert.equal(saved.lastSuccessful.telemetry.supervisor.finishReason, 'stop');
+    assert.equal(saved.lastSuccessful.agentWorkflowVersions.worker.schemaVersion, 'deck_plan_draft_v1');
     // Older schemaVersion=1 planning states did not store finishReason.
     delete saved.lastSuccessful.telemetry.worker.finishReason;
     delete saved.lastSuccessful.telemetry.supervisor.finishReason;
@@ -206,6 +210,22 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     const reloaded = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
     assert.equal(reloaded.status, 'ready');
     assert.equal(reloaded.deckPlan.hash, first.deckPlan.hash);
+
+    const { readWorkspaceDraft } = await import('../../web/src/workspace-draft.ts');
+    const draft = {
+      updatedAt: Date.now() + 1,
+      selectedContentFiles: ['source.md'],
+      briefAudience: 'Руководители',
+      briefPurpose: 'Выбрать приоритет',
+      briefExpectedOutcome: 'Согласовать следующий шаг',
+      briefPreferences: '',
+      requestedSlideCount: '2',
+    };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const repeatedRead = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
+    assert.equal(repeatedRead.updatedAt, reloaded.updatedAt, 'a read-only GET does not make saved planning state appear newer');
+    assert.deepEqual(readWorkspaceDraft({ getItem: () => JSON.stringify(draft) }, projectId, repeatedRead.updatedAt, new Set(['source.md'])), draft,
+      'a client draft edited after the last persisted plan survives a refresh planning read');
 
     control.reviewMode = 'warn';
     const warnResponse = await generate(started, projectId);
@@ -327,7 +347,50 @@ test('Planning API starts offline and reports inference configuration failure on
   }
 });
 
-test('planning input fingerprint changes when either versioned prompt asset changes', () => {
+test('deleting a project cancels and drains an in-flight planning request before removing its files', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-planning-delete-'));
+  let enterInference;
+  const inferenceStarted = new Promise((resolve) => { enterInference = resolve; });
+  let abortObserved = false;
+  const adapter = {
+    infer(request) {
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => {
+          abortObserved = true;
+          reject(new Error('cancelled by project deletion'));
+        }, { once: true });
+        enterInference();
+      });
+    },
+  };
+  const started = await startServer({
+    host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
+    serveWeb: false, returnServer: true, semanticInferenceAdapter: adapter,
+  });
+  const projectId = 'planning-delete-inflight';
+  t.after(async () => {
+    await closeStartedServer(started);
+    await rm(temp, { recursive: true, force: true });
+  });
+  await createProject(started, projectId);
+  if (!await compileTemplate(started, projectId, await makeSyntheticPptx({ slideCount: 1, layoutCount: 1 }))) {
+    t.skip('Python 3.12 unavailable: local template fixture cannot be compiled');
+    return;
+  }
+  await upload(started, projectId, 'source.md', Buffer.from('Evidence for a bounded planning cancellation test.', 'utf8'));
+  const planRequest = generate(started, projectId);
+  await Promise.race([inferenceStarted, new Promise((_, reject) => setTimeout(() => reject(new Error('planning did not reach inference')), 10_000))]);
+  const deletion = await fetch(`${started.url}/api/projects/${projectId}`, { method: 'DELETE' });
+  assert.equal(deletion.status, 200, await deletion.clone().text());
+  assert.equal(abortObserved, true);
+  const cancelledResponse = await planRequest;
+  assert.equal(cancelledResponse.status, 409);
+  assert.equal((await responseJson(cancelledResponse)).error.code, 'PLANNING_CANCELLED');
+  assert.equal((await fetch(`${started.url}/api/projects/${projectId}`)).status, 404);
+  await assert.rejects(access(path.join(temp, 'data', 'projects', projectId)), { code: 'ENOENT' });
+});
+
+test('planning input fingerprint changes when prompt assets or the agent workflow contract changes', () => {
   const input = {
     templateIRHash: 'a'.repeat(64),
     presentationDesignSystemHash: 'b'.repeat(64),
@@ -339,4 +402,8 @@ test('planning input fingerprint changes when either versioned prompt asset chan
   const baseline = planningInputFingerprint(input);
   assert.notEqual(planningInputFingerprint({ ...input, workerPromptSha256: '1'.repeat(64) }), baseline);
   assert.notEqual(planningInputFingerprint({ ...input, supervisorPromptSha256: '2'.repeat(64) }), baseline);
+  assert.notEqual(planningInputFingerprint({ ...input, agentWorkflowContractSha256: '3'.repeat(64) }), baseline);
+  assert.equal(AGENT_WORKFLOW_VERSIONS.worker.promptVersion, 'worker-deck-plan.v2');
+  assert.equal(AGENT_WORKFLOW_VERSIONS.supervisor.schemaVersion, 'supervisor_plan_review_v1');
+  assert.match(AGENT_WORKFLOW_CONTRACT_SHA256, /^[a-f0-9]{64}$/);
 });

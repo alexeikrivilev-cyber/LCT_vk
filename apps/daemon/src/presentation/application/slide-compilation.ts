@@ -99,6 +99,8 @@ export interface CompiledSlide {
   placements: { title: PlacementBox; body: PlacementBox; visual: PlacementBox | null };
   layoutCandidates: CompatibleLayoutMatchCandidate[];
   selectedCandidateIndex: number;
+  /** Runtime-only selector choice. Set only after A/B/C qualification proves a safe native layout fallback. */
+  nativeLayoutFallback?: true;
 }
 
 export interface CompiledChartData {
@@ -526,10 +528,19 @@ function matchLayouts(slide: DeckPlanSlide, template: TemplateIR, policy: Varian
 }
 
 function textForUnit(unit: ContentUnit): string | null {
-  if (typeof unit.text === 'string') return unit.text;
+  if (typeof unit.text === 'string') {
+    // ContentIR keeps the source-faithful Markdown heading (including its locator);
+    // slide text uses the visible heading content, without Markdown syntax.
+    return unit.kind === 'heading' ? unit.text.replace(/^ {0,3}#{1,6}(?:[\t ]+|$)/u, '').trim() : unit.text;
+  }
   if (typeof unit.cellValue === 'string') return unit.cellValue;
   if (typeof unit.numericLexeme === 'string') return unit.numericLexeme;
   return null;
+}
+
+function claimComparisonKey(value: string): string {
+  return value.normalize('NFKC').replace(/^\s{0,3}#{1,6}(?:[\t ]+|$)/u, '').trim()
+    .replace(/[\s.,!?…:;]+$/u, '').replace(/\s+/gu, ' ').toLowerCase();
 }
 
 function tableDataFor(units: ContentUnit[]): string[][] | null {
@@ -668,7 +679,7 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
   const body = referenced.flatMap((unit) => {
     if ((tableData || chartData || kpi) && unit.kind === 'table-cell') return [];
     const value = textForUnit(unit);
-    return value === null || !value.trim() ? [] : [value];
+    return value === null || !value.trim() || claimComparisonKey(value) === claimComparisonKey(slide.takeaway) ? [] : [value];
   });
   const mediaRefs = (slide.mediaRefs ?? []).map((id) => byId.get(id)).filter((unit): unit is ContentUnit => unit?.kind === 'media-reference');
   const imageRefs = mediaRefs.flatMap((unit) => {

@@ -4,14 +4,17 @@ import {
   type PresentationDesignSystem,
   type TemplateIR,
 } from '../domain/template-ir.js';
+import { createHash, randomBytes } from 'node:crypto';
+import { readFile, rename, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import templateProfilerWorkflow from '../contracts/template-profiler.v1.json' with { type: 'json' };
 import type {
   SemanticInferenceAdapter,
   SemanticInferenceRequest,
   SemanticJsonSchema,
   SemanticOutputContract,
 } from './semantic-inference-port.js';
-import { randomBytes } from 'node:crypto';
-import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { resolvePresentationFilePath } from '../../presentation-files.js';
 
 export const TEMPLATE_SLIDE_ARCHETYPES = [
@@ -31,6 +34,10 @@ export interface TemplateSemanticSlideProfile {
   titleElementId: string | null;
   bodyElementIds: string[];
   visualElementIds: string[];
+  /** Semantic evidence for template labels, branding, and other text that must survive donor projection. */
+  preservedElementIds?: string[];
+  /** Semantic evidence for sample copy outside the mapped title/body that is safe to remove. */
+  replaceableTextElementIds?: string[];
   confidence: number;
   reasonCodes: string[];
 }
@@ -41,12 +48,12 @@ export interface TemplateSemanticProfile {
 }
 
 export interface TemplateSemanticProfileCache {
-  read(templateIRHash: string): Promise<unknown | null>;
-  write(profile: TemplateSemanticProfile): Promise<void>;
-  invalidate?(templateIRHash: string): Promise<void>;
+  read(cacheKey: string): Promise<unknown | null>;
+  write(profile: TemplateSemanticProfile, cacheKey?: string): Promise<void>;
+  invalidate?(cacheKey: string): Promise<void>;
 }
 
-/** Stores replaceable semantic evidence inside the owning project, keyed by the validated TemplateIR hash. */
+/** Stores replaceable semantic evidence inside the owning project, keyed by TemplateIR and prompt/config fingerprints. */
 export function projectTemplateSemanticProfileCache(projectsRoot: string, projectId: string): TemplateSemanticProfileCache {
   const profilePath = async (hash: string, createParent = false) => {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new TypeError('Template semantic profile hash is invalid.');
@@ -69,8 +76,8 @@ export function projectTemplateSemanticProfileCache(projectsRoot: string, projec
         return null;
       }
     },
-    async write(profile) {
-      const target = await profilePath(profile.templateIRHash, true);
+    async write(profile, cacheKey = profile.templateIRHash) {
+      const target = await profilePath(cacheKey, true);
       const temporary = `${target}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
       try {
         await writeFile(temporary, `${JSON.stringify(profile, null, 2)}\n`, { flag: 'wx' });
@@ -86,15 +93,24 @@ export function projectTemplateSemanticProfileCache(projectsRoot: string, projec
   };
 }
 
-const PROFILE_MAX_SLIDES = 500;
-const PROFILE_MAX_ELEMENTS_PER_SLIDE = 120;
-const PROFILE_SYSTEM_PROMPT = [
-  'Classify each PowerPoint slide from the supplied deterministic evidence.',
-  'Return one profile entry for every supplied sourceSlideIndex, preserving that index exactly.',
-  'Use only supplied element IDs. Return null when a role is unclear.',
-  'Do not infer meaning from filenames, layout names, or organizer identity; none are supplied.',
-  'Treat text and style as evidence, state uncertainty with confidence and short reason codes.',
-].join(' ');
+const TEMPLATE_PROFILE_WORKFLOW = templateProfilerWorkflow;
+const PROFILE_MAX_SLIDES = TEMPLATE_PROFILE_WORKFLOW.maxSlides;
+const PROFILE_MAX_ELEMENTS_PER_SLIDE = TEMPLATE_PROFILE_WORKFLOW.maxElementsPerSlide;
+const TEMPLATE_PROFILE_VERSION = TEMPLATE_PROFILE_WORKFLOW.promptVersion;
+const DEFAULT_PROMPT_DIRECTORY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../prompts');
+
+export function templateSemanticProfileCacheKey(templateIRHash: string, promptSha256: string): string {
+  if (!/^[a-f0-9]{64}$/.test(templateIRHash) || !/^[a-f0-9]{64}$/.test(promptSha256)) {
+    throw new TypeError('Template semantic profile cache fingerprint is invalid.');
+  }
+  return createHash('sha256').update(JSON.stringify({
+    templateIRHash,
+    promptVersion: TEMPLATE_PROFILE_VERSION,
+    promptSha256,
+    schemaCompatibility: TEMPLATE_PROFILE_WORKFLOW.schemaCompatibility,
+    configVersion: TEMPLATE_PROFILE_WORKFLOW.configVersion,
+  })).digest('hex');
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -109,8 +125,10 @@ function isStringArray(value: unknown, maximum: number): value is string[] {
 }
 
 function isTemplateSemanticSlideProfile(value: unknown): value is TemplateSemanticSlideProfile {
-  return isRecord(value)
-    && exactKeys(value, ['sourceSlideIndex', 'archetype', 'supportedContentModes', 'titleElementId', 'bodyElementIds', 'visualElementIds', 'confidence', 'reasonCodes'])
+  if (!isRecord(value)) return false;
+  const legacyKeys = ['sourceSlideIndex', 'archetype', 'supportedContentModes', 'titleElementId', 'bodyElementIds', 'visualElementIds', 'confidence', 'reasonCodes'];
+  const currentKeys = [...legacyKeys.slice(0, 6), 'preservedElementIds', 'replaceableTextElementIds', ...legacyKeys.slice(6)];
+  return (exactKeys(value, legacyKeys) || exactKeys(value, currentKeys))
     && Number.isSafeInteger(value.sourceSlideIndex) && Number(value.sourceSlideIndex) > 0
     && TEMPLATE_SLIDE_ARCHETYPES.includes(value.archetype as TemplateSlideArchetype)
     && Array.isArray(value.supportedContentModes) && value.supportedContentModes.length <= TEMPLATE_CONTENT_MODES.length
@@ -118,6 +136,8 @@ function isTemplateSemanticSlideProfile(value: unknown): value is TemplateSemant
     && (value.titleElementId === null || typeof value.titleElementId === 'string')
     && isStringArray(value.bodyElementIds, PROFILE_MAX_ELEMENTS_PER_SLIDE)
     && isStringArray(value.visualElementIds, PROFILE_MAX_ELEMENTS_PER_SLIDE)
+    && (value.preservedElementIds === undefined || isStringArray(value.preservedElementIds, PROFILE_MAX_ELEMENTS_PER_SLIDE))
+    && (value.replaceableTextElementIds === undefined || isStringArray(value.replaceableTextElementIds, PROFILE_MAX_ELEMENTS_PER_SLIDE))
     && typeof value.confidence === 'number' && Number.isFinite(value.confidence) && value.confidence >= 0 && value.confidence <= 1
     && isStringArray(value.reasonCodes, 8) && value.reasonCodes.every((code) => /^[a-z0-9][a-z0-9._-]{0,63}$/.test(code));
 }
@@ -140,10 +160,12 @@ export function templateSemanticProfileJsonSchema(): SemanticJsonSchema {
             titleElementId: { type: ['string', 'null'] },
             bodyElementIds: stringArray,
             visualElementIds: stringArray,
+            preservedElementIds: stringArray,
+            replaceableTextElementIds: stringArray,
             confidence: { type: 'number', minimum: 0, maximum: 1 },
             reasonCodes: { type: 'array', maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9._-]*$' } },
           },
-          required: ['sourceSlideIndex', 'archetype', 'supportedContentModes', 'titleElementId', 'bodyElementIds', 'visualElementIds', 'confidence', 'reasonCodes'],
+          required: ['sourceSlideIndex', 'archetype', 'supportedContentModes', 'titleElementId', 'bodyElementIds', 'visualElementIds', 'preservedElementIds', 'replaceableTextElementIds', 'confidence', 'reasonCodes'],
         },
       },
     },
@@ -168,17 +190,30 @@ export function isValidTemplateSemanticProfile(value: unknown, templateIR: Templ
       ...(candidate.titleElementId ? [candidate.titleElementId] : []),
       ...candidate.bodyElementIds,
       ...candidate.visualElementIds,
+      ...(candidate.preservedElementIds ?? []),
+      ...(candidate.replaceableTextElementIds ?? []),
     ];
     if (new Set(selectedIds).size !== selectedIds.length || selectedIds.some((id) => !allElements.has(id))) return false;
     if (candidate.titleElementId && !allElements.get(candidate.titleElementId)?.text?.trim()) return false;
     if (candidate.bodyElementIds.some((id) => !allElements.get(id)?.text?.trim())) return false;
+    if ((candidate.replaceableTextElementIds ?? []).some((id) => {
+      const element = allElements.get(id)!;
+      return element.kind.toLowerCase() !== 'shape' || !element.nativeId || !element.text?.trim();
+    })) return false;
   }
   return seenIndexes.size === sourceSlides.size;
 }
 
 export function validateTemplateSemanticProfile(value: unknown, templateIR: TemplateIR): TemplateSemanticProfile {
   if (!isValidTemplateSemanticProfile(value, templateIR)) throw new TypeError('Template semantic profile contains an invalid slide or element reference.');
-  return structuredClone(value);
+  return {
+    ...structuredClone(value),
+    slides: value.slides.map((slide) => ({
+      ...structuredClone(slide),
+      preservedElementIds: [...(slide.preservedElementIds ?? [])],
+      replaceableTextElementIds: [...(slide.replaceableTextElementIds ?? [])],
+    })),
+  };
 }
 
 function profileEvidence(templateIR: TemplateIR, presentationDesignSystem: PresentationDesignSystem): Record<string, unknown> {
@@ -207,6 +242,9 @@ function profileEvidence(templateIR: TemplateIR, presentationDesignSystem: Prese
         kind: element.kind,
         text: element.text?.slice(0, 320) ?? null,
         placeholderRole: element.placeholder?.role ?? null,
+        placeholderType: element.placeholder?.type ?? null,
+        parentId: element.parentId,
+        relationshipCount: element.relationshipIds.length,
         geometry: element.geometry.resolved ?? element.geometry.direct,
         styles: {
           fonts: element.directStyles.fonts?.slice(0, 4) ?? null,
@@ -220,9 +258,9 @@ function profileEvidence(templateIR: TemplateIR, presentationDesignSystem: Prese
   };
 }
 
-function requestFor(templateIR: TemplateIR, presentationDesignSystem: PresentationDesignSystem): SemanticInferenceRequest<TemplateSemanticProfile> {
+function requestFor(templateIR: TemplateIR, presentationDesignSystem: PresentationDesignSystem, systemPrompt: string): SemanticInferenceRequest<TemplateSemanticProfile> {
   const contract: SemanticOutputContract<TemplateSemanticProfile> = {
-    name: 'template_semantic_profile_v1',
+    name: TEMPLATE_PROFILE_WORKFLOW.schemaCompatibility,
     schema: templateSemanticProfileJsonSchema(),
     validate: (value): value is TemplateSemanticProfile => isValidTemplateSemanticProfile(value, templateIR),
   };
@@ -230,13 +268,13 @@ function requestFor(templateIR: TemplateIR, presentationDesignSystem: Presentati
     role: 'worker',
     operation: 'template-semantic-profile',
     messages: [
-      { role: 'system', content: PROFILE_SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: JSON.stringify(profileEvidence(templateIR, presentationDesignSystem)) },
     ],
     output: contract,
-    maxOutputTokens: Math.min(8192, Math.max(1024, templateIR.slides.length * 96)),
-    temperature: 0,
-    timeoutMs: 90_000,
+    maxOutputTokens: Math.min(TEMPLATE_PROFILE_WORKFLOW.maxOutputTokens, Math.max(TEMPLATE_PROFILE_WORKFLOW.minOutputTokens, templateIR.slides.length * TEMPLATE_PROFILE_WORKFLOW.outputTokensPerSlide)),
+    temperature: TEMPLATE_PROFILE_WORKFLOW.temperature,
+    timeoutMs: TEMPLATE_PROFILE_WORKFLOW.timeoutMs,
   };
 }
 
@@ -247,37 +285,60 @@ function requestFor(templateIR: TemplateIR, presentationDesignSystem: Presentati
 export class TemplateSemanticProfiler {
   private readonly cache = new Map<string, TemplateSemanticProfile>();
   private readonly inFlight = new Map<string, Promise<TemplateSemanticProfile>>();
+  private promptAsset?: Promise<{ content: string; sha256: string }>;
 
-  constructor(private readonly inference: SemanticInferenceAdapter, private readonly persistentCache?: TemplateSemanticProfileCache) {}
+  constructor(
+    private readonly inference: SemanticInferenceAdapter,
+    private readonly persistentCache?: TemplateSemanticProfileCache,
+    private readonly options: { promptDirectory?: string } = {},
+  ) {}
+
+  private loadPromptAsset(): Promise<{ content: string; sha256: string }> {
+    if (!this.promptAsset) {
+      this.promptAsset = (async () => {
+        const promptFile = TEMPLATE_PROFILE_WORKFLOW.promptFile;
+        if (!/^[a-z0-9][a-z0-9._-]*\.md$/.test(promptFile)) throw new TypeError('Template profiler prompt asset name is invalid.');
+        const raw = await readFile(path.join(this.options.promptDirectory ?? DEFAULT_PROMPT_DIRECTORY, promptFile), 'utf8');
+        const content = raw.replace(/\s+/g, ' ').trim();
+        if (!content || Buffer.byteLength(content, 'utf8') > TEMPLATE_PROFILE_WORKFLOW.maxPromptBytes) {
+          throw new TypeError('Template profiler prompt asset is empty or too large.');
+        }
+        return { content, sha256: createHash('sha256').update(content, 'utf8').digest('hex') };
+      })();
+    }
+    return this.promptAsset;
+  }
 
   async profile(templateIRInput: TemplateIR, designSystemInput: PresentationDesignSystem, signal?: AbortSignal): Promise<TemplateSemanticProfile> {
     const templateIR = validateTemplateIR(templateIRInput);
     const presentationDesignSystem = validatePresentationDesignSystem(designSystemInput, templateIR);
-    const cached = this.cache.get(templateIR.hash);
+    const prompt = await this.loadPromptAsset();
+    const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, prompt.sha256);
+    const cached = this.cache.get(cacheKey);
     if (cached) return structuredClone(cached);
-    const pending = this.inFlight.get(templateIR.hash);
+    const pending = this.inFlight.get(cacheKey);
     if (pending) return structuredClone(await pending);
 
     const task = (async () => {
-      const persisted = await this.persistentCache?.read(templateIR.hash);
+      const persisted = await this.persistentCache?.read(cacheKey);
       if (persisted !== null && persisted !== undefined) {
         try {
           const profile = validateTemplateSemanticProfile(persisted, templateIR);
-          this.cache.set(templateIR.hash, profile);
+          this.cache.set(cacheKey, profile);
           return profile;
         } catch {
-          await this.persistentCache?.invalidate?.(templateIR.hash);
+          await this.persistentCache?.invalidate?.(cacheKey);
         }
       }
-      const response = await this.inference.infer({ ...requestFor(templateIR, presentationDesignSystem), signal });
+      const response = await this.inference.infer({ ...requestFor(templateIR, presentationDesignSystem, prompt.content), signal });
       const profile = validateTemplateSemanticProfile(response.value, templateIR);
-      await this.persistentCache?.write(profile);
-      this.cache.set(templateIR.hash, profile);
+      await this.persistentCache?.write(profile, cacheKey);
+      this.cache.set(cacheKey, profile);
       return profile;
     })();
-    this.inFlight.set(templateIR.hash, task);
+    this.inFlight.set(cacheKey, task);
     try { return structuredClone(await task); }
-    finally { if (this.inFlight.get(templateIR.hash) === task) this.inFlight.delete(templateIR.hash); }
+    finally { if (this.inFlight.get(cacheKey) === task) this.inFlight.delete(cacheKey); }
   }
 
   clear(): void {

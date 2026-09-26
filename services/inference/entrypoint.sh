@@ -8,6 +8,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 PREFLIGHT_ONLY="${LCT_INFERENCE_PREFLIGHT_ONLY:-0}"
+OFFLINE_PREFLIGHT="${LCT_INFERENCE_OFFLINE_PREFLIGHT:-0}"
 LCT_MODEL_STORAGE_ROOT="${LCT_MODEL_STORAGE_ROOT:-/tmp/lct-model-storage}"
 HOME="${HOME:-/tmp/lct-home}"
 VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/tmp/lct-vllm-cache}"
@@ -74,6 +75,10 @@ if [[ "$PREFLIGHT_ONLY" != "0" && "$PREFLIGHT_ONLY" != "1" ]]; then
   echo "LCT_INFERENCE_PREFLIGHT_ONLY must be 0 or 1" >&2
   exit 64
 fi
+if [[ "$OFFLINE_PREFLIGHT" != "0" && "$OFFLINE_PREFLIGHT" != "1" ]]; then
+  echo "LCT_INFERENCE_OFFLINE_PREFLIGHT must be 0 or 1" >&2
+  exit 64
+fi
 if [[ "$LCT_MODEL_STORAGE_ROOT" != /* ]]; then
   echo "LCT_MODEL_STORAGE_ROOT must be an absolute path" >&2
   exit 64
@@ -89,17 +94,24 @@ HF_HOME="$LCT_MODEL_STORAGE_ROOT/huggingface"
 HF_HUB_CACHE="$HF_HOME/hub"
 export LCT_MODEL_STORAGE_ROOT HF_HOME HF_HUB_CACHE
 mkdir -p "$HOME" "$VLLM_CACHE_ROOT" "$VLLM_CONFIG_ROOT" "$TRITON_CACHE_DIR"
-if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
+if [[ "$OFFLINE_PREFLIGHT" == "1" ]]; then
+  SNAPSHOT_MODE="offline"
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+elif [[ "$PREFLIGHT_ONLY" == "1" ]]; then
   SNAPSHOT_MODE="preflight"
 else
   SNAPSHOT_MODE="full"
 fi
 
-echo "Materializing model snapshot for $MODEL_ID@$MODEL_REVISION (mode=$SNAPSHOT_MODE)"
+echo "Checking model snapshot for $MODEL_ID@$MODEL_REVISION (mode=$SNAPSHOT_MODE)"
 MODEL_LOCAL_PATH="$(env CUDA_VISIBLE_DEVICES= python3 /opt/lct-inference/model_snapshot.py "$MODEL_ID" "$MODEL_REVISION" "$LCT_MODEL_STORAGE_ROOT" "$SNAPSHOT_MODE")"
 echo "Resolved local model snapshot: $MODEL_LOCAL_PATH"
 echo "Running tokenizer/config preflight from the local snapshot"
 env CUDA_VISIBLE_DEVICES= python3 /opt/lct-inference/tokenizer_preflight.py "$MODEL_LOCAL_PATH" "$MODEL_ID" "$MODEL_REVISION"
+if [[ "$OFFLINE_PREFLIGHT" == "1" ]]; then
+  echo "Offline snapshot and tokenizer preflight passed; network and vLLM were not used"
+  exit 0
+fi
 if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
   echo "Local snapshot preflight passed; vLLM was not started"
   exit 0

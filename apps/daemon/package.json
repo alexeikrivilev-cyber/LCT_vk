@@ -15,7 +15,7 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["bin", "dist", "python-inspector", "package.json"],
+  "files": ["bin", "dist", "prompts", "python-inspector", "package.json"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "pnpm run build && node dist/cli.js --no-open",
