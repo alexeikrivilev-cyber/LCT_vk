@@ -6,9 +6,9 @@
 ## CASE COMPLIANCE
 
 - Organizer source: official 7-page local PDF was read in full, including appendix. SHA-256 in [`CASE_REQUIREMENTS.md`](./docs/compliance/CASE_REQUIREMENTS.md) matches the local source. PDF is not tracked in Git and has no source URL printed in it; provenance is recorded without an invented link. Organizer source/version should later be added to a tracked source register.
-- Current traceability count: **PASS 6/25, PARTIAL 15/25, FAIL 4/25**. Do not interpret this as organizer acceptance.
-- The organizer content pack and brief are not available locally. Current 3×3 is synthetic.
-- Blocking case items include text-to-image path (C07), exact 9 deliverables (C15), held-out full E2E (C16), and VK inference requirement (C21).
+- Current traceability count: **PASS 9/25, PARTIAL 14/25, FAIL 2/25**. C15 3×3 and C16 held-out now pass the bounded local qualification; this is not full organizer acceptance.
+- Organizer clarification for this run: a separate content package is not expected; the user task is required, context and source files are optional. The latest matrix uses one persisted task/context-only plan across all three templates.
+- Remaining failed/unknown case items include text-to-image path (C07), the unverified 300-second live workload (C18), and VK inference requirement (C21).
 
 ## UI
 
@@ -36,20 +36,19 @@ Safe config example: `.env.example` (no credentials; loopback and fake endpoint)
 
 | Format | Evidence | Acceptance |
 |---|---|---|
-| PPTX | Smoke and six generated matrix files passed package reopen; structural reports show editable native text, no raster slides and no speaker notes | Structural PASS; not opened/saved in PowerPoint or LibreOffice; 9-deck release acceptance BLOCKED |
+| PPTX | Smoke and all nine current matrix files passed package reopen; structural reports show editable native text, no raster slides and no speaker notes | Structural PASS; not opened/saved in PowerPoint or LibreOffice; native visual acceptance BLOCKED |
 | PDF | Pinned adapter and PDF reopen/page-count tests exist | Structural test only; no release-candidate PDF matrix or browser/visual inspection; acceptance not confirmed |
 | HTML | Escaping and structural adapter tests exist | Structural test only; no release-candidate HTML matrix or browser matrix; acceptance not confirmed |
 
 ## 3×3 DELIVERABLE
 
-- Expected: 9 organizer-template × A/B/C decks from one content package.
-- Actual: **6/9** from synthetic content. VK Tech 3/3; WorkSpace 0/3 withheld; Education 3/3.
-- Contact sheets and machine-readable quality JSON for all three templates are packaged under `.lct/release-candidate/3x3-synthetic-20260926/contact-sheets/`. The WorkSpace cells remain withheld. This is diagnostic packaging, not the requested final 9-deck deliverable.
-- All six PPTX reopened structurally and preserved template parts/source facts. Preview warnings remain. No release PDFs/HTML were produced.
+- Expected: 9 organizer-template × A/B/C decks from one shared task/context plan; no separate organizer content package is expected under the supplied clarification.
+- Actual: **9/9** in `.lct/core-generation-fix-20260926/case-3x3/`, Office Kit backend, one shared three-slide task/context-only plan. VK Tech 3/3; WorkSpace 3/3; Education 3/3. Every PPTX reopened, passed factual-equivalence and template-preservation gates, had zero deterministic audit findings, zero notes, and zero raster slides.
+- This is a local fake-only qualification artifact set, not a manually reviewed final demo deck. Preview text-metric warnings remain (10 total, low-confidence approximation); no PowerPoint/LibreOffice visual review was performed.
 
 ## UNKNOWN TEMPLATE
 
-**FAIL.** Latest held-out candidate AIOS: analyze/profile and plan passed; A/B/C stopped with `VARIANTS_NOT_DISTINCT`; audit and export were not run. Manifest: `.lct/unknown-template-qualification/unknown-template-2026-09-26T141235-629Z-c21878e8/UNKNOWN_TEMPLATE_MANIFEST.json`.
+**PASS for the bounded local fake E2E.** Exact held-out `AIOS_Онбординг (4) (1) (1).pptx`, SHA-256 `18198cc08df9fc3ea5aee5f509d89e70a4ade68bb539fed61a957581ee365ad`, 16 slides / 2 masters / 2 layouts. Task+context only, 0 source files; A/B/C, audit, export/reopen passed. Five forbidden source-specific phrases were absent from the selected deck and all three track exports. Manifest: `.lct/unknown-template-qualification/unknown-template-2026-09-26T164941-924Z-ceef591a/UNKNOWN_TEMPLATE_MANIFEST.json`. Native Office visual fidelity and live-model behavior remain unverified.
 
 ## 10–15 SLIDE
 
@@ -60,9 +59,9 @@ Safe config example: `.env.example` (no credentials; loopback and fake endpoint)
 
 ## TESTS
 
-Проверено 2026-09-26 после regression fix: frozen install (`pnpm 10.33.2`) — PASS; test — **181 passed, 0 failed**; typecheck — PASS; build — PASS; boundary — PASS; craft lint — PASS; docs links — PASS (55 required files); `git diff --check` — PASS. `git diff --check` выдал только предупреждения Git о нормализации LF→CRLF на Windows.
+Повторно проверено 2026-09-26 после P0 Core Generation Fix: frozen install (`pnpm 10.33.2`) — PASS; test — **187 passed, 0 failed**; typecheck — PASS; build — PASS; boundary — PASS; craft lint — PASS; docs links — PASS (55 required files); `git diff --check` — PASS. Git выдал только предупреждения о нормализации LF→CRLF на Windows.
 
-Результаты продукта основаны на генерационных прогонах текущей рабочей копии: синтетическая матрица 3×3 — **FAIL 6/9**, held-out AIOS — **FAIL до audit/export**. 12-слайдовый smoke запускался из чистой временной копии актуального тогда исходного кода. После него код генерации не менялся, но документы и отображение audit в UI обновились. Release matrix и unknown-template gate были запущены до последнего изменения русской подписи аудита в UI; затронутый regression-test и полный набор из 181 теста прошли после этого изменения.
+Текущие продуктовые результаты: task/context-only organizer-template matrix — **PASS 9/9**, exact held-out AIOS onboarding local fake E2E — **PASS** с audit/export/reopen и source-residue gate. Отдельный 12-слайдовый smoke из предыдущего этапа занимал 322.635 s; он не входит в P0 acceptance и остаётся performance blocker. Матрица и held-out run выполнены Office Kit/fake-only без external inference.
 
 ## KNOWN LIVE-ONLY RISKS
 
@@ -73,4 +72,4 @@ Safe config example: `.env.example` (no credentials; loopback and fake endpoint)
 
 ## NEXT ACTION
 
-First obtain and hash the organizer content pack/brief, then resolve WorkSpace's generic-safe composition failure and demonstrate held-out audit/export without weakening validation. Re-run the 12-slide timing gate and structural/visual export review. Only after those offline blockers clear, perform one bounded live qualification: profiler 1, Worker 1, Supervisor 1, generation 0; total no more than 3 inference requests.
+The missing organizer content package is not a blocker under the supplied clarification. Remaining offline work is to review the 9-deck/AIOS output visually in native Office software and address or accept preview approximation warnings; the 12-slide synthetic flow still exceeds 300 seconds. Then perform one bounded live qualification: profiler 1, Worker 1, Supervisor 1, generation 0; total no more than 3 inference requests.

@@ -32,8 +32,17 @@ export interface ExemplarSlideSelection {
     bodySlots: Array<{ elementId: string; nativeId: string }>;
     visual: { elementId: string; nativeId: string; geometry: TemplateGeometry; kind: string } | null;
   };
-  /** Exclusive, ordered ranges of CompiledSlide.body assigned to matching bodySlots. */
+  /** Exclusive, ordered ranges of bounded natural text fragments assigned to matching bodySlots. */
   bodyContentRanges: Array<{ start: number; end: number }>;
+  /** Exact source text assigned to each body region; concatenating preserves CompiledSlide.body.join('\\n'). */
+  bodyContentSegments: string[];
+  bodySegmentation: {
+    method: 'existing-blocks' | 'paragraphs' | 'sentences' | 'mixed';
+    sourceTextSha256: string;
+    sourceBodyBlockCount: number;
+    fragmentCount: number;
+    regionCount: number;
+  };
   textProjection: {
     preserved: string[];
     replaced: string[];
@@ -56,6 +65,8 @@ export interface ExemplarSlideSelection {
 
 export interface ExemplarSelectionAssessment {
   selection: ExemplarSlideSelection | null;
+  /** Every distinct candidate that passed all hard projection and geometry gates, ranked deterministically. */
+  safeSelections: ExemplarSlideSelection[];
   availableDistinctFamilies: number;
   distinctSourceFamilyKeys: string[];
   candidateDiagnostics: Array<{
@@ -65,6 +76,12 @@ export interface ExemplarSelectionAssessment {
     semanticConfidence: number | null;
     titleElementId: string | null;
     bodyElementIds: string[];
+    bodyMappingOptionIndex: number;
+    bodyMappingOptionCount: number;
+    bodyRegionCount: number;
+    bodySegmentation: ExemplarSlideSelection['bodySegmentation'] | null;
+    projectedFit: { title: number | null; body: number | null; combined: number | null };
+    sourceResidueRisk: 'unassessed' | 'clear' | 'ambiguous' | 'source-specific';
     visualElementIds: string[];
     visualClassification: string[];
     preservedTextElementIds: string[];
@@ -113,6 +130,44 @@ export interface VariantCompositionAssignment {
   compositionKind: 'exemplar-backed' | 'layout-placeholder-backed' | 'safe-generated-fallback';
   layoutCandidateIndex: number;
   projectedCompositionSignature: string;
+  /** Present for exemplar-backed choices so the renderer can honor the joint assignment exactly. */
+  exemplarSelection?: ExemplarSlideSelection;
+}
+
+/** Minimal persisted identity for an exact exemplar choice; content is recomputed from the current plan. */
+export interface ExemplarSelectionReference {
+  sourcePart: string;
+  sourceSlideIndex: number;
+  projectedCompositionSignature: string;
+}
+
+export function exemplarSelectionReference(selection: ExemplarSlideSelection | undefined): ExemplarSelectionReference | null {
+  return selection ? {
+    sourcePart: selection.sourcePart,
+    sourceSlideIndex: selection.sourceSlideIndex,
+    projectedCompositionSignature: selection.projectedCompositionSignature,
+  } : null;
+}
+
+/** Restore and revalidate an exact persisted donor instead of silently choosing a new ranked donor. */
+export function applyPersistedExemplarSelection(
+  compiled: CompiledSlide,
+  reference: ExemplarSelectionReference,
+  template: TemplateIR,
+  semanticProfile?: TemplateSemanticProfile,
+): CompiledSlide {
+  const assessment = assessExemplarSelection(compiled, template, semanticProfile);
+  const selection = assessment.safeSelections.find((candidate) => candidate.sourcePart === reference.sourcePart
+    && candidate.sourceSlideIndex === reference.sourceSlideIndex
+    && candidate.projectedCompositionSignature === reference.projectedCompositionSignature);
+  if (!selection) throw new TypeError('Persisted exemplar choice no longer passes the current projection gates');
+  return applyVariantCompositionAssignment(compiled, {
+    variantId: compiled.variantId,
+    compositionKind: 'exemplar-backed',
+    layoutCandidateIndex: compiled.selectedCandidateIndex,
+    projectedCompositionSignature: selection.projectedCompositionSignature,
+    exemplarSelection: selection,
+  }, template, semanticProfile);
 }
 
 interface NormalizedGeometry {
@@ -491,11 +546,16 @@ function projectedCompositionSignature(
   slide: TemplateSlide,
   title: TemplateElement,
   bodies: readonly TemplateElement[],
+  bodyHasContent: boolean,
   preservedChromeIds: ReadonlySet<string>,
   template: TemplateIR,
   visualSlot: TemplateElement | null,
 ): string {
-  const bodyIds = new Set(bodies.map((body) => body.id));
+  // When there is no body copy, choosing different empty text regions does not
+  // change the rendered slide: the entire donor remains, with source text cleared.
+  // Do not let an empty-region mapping manufacture A/B/C visual distinctness.
+  const projectedBodies = bodyHasContent ? bodies : [];
+  const bodyIds = new Set(projectedBodies.map((body) => body.id));
   const mappedVisualId = visualSlot?.id ?? null;
   const keptTextIds = new Set([title.id, ...bodyIds, ...preservedChromeIds]);
   const projectedElements = slide.elements.filter((element) => {
@@ -507,13 +567,13 @@ function projectedCompositionSignature(
     }
     return true;
   });
-  const allProjectedElements = [...projectedElements, title, ...bodies, ...(visualSlot ? [visualSlot] : [])].sort((left, right) => left.order - right.order);
+  const allProjectedElements = [...projectedElements, title, ...projectedBodies, ...(visualSlot ? [visualSlot] : [])].sort((left, right) => left.order - right.order);
   const relativeZOrder = new Map(allProjectedElements.map((element, index) => [element.id, index]));
   const retainedElements = projectedElements.map((element) => elementDescriptor(element, template, relativeZOrder.get(element.id)!));
   return signature({
     mappedText: {
       title: elementDescriptor(title, template, relativeZOrder.get(title.id)!),
-      body: bodies.map((body) => elementDescriptor(body, template, relativeZOrder.get(body.id)!)),
+      body: projectedBodies.map((body) => elementDescriptor(body, template, relativeZOrder.get(body.id)!)),
     },
     mappedVisualSlot: visualSlot ? elementDescriptor(visualSlot, template, relativeZOrder.get(visualSlot.id)!) : null,
     retainedNativeElements: retainedElements,
@@ -571,12 +631,42 @@ function inCanvas(box: TemplateGeometry, template: TemplateIR): boolean {
     && box.x + box.width <= template.slideSize.width && box.y + box.height <= template.slideSize.height;
 }
 
+interface BodySlotsChoice {
+  elements: TemplateElement[];
+  ranges: Array<{ start: number; end: number }>;
+  fits: number[];
+  segments: string[];
+  segmentation: ExemplarSlideSelection['bodySegmentation'];
+}
+
 function bodySlotsFor(
   candidates: TemplateElement[],
   compiled: CompiledSlide,
   allowMultiple: boolean,
-): { elements: TemplateElement[]; ranges: Array<{ start: number; end: number }>; fits: number[] } | null {
-  if (!candidates.length) return null;
+): BodySlotsChoice[] {
+  if (!candidates.length) return [];
+  const sourceText = compiled.body.join('\n');
+  const boundaryPattern = /(?:\r?\n)+|(?<=[.!?])(?=\s|$)/gu;
+  const fragments: string[] = [];
+  let cursor = 0;
+  let usedSentenceBoundary = false;
+  let usedParagraphBoundary = false;
+  for (const match of sourceText.matchAll(boundaryPattern)) {
+    const index = match.index ?? 0;
+    const boundary = match[0];
+    const end = index + boundary.length;
+    if (end <= cursor) continue;
+    fragments.push(sourceText.slice(cursor, end));
+    cursor = end;
+    if (/\n/.test(boundary)) usedParagraphBoundary = true;
+    else usedSentenceBoundary = true;
+  }
+  if (cursor < sourceText.length || fragments.length === 0) fragments.push(sourceText.slice(cursor));
+  // Keep search bounded even for pasted documents with thousands of sentences.
+  const boundedFragments = fragments.length <= 64 ? fragments : [sourceText];
+  const segmentationMethod = boundedFragments.length > compiled.body.length
+    ? usedParagraphBoundary && usedSentenceBoundary ? 'mixed' : usedParagraphBoundary ? 'paragraphs' : 'sentences'
+    : 'existing-blocks';
   const orderedByArea = [...candidates].sort((left, right) => area(geometryOf(right)) - area(geometryOf(left)) || left.order - right.order);
   const available: TemplateElement[] = [];
   for (const element of orderedByArea) {
@@ -587,52 +677,81 @@ function bodySlotsFor(
         && box.y < other.y + other.height && box.y + box.height > other.y;
     })) continue;
     available.push(element);
-    if (available.length >= (allowMultiple ? Math.min(4, Math.max(1, compiled.body.length)) : 1)) break;
+    if (available.length >= (allowMultiple ? 4 : 1)) break;
   }
   const elements = available.sort((left, right) => geometryOf(left)!.y - geometryOf(right)!.y
     || geometryOf(left)!.x - geometryOf(right)!.x || left.order - right.order);
-  for (let count = elements.length; count >= 1; count -= 1) {
-    const selected = elements.slice(0, count);
-    const blocks = compiled.body.length ? compiled.body : [''];
-    const capacities = selected.map((element) => {
-      const box = geometryOf(element)!;
-      const font = Math.max(8, maxFont(element));
-      return Math.max(0.25, (box.width / 12700) / (font * 0.52) * (box.height / 12700) / (font * 1.2));
-    });
-    const demandFor = (text: string, element: TemplateElement) => {
-      const box = geometryOf(element)!;
-      const font = Math.max(8, maxFont(element));
-      const charsPerLine = Math.max(6, (box.width / 12700) / (font * 0.52));
-      return Math.max(1, text.split(/\r?\n/).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charsPerLine)), 0));
+  // Splitting a single Worker block is permitted only with trusted, explicit
+  // multi-region semantics. Sentence/paragraph boundaries remain intact and
+  // every resulting segment is independently fit-checked below.
+  const maxCount = Math.min(elements.length, boundedFragments.length);
+  const choices: BodySlotsChoice[] = [];
+  for (let count = maxCount; count >= 1; count -= 1) {
+    const combinations: TemplateElement[][] = [];
+    const chosen: TemplateElement[] = [];
+    const visit = (start: number): void => {
+      if (chosen.length === count) { combinations.push([...chosen]); return; }
+      for (let index = start; index <= elements.length - (count - chosen.length); index += 1) {
+        chosen.push(elements[index]!);
+        visit(index + 1);
+        chosen.pop();
+      }
     };
-    type Partition = { cost: number; ranges: Array<{ start: number; end: number }>; fits: number[] };
-    const dp: Array<Array<Partition | null>> = Array.from({ length: count + 1 }, () => Array(blocks.length + 1).fill(null));
-    dp[0]![0] = { cost: 0, ranges: [], fits: [] };
-    for (let regionIndex = 0; regionIndex < count; regionIndex += 1) {
-      for (let end = regionIndex + 1; end <= blocks.length; end += 1) {
-        for (let start = regionIndex; start < end; start += 1) {
-          const previous = dp[regionIndex]![start];
-          if (!previous) continue;
-          const text = blocks.slice(start, end).join('\n');
-          const fit = estimatedLineFit(text, selected[regionIndex]!);
-          if (fit < 0.55) continue;
-          const utilization = demandFor(text, selected[regionIndex]!) / capacities[regionIndex]!;
-          const next: Partition = {
-            cost: previous.cost + utilization * utilization,
-            ranges: [...previous.ranges, { start, end }],
-            fits: [...previous.fits, fit],
-          };
-          const current = dp[regionIndex + 1]![end];
-          if (!current || next.cost < current.cost - 1e-9) dp[regionIndex + 1]![end] = next;
+    visit(0);
+    for (const selected of combinations) {
+      const blocks = boundedFragments;
+      const capacities = selected.map((element) => {
+        const box = geometryOf(element)!;
+        const font = Math.max(8, maxFont(element));
+        return Math.max(0.25, (box.width / 12700) / (font * 0.52) * (box.height / 12700) / (font * 1.2));
+      });
+      const demandFor = (text: string, element: TemplateElement) => {
+        const box = geometryOf(element)!;
+        const font = Math.max(8, maxFont(element));
+        const charsPerLine = Math.max(6, (box.width / 12700) / (font * 0.52));
+        return Math.max(1, text.split(/\r?\n/).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charsPerLine)), 0));
+      };
+      type Partition = { cost: number; ranges: Array<{ start: number; end: number }>; fits: number[] };
+      const dp: Array<Array<Partition | null>> = Array.from({ length: count + 1 }, () => Array(blocks.length + 1).fill(null));
+      dp[0]![0] = { cost: 0, ranges: [], fits: [] };
+      for (let regionIndex = 0; regionIndex < count; regionIndex += 1) {
+        for (let end = regionIndex + 1; end <= blocks.length; end += 1) {
+          for (let start = regionIndex; start < end; start += 1) {
+            const previous = dp[regionIndex]![start];
+            if (!previous) continue;
+            const text = blocks.slice(start, end).join('');
+            const fit = estimatedLineFit(text, selected[regionIndex]!);
+            if (fit < 0.55) continue;
+            const utilization = demandFor(text, selected[regionIndex]!) / capacities[regionIndex]!;
+            const next: Partition = {
+              cost: previous.cost + utilization * utilization,
+              ranges: [...previous.ranges, { start, end }],
+              fits: [...previous.fits, fit],
+            };
+            const current = dp[regionIndex + 1]![end];
+            if (!current || next.cost < current.cost - 1e-9) dp[regionIndex + 1]![end] = next;
+          }
         }
       }
-    }
-    const assignment = dp[count]![blocks.length];
-    if (assignment && assignment.ranges.every((range) => range.end > range.start)) {
-      return { elements: selected, ranges: assignment.ranges, fits: assignment.fits };
+      const assignment = dp[count]![blocks.length];
+      if (assignment && assignment.ranges.every((range) => range.end > range.start)) {
+        choices.push({
+          elements: selected,
+          ranges: assignment.ranges,
+          fits: assignment.fits,
+          segments: assignment.ranges.map((range) => blocks.slice(range.start, range.end).join('')),
+          segmentation: {
+            method: segmentationMethod,
+            sourceTextSha256: createHash('sha256').update(sourceText).digest('hex'),
+            sourceBodyBlockCount: compiled.body.length,
+            fragmentCount: blocks.length,
+            regionCount: selected.length,
+          },
+        });
+      }
     }
   }
-  return null;
+  return choices;
 }
 
 function candidateFor(
@@ -642,6 +761,7 @@ function candidateFor(
   titleEvidence: NonNullable<CompiledSlide['layoutCandidates'][number]['slotEvidence']['title']> | null,
   bodyEvidence: NonNullable<CompiledSlide['layoutCandidates'][number]['slotEvidence']['body']> | null,
   profileSlide: TemplateSemanticSlideProfile | undefined,
+  bodyMappingOptionIndex = 0,
 ): CandidateBuild {
   const trustedProfile = profileSlide && profileSlide.confidence >= 0.6 ? profileSlide : null;
   const preservedChromeIds = chromeIds(template, slide.layoutId ?? '');
@@ -654,6 +774,12 @@ function candidateFor(
     semanticConfidence: profileSlide?.confidence ?? null,
     titleElementId: trustedProfile?.titleElementId ?? null,
     bodyElementIds: trustedProfile?.bodyElementIds ?? [],
+    bodyMappingOptionIndex,
+    bodyMappingOptionCount: 0,
+    bodyRegionCount: 0,
+    bodySegmentation: null,
+    projectedFit: { title: null, body: null, combined: null },
+    sourceResidueRisk: 'unassessed',
     visualElementIds,
     visualClassification: visualClasses.map((item) => `${item.elementId}:${item.kind}:${item.reason}`),
     preservedTextElementIds: [], replacedTextElementIds: [], clearedTextElementIds: [], blockedTextElementIds: [],
@@ -669,8 +795,11 @@ function candidateFor(
   };
   if (!slide.sourcePart) return reject('source-part', 'source slide part is missing');
   const inheritedText = inheritedStaticText(template, slide.layoutId, slide.masterId);
-  if (inheritedText.length) return reject('inherited-source-text',
-    `${inheritedText.length} non-placeholder text element(s) inherited from the layout/master cannot be proven to be template chrome; projection is withheld`);
+  if (inheritedText.length) {
+    diagnostic.sourceResidueRisk = 'ambiguous';
+    return reject('inherited-source-text',
+      `${inheritedText.length} non-placeholder text element(s) inherited from the layout/master cannot be proven to be template chrome; projection is withheld`);
+  }
   if (slide.layoutId !== compiled.layoutId && !trustedProfile) return reject('layout-match', `donor layout ${slide.layoutId ?? 'null'} differs from compiled layout ${compiled.layoutId}; no trusted semantic role mapping`);
   if (!supportedNestedElements(slide)) return reject('opaque-unsafe', 'nested/grouped elements contain unsupported kinds, unresolved native IDs, or unsafe ancestry');
   if (slide.relationships.some((relationship) => {
@@ -678,7 +807,10 @@ function candidateFor(
     return type.endsWith('/slide') || type.endsWith('/hyperlink');
   })) return reject('relationships', 'slide/hyperlink relationship is unsafe');
   const unsafeVisuals = visualClasses.filter((item) => item.kind === 'source-specific-content' || item.kind === 'opaque-unsafe');
-  if (unsafeVisuals.length) return reject('visual-safety', `source-specific content or opaque native visuals are unsafe to preserve: ${unsafeVisuals.map((item) => `${item.elementId} (${item.kind})`).join(',')}`);
+  if (unsafeVisuals.length) {
+    diagnostic.sourceResidueRisk = 'source-specific';
+    return reject('visual-safety', `source-specific content or opaque native visuals are unsafe to preserve: ${unsafeVisuals.map((item) => `${item.elementId} (${item.kind})`).join(',')}`);
+  }
 
   const profileTitle = trustedProfile?.titleElementId
     ? slide.elements.find((element) => element.id === trustedProfile.titleElementId) : null;
@@ -706,12 +838,16 @@ function candidateFor(
     }))
     .filter((item) => trustedProfile && semanticBodyCandidates?.length ? true : item.overlap >= 0.65)
     .sort((left, right) => right.areaRatio - left.areaRatio || left.element.order - right.element.order);
-  const bodyChoice = bodySlotsFor(bodyCandidates.map((item) => item.element), compiled, Boolean(trustedProfile));
+  const bodyChoices = bodySlotsFor(bodyCandidates.map((item) => item.element), compiled, Boolean(trustedProfile));
+  diagnostic.bodyMappingOptionCount = bodyChoices.length;
+  const bodyChoice = bodyChoices[bodyMappingOptionIndex];
   if (!bodyChoice) return reject('body-role-fit', trustedProfile
     ? 'semantic body mappings did not provide usable, non-overlapping text geometry with sufficient projected fit'
     : 'no repeated body-evidence shape overlaps inferred region by at least 65% with sufficient projected fit');
   const bodies = bodyChoice.elements;
   const body = bodies[0]!;
+  diagnostic.bodyRegionCount = bodies.length;
+  diagnostic.bodySegmentation = bodyChoice.segmentation;
   const bodyBox = geometryOf(body)!;
   const allBoxes = [titleBox, ...bodies.map((element) => geometryOf(element)!)];
   if (allBoxes.some((box) => !inCanvas(box, template))) return reject('candidate-geometry', 'mapped title/body geometry extends outside the slide canvas');
@@ -731,6 +867,7 @@ function candidateFor(
   const titleFit = estimatedLineFit(compiled.title, title);
   const bodyFit = Math.min(...bodyChoice.fits);
   const contentFit = Math.min(titleFit, bodyFit);
+  diagnostic.projectedFit = { title: titleFit, body: bodyFit, combined: contentFit };
   if (contentFit < 0.55) return reject('projected-text-fit', `projected title/body text fit ${contentFit}<0.55`);
   const confidence = trustedProfile
     ? Number((0.42 * trustedProfile.confidence + 0.22 * geometryFit + 0.18 * styleHierarchy + 0.18 * contentFit).toFixed(4))
@@ -767,6 +904,7 @@ function candidateFor(
     && !replacedTextIds.includes(element.id) && !preservedText.includes(element));
   const blockedText = textShapes.filter((element) => !replacedTextIds.includes(element.id)
     && !preservedText.includes(element) && !explicitlyReplaceableText.includes(element));
+  diagnostic.sourceResidueRisk = blockedText.length ? 'ambiguous' : 'clear';
   diagnostic.preservedTextElementIds = preservedText.map((element) => element.id);
   diagnostic.replacedTextElementIds = replacedTextIds;
   diagnostic.clearedTextElementIds = explicitlyReplaceableText.map((element) => element.id);
@@ -812,7 +950,8 @@ function candidateFor(
       : compiled.intent === 'section'
         ? ['section-divider', 'hero'].includes(archetype.archetype) ? 0.16 : 0
         : ['content', 'content-dense'].includes(archetype.archetype) ? 0.12 : -0.12;
-  const score = confidenceScore + semanticBoost - Math.min(0.25, contentGateReasons.length * 0.1)
+  const segmentedRegionBoost = bodies.length > 1 && bodyChoice.segmentation.method !== 'existing-blocks' ? 0.08 : 0;
+  const score = confidenceScore + semanticBoost + segmentedRegionBoost - Math.min(0.25, contentGateReasons.length * 0.1)
     - (textDensity < 0.08 && bodyAreaShare > 0.3 ? 0.12 : 0);
   const clearElementNativeIds = [...new Set(explicitlyReplaceableText)].map((element) => element.nativeId!);
   const renderableVisual = hasRenderableVisual(compiled);
@@ -871,6 +1010,8 @@ function candidateFor(
       visual: visualSlot ? { elementId: visualSlot.id, nativeId: visualSlot.nativeId!, geometry: geometryOf(visualSlot)!, kind: visualSlot.kind } : null,
     },
       bodyContentRanges: bodyChoice.ranges,
+      bodyContentSegments: bodyChoice.segments,
+      bodySegmentation: bodyChoice.segmentation,
       textProjection: {
         preserved: preservedText.map((element) => element.nativeId!).filter(Boolean),
         replaced: replacedTextIds.map((id) => slide.elements.find((element) => element.id === id)?.nativeId).filter((id): id is string => Boolean(id)),
@@ -880,7 +1021,7 @@ function candidateFor(
       clearElementNativeIds,
       preserveChromeNativeIds,
       familyKey: familyKey(slide, title, body, template),
-      projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies,
+      projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies, compiled.body.some((text) => text.trim()),
         new Set([...preservedChromeIds, ...preservedText.map((element) => element.id)]), template, visualSlot),
       titleGeometryNormalized: titleNormalized,
       bodyGeometryNormalized: bodyNormalized,
@@ -910,20 +1051,10 @@ function candidateFor(
 }
 
 function semanticCandidates(candidates: Candidate[], intent: CompiledSlide['intent']): Candidate[] {
-  if (intent === 'narrative') {
-    return candidates.filter((candidate) => candidate.projectionSafe && candidate.contentSafe);
-  }
-  if (intent === 'title') {
-    const eligible = candidates.filter((candidate) => candidate.projectionSafe);
-    const preferred = eligible.filter((candidate) => ['cover', 'hero'].includes(candidate.selection.semanticArchetype));
-    return preferred.length ? preferred : candidates.filter((candidate) => candidate.contentSafe);
-  }
-  if (intent === 'section') {
-    const eligible = candidates.filter((candidate) => candidate.projectionSafe);
-    const preferred = eligible.filter((candidate) => ['section-divider', 'hero'].includes(candidate.selection.semanticArchetype));
-    return preferred.length ? preferred : candidates.filter((candidate) => candidate.contentSafe);
-  }
-  return candidates.filter((candidate) => candidate.projectionSafe && candidate.contentSafe);
+  // Intent/archetype is a ranking signal only. Projection safety, source residue,
+  // geometry, and per-region fit have already been enforced as hard gates.
+  void intent;
+  return candidates.filter((candidate) => candidate.projectionSafe);
 }
 
 function nativePlaceholderFallbackSupported(
@@ -975,17 +1106,34 @@ export function applyVariantCompositionAssignment(
   compiled: CompiledSlide,
   assignment: VariantCompositionAssignment,
   template: TemplateIR,
+  semanticProfile?: TemplateSemanticProfile,
 ): CompiledSlide {
   if (compiled.variantId !== assignment.variantId) throw new TypeError('Composition assignment does not match the compiled variant');
-  if (assignment.compositionKind !== 'layout-placeholder-backed') {
+  if (assignment.compositionKind === 'exemplar-backed') {
+    const selection = assignment.exemplarSelection;
+    if (!selection || !template.slides.some((slide) => slide.sourcePart === selection.sourcePart && slide.index === selection.sourceSlideIndex)
+        || selection.projectedCompositionSignature !== assignment.projectedCompositionSignature) {
+      throw new TypeError('Qualified exemplar assignment is missing its exact validated donor selection');
+    }
+    const assessment = assessExemplarSelection(compiled, template, semanticProfile);
+    if (!assessment.safeSelections.some((candidate) => candidate.sourcePart === selection.sourcePart
+        && candidate.sourceSlideIndex === selection.sourceSlideIndex
+        && candidate.projectedCompositionSignature === selection.projectedCompositionSignature)) {
+      throw new TypeError('Qualified exemplar assignment no longer passes the current hard projection gates');
+    }
     const { nativeLayoutFallback: _fallback, ...automatic } = compiled;
+    return { ...automatic, exemplarSelection: selection };
+  }
+  if (assignment.compositionKind === 'safe-generated-fallback') {
+    const { nativeLayoutFallback: _fallback, exemplarSelection: _exemplar, ...automatic } = compiled;
     return automatic;
   }
   const candidate = compiled.layoutCandidates[assignment.layoutCandidateIndex];
   if (!candidate || !nativePlaceholderFallbackSupported(compiled, template, candidate)) {
     throw new TypeError('Qualified native layout composition is no longer safe for the compiled slide');
   }
-  return { ...withLayoutCandidate(compiled, candidate, assignment.layoutCandidateIndex), nativeLayoutFallback: true };
+  const { exemplarSelection: _exemplar, ...withoutExemplar } = withLayoutCandidate(compiled, candidate, assignment.layoutCandidateIndex);
+  return { ...withoutExemplar, nativeLayoutFallback: true };
 }
 
 /**
@@ -999,6 +1147,7 @@ export function assessExemplarSelection(
 ): ExemplarSelectionAssessment {
   if (compiled.nativeLayoutFallback) return {
     selection: null,
+    safeSelections: [],
     availableDistinctFamilies: 0,
     distinctSourceFamilyKeys: [],
     candidateDiagnostics: [],
@@ -1013,14 +1162,21 @@ export function assessExemplarSelection(
   const hasHighStructuralEvidence = Boolean(titleEvidence && bodyEvidence
     && titleEvidence.confidence >= MIN_EXEMPLAR_CONFIDENCE && bodyEvidence.confidence >= MIN_EXEMPLAR_CONFIDENCE);
   if (!hasHighStructuralEvidence && !semanticProfile) {
-    return { selection: null, availableDistinctFamilies: 0, distinctSourceFamilyKeys: [], candidateDiagnostics: [], supportedCandidateCount: 0,
+    return { selection: null, safeSelections: [], availableDistinctFamilies: 0, distinctSourceFamilyKeys: [], candidateDiagnostics: [], supportedCandidateCount: 0,
       evidence: ['high-confidence repeated title/body evidence is unavailable for the selected layout'] };
   }
   const profileByIndex = new Map(semanticProfile?.slides.map((slide) => [slide.sourceSlideIndex, slide]) ?? []);
-  const attempts = template.slides.map((slide) => candidateFor(compiled, template, slide,
-    hasHighStructuralEvidence ? titleEvidence! : null,
-    hasHighStructuralEvidence ? bodyEvidence! : null,
-    profileByIndex.get(slide.index)));
+  const attempts: CandidateBuild[] = [];
+  for (const slide of template.slides) {
+    const title = hasHighStructuralEvidence ? titleEvidence! : null;
+    const body = hasHighStructuralEvidence ? bodyEvidence! : null;
+    const profile = profileByIndex.get(slide.index);
+    const first = candidateFor(compiled, template, slide, title, body, profile, 0);
+    attempts.push(first);
+    for (let optionIndex = 1; optionIndex < first.diagnostic.bodyMappingOptionCount; optionIndex += 1) {
+      attempts.push(candidateFor(compiled, template, slide, title, body, profile, optionIndex));
+    }
+  }
   const candidates = attempts.map((attempt) => attempt.candidate).filter((candidate): candidate is Candidate => candidate !== null);
   const compatible = semanticCandidates(candidates, compiled.intent);
   const compatibleCandidates = new Set(compatible);
@@ -1035,41 +1191,35 @@ export function assessExemplarSelection(
   }
   const families = [...bySignature.values()].sort((left, right) => right.score - left.score
     || left.selection.projectedCompositionSignature.localeCompare(right.selection.projectedCompositionSignature));
-  const familyIndex = VARIANT_FAMILY_INDEX[compiled.variantId];
-  const chosen = families[familyIndex];
-  if (!chosen) return {
-    selection: null,
-    availableDistinctFamilies: families.length,
-    distinctSourceFamilyKeys,
-    candidateDiagnostics,
-    supportedCandidateCount: compatible.length,
-    evidence: [
-      `availableDistinctFamilies=${families.length}`,
-      `variant ${compiled.variantId} needs distinct rank ${familyIndex + 1}; no safe projected composition is available at that rank`,
-      ...(families[0]?.selection.evidence ?? []),
-    ],
-  };
-  const selectionReason = chosen.contentSafe
-    ? `${chosen.selection.semanticArchetype} donor passed content-sanity gates and is distinct after projection`
-    : `no safer supported content donor exists; used ${chosen.selection.semanticArchetype} as the remaining compatible path`;
-  const selection: ExemplarSlideSelection = {
-    ...chosen.selection,
-    selectionReason,
-    availableDistinctFamilies: families.length,
-    evidence: [
-      `availableDistinctFamilies=${families.length}`,
-      ...chosen.selection.evidence,
+  const safeSelections: ExemplarSlideSelection[] = families.map((candidate, familyIndex) => {
+    const selectionReason = candidate.contentSafe
+      ? `${candidate.selection.semanticArchetype} donor passed content-sanity gates and is distinct after projection`
+      : `${candidate.selection.semanticArchetype} donor passed hard projection gates; content/archetype preference is lower-ranked`;
+    return {
+      ...candidate.selection,
       selectionReason,
-      `selected projected composition rank ${familyIndex + 1} of ${families.length} distinct supported families for variant ${compiled.variantId}`,
-    ],
-  };
+      availableDistinctFamilies: families.length,
+      evidence: [
+        `availableDistinctFamilies=${families.length}`,
+        ...candidate.selection.evidence,
+        selectionReason,
+        `rank ${familyIndex + 1} of ${families.length} distinct safe projected compositions for variant ${compiled.variantId}`,
+      ],
+    };
+  });
+  const familyIndex = VARIANT_FAMILY_INDEX[compiled.variantId];
+  const selection = safeSelections[familyIndex] ?? null;
   return {
     selection,
+    safeSelections,
     availableDistinctFamilies: families.length,
     distinctSourceFamilyKeys,
     candidateDiagnostics,
     supportedCandidateCount: compatible.length,
-    evidence: selection.evidence,
+    evidence: selection?.evidence ?? [
+      `availableDistinctFamilies=${families.length}`,
+      `variant ${compiled.variantId} has no preferred rank, but every item in safeSelections remains available to joint assignment`,
+    ],
   };
 }
 
@@ -1086,6 +1236,7 @@ export function generatedFallbackCompositionSignature(compiled: CompiledSlide, t
 export interface VariantCompositionDistinctness {
   distinct: boolean;
   availableDistinctFamilies: number;
+  candidateCounts: { sourceCandidates: number; safeExemplarOptions: number; safeLayoutOptions: number; distinctSafeSignatures: number };
   signatures: string[];
   assignments: VariantCompositionAssignment[];
   evidence: string[];
@@ -1119,7 +1270,9 @@ export function assessVariantCompositionDistinctness(
     const availableDistinctFamilies = new Set(signatures).size;
     const distinct = signatures.length === variants.length && availableDistinctFamilies === variants.length;
     return {
-      distinct, availableDistinctFamilies, signatures, assignments,
+      distinct, availableDistinctFamilies,
+      candidateCounts: { sourceCandidates: 0, safeExemplarOptions: 0, safeLayoutOptions: 0, distinctSafeSignatures: availableDistinctFamilies },
+      signatures, assignments,
       evidence: distinct ? ['A/B/C have three distinct projected composition signatures']
         : [`availableDistinctFamilies=${availableDistinctFamilies}; duplicate projected compositions are withheld`],
     };
@@ -1128,12 +1281,12 @@ export function assessVariantCompositionDistinctness(
     type Option = VariantCompositionAssignment;
     const optionsByVariant = ordered.map((slide, index) => {
       const options: Option[] = [];
-      const selection = assessments[index]!.selection;
-      if (selection) options.push({
+      for (const selection of assessments[index]!.safeSelections) options.push({
         variantId: slide.variantId,
         compositionKind: 'exemplar-backed',
         layoutCandidateIndex: slide.selectedCandidateIndex,
         projectedCompositionSignature: selection.projectedCompositionSignature,
+        exemplarSelection: selection,
       });
       slide.layoutCandidates.forEach((candidate, candidateIndex) => {
         if (!nativePlaceholderFallbackSupported(slide, template, candidate)) return;
@@ -1189,9 +1342,20 @@ export function assessVariantCompositionDistinctness(
         ? optionsByVariant.map((options) => options[0]!.projectedCompositionSignature)
         : [];
     const assignments = proposedAssignments;
+    const safeExemplarSignatures = new Set(optionsByVariant.flat().filter((option) => option.compositionKind === 'exemplar-backed')
+      .map((option) => option.projectedCompositionSignature));
+    const safeLayoutSignatures = new Set(optionsByVariant.flat().filter((option) => option.compositionKind === 'layout-placeholder-backed')
+      .map((option) => option.projectedCompositionSignature));
+    const allSafeSignatures = new Set([...safeExemplarSignatures, ...safeLayoutSignatures]);
     return {
       distinct,
       availableDistinctFamilies: best.length,
+      candidateCounts: {
+        sourceCandidates: assessments[0]?.candidateDiagnostics.length ?? 0,
+        safeExemplarOptions: safeExemplarSignatures.size,
+        safeLayoutOptions: safeLayoutSignatures.size,
+        distinctSafeSignatures: allSafeSignatures.size,
+      },
       signatures,
       assignments,
       evidence: distinct

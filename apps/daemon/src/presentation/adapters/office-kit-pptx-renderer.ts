@@ -213,13 +213,18 @@ function projectExemplarText(
   const title = requiredDonorShape(slide, selection.slots.title.nativeId, 'title');
   const bodySlots = selection.slots.bodySlots.length ? selection.slots.bodySlots : [selection.slots.body];
   const bodyShapes = bodySlots.map((slot, index) => requiredDonorShape(slide, slot.nativeId, `body ${index + 1}`));
-  const bodyCount = Math.max(1, compiled.body.length);
+  const sourceBodyText = compiled.body.join('\n');
   if (selection.bodyContentRanges.length !== bodyShapes.length
+      || selection.bodyContentSegments.length !== bodyShapes.length
+      || selection.bodySegmentation.regionCount !== bodyShapes.length
+      || selection.bodySegmentation.fragmentCount < bodyShapes.length
+      || selection.bodySegmentation.sourceTextSha256 !== createHash('sha256').update(sourceBodyText).digest('hex')
+      || selection.bodyContentSegments.join('') !== sourceBodyText
       || selection.bodyContentRanges.some((range, index) => !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
-        || range.start < 0 || range.end <= range.start || range.end > bodyCount
+        || range.start < 0 || range.end <= range.start || range.end > selection.bodySegmentation.fragmentCount
         || (index > 0 && selection.bodyContentRanges[index - 1]!.end !== range.start))
       || selection.bodyContentRanges[0]?.start !== 0
-      || selection.bodyContentRanges.at(-1)?.end !== bodyCount) {
+      || selection.bodyContentRanges.at(-1)?.end !== selection.bodySegmentation.fragmentCount) {
     throw new PptxBackendError('EXEMPLAR_BODY_ASSIGNMENT_INVALID', `The selected exemplar body assignment does not cover the source text exactly once.`);
   }
   for (const [role, shape] of [['title', title] as const, ...bodyShapes.map((shape, index) => [`body ${index + 1}`, shape] as const)]) {
@@ -238,8 +243,7 @@ function projectExemplarText(
   }
   setShapeText(title, compiled.title);
   for (let index = 0; index < bodyShapes.length; index += 1) {
-    const range = selection.bodyContentRanges[index]!;
-    setShapeText(bodyShapes[index]!, compiled.body.slice(range.start, range.end).join('\n'));
+    setShapeText(bodyShapes[index]!, selection.bodyContentSegments[index]!);
   }
 }
 
@@ -398,7 +402,17 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       compiled.id, assessExemplarSelection(compiled, input.templateIR, input.semanticProfile),
     ] as const));
     const exemplarSelections = new Map(input.compiledPresentation.slides.flatMap((compiled) => {
-      const selection = exemplarAssessments.get(compiled.id)?.selection;
+      const assessment = exemplarAssessments.get(compiled.id);
+      const selected = compiled.exemplarSelection;
+      const selection = selected
+        ? assessment?.safeSelections.find((candidate) => candidate.sourcePart === selected.sourcePart
+          && candidate.sourceSlideIndex === selected.sourceSlideIndex
+          && candidate.projectedCompositionSignature === selected.projectedCompositionSignature)
+        : assessment?.selection;
+      if (selected && !selection) {
+        throw new PptxBackendError('EXEMPLAR_ASSIGNMENT_REVALIDATION_FAILED',
+          'The jointly qualified donor no longer passes the current template projection checks.');
+      }
       if (!selection || !sourceSlidesByPart.has(selection.sourcePart)) return [];
       return [[compiled.id, selection] as const];
     }));

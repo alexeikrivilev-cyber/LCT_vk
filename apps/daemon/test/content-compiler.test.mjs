@@ -166,3 +166,24 @@ test('validator rejects a changed source and a changed derived hash/id', async (
   changedId.id = 'cir_000000000000000000000000';
   assert.throws(() => validateContentIR(changedId), /id does not match/);
 });
+
+test('compiles a required task and optional context into deterministic provenance sources without temporary files', async (t) => {
+  const fixture = await projectFixture(t);
+  await fixture.write('evidence.md', '# Evidence\n\nThe supplied source remains additive.');
+  const intent = { task: 'Explain the onboarding goal without inventing metrics.', context: 'Preserve the product constraints.' };
+
+  const taskOnly = await compileContentIR(fixture.root, fixture.projectId, [], { task: intent.task });
+  const repeated = await compileContentIR(fixture.root, fixture.projectId, [], { task: intent.task });
+  const additive = await compileContentIR(fixture.root, fixture.projectId, ['evidence.md'], intent);
+
+  assert.equal(taskOnly.hash, repeated.hash);
+  assert.deepEqual(taskOnly.sources.map((source) => source.kind), ['brief-task']);
+  assert.equal(taskOnly.sources[0].sourcePath, '__lct_input__/task.md');
+  assert.equal(taskOnly.units[0].sourceId, taskOnly.sources[0].id);
+  assert.match(taskOnly.units[0].text, /onboarding goal/);
+  assert.deepEqual(validateContentIR(taskOnly), taskOnly);
+  assert.deepEqual(additive.sources.map((source) => source.kind), ['text', 'brief-task', 'brief-context']);
+  assert.ok(additive.units.some((unit) => unit.sourceId === additive.sources[0].id && unit.text.includes('additive')));
+  assert.notEqual(additive.hash, taskOnly.hash);
+  await assert.rejects(compileContentIR(fixture.root, fixture.projectId, [], { task: ' ' }), hasCode('INVALID_CONTENT_SELECTION'));
+});

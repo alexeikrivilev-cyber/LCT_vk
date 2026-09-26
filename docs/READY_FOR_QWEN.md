@@ -12,10 +12,10 @@
 
 ## Organizer matrix и held-out
 
-- Последняя текущая synthetic матрица: `.lct/release-candidate/3x3-synthetic-20260926/CASE_QUALIFICATION_MANIFEST.json`; **FAIL, 6/9**. VK Tech — A/B/C; WorkSpace — 0/3 withheld; Education — A/B/C. Все шесть PPTX структурно reopened, source facts и template parts сохранены. Три profiler обращения были только к локальному fake endpoint; Worker/Supervisor/generation в матрице не вызывались.
-- Contact sheets и quality JSON находятся рядом в `contact-sheets/`. Это synthetic qualification package с withheld ячейками, не сдаваемые 9 organizer deck.
-- Последний held-out AIOS manifest: `.lct/unknown-template-qualification/unknown-template-2026-09-26T141235-629Z-c21878e8/UNKNOWN_TEMPLATE_MANIFEST.json`; **FAIL**. Analyze/profile и plan прошли, генерация остановилась на `VARIANTS_NOT_DISTINCT`; audit/export не запускались.
-- Organizer content pack и brief отсутствуют. Synthetic content не используется как их замена.
+- Последняя fake-only матрица: `.lct/core-generation-fix-20260926/case-3x3/CASE_QUALIFICATION_MANIFEST.json`; **PASS, 9/9** на одном task/context-only planning state. VK Tech, WorkSpace, Education — по A/B/C. Все PPTX reopened, прошли factual-equivalence/template-preservation, имеют 0 deterministic audit findings, notes и raster slides. Три profiler обращения были только к локальному fake endpoint.
+- Preview gate содержит 10 низкоуверенных текстовых предупреждений приближённого Office Kit renderer; PowerPoint/LibreOffice визуально не проверялись.
+- Точный held-out AIOS manifest: `.lct/unknown-template-qualification/unknown-template-2026-09-26T164941-924Z-ceef591a/UNKNOWN_TEMPLATE_MANIFEST.json`; **PASS**. `AIOS_Онбординг (4) (1) (1).pptx`, SHA `18198cc08df9fc3ea5aee5f509d89e70a4ade68bb539fed61a957581ee365ad`, 16 slides / 2 masters / 2 layouts. Task+context only, 0 source files; analysis/profile, plan, A/B/C, audit, selected and track exports/reopen passed. Проверены пять предметных строк на отсутствие во всех четырёх выходах; residue check — PASS.
+- Organizer clarification: отдельного content package не будет; обязательны шаблон и задача, контекст и source files optional. 3×3 использует одну qualification task/context, а не отсутствующий пакет.
 
 ## Визуальное качество и экспорт
 
@@ -31,17 +31,15 @@
 
 ## Offline checks и live-only риски
 
-2026-09-26 после добавления русских audit messages повторно пройдены frozen install на pnpm 10.33.2, **181/181 тест**, typecheck, build, boundary, craft lint, docs links (55 required files) и `git diff --check`. Команды и ограничения evidence: в [`RELEASE_READINESS.md`](../RELEASE_READINESS.md).
+2026-09-26 после P0 Core Generation Fix повторно пройдены frozen install на pnpm 10.33.2, **187/187 тестов**, typecheck, build, boundary, craft lint, docs links (55 required files) и `git diff --check`. Команды и ограничения evidence: в [`RELEASE_READINESS.md`](../RELEASE_READINESS.md).
 
 Не запускались RunPod, GPU, Qwen, VK endpoint или внешнее inference. Остаются live-only риски: Qwen semantic quality, strict schema compliance, latency, VK endpoint/configuration.
 
 ## Блокеры
 
-1. Получить organizer content pack и brief, записать provenance/hash и повторить 3×3 с ним.
-2. Исправить generic-safe composition blockers WorkSpace, затем повторить полный 3×3 без ослабления safety gates.
-3. Довести held-out AIOS или другой действительно неизвестный шаблон до audit/export/reopen; текущий run остановился до этих стадий.
-4. Подтвердить 10–15 slide performance: текущий 12-slide synthetic run превысил 300 s.
-5. Проверить release PPTX в PowerPoint/LibreOffice и PDF/HTML в браузере; выполнить customer-facing browser walkthrough.
-6. Зафиксировать clean final Git revision и config-based startup для целевого VK endpoint.
+1. Проверить 9-deck и held-out exports в PowerPoint/LibreOffice; принять или исправить preview approximation warnings.
+2. Подтвердить 10–15 slide performance: текущий 12-slide synthetic run превысил 300 s.
+3. Проверить PDF/HTML в браузере и выполнить customer-facing browser walkthrough.
+4. Зафиксировать clean final Git revision и config-based startup для целевого VK endpoint.
 
-**NEXT ACTION:** снять offline blockers 1–5; затем выполнить один ограниченный live Qwen/VK qualification с бюджетом не более 3 inference-запросов (profiler 1, Worker 1, Supervisor 1, generation 0).
+**NEXT ACTION:** закрыть offline blockers 1–4; затем выполнить один ограниченный live Qwen/VK qualification с бюджетом не более 3 inference-запросов (profiler 1, Worker 1, Supervisor 1, generation 0).

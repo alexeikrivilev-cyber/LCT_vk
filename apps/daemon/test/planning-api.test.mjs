@@ -282,7 +282,7 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     const mediaReference = await generate(started, projectId, undefined, ['source.md', 'photo.png']);
     assert.equal(mediaReference.status, 422, 'an image metadata reference cannot be cited as factual evidence');
     const mediaEvidence = control.workerEvidence.at(-1);
-    assert.ok(mediaEvidence.sources.every((source) => source.kind === 'text'));
+    assert.ok(mediaEvidence.sources.every((source) => ['text', 'brief-task', 'brief-context'].includes(source.kind)));
     assert.ok(mediaEvidence.units.every((unit) => unit.kind !== 'media-reference'));
     assert.equal(mediaEvidence.sources.some((source) => source.originalName === 'photo.png'), false);
     control.badWorker = null;
@@ -307,6 +307,43 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     assert.equal(await compileTemplate(started, projectId, changedTemplate), true);
     const templateStale = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
     assert.equal(templateStale.status, 'stale', 'recompiling a different canonical template invalidates the prior plan');
+  } finally {
+    await closeStartedServer(started);
+  }
+});
+
+test('Planning API accepts a task and optional context with zero uploaded source files', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-planning-task-only-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const control = { reviewMode: 'pass', badWorker: null, workerFailure: false, calls: [], workerEvidence: [] };
+  const options = {
+    host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
+    serveWeb: false, returnServer: true, semanticInferenceAdapter: makeFakeAdapter(control),
+  };
+  let started = await startServer(options);
+  const projectId = 'planning-task-only';
+  try {
+    await createProject(started, projectId);
+    if (!await compileTemplate(started, projectId, await makeSyntheticPptx({ slideCount: 2, layoutCount: 2 }))) {
+      t.skip('Python 3.12 unavailable: local template fixture cannot be compiled');
+      return;
+    }
+    const brief = { purpose: 'Explain the onboarding objective without adding unsupported facts.', context: 'Keep the recommendation practical.', preferences: [], requestedSlideCount: 2 };
+    const response = await generate(started, projectId, brief, []);
+    assert.equal(response.status, 200, await response.clone().text());
+    const planned = await responseJson(response);
+    assert.equal(planned.status, 'ready');
+    assert.deepEqual(planned.contentFiles, []);
+    assert.deepEqual(planned.contentIR.sources.map((source) => source.kind), ['brief-task', 'brief-context']);
+    assert.equal(planned.contentIR.hash, control.workerEvidence[0].hash);
+    assert.ok(planned.deckPlan.slides[1].contentRefs.every((id) => planned.contentIR.units.some((unit) => unit.id === id)));
+    assert.deepEqual(control.calls.map(({ role }) => role), ['worker', 'supervisor']);
+
+    await closeStartedServer(started);
+    started = await startServer(options);
+    const reloaded = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
+    assert.equal(reloaded.status, 'ready');
+    assert.equal(reloaded.contentIR.hash, planned.contentIR.hash, 'task/context provenance is deterministic across reload');
   } finally {
     await closeStartedServer(started);
   }

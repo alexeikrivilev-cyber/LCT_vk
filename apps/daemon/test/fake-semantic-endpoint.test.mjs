@@ -46,6 +46,44 @@ test('local fake plans a contentful three-slide deck from source sections and pa
   assert.deepEqual(review, { checkpointVersion: 7, outcome: 'pass', findings: [], operations: [] });
 });
 
+test('local fake treats task as instruction and grounds task/context-only slides in context units', () => {
+  const units = [
+    { id: 'task', sourceId: 'task-source', kind: 'text', text: 'Prepare a short deck about reliable automation.' },
+    { id: 'context-heading-1', sourceId: 'context-source', kind: 'heading', text: '## Verification' },
+    { id: 'context-1', sourceId: 'context-source', kind: 'text', text: 'Reliability requires checking results before handoff. The check remains visible to the next owner.' },
+    { id: 'context-heading-2', sourceId: 'context-source', kind: 'heading', text: '## Rules' },
+    { id: 'context-2', sourceId: 'context-source', kind: 'text', text: 'Explicit constraints make each stage inspectable. Reviewers can check each decision.' },
+    { id: 'context-heading-3', sourceId: 'context-source', kind: 'heading', text: '## Reproducibility' },
+    { id: 'context-3', sourceId: 'context-source', kind: 'text', text: 'Reproducibility supports later verification. The same inputs produce a checkable result.' },
+  ];
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v1', {
+    brief: { purpose: 'Present reliable automation.' },
+    requestedSlideCount: 3,
+    contentIR: { sources: [{ id: 'task-source', kind: 'brief-task' }, { id: 'context-source', kind: 'brief-context' }], units },
+  }));
+  const draft = JSON.parse(response.choices[0].message.content);
+  assert.equal(new Set(draft.slides.map((slide) => slide.takeaway)).size, 3);
+  assert.equal(new Set(draft.slides.map((slide) => slide.contentRefs.join('|'))).size, 3);
+  assert.deepEqual(draft.slides.map((slide) => slide.takeaway), ['Verification', 'Rules', 'Reproducibility']);
+  assert.ok(draft.slides.every((slide) => slide.contentRefs.length === 2
+    && slide.contentRefs.every((id) => units.some((unit) => unit.id === id))
+    && !slide.contentRefs.includes('task')));
+});
+
+test('local fake still accepts task-only planning without inventing content units', () => {
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v1', {
+    brief: { purpose: 'Prepare a short deck about reliable automation.' },
+    requestedSlideCount: 1,
+    contentIR: { sources: [{ id: 'task-source', kind: 'brief-task' }], units: [
+      { id: 'task', sourceId: 'task-source', kind: 'text', text: 'Prepare a short deck about reliable automation.' },
+    ] },
+  }));
+  const draft = JSON.parse(response.choices[0].message.content);
+  assert.equal(draft.slides.length, 1);
+  assert.deepEqual(draft.slides[0].contentRefs, ['task']);
+  assert.equal(draft.slides[0].takeaway, 'Prepare a short deck about reliable automation.');
+});
+
 test('local fake returns generic strict-schema template role mappings from supplied evidence', () => {
   const hash = 'a'.repeat(64);
   const evidence = {

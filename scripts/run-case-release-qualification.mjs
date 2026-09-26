@@ -67,7 +67,7 @@ export function createCaseQualificationManifest({ state, templates, matrix, diag
       sourceCount: saved.contentIR.sources.length,
       sourceHashes: saved.contentIR.sources.map((source) => source.sha256),
       modelUsedForPlanning: saved.model,
-      provenance: 'One persisted ContentIR, brief, and DeckPlan were applied to all three templates; the organizer content package must be verified separately.',
+      provenance: 'One persisted ContentIR, brief, and DeckPlan were applied to all three templates. Organizer clarification: there is no separate content package; task is required, context and source files are optional.',
     },
     workflows: saved.agentWorkflowVersions ?? LEGACY_UNRECORDED_WORKFLOW_VERSIONS,
     promptVersions: saved.promptVersions ?? null,

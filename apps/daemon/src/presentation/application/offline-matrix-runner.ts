@@ -85,6 +85,7 @@ export interface OfflineMatrixResult {
       plannedSlideIndex: number;
       intent: string;
       availableDistinctCompositions: number;
+      candidateCounts: ReturnType<typeof assessVariantCompositionDistinctness>['candidateCounts'];
       requiredDistinctCompositions: 3;
       status: 'passed' | 'blocked';
       signatures: string[];
@@ -102,6 +103,7 @@ export interface OfflineMatrixResult {
           semanticConfidence: number;
           titleElementId: string;
           bodyElementIds: string[];
+          bodySegmentation: NonNullable<ReturnType<typeof assessExemplarSelection>['selection']>['bodySegmentation'];
           projectedCompositionSignature: string;
           projectionSafe: boolean;
           contentSafe: boolean | null;
@@ -202,7 +204,7 @@ export async function runOfflinePresentationMatrix(input: {
         ? variantSlides.map((slide) => {
           const assignment = distinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
           if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
-          return applyVariantCompositionAssignment(slide, assignment, template.templateIR);
+          return applyVariantCompositionAssignment(slide, assignment, template.templateIR, semanticProfile);
         })
         : variantSlides;
       if (distinctness.distinct) for (const assigned of assignedVariantSlides) {
@@ -215,14 +217,14 @@ export async function runOfflinePresentationMatrix(input: {
       const variants = assignedVariantSlides.map((slide, variantIndex) => {
         const assessment = donorAssessments[variantIndex]!;
         const assignment = distinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
-        const selection = assignment?.compositionKind === 'exemplar-backed' ? assessment.selection : null;
+        const selection = assignment?.compositionKind === 'exemplar-backed' ? assignment.exemplarSelection ?? null : null;
         return {
           variantId: slide.variantId,
           projectedCompositionSignature: assignment?.projectedCompositionSignature ?? null,
           compositionKind: assignment?.compositionKind ?? 'unavailable' as const,
           layoutCandidateIndex: assignment?.layoutCandidateIndex ?? null,
           layoutId: assignment?.compositionKind === 'layout-placeholder-backed'
-            ? slide.layoutCandidates[assignment.layoutCandidateIndex]?.layoutId ?? null : slide.layoutId,
+            ? slide.layoutCandidates[assignment.layoutCandidateIndex]?.layoutId ?? null : selection?.layoutId ?? slide.layoutId,
           selectedDonor: selection ? {
             sourceSlideIndex: selection.sourceSlideIndex,
             structuralArchetype: assessment.candidateDiagnostics.find((candidate) => candidate.sourceSlideIndex === selection.sourceSlideIndex)?.structuralArchetype ?? selection.semanticArchetype,
@@ -230,6 +232,7 @@ export async function runOfflinePresentationMatrix(input: {
             semanticConfidence: selection.confidence,
             titleElementId: selection.slots.title.elementId,
             bodyElementIds: selection.slots.bodySlots.map((slot) => slot.elementId),
+            bodySegmentation: selection.bodySegmentation,
             projectedCompositionSignature: selection.projectedCompositionSignature,
             projectionSafe: true,
             contentSafe: assessment.candidateDiagnostics.find((candidate) => candidate.sourceSlideIndex === selection.sourceSlideIndex)?.contentSafe ?? null,
@@ -242,6 +245,7 @@ export async function runOfflinePresentationMatrix(input: {
         plannedSlideIndex: slideIndex + 1,
         intent: variantSlides[0]!.intent,
         availableDistinctCompositions: distinctness.availableDistinctFamilies,
+        candidateCounts: distinctness.candidateCounts,
         requiredDistinctCompositions: 3,
         status: distinctness.distinct ? 'passed' : 'blocked',
         signatures: distinctness.signatures,

@@ -1,13 +1,14 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 
-export const MAX_CONTENT_SOURCES = 12;
+export const MAX_CONTENT_SOURCES = 14;
+export const MAX_SELECTED_CONTENT_FILES = 12;
 export const MAX_CONTENT_SOURCE_BYTES = 16 * 1024 * 1024;
 export const MAX_CONTENT_TOTAL_BYTES = 32 * 1024 * 1024;
 export const MAX_CONTENT_TEXT_BYTES = 256 * 1024;
 export const MAX_CONTENT_UNITS = 4096;
 
-export type ContentSourceKind = 'text' | 'image' | 'unsupported';
+export type ContentSourceKind = 'text' | 'brief-task' | 'brief-context' | 'image' | 'unsupported';
 export type ContentUnitKind = 'text' | 'heading' | 'json-value' | 'table-cell' | 'media-reference';
 export type ContentJsonValueKind = 'object' | 'array' | 'string' | 'number' | 'boolean' | 'null';
 
@@ -302,7 +303,7 @@ export function validateContentIR(value: unknown): ContentIR {
         || typeof item.sha256 !== 'string' || !SHA256_PATTERN.test(item.sha256)
         || item.order !== index || !Number.isSafeInteger(item.byteLength) || (item.byteLength as number) < 0
         || (item.byteLength as number) > MAX_CONTENT_SOURCE_BYTES
-        || !['text', 'image', 'unsupported'].includes(String(item.kind)) || !isDenseArray(item.warnings)
+        || !['text', 'brief-task', 'brief-context', 'image', 'unsupported'].includes(String(item.kind)) || !isDenseArray(item.warnings)
         || !item.warnings.every(validWarning)) {
       throw new TypeError(`ContentIR source ${index} is invalid`);
     }
@@ -312,9 +313,10 @@ export function validateContentIR(value: unknown): ContentIR {
     }
     totalSourceBytes += source.byteLength;
     if (totalSourceBytes > MAX_CONTENT_TOTAL_BYTES) throw new TypeError('ContentIR exceeds the selected source byte limit');
-    if (source.kind === 'text') {
+    if (source.kind === 'text' || source.kind === 'brief-task' || source.kind === 'brief-context') {
       const extension = sourceExtension(source.sourcePath);
-      if (!SUPPORTED_TEXT_EXTENSIONS.has(extension) || typeof source.text !== 'string') {
+      if ((source.kind === 'text' && !SUPPORTED_TEXT_EXTENSIONS.has(extension))
+          || (source.kind !== 'text' && extension !== '.md') || typeof source.text !== 'string') {
         throw new TypeError(`ContentIR text source ${index} is invalid`);
       }
       const textBytes = Buffer.byteLength(source.text, 'utf8');
@@ -350,7 +352,7 @@ export function validateContentIR(value: unknown): ContentIR {
     const extension = sourceExtension(source.sourcePath);
     const valid = item.kind === 'media-reference'
       ? validMediaReferenceUnit(item, source)
-      : source.kind !== 'text'
+      : !['text', 'brief-task', 'brief-context'].includes(source.kind)
         ? false
         : item.kind === 'text'
           ? ['.txt', '.md'].includes(extension) && validTextUnit(item, source, 'text')

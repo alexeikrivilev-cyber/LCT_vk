@@ -450,6 +450,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const [briefAudience, setBriefAudience] = useState('');
   const [briefPurpose, setBriefPurpose] = useState('');
   const [briefExpectedOutcome, setBriefExpectedOutcome] = useState('');
+  const [briefContext, setBriefContext] = useState('');
   const [briefPreferences, setBriefPreferences] = useState('');
   const [requestedSlideCount, setRequestedSlideCount] = useState('');
   const [editorText, setEditorText] = useState('');
@@ -526,6 +527,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     setBriefAudience(draft.briefAudience);
     setBriefPurpose(draft.briefPurpose);
     setBriefExpectedOutcome(draft.briefExpectedOutcome);
+    setBriefContext(draft.briefContext ?? '');
     setBriefPreferences(draft.briefPreferences);
     setRequestedSlideCount(draft.requestedSlideCount);
   }, [projectId]);
@@ -543,6 +545,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       setBriefAudience(stringValue(brief?.audience));
       setBriefPurpose(stringValue(brief?.purpose));
       setBriefExpectedOutcome(stringValue(brief?.expectedOutcome));
+      setBriefContext(stringValue(brief?.context));
       setBriefPreferences(Array.isArray(brief?.preferences)
         ? brief.preferences.filter((item): item is string => typeof item === 'string').join('\n')
         : '');
@@ -581,11 +584,12 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         briefAudience,
         briefPurpose,
         briefExpectedOutcome,
+        briefContext,
         briefPreferences,
         requestedSlideCount,
       });
     } catch { /* Browser storage can be disabled by policy. */ }
-  }, [briefAudience, briefExpectedOutcome, briefPreferences, briefPurpose, draftHydrated, projectId, requestedSlideCount, selectedContentFiles]);
+  }, [briefAudience, briefContext, briefExpectedOutcome, briefPreferences, briefPurpose, draftHydrated, projectId, requestedSlideCount, selectedContentFiles]);
 
   const previewFile = useMemo(() => pickPreviewFile(files, selectedFile), [files, selectedFile]);
   const templateFiles = useMemo(() => files.filter((file) => /\.pptx$/i.test(filePath(file))), [files]);
@@ -658,6 +662,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     || briefAudience.trim() !== stringValue(savedBrief?.audience)
     || briefPurpose.trim() !== stringValue(savedBrief?.purpose)
     || briefExpectedOutcome.trim() !== stringValue(savedBrief?.expectedOutcome)
+    || briefContext.trim() !== stringValue(savedBrief?.context)
     || normalizePreferenceLines(briefPreferences) !== normalizePreferenceLines(savedPreferences)
     || requestedSlideCount.trim() !== (typeof savedBrief?.requestedSlideCount === 'number' ? String(savedBrief.requestedSlideCount) : '')
   );
@@ -713,11 +718,11 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
 
   const generatePlan = async () => {
     setPlanningError(null);
-    if (planningSelectedPaths.length < 1 || planningSelectedPaths.length > 12) {
+    if (planningSelectedPaths.length > 12) {
       setPlanningError({ message: ru.validation.filesRange });
       return;
     }
-    if (!briefAudience.trim() || !briefPurpose.trim() || !briefExpectedOutcome.trim()) {
+    if (!briefPurpose.trim()) {
       setPlanningError({ message: ru.validation.briefRequired });
       return;
     }
@@ -735,6 +740,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       audience: briefAudience.trim(),
       purpose: briefPurpose.trim(),
       expectedOutcome: briefExpectedOutcome.trim(),
+      context: briefContext.trim(),
       preferences,
       ...(count === undefined ? {} : { requestedSlideCount: count }),
     };
@@ -1212,6 +1218,9 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             <label>{ru.planning.outcome}
               <textarea maxLength={1000} value={briefExpectedOutcome} onChange={(event) => setBriefExpectedOutcome(event.target.value)} disabled={planningGenerating} rows={2} placeholder={ru.planning.outcomePlaceholder} />
             </label>
+            <label>{ru.planning.context}
+              <textarea maxLength={16_000} value={briefContext} onChange={(event) => setBriefContext(event.target.value)} disabled={planningGenerating} rows={3} placeholder={ru.planning.contextPlaceholder} />
+            </label>
             <label>{ru.planning.preferences} <span className="planning-label-note">{ru.planning.perLine}</span>
               <textarea value={briefPreferences} onChange={(event) => setBriefPreferences(event.target.value)} disabled={planningGenerating} rows={2} placeholder={ru.planning.preferencesPlaceholder} />
             </label>
@@ -1220,7 +1229,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             </label>
             <div className="planning-submit-row">
               <span className="planning-muted">{ru.planning.requires}</span>
-              <button className="primary" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateFetching || templateAnalyzing || planning?.templateStatus !== 'ready' || !matchingScan}>
+              <button className="primary" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateFetching || templateAnalyzing || planning?.templateStatus !== 'ready' || !matchingScan || !briefPurpose.trim()}>
                 {planningGenerating ? ru.planning.generating : ru.planning.generate}
               </button>
             </div>

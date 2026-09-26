@@ -12,9 +12,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const daemonRequire = createRequire(path.join(repoRoot, 'apps/daemon/package.json'));
 
 function parseArgs(argv) {
-  const result = { slideCount: 3 };
+  const result = { slideCount: 3, task: 'Explain the presentation compiler product and its generation pipeline.', forbiddenOutputText: [] };
   for (let index = 0; index < argv.length; index += 1) {
     const item = argv[index];
+    if (item === '--assert-no-output-text') {
+      const value = argv[++index];
+      if (value === undefined || value.trim() === '' || value.length > 256) throw new TypeError('--assert-no-output-text requires a non-empty phrase up to 256 characters');
+      result.forbiddenOutputText.push(value);
+      continue;
+    }
     if (item === '--slides') {
       const value = Number(argv[++index]);
       if (!Number.isSafeInteger(value) || value < 3 || value > 15) {
@@ -23,15 +29,29 @@ function parseArgs(argv) {
       result.slideCount = value;
       continue;
     }
-    if (item !== '--template' && item !== '--source') throw new TypeError(`Unknown option: ${item}`);
+    if (!['--template', '--source', '--task', '--context'].includes(item)) throw new TypeError(`Unknown option: ${item}`);
     const value = argv[++index];
-    if (!value) throw new TypeError(`${item} requires a path`);
-    result[item === '--template' ? 'templatePath' : 'sourcePath'] = value;
+    if (value === undefined || value === '') throw new TypeError(`${item} requires a value`);
+    if (item === '--template') result.templatePath = value;
+    else if (item === '--source') result.sourcePath = value;
+    else if (item === '--task') result.task = value;
+    else result.context = value;
   }
-  if (!result.templatePath || !result.sourcePath) {
-    throw new TypeError('Usage: node --import tsx scripts/run-local-product-smoke.mjs --template <template.pptx> --source <synthetic.md> [--slides 3..15]');
+  if (!result.templatePath || !result.task.trim()) {
+    throw new TypeError('Usage: node --import tsx scripts/run-local-product-smoke.mjs --template <template.pptx> --task <presentation task> [--context <optional context>] [--source <optional source.md>] [--slides 3..15]');
   }
   return result;
+}
+
+function forbiddenTextMatches(presentation, forbiddenTerms, officeKitNode) {
+  const { getSlides, getSlideShapes, getShapeText, hasShapeText } = officeKitNode;
+  const visibleText = getSlides(presentation).flatMap((slide) => getSlideShapes(slide))
+    .filter((shape) => hasShapeText(shape))
+    .map((shape) => getShapeText(shape).normalize('NFKC').toLocaleLowerCase('ru-RU'));
+  return forbiddenTerms.filter((term) => {
+    const normalized = term.normalize('NFKC').toLocaleLowerCase('ru-RU');
+    return visibleText.some((text) => text.includes(normalized));
+  });
 }
 
 function sha256(bytes) {
@@ -78,12 +98,12 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const runStartedAt = performance.now();
   const templatePath = await realpath(args.templatePath);
-  const sourcePath = await realpath(args.sourcePath);
+  const sourcePath = args.sourcePath ? await realpath(args.sourcePath) : null;
   const templateName = path.basename(templatePath);
-  const sourceName = path.basename(sourcePath);
+  const sourceName = sourcePath ? path.basename(sourcePath) : null;
   const templateBytes = await readFile(templatePath);
-  const sourceBytes = await readFile(sourcePath);
-  const sourceHashBefore = sha256(templateBytes);
+  const sourceBytes = sourcePath ? await readFile(sourcePath) : null;
+  const templateHashBefore = sha256(templateBytes);
   const runId = `local-product-smoke-${new Date().toISOString().replaceAll(':', '').replaceAll('.', '-')}-${randomUUID().slice(0, 8)}`;
   const runDir = await realpath(repoRoot).then((root) => path.join(root, '.lct', runId));
   const dataDir = path.join(runDir, 'data');
@@ -107,8 +127,9 @@ async function main() {
   let daemon;
   const report = {
     status: 'running', runDir, projectId: `smoke_${randomUUID().replaceAll('-', '').slice(0, 12)}`,
-    template: { path: templatePath, sha256: sourceHashBefore, originalName: templateName },
-    source: { path: sourcePath, sha256: sha256(sourceBytes), originalName: sourceName },
+    template: { path: templatePath, sha256: templateHashBefore, originalName: templateName },
+    inputContract: { task: args.task, contextProvided: Boolean(args.context?.trim()), sourceFileCount: Number(Boolean(sourceName)) },
+    source: sourcePath && sourceBytes && sourceName ? { path: sourcePath, sha256: sha256(sourceBytes), originalName: sourceName } : null,
     gates: {},
     timingsMs: {},
   };
@@ -127,10 +148,10 @@ async function main() {
 
     let stageStartedAt = performance.now();
     const templateUpload = await upload(daemon.url, projectId, templateName, templateBytes);
-    const sourceUpload = await upload(daemon.url, projectId, sourceName, sourceBytes);
+    const sourceUpload = sourceName && sourceBytes ? await upload(daemon.url, projectId, sourceName, sourceBytes) : null;
     const uploadedFiles = await requestJson(daemon.url, `/api/projects/${projectId}/files`);
     assert.ok(uploadedFiles.files.some((file) => file.path === templateName), `template filename was not preserved: ${JSON.stringify(templateUpload.files)}`);
-    assert.ok(uploadedFiles.files.some((file) => file.path === sourceName), `source file was not uploaded: ${JSON.stringify(sourceUpload.files)}`);
+    if (sourceName) assert.ok(uploadedFiles.files.some((file) => file.path === sourceName), `source file was not uploaded: ${JSON.stringify(sourceUpload?.files)}`);
     report.gates.upload = 'passed';
     report.gates.uploadedNames = uploadedFiles.files.map((file) => file.path);
     report.timingsMs.uploadAndList = Math.round(performance.now() - stageStartedAt);
@@ -144,25 +165,32 @@ async function main() {
     assert.ok(templateResponse.templateIR?.hash);
     assert.ok(templateResponse.templateIR.slides.length > 0);
     report.gates.template = 'passed';
+    const sourcePackage = await inspectOfficeKitPackage(templateBytes);
     report.templateIR = {
       hash: templateResponse.templateIR.hash,
       slides: templateResponse.templateIR.slides.length,
       layouts: templateResponse.templateIR.layouts.length,
       packageParts: templateResponse.templateIR.packageInventory?.length ?? null,
     };
+    report.templatePackage = {
+      masters: sourcePackage.masterParts.length,
+      layouts: sourcePackage.layoutNames.length,
+      themeAvailable: sourcePackage.themeAvailable,
+    };
     report.timingsMs.templateAnalysis = Math.round(performance.now() - stageStartedAt);
 
     const brief = {
       audience: 'Hackathon jury and technical reviewers',
-      purpose: 'Explain the presentation compiler product and its generation pipeline.',
-      expectedOutcome: 'Understand the problem, pipeline, and product value.',
+      purpose: args.task,
+      expectedOutcome: '',
+      ...(args.context?.trim() ? { context: args.context } : {}),
       preferences: ['Use uploaded template', 'Concise slides', 'Clear hierarchy', 'Do not invent unsupported facts'],
       requestedSlideCount: args.slideCount,
     };
     stageStartedAt = performance.now();
     const planning = await requestJson(daemon.url, `/api/projects/${projectId}/planning/generate`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ contentFiles: [sourceName], brief }),
+      body: JSON.stringify({ contentFiles: sourceName ? [sourceName] : [], brief }),
     });
     assert.equal(planning.status, 'ready', JSON.stringify(planning.failure));
     assert.equal(planning.deckPlan.slides.length, args.slideCount);
@@ -303,18 +331,28 @@ async function main() {
     const download = await fetch(`${daemon.url}${exported.artifact.downloadUrl}`);
     assert.equal(download.status, 200);
     const pptx = Buffer.from(await download.arrayBuffer());
-    assert.ok(pptx.length > 100_000, `export unexpectedly small (${pptx.length} bytes)`);
-    const { slideCount, notesSlideCount, validationIssues } = await inspectOfficeKitPackage(pptx);
+    const outputPackage = await inspectOfficeKitPackage(pptx);
+    const { slideCount, notesSlideCount, validationIssues } = outputPackage;
     assert.equal(slideCount, args.slideCount);
     assert.equal(notesSlideCount, 0);
     assert.ok(!validationIssues.some((issue) => issue.severity === 'error'), JSON.stringify(validationIssues));
+    assert.deepEqual([...outputPackage.masterParts].sort(), [...sourcePackage.masterParts].sort(), 'PPTX export retains the template master parts');
+    assert.equal(outputPackage.layoutNames.length, sourcePackage.layoutNames.length, 'PPTX export retains the template layouts');
+    assert.equal(outputPackage.themeAvailable, sourcePackage.themeAvailable, 'PPTX export retains the source theme');
     const reopened = await loadPresentation(pptx);
     const slides = getSlides(reopened);
+    const selectedResidue = forbiddenTextMatches(reopened, args.forbiddenOutputText, officeKitNode);
+    assert.deepEqual(selectedResidue, [], `selected PPTX contains forbidden source-specific text: ${selectedResidue.join(', ')}`);
     const nativeTextShapes = slides.flatMap((slide) => getSlideShapes(slide)).filter((shape) => hasShapeText(shape) && getShapeText(shape).trim());
     assert.ok(nativeTextShapes.length >= 6, `expected at least two native editable text shapes per slide; got ${nativeTextShapes.length}`);
     assert.ok(nativeTextShapes.every((shape) => getShapeKind(shape) === 'shape'));
     report.gates.exportAndReopen = 'passed';
-    report.export = { bytes: pptx.length, sha256: sha256(pptx), slides: slideCount, nativeTextShapes: nativeTextShapes.length, notesSlides: notesSlideCount, nativeOfficeStatus: exported.artifact.nativeOfficeStatus };
+    report.export = {
+      bytes: pptx.length, sha256: sha256(pptx), slides: slideCount,
+      nativeTextShapes: nativeTextShapes.length, notesSlides: notesSlideCount,
+      masters: outputPackage.masterParts.length, layouts: outputPackage.layoutNames.length,
+      themeAvailable: outputPackage.themeAvailable, nativeOfficeStatus: exported.artifact.nativeOfficeStatus,
+    };
     report.timingsMs.selectedExportAndReopen = Math.round(performance.now() - stageStartedAt);
 
     stageStartedAt = performance.now();
@@ -334,10 +372,18 @@ async function main() {
       assert.ok(!inspectedTrack.validationIssues.some((issue) => issue.severity === 'error'), `${mode} track package errors`);
       const reopenedTrack = await loadPresentation(trackPptx);
       assert.equal(getSlides(reopenedTrack).length, args.slideCount, `${mode} track should reopen`);
+      const residue = forbiddenTextMatches(reopenedTrack, args.forbiddenOutputText, officeKitNode);
+      assert.deepEqual(residue, [], `${mode} track contains forbidden source-specific text: ${residue.join(', ')}`);
       trackExports.push({ mode, bytes: trackPptx.length, sha256: sha256(trackPptx), slides: inspectedTrack.slideCount, reopened: true });
     }
     report.gates.trackExportsAndReopen = 'passed';
     report.trackExports = trackExports;
+    report.sourceResidueCheck = {
+      status: args.forbiddenOutputText.length ? 'passed' : 'not-requested',
+      scannedPresentations: 4,
+      forbiddenTermCount: args.forbiddenOutputText.length,
+      forbiddenTermHashes: args.forbiddenOutputText.map((term) => sha256(term)),
+    };
     report.timingsMs.trackExportsAndReopen = Math.round(performance.now() - stageStartedAt);
 
     await closeDaemon(daemon);
@@ -352,7 +398,8 @@ async function main() {
     assert.equal(persistedPreview.status, 200);
     report.gates.generationReload = 'passed';
 
-    assert.equal(sha256(await readFile(templatePath)), sourceHashBefore, 'source template must remain byte-identical');
+    assert.equal(sha256(await readFile(templatePath)), templateHashBefore, 'source template must remain byte-identical');
+    if (sourcePath && report.source) assert.equal(sha256(await readFile(sourcePath)), report.source.sha256, 'optional source file must remain byte-identical');
     report.gates.sourceImmutable = 'passed';
     assert.equal(fake.state.inference.filter((item) => item.operation === 'template-semantic-profile').length, 1,
       'template profiling happens once during compile and remains cached after daemon reload');

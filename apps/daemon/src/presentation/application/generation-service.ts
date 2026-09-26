@@ -16,7 +16,14 @@ import type { PlanningResponse, PlanningService } from './planning-service.js';
 import { getTemplateCompilation, type TemplateCompilationResponse } from './template-compiler.js';
 import { compilePresentation, UnsupportedTemplateLayoutError, VARIANT_POLICIES, type CompiledPresentation, type CompiledSlide, type PresentationVariantId } from './slide-compilation.js';
 import { auditCompiledPresentation, type DeterministicAuditReport } from './deterministic-audit.js';
-import { applyVariantCompositionAssignment, assessVariantCompositionDistinctness } from './exemplar-slide-selector.js';
+import {
+  applyPersistedExemplarSelection,
+  applyVariantCompositionAssignment,
+  assessVariantCompositionDistinctness,
+  exemplarSelectionReference,
+  type ExemplarSelectionReference,
+  type VariantCompositionAssignment,
+} from './exemplar-slide-selector.js';
 import { renderPresentation } from '../adapters/pptx-renderer-factory.js';
 import { OfficeKitPreviewAdapter } from '../adapters/office-kit-preview-adapter.js';
 import { inspectOfficeKitPackage } from '../adapters/office-kit-package-inspector.js';
@@ -41,6 +48,12 @@ export interface GeneratedVariantState {
   layoutCandidateIndex: number;
   /** Persisted internal renderer choice; intentionally omitted from the public generation API. */
   nativeLayoutFallback: boolean;
+  /** Exact internal composition assignment; omitted from the public generation API. */
+  compositionChoice: {
+    kind: VariantCompositionAssignment['compositionKind'];
+    signature: string;
+    exemplar: ExemplarSelectionReference | null;
+  } | null;
   previewRef: string | null;
   layoutIssueCount: number;
   visualSlotStatus: VisualSlotStatus;
@@ -101,7 +114,7 @@ export interface PresentationGenerationState {
   updatedAt: string;
 }
 
-export interface PublicGeneratedVariant extends Omit<GeneratedVariantState, 'previewRef' | 'nativeLayoutFallback'> {
+export interface PublicGeneratedVariant extends Omit<GeneratedVariantState, 'previewRef' | 'nativeLayoutFallback' | 'compositionChoice'> {
   previewUrl: string | null;
 }
 export interface PublicGeneratedSlidePack extends Omit<GeneratedSlidePack, 'variants'> {
@@ -169,6 +182,19 @@ function isSafeFailure(value: unknown): value is { code: string; message: string
     && typeof value.message === 'string' && value.message.length > 0 && value.message.length <= 1000;
 }
 
+function isSafeCompositionChoice(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (!isRecord(value) || !['exemplar-backed', 'layout-placeholder-backed', 'safe-generated-fallback'].includes(String(value.kind))
+      || typeof value.signature !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.signature)) return false;
+  if (value.exemplar === null) return value.kind !== 'exemplar-backed';
+  return value.kind === 'exemplar-backed' && isRecord(value.exemplar)
+    && typeof value.exemplar.sourcePart === 'string'
+    && /^\/?ppt\/slides\/[^/]+\.xml$/.test(value.exemplar.sourcePart)
+    && !value.exemplar.sourcePart.includes('..')
+    && Number.isSafeInteger(value.exemplar.sourceSlideIndex) && Number(value.exemplar.sourceSlideIndex) >= 0
+    && value.exemplar.projectedCompositionSignature === value.signature;
+}
+
 function sha256(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -190,7 +216,8 @@ function sourceContextFingerprint(input: {
 
 function emptyVariant(): GeneratedVariantState {
   return {
-    status: 'pending', version: 0, layoutCandidateIndex: 0, nativeLayoutFallback: false, previewRef: null, layoutIssueCount: 0,
+    status: 'pending', version: 0, layoutCandidateIndex: 0, nativeLayoutFallback: false, compositionChoice: null,
+    previewRef: null, layoutIssueCount: 0,
     visualSlotStatus: 'unresolved', audit: null, renderCheck: null,
   };
 }
@@ -237,6 +264,7 @@ function validateStoredGeneration(value: unknown): PresentationGenerationState {
           || !Number.isSafeInteger(generated.version) || generated.version < 0
           || !Number.isSafeInteger(generated.layoutCandidateIndex) || generated.layoutCandidateIndex < 0
           || !(generated.nativeLayoutFallback === undefined || typeof generated.nativeLayoutFallback === 'boolean')
+          || !isSafeCompositionChoice(generated.compositionChoice)
           || !(generated.previewRef === null || typeof generated.previewRef === 'string'
             && generated.previewRef.startsWith(`${state.generationId}/slides/`)
             && !generated.previewRef.includes('..') && !path.isAbsolute(generated.previewRef))
@@ -329,7 +357,7 @@ function publicSnapshot(stateValue: PresentationGenerationState): PublicPresenta
     ...pack,
     selectedVariant: selectedVariant(state, pack.slideId),
     variants: Object.fromEntries(VARIANT_IDS.map((variant) => {
-      const { previewRef, nativeLayoutFallback: _nativeLayoutFallback, ...metadata } = pack.variants[variant];
+      const { previewRef, nativeLayoutFallback: _nativeLayoutFallback, compositionChoice: _compositionChoice, ...metadata } = pack.variants[variant];
       return [variant, {
         ...metadata,
         previewUrl: previewRef ? `/api/projects/${encodeURIComponent(state.projectId)}/generation/previews/${encodeURIComponent(pack.slideId)}/${variant}` : null,
@@ -739,7 +767,9 @@ export class PresentationGenerationService {
 
     const context = await this.context(projectId);
     this.assertSameContext(initial, context);
-    const tracks = this.applyPersistedRepairs(this.compileTracks(context), initial);
+    const tracks = this.applyPersistedCompositionChoices(
+      this.applyPersistedRepairs(this.compileTracks(context), initial), initial, context,
+    );
     const sourceSlideId = slideId;
     const presentation = variantsById(tracks, variant);
     const originalSlide = presentation.slides.find((slide) => slide.sourceDeckPlanSlideId === sourceSlideId);
@@ -759,6 +789,7 @@ export class PresentationGenerationService {
       selectedCandidateIndex: candidateIndex,
       nativeLayoutFallback: true,
     };
+    delete repairedSlide.exemplarSelection;
     const repairedPresentation = { ...presentation, slides: presentation.slides.map((slide) => slide.id === repairedSlide.id ? repairedSlide : slide) };
     const repairedAudit = auditForSlide(repairedPresentation, context.contentIR, context.templateIR, repairedSlide);
     if (repairedAudit.findings.some((item) => item.severity === 'error')) {
@@ -832,7 +863,9 @@ export class PresentationGenerationService {
   ): Promise<{ state: PublicPresentationGeneration; artifact: Omit<GeneratedExport, 'fileRef'> & { downloadUrl: string } }> {
     const context = await this.context(projectId);
     this.assertSameContext(initial, context);
-    const tracks = this.applyPersistedRepairs(this.compileTracks(context), initial);
+    const tracks = this.applyPersistedCompositionChoices(
+      this.applyPersistedRepairs(this.compileTracks(context), initial), initial, context,
+    );
     const selected = initial.slides.map((pack) => mode === 'selected' ? selectedVariant(initial, pack.slideId) : mode);
     const firstVariant = selected[0] ?? 'A';
     const base = variantsById(tracks, firstVariant);
@@ -865,6 +898,15 @@ export class PresentationGenerationService {
         outputPath: pptxOutput.absolute,
         contentRoot: path.join(this.options.projectsRoot, projectId),
       });
+      for (const [index, slide] of slides.entries()) {
+        const variant = selected[index] ?? firstVariant;
+        const choice = initial.slides[index]?.variants[variant]?.compositionChoice;
+        const projected = renderResult.projectedCompositions.find((item) => item.variantId === variant && item.slideId === slide.id);
+        if (choice && (!projected || projected.projectedCompositionSignature !== choice.signature)) {
+          throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_CHANGED',
+            'The saved slide composition no longer matches its qualified variant. Regenerate the slide before exporting.', 409);
+        }
+      }
       const pptxBytes = await readFile(pptxOutput.absolute);
       const inspected = await this.inspectPackage(pptxBytes);
       if (inspected.slideCount !== slides.length || inspected.validationIssues.some((issue) => issue.severity === 'error')) {
@@ -1018,7 +1060,7 @@ export class PresentationGenerationService {
         const assignedVariantSlides = variantSlides.map((slide) => {
           const assignment = compositionDistinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
           if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
-          return applyVariantCompositionAssignment(slide, assignment, context.templateIR);
+          return applyVariantCompositionAssignment(slide, assignment, context.templateIR, context.semanticProfile);
         });
         const audits = {} as Record<PresentationVariantId, DeterministicAuditReport>;
         for (const variant of VARIANT_IDS) {
@@ -1131,6 +1173,8 @@ export class PresentationGenerationService {
       if (rendered.slideCount !== 1 || rendered.validationStatus === 'failed' || rendered.reopenStatus === 'failed') {
         throw new PresentationGenerationError('RENDER_VALIDATION_FAILED', 'Renderer output did not pass its slide and validation checks.', 422);
       }
+      const projected = rendered.projectedCompositions.find((item) => item.variantId === variant && item.slideId === slide.id);
+      if (!projected) throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_MISSING', 'Renderer omitted the selected slide composition evidence.', 422);
       const bytes = await readFile(temp.absolute);
       const inspected = await this.inspectPackage(bytes);
       if (inspected.slideCount !== 1 || inspected.validationIssues.some((issue) => issue.severity === 'error')) {
@@ -1146,6 +1190,11 @@ export class PresentationGenerationService {
         previewRef,
         layoutCandidateIndex,
         nativeLayoutFallback: slide.nativeLayoutFallback === true,
+        compositionChoice: {
+          kind: slide.exemplarSelection ? 'exemplar-backed' : slide.nativeLayoutFallback ? 'layout-placeholder-backed' : 'safe-generated-fallback',
+          signature: projected.projectedCompositionSignature,
+          exemplar: exemplarSelectionReference(slide.exemplarSelection),
+        },
         layoutIssueCount: preview.textLayoutIssues.length,
         visualSlotStatus: slide.visualization.type === 'none' ? 'not-applicable' : unresolved ? 'unresolved' : 'ready',
         audit: auditForSlide(sourcePresentation, context.contentIR, context.templateIR, slide),
@@ -1195,6 +1244,17 @@ export class PresentationGenerationService {
       if (rendered.slideCount !== VARIANT_IDS.length || rendered.validationStatus === 'failed' || rendered.reopenStatus === 'failed') {
         throw new PresentationGenerationError('RENDER_VALIDATION_FAILED', 'Renderer output did not pass its A/B/C slide and validation checks.', 422);
       }
+      const renderedSignatures = new Set(rendered.projectedCompositions.map((item) => item.projectedCompositionSignature));
+      if (rendered.projectedCompositions.length !== VARIANT_IDS.length || renderedSignatures.size !== VARIANT_IDS.length) {
+        throw new PresentationGenerationError('VARIANTS_NOT_DISTINCT', 'Renderer output did not preserve three distinct qualified A/B/C compositions.', 422);
+      }
+      for (const slide of slides) {
+        const assignment = rendered.projectedCompositions.find((item) => item.variantId === slide.variantId && item.slideId === slide.id);
+        if (!assignment || slide.exemplarSelection
+            && assignment.projectedCompositionSignature !== slide.exemplarSelection.projectedCompositionSignature) {
+          throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_CHANGED', 'Renderer did not preserve the exact qualified composition assignment.', 422);
+        }
+      }
       const bytes = await readFile(temp.absolute);
       const inspected = await this.inspectPackage(bytes);
       if (inspected.slideCount !== VARIANT_IDS.length || inspected.validationIssues.some((issue) => issue.severity === 'error')) {
@@ -1203,6 +1263,8 @@ export class PresentationGenerationService {
       const results = {} as Record<PresentationVariantId, Omit<GeneratedVariantState, 'status' | 'version'>>;
       for (const [index, variant] of VARIANT_IDS.entries()) {
         const slide = slides[index]!;
+        const projected = rendered.projectedCompositions.find((item) => item.variantId === variant && item.slideId === slide.id);
+        if (!projected) throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_MISSING', `Renderer omitted the ${variant} composition evidence.`, 422);
         const previewRef = `${state.generationId}/slides/${String(pack.index).padStart(2, '0')}/${variant}-v1.png`;
         const previewPath = await this.generatedFile(projectId, previewRef.split('/'), true);
         const preview = await this.preview.preview(bytes, index, 1280);
@@ -1216,6 +1278,11 @@ export class PresentationGenerationService {
           previewRef,
           layoutCandidateIndex: slide.selectedCandidateIndex,
           nativeLayoutFallback: slide.nativeLayoutFallback === true,
+          compositionChoice: {
+            kind: slide.exemplarSelection ? 'exemplar-backed' : slide.nativeLayoutFallback ? 'layout-placeholder-backed' : 'safe-generated-fallback',
+            signature: projected.projectedCompositionSignature,
+            exemplar: exemplarSelectionReference(slide.exemplarSelection),
+          },
           layoutIssueCount: preview.textLayoutIssues.length,
           visualSlotStatus: slide.visualization.type === 'none' ? 'not-applicable' : unresolved ? 'unresolved' : 'ready',
           audit: audits[variant],
@@ -1271,13 +1338,48 @@ export class PresentationGenerationService {
           placements: { title: candidate.titleBox, body: candidate.bodyBox, visual: candidate.visualBox },
           selectedCandidateIndex: candidateIndex,
         };
-        return generated?.nativeLayoutFallback === true || candidateIndex !== slide.selectedCandidateIndex
-          ? { ...selected, nativeLayoutFallback: true as const }
-          : selected;
+        if (generated?.nativeLayoutFallback === true || candidateIndex !== slide.selectedCandidateIndex) {
+          const { exemplarSelection: _exemplarSelection, ...withoutExemplar } = selected;
+          return { ...withoutExemplar, nativeLayoutFallback: true as const };
+        }
+        return selected;
       });
       repaired.set(variant, { ...base, slides });
     }
     return repaired;
+  }
+
+  private applyPersistedCompositionChoices(
+    tracks: Map<PresentationVariantId, CompiledPresentation>,
+    state: PresentationGenerationState,
+    context: GenerationContext,
+  ): Map<PresentationVariantId, CompiledPresentation> {
+    const restored = new Map<PresentationVariantId, CompiledPresentation>();
+    for (const variant of VARIANT_IDS) {
+      const presentation = variantsById(tracks, variant);
+      const slides = presentation.slides.map((slide) => {
+        const pack = state.slides.find((item) => item.slideId === slide.sourceDeckPlanSlideId);
+        const choice = pack?.variants[variant].compositionChoice;
+        if (!choice) return slide; // Compatibility with generation rows created before exact assignments were persisted.
+        if (choice.kind === 'exemplar-backed') {
+          if (!choice.exemplar || slide.nativeLayoutFallback) {
+            throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_INVALID', 'The saved exemplar assignment is incomplete. Regenerate the slide before exporting.', 409);
+          }
+          try {
+            return applyPersistedExemplarSelection(slide, choice.exemplar, context.templateIR, context.semanticProfile);
+          } catch (error) {
+            throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_STALE', 'The saved exemplar no longer passes projection safety. Regenerate the slide before exporting.', 409, { cause: error });
+          }
+        }
+        if (choice.kind === 'layout-placeholder-backed' && !slide.nativeLayoutFallback) {
+          throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_INVALID', 'The saved native layout assignment is incomplete. Regenerate the slide before exporting.', 409);
+        }
+        const { exemplarSelection: _exemplarSelection, ...withoutExemplar } = slide;
+        return withoutExemplar;
+      });
+      restored.set(variant, { ...presentation, slides });
+    }
+    return restored;
   }
 
   private assertSameContext(state: PresentationGenerationState, context: GenerationContext): void {

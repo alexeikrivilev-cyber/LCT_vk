@@ -925,9 +925,10 @@ test('semantic projection assigns complete body blocks across two native regions
   assert.equal(selection.slots.bodySlots.length, 2);
   assert.equal(selection.bodyContentRanges.length, 2);
   assert.equal(selection.bodyContentRanges[0]?.start, 0);
-  assert.equal(selection.bodyContentRanges.at(-1)?.end, slide.body.length);
-  const expectedBlocks = selection.bodyContentRanges.map((range) => slide.body.slice(range.start, range.end).join('\n'));
-  assert.equal(expectedBlocks.join('\n'), slide.body.join('\n'), 'region assignment preserves every source-backed body block in order');
+  assert.equal(selection.bodyContentRanges.at(-1)?.end, selection.bodySegmentation.fragmentCount);
+  const expectedBlocks = selection.bodyContentSegments;
+  assert.equal(expectedBlocks.join(''), slide.body.join('\n'), 'region assignment preserves every source-backed body byte in order');
+  assert.equal(selection.bodySegmentation.sourceTextSha256, createHash('sha256').update(slide.body.join('\n')).digest('hex'));
 
   const outputPath = path.join(root, 'output', 'multi-region.pptx');
   await mkdir(path.dirname(outputPath), { recursive: true });
@@ -954,6 +955,24 @@ test('semantic projection assigns complete body blocks across two native regions
     ?.elements.find((element) => element.id === unusedMappedBodyId);
   assert.ok(unusedMappedBody?.nativeId && oneBlockAssessment.selection.clearElementNativeIds.includes(unusedMappedBody.nativeId),
     'a validated donor body region with no assigned source block is cleared as template sample text');
+
+  const multiSentenceBlock = {
+    ...oneBlockSlide,
+    body: ['The first supported point is retained. The second supported point stays in order.'],
+  };
+  const segmentedAssessment = assessExemplarSelection(multiSentenceBlock, template.templateIR, semanticProfile);
+  assert.ok(segmentedAssessment.selection, JSON.stringify(segmentedAssessment.candidateDiagnostics));
+  assert.equal(segmentedAssessment.selection.slots.bodySlots.length, 2,
+    'one worker body block can use two explicitly mapped native card regions when sentence boundaries fit');
+  assert.equal(segmentedAssessment.selection.bodyContentSegments.join(''), multiSentenceBlock.body.join('\n'));
+  assert.equal(segmentedAssessment.selection.bodySegmentation.method, 'sentences');
+  const emptyBodyAssessment = assessExemplarSelection({ ...oneBlockSlide, body: [] }, template.templateIR, semanticProfile);
+  const mappedSourcePart = template.templateIR.slides.find((source) => source.index === segmentedAssessment.selection.sourceSlideIndex)?.sourcePart;
+  const emptyMappedSignatures = emptyBodyAssessment.safeSelections
+    .filter((selection) => selection.sourcePart === mappedSourcePart)
+    .map((selection) => selection.projectedCompositionSignature);
+  assert.equal(new Set(emptyMappedSignatures).size, 1,
+    'assigning empty body regions cannot manufacture multiple projected compositions from the same donor slide');
   const oneBlockPath = path.join(root, 'output', 'multi-region-one-block.pptx');
   const oneBlockPresentation = { ...compiled, id: `${compiled.id}_one_body_block`, slides: [oneBlockSlide] };
   const oneBlockRender = await new OfficeKitPptxRenderer().render({
@@ -990,14 +1009,24 @@ test('two exemplar tracks and one native-placeholder track qualify only when the
     slides, template.templateIR, 'office-kit', semanticProfile);
   assert.equal(distinctness.distinct, true, JSON.stringify(distinctness));
   assert.equal(new Set(distinctness.signatures).size, 3);
+  const assessments = slides.map((slide) => assessExemplarSelectionRaw(slide, template.templateIR, semanticProfile));
+  assert.ok(assessments.some((assessment) => assessment.safeSelections.length > 1),
+    'the joint resolver receives all qualified distinct exemplar options, not only the per-track preferred rank');
+  assert.ok(distinctness.candidateCounts.safeExemplarOptions >= 2);
+  assert.ok(distinctness.candidateCounts.distinctSafeSignatures >= 3);
   const assignedSlides = slides.map((slide) => {
     const assignment = distinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
     assert.ok(assignment);
-    return applyVariantCompositionAssignment(slide, assignment, template.templateIR);
+    return applyVariantCompositionAssignment(slide, assignment, template.templateIR, semanticProfile);
   });
   assert.deepEqual(distinctness.assignments.map((assignment) => assignment.compositionKind), [
     'exemplar-backed', 'exemplar-backed', 'layout-placeholder-backed',
   ]);
+  for (const assigned of assignedSlides.slice(0, 2)) {
+    const exact = distinctness.assignments.find((assignment) => assignment.variantId === assigned.variantId)?.exemplarSelection;
+    assert.equal(assigned.exemplarSelection?.projectedCompositionSignature, exact?.projectedCompositionSignature,
+      'the compiled track retains the exact jointly assigned donor for renderer revalidation');
+  }
   const nativeTrack = assignedSlides[2];
   assert.ok(assessExemplarSelectionRaw(assignedSlides[0], template.templateIR, semanticProfile).selection);
   assert.ok(assessExemplarSelectionRaw(assignedSlides[1], template.templateIR, semanticProfile).selection);

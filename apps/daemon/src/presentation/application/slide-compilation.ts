@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { validateContentIR, type ContentIR, type ContentUnit } from '../domain/content-ir.js';
 import { validateDeckPlan, type DeckPlan, type DeckPlanSlide, type SemanticVisualType } from '../domain/deck-plan.js';
 import { validateTemplateIR, type TemplateElement, type TemplateGeometry, type TemplateIR, type TemplateLayout, type TemplateSlide } from '../domain/template-ir.js';
+import type { ExemplarSlideSelection } from './exemplar-slide-selector.js';
 
 /** Internal pre-TZ representation. Replaceable until the final product specification fixes this boundary. */
 export type PresentationVariantId = 'A' | 'B' | 'C';
@@ -101,6 +102,8 @@ export interface CompiledSlide {
   selectedCandidateIndex: number;
   /** Runtime-only selector choice. Set only after A/B/C qualification proves a safe native layout fallback. */
   nativeLayoutFallback?: true;
+  /** Runtime-only exact donor chosen by the joint A/B/C resolver; revalidated by the renderer. */
+  exemplarSelection?: ExemplarSlideSelection;
 }
 
 export interface CompiledChartData {

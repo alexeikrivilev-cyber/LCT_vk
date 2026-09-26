@@ -35,4 +35,5 @@
 - [Текущий readiness status](./READY_FOR_QWEN.md)
 - [Финальная оценка release acceptance](../RELEASE_READINESS.md), [release notes](../RELEASE_NOTES.md)
 - [7-минутный сценарий демонстрации](./DEMO_RUNBOOK.md), [план выступления](./PITCH_OUTLINE.md)
-- [Активный план release acceptance](./plans/active/final-release-acceptance.md)
+- [Активный план P0 core generation fix](./plans/active/core-generation-fix.md)
+- [Superseded release acceptance plan](./plans/active/final-release-acceptance.md)

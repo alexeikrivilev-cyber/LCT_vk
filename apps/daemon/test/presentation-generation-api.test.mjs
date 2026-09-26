@@ -116,11 +116,6 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
   await upload(server, projectId, sourceFile, sourceBytes);
 
   const projectsRoot = path.join(dataDir, 'projects');
-  const contentIR = await compileContentIR(projectsRoot, projectId, [sourceFile]);
-  const [workerPrompt, supervisorPrompt] = await Promise.all([
-    readFile(path.join(repoRoot, 'apps/daemon/prompts/worker-deck-plan.v2.md'), 'utf8'),
-    readFile(path.join(repoRoot, 'apps/daemon/prompts/supervisor-plan-review.v1.md'), 'utf8'),
-  ]);
   const brief = {
     audience: 'Executive team',
     purpose: 'Choose a retention investment',
@@ -128,6 +123,11 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
     preferences: ['Use supplied evidence'],
     requestedSlideCount: 3,
   };
+  const contentIR = await compileContentIR(projectsRoot, projectId, [sourceFile], { task: brief.purpose });
+  const [workerPrompt, supervisorPrompt] = await Promise.all([
+    readFile(path.join(repoRoot, 'apps/daemon/prompts/worker-deck-plan.v2.md'), 'utf8'),
+    readFile(path.join(repoRoot, 'apps/daemon/prompts/supervisor-plan-review.v1.md'), 'utf8'),
+  ]);
   const fingerprint = planningInputFingerprint({
     templateIRHash: template.templateIR.hash,
     presentationDesignSystemHash: template.presentationDesignSystem.hash,
@@ -192,10 +192,12 @@ function gateRenderer(targetSlideId) {
   let blocked = false;
   const errors = [];
   const renderSlideCounts = [];
+  const renderAssignments = [];
   return {
     entered,
     errors,
     renderSlideCounts,
+    renderAssignments,
     release: () => release(),
     renderer: {
       id: 'office-kit',
@@ -206,7 +208,26 @@ function gateRenderer(targetSlideId) {
           enter();
           await gate;
         }
-        try { return await renderer.render(input); }
+        try {
+          const result = await renderer.render(input);
+          renderAssignments.push({
+            slides: input.compiledPresentation.slides.map((slide) => ({
+              planSlideId: slide.sourceDeckPlanSlideId,
+              variantId: slide.variantId,
+              layoutCandidateIndex: slide.selectedCandidateIndex,
+              exemplar: slide.exemplarSelection ? {
+                sourcePart: slide.exemplarSelection.sourcePart,
+                sourceSlideIndex: slide.exemplarSelection.sourceSlideIndex,
+                projectedCompositionSignature: slide.exemplarSelection.projectedCompositionSignature,
+              } : null,
+            })),
+            projectedCompositions: result.projectedCompositions.map((item) => ({
+              variantId: item.variantId,
+              projectedCompositionSignature: item.projectedCompositionSignature,
+            })),
+          });
+          return result;
+        }
         catch (error) { errors.push(error); throw error; }
       },
     },
@@ -356,6 +377,38 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     assert.equal(inspection.slideCount, 3);
     assert.equal(exportBody.artifact.format, 'pptx');
 
+    for (const variant of variants) {
+      const trackResponse = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: variant, format: 'pptx' }),
+      });
+      assert.equal(trackResponse.status, 201, await trackResponse.clone().text());
+      const trackExport = await json(trackResponse);
+      const trackDownload = await fetch(`${started.url}${trackExport.artifact.downloadUrl}`);
+      assert.equal(trackDownload.status, 200);
+      assert.equal((await inspectOfficeKitPackage(Buffer.from(await trackDownload.arrayBuffer()))).slideCount, 3);
+    }
+
+    const persistedStateDb = new Database(path.join(dataDir, 'app.sqlite'), { readonly: true });
+    const compositionStateRow = persistedStateDb.prepare('SELECT state_json FROM presentation_generations WHERE project_id = ?').get(projectId);
+    persistedStateDb.close();
+    const persistedCompositionState = JSON.parse(compositionStateRow.state_json);
+    for (const variant of variants) {
+      const exportedTrack = gate.renderAssignments.findLast((call) => call.slides.length === 3
+        && call.slides.every((slide) => slide.variantId === variant));
+      assert.ok(exportedTrack, `${variant} export must render the persisted track assignment`);
+      for (const [index, slide] of exportedTrack.slides.entries()) {
+        const expected = persistedCompositionState.slides[index].variants[variant];
+        assert.deepEqual(slide.exemplar, expected.compositionChoice.exemplar,
+          `${variant} export must keep the exact qualified exemplar for slide ${index + 1}`);
+        const projected = exportedTrack.projectedCompositions[index];
+        assert.equal(projected?.variantId, variant);
+        assert.equal(projected?.projectedCompositionSignature, expected.compositionChoice.signature,
+          `${variant} export must reopen with the persisted composition signature for slide ${index + 1}`);
+      }
+    }
+    const publicVariant = completed.slides[0].variants.A;
+    assert.equal(Object.hasOwn(publicVariant, 'compositionChoice'), false, 'internal donor identity must stay outside the public API');
+
     for (const format of ['pdf', 'html']) {
       const alternateExport = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'selected', format }),
@@ -395,13 +448,13 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     assert.equal(reloaded.slides[0].selectedVariant, 'B');
     assert.equal(reloaded.slides[1].lockedVariant, 'C');
     assert.equal(reloaded.exports[0].id, exportBody.artifact.id);
-    assert.deepEqual(reloaded.exports.map((item) => item.format), ['pptx', 'pdf', 'html']);
+    assert.deepEqual(reloaded.exports.map((item) => item.format), ['pptx', 'pptx', 'pptx', 'pptx', 'pdf', 'html']);
     const runManifestPath = path.join(dataDir, 'projects', projectId, '.generation', initial.generationId, 'run-manifest.json');
     const runManifest = JSON.parse(await readFile(runManifestPath, 'utf8'));
     assert.equal(runManifest.schemaVersion, 1);
     assert.equal(runManifest.run.generationId, initial.generationId);
     assert.equal(runManifest.inputHashes.template, reloaded.templateIRHash);
-    assert.equal(runManifest.exports.length, 3);
+    assert.equal(runManifest.exports.length, 6);
     assert.equal(runManifest.contentExcluded, true);
     assert.equal(runManifest.secretsExcluded, true);
     assert.doesNotMatch(JSON.stringify(runManifest), /Evidence points to a retention constraint/);

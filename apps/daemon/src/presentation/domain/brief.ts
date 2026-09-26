@@ -10,12 +10,15 @@ export interface Brief {
   expectedOutcome: string;
   preferences: string[];
   requestedSlideCount?: number;
+  /** Optional factual/context material supplied alongside the required task. */
+  context?: string;
 }
 
 const BRIEF_LIMITS = {
   audience: 500,
   purpose: 1_000,
   expectedOutcome: 1_000,
+  context: 16_000,
   preferencesCount: 12,
   preference: 200,
 } as const;
@@ -70,15 +73,18 @@ function canonicalJson(value: unknown): string {
 
 /** Validate and normalize untrusted Brief v1 input. Unknown keys are rejected. */
 export function validateBrief(value: unknown): Brief {
-  if (!exactDataRecord(value, ['audience', 'purpose', 'expectedOutcome', 'preferences', 'requestedSlideCount'],
-    ['audience', 'purpose', 'expectedOutcome', 'preferences'])) {
+  if (!exactDataRecord(value, ['audience', 'purpose', 'expectedOutcome', 'preferences', 'requestedSlideCount', 'context'],
+    ['purpose', 'preferences'])) {
     throw new TypeError('Invalid Brief v1 fields');
   }
 
-  if (!boundedText(value.audience, BRIEF_LIMITS.audience)
+  const optionalBriefText = (item: unknown, maxLength: number): item is string | undefined => item === undefined
+    || (typeof item === 'string' && (item === '' || boundedText(item, maxLength)));
+  if (!optionalBriefText(value.audience, BRIEF_LIMITS.audience)
     || !boundedText(value.purpose, BRIEF_LIMITS.purpose)
-    || !boundedText(value.expectedOutcome, BRIEF_LIMITS.expectedOutcome)) {
-    throw new TypeError('Brief audience, purpose, and expectedOutcome must be non-empty and within their limits');
+    || !optionalBriefText(value.expectedOutcome, BRIEF_LIMITS.expectedOutcome)
+    || !optionalBriefText(value.context, BRIEF_LIMITS.context)) {
+    throw new TypeError('Brief purpose must contain a bounded task; audience, expectedOutcome, and context are optional bounded text');
   }
   if (!isDenseArray(value.preferences) || value.preferences.length > BRIEF_LIMITS.preferencesCount
     || !value.preferences.every((item) => boundedText(item, BRIEF_LIMITS.preference))) {
@@ -91,11 +97,12 @@ export function validateBrief(value: unknown): Brief {
   }
 
   return {
-    audience: value.audience.trim(),
+    audience: (value.audience as string | undefined)?.trim() ?? '',
     purpose: value.purpose.trim(),
-    expectedOutcome: value.expectedOutcome.trim(),
+    expectedOutcome: (value.expectedOutcome as string | undefined)?.trim() ?? '',
     preferences: value.preferences.map((item) => item.trim()),
     ...('requestedSlideCount' in value ? { requestedSlideCount: value.requestedSlideCount as number } : {}),
+    ...('context' in value && typeof value.context === 'string' && value.context.trim() ? { context: value.context.trim() } : {}),
   };
 }
 

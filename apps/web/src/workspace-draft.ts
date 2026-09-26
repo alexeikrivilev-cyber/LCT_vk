@@ -4,6 +4,7 @@ export interface WorkspaceDraft {
   briefAudience: string;
   briefPurpose: string;
   briefExpectedOutcome: string;
+  briefContext?: string;
   briefPreferences: string;
   requestedSlideCount: string;
 }
@@ -21,7 +22,8 @@ export function parseWorkspaceDraft(value: unknown): WorkspaceDraft | null {
       || !Array.isArray(draft.selectedContentFiles) || draft.selectedContentFiles.length > 12
       || !draft.selectedContentFiles.every((item) => typeof item === 'string' && item.length <= 1024)
       || !['briefAudience', 'briefPurpose', 'briefExpectedOutcome', 'briefPreferences', 'requestedSlideCount']
-        .every((key) => typeof draft[key] === 'string' && (draft[key] as string).length <= 4000)) return null;
+        .every((key) => typeof draft[key] === 'string' && (draft[key] as string).length <= 4000)
+      || (draft.briefContext !== undefined && (typeof draft.briefContext !== 'string' || draft.briefContext.length > 16_000))) return null;
   return draft as unknown as WorkspaceDraft;
 }
 

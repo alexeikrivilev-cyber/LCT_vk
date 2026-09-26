@@ -16,9 +16,21 @@ function deterministicPlanningResponse(request) {
   }
   const evidence = JSON.parse(request.messages.at(-1).content);
   if (schemaName === 'deck_plan_draft_v1') {
-    const sections = [];
+    const allTextUnits = evidence.contentIR.units.filter((unit) => unit.kind !== 'media-reference'
+      && typeof unit.text === 'string' && unit.text.trim());
+    const taskSourceIds = new Set((evidence.contentIR.sources ?? [])
+      .filter((source) => source.kind === 'brief-task').map((source) => source.id));
+    const contextUnits = allTextUnits.filter((unit) => !taskSourceIds.has(unit.sourceId));
+    // A brief-task is instruction, not slide evidence. Use it as a grounded
+    // fallback only when no context/source material exists.
+    const textUnits = contextUnits.length ? contextUnits : allTextUnits;
+    const hasHeadings = textUnits.some((unit) => unit.kind === 'heading');
+    // Task/context-only planning has no uploaded Markdown heading structure.
+    // Keep each bounded ContentIR unit as its own evidence section so the local
+    // fake exercises the real no-file workflow without repeating one claim.
+    const sections = !hasHeadings ? textUnits.map((unit) => ({ heading: null, contentUnits: [unit] })) : [];
     let section = null;
-    for (const unit of evidence.contentIR.units) {
+    for (const unit of hasHeadings ? textUnits : []) {
       if (unit.kind === 'media-reference' || typeof unit.text !== 'string' || !unit.text.trim()) continue;
       if (unit.kind === 'heading') {
         if (section?.contentUnits.length) sections.push(section);

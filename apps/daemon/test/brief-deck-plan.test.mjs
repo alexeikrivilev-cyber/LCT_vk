@@ -69,10 +69,18 @@ test('Brief v1 normalizes bounded required text and hashes the canonical value',
   }));
   assert.match(briefHash(brief), /^[a-f0-9]{64}$/);
   assert.throws(() => validateBrief(validBrief({ private: true })), /Brief v1 fields/);
-  assert.throws(() => validateBrief(validBrief({ audience: '  ' })), /non-empty/);
+  assert.throws(() => validateBrief(validBrief({ audience: '  ' })), /optional bounded text/);
   assert.throws(() => validateBrief(validBrief({ requestedSlideCount: 31 })), /1 through 30/);
   assert.throws(() => validateBrief(validBrief({ preferences: Array(13).fill('x') })), /at most 12/);
   assert.throws(() => validateBrief(validBrief({ preferences: ['x'.repeat(201)] })), /at most 12/);
+});
+
+test('task-only Brief accepts an optional context without requiring audience, outcome, or source files', () => {
+  const brief = validateBrief({ purpose: 'Explain the requested workflow', preferences: [], context: 'Use only these stated constraints.' });
+  assert.deepEqual(brief, {
+    audience: '', purpose: 'Explain the requested workflow', expectedOutcome: '', preferences: [], context: 'Use only these stated constraints.',
+  });
+  assert.notEqual(briefHash(brief), briefHash({ purpose: 'Explain the requested workflow', preferences: [] }));
 });
 
 test('Brief validator rejects accessor properties without invoking them', () => {

@@ -1,5 +1,7 @@
 # План: финальная приёмка релиза
 
+> Этот план superseded P0-работой [`core-generation-fix.md`](./core-generation-fix.md). Старые результаты ниже — снимок до исправления WorkSpace/held-out; blocker «нет organizer content pack» снят уточнением организатора: отдельного пакета не будет, обязательна задача, остальные материалы optional. Актуальные продуктовые результаты и оставшиеся проверки записываются в P0-план и `RELEASE_READINESS.md`.
+
 ## Цель
 
 Проверить фактическое состояние LCT перед ограниченной live-квалификацией Qwen/VK; исправить только P0/P1, упаковать результаты и обновить документацию. Не запускать RunPod/GPU/внешний inference, не выполнять commit или push.
@@ -15,11 +17,11 @@
 ## Итог текущей проверки
 
 - Официальный PDF кейса из 7 страниц проверен; SHA-256 записан в `docs/compliance/CASE_REQUIREMENTS.md`; PDF отсутствует в Git, URL не придумывался.
-- Матрица шаблонов: 6/9 на синтетическом содержимом; варианты WorkSpace withheld; проверка AIOS как held-out шаблона останавливается до audit/export.
+- На момент этого исторического среза матрица была 6/9 и held-out AIOS остановился до audit/export; новый прогон и исправленный статус см. в P0-плане.
 - 12-слайдовый fake-only smoke функционально прошёл, но генерация/рендер/предпросмотр заняли 304.077 s, весь поток — 322.635 s; цель 300 s не достигнута.
 - Устранён показ английских deterministic audit-сообщений в UI через типизированный русский каталог; добавлен regression-тест для всех текущих audit rules.
 - Текущий статус релиза: BLOCKED. Live inference, RunPod, GPU, commit и push не выполнялись.
 
 ## Проверки и точный следующий шаг
 
-Финальные offline gates после UI regression fix завершились успешно: frozen install pnpm 10.33.2; 181/181 test; typecheck; build; boundary; craft lint; docs links (55 обязательных файлов); `git diff --check`. Все результаты записаны в `RELEASE_READINESS.md`; acceptance остаётся BLOCKED из-за 6/9 matrix, провала held-out до audit/export и превышения 300 s. Точный следующий шаг: получить organizer content pack/brief и закрыть эти offline blockers, затем провести ограниченную live qualification до 3 запросов.
+Полный финальный gate после P0-изменений ещё выполняется. Ранее зафиксированные 181 теста и проверки относятся к baseline-срезу выше. Organizer content pack получать не требуется; актуальный следующий шаг — финальные offline gates и запись их результата в P0-план и `RELEASE_READINESS.md`.

@@ -678,8 +678,9 @@ function compactContentIR(contentIR: ContentIR): unknown {
     schemaVersion: contentIR.schemaVersion,
     id: contentIR.id,
     hash: contentIR.hash,
-    sources: contentIR.sources.filter((source) => source.kind === 'text').map(({ id, sourcePath, originalName, mediaType, sha256, order, byteLength, warnings }) => ({
-      id, sourcePath, originalName, mediaType, sha256, order, byteLength, kind: 'text', warnings,
+    sources: contentIR.sources.filter((source) => source.kind === 'text' || source.kind === 'brief-task' || source.kind === 'brief-context')
+      .map(({ id, sourcePath, originalName, mediaType, sha256, order, byteLength, warnings, kind }) => ({
+      id, sourcePath, originalName, mediaType, sha256, order, byteLength, kind, warnings,
     })),
     units: contentIR.units.filter((unit) => unit.kind !== 'media-reference'),
     // Visual references are selectors only. The text model sees no image pixels
@@ -810,7 +811,10 @@ export class PlanningService {
 
     const savedInputs = state.inputs;
     try {
-      const currentContentIR = await compileContentIR(this.options.projectsRoot, projectId, savedInputs.contentFiles);
+      const currentContentIR = await compileContentIR(this.options.projectsRoot, projectId, savedInputs.contentFiles, {
+        task: savedInputs.brief.purpose,
+        ...(savedInputs.brief.context ? { context: savedInputs.brief.context } : {}),
+      });
       const promptAssets = await readPlanningPromptAssets(this.options.projectRoot);
       const currentFingerprint = planningInputFingerprint({
         templateIRHash: template.templateIR!.hash,
@@ -851,10 +855,10 @@ export class PlanningService {
     if (this.activeProjects.has(projectId)) throw new PlanningServiceError('PLANNING_ALREADY_RUNNING', 'A plan is already being generated for this project.', 409);
     if (this.activeProjects.size >= 2) throw new PlanningServiceError('PLANNING_CAPACITY', 'Planning capacity is full. Wait for another project to finish and retry.', 429);
     if (!isRecord(input) || !exactKeys(input as Record<string, unknown>, ['contentFiles', 'brief'])
-        || !Array.isArray(input.contentFiles) || input.contentFiles.length < 1 || input.contentFiles.length > MAX_SELECTED_FILES
+        || !Array.isArray(input.contentFiles) || input.contentFiles.length > MAX_SELECTED_FILES
         || input.contentFiles.some((file) => typeof file !== 'string')
         || new Set(input.contentFiles).size !== input.contentFiles.length) {
-      throw new PlanningServiceError('INVALID_PLANNING_INPUT', `Select between 1 and ${MAX_SELECTED_FILES} unique project source files.`, 400);
+      throw new PlanningServiceError('INVALID_PLANNING_INPUT', `Provide a task and no more than ${MAX_SELECTED_FILES} unique optional source files.`, 400);
     }
     let brief: Brief;
     try { brief = validateBrief(input.brief); }
@@ -884,7 +888,10 @@ export class PlanningService {
       if (template.status !== 'ready' || !template.templateIR || !template.presentationDesignSystem) {
         throw new PlanningServiceError('TEMPLATE_NOT_READY', 'Analyze the current project PPTX template before generating a plan.', 409);
       }
-      const contentIR = await compileContentIR(this.options.projectsRoot, projectId, input.contentFiles);
+      const contentIR = await compileContentIR(this.options.projectsRoot, projectId, input.contentFiles, {
+        task: brief.purpose,
+        ...(brief.context ? { context: brief.context } : {}),
+      });
       ensureActive();
       const promptAssets = await readPlanningPromptAssets(this.options.projectRoot);
       ensureActive();
@@ -1039,7 +1046,10 @@ export class PlanningService {
 
       const finalTemplate = await getTemplateCompilation(this.options.projectsRoot, projectId);
       ensureActive();
-      const finalContentIR = await compileContentIR(this.options.projectsRoot, projectId, input.contentFiles);
+      const finalContentIR = await compileContentIR(this.options.projectsRoot, projectId, input.contentFiles, {
+        task: brief.purpose,
+        ...(brief.context ? { context: brief.context } : {}),
+      });
       ensureActive();
       const finalPromptAssets = await readPlanningPromptAssets(this.options.projectRoot);
       ensureActive();

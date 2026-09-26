@@ -19,18 +19,34 @@ export function isUnknownTemplateCandidate(candidate, knownTemplates) {
     || path.basename(known.name).normalize('NFKC').toLocaleLowerCase('en-US') === candidateName);
 }
 
+export function matchesExpectedTemplateIdentity(candidate, expected) {
+  return candidate?.sha256 === expected?.sha256
+    && candidate?.name?.normalize('NFC') === expected?.name?.normalize('NFC');
+}
+
 function parseArgs(argv) {
-  const result = { knownTemplates: [], slideCount: 3 };
+  const result = { knownTemplates: [], forbiddenOutputText: [], slideCount: 3, task: 'Create an onboarding presentation explaining the objective, process, and expected outcome.' };
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
-    if (option === '--template' || option === '--source' || option === '--slides') {
+    if (option === '--assert-no-output-text') {
       const value = argv[++index];
-      if (!value) throw new TypeError(`${option} requires a value`);
+      if (value === undefined || value.trim() === '' || value.length > 256) throw new TypeError('--assert-no-output-text requires a non-empty phrase up to 256 characters');
+      result.forbiddenOutputText.push(value);
+      continue;
+    }
+    if (['--template', '--source', '--slides', '--task', '--context', '--expected-template-name', '--expected-template-sha256'].includes(option)) {
+      const value = argv[++index];
+      if (value === undefined || value === '') throw new TypeError(`${option} requires a value`);
       if (option === '--slides') {
         const slides = Number(value);
         if (!Number.isSafeInteger(slides) || ![3, 6, 7, 8].includes(slides)) throw new TypeError('--slides must be one of 3, 6, 7, or 8');
         result.slideCount = slides;
-      } else result[option === '--template' ? 'templatePath' : 'sourcePath'] = value;
+      } else if (option === '--template') result.templatePath = value;
+      else if (option === '--source') result.sourcePath = value;
+      else if (option === '--task') result.task = value;
+      else if (option === '--context') result.context = value;
+      else if (option === '--expected-template-name') result.expectedTemplateName = value;
+      else result.expectedTemplateSha256 = value;
     } else if (option === '--known-template') {
       const value = argv[++index];
       if (!value) throw new TypeError('--known-template requires a path');
@@ -39,8 +55,10 @@ function parseArgs(argv) {
       throw new TypeError(`Unknown option: ${option}`);
     }
   }
-  if (!result.templatePath || !result.sourcePath || result.knownTemplates.length !== 3) {
-    throw new TypeError('Usage: node --import tsx scripts/run-unknown-template-qualification.mjs --template <held-out.pptx> --source <synthetic.md> --known-template <known-1.pptx> --known-template <known-2.pptx> --known-template <known-3.pptx> [--slides 3|6|7|8]');
+  if (!result.templatePath || result.knownTemplates.length !== 3 || !result.task.trim()
+      || (result.expectedTemplateName === undefined) !== (result.expectedTemplateSha256 === undefined)
+      || (result.expectedTemplateSha256 !== undefined && !/^[a-f0-9]{64}$/.test(result.expectedTemplateSha256))) {
+    throw new TypeError('Usage: node --import tsx scripts/run-unknown-template-qualification.mjs --template <held-out.pptx> --known-template <known-1.pptx> --known-template <known-2.pptx> --known-template <known-3.pptx> [--task <task>] [--context <context>] [--source <optional source.md>] [--expected-template-name <exact filename> --expected-template-sha256 <64-char hash>] [--slides 3|6|7|8]');
   }
   return result;
 }
@@ -66,6 +84,7 @@ export function isCompleteUnknownTemplateSmoke(report) {
     && report.fakeInferenceCallCount === 3
     && Array.isArray(report.fakeInferenceRequests)
     && report.fakeInferenceRequests.map((request) => request.operation).join(',') === 'template-semantic-profile,deck-plan,plan-review'
+    && (Number(report?.sourceResidueCheck?.forbiddenTermCount ?? 0) === 0 || report.sourceResidueCheck.status === 'passed')
     && Array.isArray(tracks) && tracks.length === 3
     && new Set(tracks.map((track) => track.mode)).size === 3
     && tracks.every((track) => ['A', 'B', 'C'].includes(track.mode) && track.reopened === true);
@@ -81,19 +100,26 @@ export async function runUnknownTemplateQualification(args) {
   const knownTemplates = await Promise.all(args.knownTemplates.map(describePptx));
   if (new Set(knownTemplates.map((item) => item.sha256)).size !== 3) throw new TypeError('Known template references must be three distinct PPTX files');
   const isUnknown = isUnknownTemplateCandidate(candidate, knownTemplates);
+  const expectedIdentityMatches = !args.expectedTemplateName || matchesExpectedTemplateIdentity(candidate, {
+    name: args.expectedTemplateName,
+    sha256: args.expectedTemplateSha256,
+  });
   const qualificationId = `unknown-template-${new Date().toISOString().replaceAll(':', '').replaceAll('.', '-')}-${randomUUID().slice(0, 8)}`;
   const outputDir = path.join(repoRoot, '.lct', 'unknown-template-qualification', qualificationId);
   await mkdir(outputDir, { recursive: true });
 
   let smokeReport = null;
   let smokeFailure = null;
-  if (isUnknown) {
+  if (isUnknown && expectedIdentityMatches) {
     const smokeReportPath = path.join(outputDir, 'product-smoke-report.json');
     const child = spawnSync(process.execPath, [
       '--import', 'tsx', smokeScript,
       '--template', candidate.filePath,
-      '--source', args.sourcePath,
+      '--task', args.task,
       '--slides', String(args.slideCount),
+      ...(args.context ? ['--context', args.context] : []),
+      ...(args.sourcePath ? ['--source', args.sourcePath] : []),
+      ...args.forbiddenOutputText.flatMap((phrase) => ['--assert-no-output-text', phrase]),
     ], {
       cwd: repoRoot, encoding: 'utf8', timeout: 600_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true,
       env: { ...process.env, LCT_SMOKE_RESULT_FILE: smokeReportPath },
@@ -110,6 +136,8 @@ export async function runUnknownTemplateQualification(args) {
         : errorCode ? `Product smoke stopped at a failing product gate: ${errorCode}`
           : `Product smoke failed with exit status ${child.status ?? 'unknown'}`;
     }
+  } else if (!expectedIdentityMatches) {
+    smokeFailure = 'Candidate template does not match the exact expected filename and SHA-256';
   } else {
     smokeFailure = 'Candidate template name or SHA-256 matches one of the three known production references';
   }
@@ -121,7 +149,7 @@ export async function runUnknownTemplateQualification(args) {
     gate: 'UNKNOWN_TEMPLATE',
     status: passed ? 'PASS' : 'FAIL',
     inference: { mode: 'local-fake-semantic', requests: fakeRequestCount, external: false },
-    candidate: { name: candidate.name, sha256: candidate.sha256, slideCount: args.slideCount },
+    candidate: { name: candidate.name, sha256: candidate.sha256, slideCount: args.slideCount, expectedIdentityMatches },
     knownTemplateReferences: knownTemplates.map(({ name, sha256: hash }) => ({ name, sha256: hash })),
     flow: {
       analyzeAndProfile: smokeReport?.gates?.template ?? (isUnknown ? 'not-run' : 'blocked-known-template'),
@@ -130,6 +158,7 @@ export async function runUnknownTemplateQualification(args) {
       audit: smokeReport?.gates?.audit ?? 'not-run',
       exportAndReopen: smokeReport?.gates?.trackExportsAndReopen ?? 'not-run',
     },
+    sourceResidueCheck: smokeReport?.sourceResidueCheck ?? { status: 'not-requested', forbiddenTermCount: 0 },
     productSmokeRunId: smokeReport?.runDir ? path.basename(smokeReport.runDir) : null,
     failure: smokeFailure,
     artifactDir: path.relative(repoRoot, outputDir).replaceAll('\\', '/'),

@@ -4,7 +4,7 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
-  MAX_CONTENT_SOURCES,
+  MAX_SELECTED_CONTENT_FILES,
   MAX_CONTENT_SOURCE_BYTES,
   MAX_CONTENT_TEXT_BYTES,
   MAX_CONTENT_TOTAL_BYTES,
@@ -36,6 +36,13 @@ export type ContentCompilerErrorCode =
   | 'CONTENT_UNIT_LIMIT_EXCEEDED'
   | 'SOURCE_CHANGED_DURING_COMPILE'
   | 'CONTENT_READ_FAILED';
+
+export interface ContentIRIntent {
+  /** Required user task. It is retained as intent provenance, not asserted as independent factual evidence. */
+  task: string;
+  /** Optional user context. Source files remain additive to this context. */
+  context?: string;
+}
 
 export class ContentCompilerError extends Error {
   readonly code: ContentCompilerErrorCode;
@@ -502,9 +509,15 @@ export async function compileContentIR(
   projectsRoot: string,
   projectId: string,
   filePaths: readonly string[],
+  intent?: ContentIRIntent,
 ): Promise<ContentIR> {
-  if (!Array.isArray(filePaths) || filePaths.length > MAX_CONTENT_SOURCES) {
+  if (!Array.isArray(filePaths) || filePaths.length > MAX_SELECTED_CONTENT_FILES) {
     throw new ContentCompilerError('INVALID_CONTENT_SELECTION', 'Select no more than 12 evidence files.', 413);
+  }
+  if (intent !== undefined && (typeof intent !== 'object' || intent === null
+      || typeof intent.task !== 'string' || !intent.task.trim() || Array.from(intent.task).length > 1_000
+      || (intent.context !== undefined && (typeof intent.context !== 'string' || Array.from(intent.context).length > 16_000)))) {
+    throw new ContentCompilerError('INVALID_CONTENT_SELECTION', 'Planning intent is missing or exceeds its text limits.', 400);
   }
 
   const selected = await resolveSources(projectsRoot, projectId, filePaths);
@@ -588,6 +601,32 @@ export async function compileContentIR(
     for (const draft of parsed) {
       const withGlobalOrder = { ...draft, order: unitDrafts.length };
       unitDrafts.push(withGlobalOrder);
+    }
+  }
+
+  if (intent) {
+    const intentSources = [
+      { kind: 'brief-task' as const, sourcePath: '__lct_input__/task.md', text: intent.task.trim() },
+      ...(intent.context?.trim() ? [{ kind: 'brief-context' as const, sourcePath: '__lct_input__/context.md', text: intent.context.trim() }] : []),
+    ];
+    for (const input of intentSources) {
+      const bytes = Buffer.from(input.text, 'utf8');
+      totalReadBytes += bytes.byteLength;
+      totalTextBytes += bytes.byteLength;
+      if (totalReadBytes > MAX_CONTENT_TOTAL_BYTES) {
+        throw new ContentCompilerError('CONTENT_SELECTION_TOO_LARGE', 'Planning sources exceed the 32 MiB total limit.', 413);
+      }
+      if (totalTextBytes > MAX_CONTENT_TEXT_BYTES) {
+        throw new ContentCompilerError('CONTENT_TEXT_TOO_LARGE', 'Extracted textual evidence exceeds the 256 KiB limit.', 413);
+      }
+      const sourceOrder = sources.length;
+      const source = createSource(input.sourcePath, sourceOrder, bytes, input.kind, input.text, []);
+      const parsed = parseTextUnits(source.id, input.text, contentByteOffsets(input.text), true);
+      if (unitDrafts.length + parsed.length > MAX_CONTENT_UNITS) {
+        throw new ContentCompilerError('CONTENT_UNIT_LIMIT_EXCEEDED', 'Extracted evidence exceeds the 4096 unit limit.', 413);
+      }
+      sources.push(source);
+      for (const draft of parsed) unitDrafts.push({ ...draft, order: unitDrafts.length });
     }
   }
 
