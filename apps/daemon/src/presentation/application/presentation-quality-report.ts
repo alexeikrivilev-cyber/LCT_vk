@@ -3,6 +3,7 @@ import type { TemplateIR } from '../domain/template-ir.js';
 import type { PptxRenderResult } from './pptx-backend-port.js';
 import type { DeterministicAuditReport } from './deterministic-audit.js';
 import type { CompiledPresentation, CompiledSlide, PlacementBox, PresentationVariantId } from './slide-compilation.js';
+import { assessDeckCompositionDistinctness } from './deck-level-review.js';
 
 export const PRESENTATION_QUALITY_CATEGORIES = [
   'hierarchy',
@@ -297,15 +298,26 @@ export function buildPresentationQualityReport(input: BuildPresentationQualityRe
 
   const signatures = input.composition?.signaturesByVariant;
   if (signatures) {
-    const counts = Math.min(...['A', 'B', 'C'].map((variant) => signatures[variant as PresentationVariantId]?.length ?? 0));
-    for (let slideIndex = 0; slideIndex < counts; slideIndex += 1) {
-      const values = ['A', 'B', 'C'].map((variant) => signatures[variant as PresentationVariantId]![slideIndex]);
-      if (new Set(values).size !== 3) add({ category: 'variant-distinctness', severity: 'error', slideId: input.presentation.slides[slideIndex]?.id ?? null,
-        ruleId: 'variant-distinctness.track-signature-collision', message: 'A/B/C tracks do not have three distinct projected composition signatures for this slide.',
-        evidence: { plannedSlideIndex: slideIndex + 1, uniqueCompositionCount: new Set(values).size }, confidence: 'high' });
-    }
-    if (!counts) add({ category: 'variant-distinctness', severity: 'info', slideId: null, ruleId: 'variant-distinctness.no-composition-evidence',
-      message: 'No complete A/B/C composition signature set was supplied.', evidence: {}, confidence: 'unknown' });
+    const variants = ['A', 'B', 'C'] as const;
+    const complete = variants.every((variant) => signatures[variant]?.length === input.presentation.slides.length
+      && signatures[variant]!.every((signature) => typeof signature === 'string' && signature.length > 0));
+    if (complete) {
+      const deckDistinctness = assessDeckCompositionDistinctness({ A: signatures.A!, B: signatures.B!, C: signatures.C! });
+      add({ category: 'variant-distinctness', severity: deckDistinctness.distinct ? 'info' : 'error', slideId: null,
+        ruleId: deckDistinctness.distinct ? 'variant-distinctness.deck-signatures-distinct' : 'variant-distinctness.deck-signature-collision',
+        message: deckDistinctness.distinct
+          ? 'A/B/C have pairwise distinct ordered whole-deck projected composition signatures.'
+          : 'At least two tracks have the same ordered whole-deck projected composition signature.',
+        evidence: {
+          deckSignatureA: deckDistinctness.deckSignatures.A,
+          deckSignatureB: deckDistinctness.deckSignatures.B,
+          deckSignatureC: deckDistinctness.deckSignatures.C,
+          slidesDifferAB: deckDistinctness.differingSlideCounts.AB,
+          slidesDifferAC: deckDistinctness.differingSlideCounts.AC,
+          slidesDifferBC: deckDistinctness.differingSlideCounts.BC,
+        }, confidence: 'high' });
+    } else add({ category: 'variant-distinctness', severity: 'info', slideId: null, ruleId: 'variant-distinctness.no-composition-evidence',
+      message: 'No complete A/B/C whole-deck composition signature set was supplied.', evidence: {}, confidence: 'unknown' });
   } else if (allSlides.length < 3) {
     add({ category: 'variant-distinctness', severity: 'info', slideId: null, ruleId: 'variant-distinctness.tracks-not-supplied',
       message: 'A/B/C track signatures were not supplied for this report.', evidence: {}, confidence: 'unknown' });

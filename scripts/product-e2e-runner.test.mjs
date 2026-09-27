@@ -6,7 +6,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
-import { assertQualificationPptxBackend, createRequestBudgetAdapter, parseArgs, runCli, runProductE2E } from './run-product-e2e.mjs';
+import { assertQualificationPptxBackend, createRequestBudgetAdapter, parseArgs, runCli, runProductE2E,
+  validateQualificationSemanticOperationAccounting } from './run-product-e2e.mjs';
 import { DEFAULT_PPTX_BACKEND, QUALIFICATION_PPTX_BACKEND, parsePptxBackend } from '../apps/daemon/src/presentation/application/pptx-backend-port.ts';
 import { SemanticInferenceError } from '../apps/daemon/src/presentation/application/semantic-inference-port.ts';
 
@@ -62,7 +63,7 @@ async function makeTemplate(filePath, { slideCount = 3 } = {}) {
 
 function workflowOptions(templatePath, outputDir, slides, task, enableTemplateProfiler = true) {
   return { mode: 'fake', templatePath, task, context: '', sources: [], slides, providerLabel: 'local-test', outputDir,
-    enableTemplateProfiler, maxSemanticRequests: enableTemplateProfiler ? 19 : 3, dryRun: false, preflightOnly: false };
+    enableTemplateProfiler, maxSemanticRequests: enableTemplateProfiler ? 20 : 4, dryRun: false, preflightOnly: false };
 }
 
 test('CLI validates external dry-run config without making any network request or printing secrets', async (t) => {
@@ -102,23 +103,24 @@ test('external preflight sends only one models GET and never sends chat completi
 
 test('versioned qualification contract separates core, profile preparation, and full workflow budgets', () => {
   const contract = JSON.parse(readFileSync(path.join(repoRoot, 'scripts/lib/live-qualification-contract.json'), 'utf8'));
-  assert.equal(contract.schemaVersion, 6);
-  assert.equal(contract.coreMaxSemanticRequests, 3);
+  assert.equal(contract.schemaVersion, 7);
+  assert.equal(contract.coreMaxSemanticRequests, 4);
   assert.equal(contract.profilePreparationMaxSemanticRequests, 16);
-  assert.equal(contract.fullWorkflowMaxSemanticRequests, 19);
-  assert.equal(contract.profilerDiagnosticMaxSemanticRequests, 19);
+  assert.equal(contract.fullWorkflowMaxSemanticRequests, 20);
+  assert.equal(contract.profilerDiagnosticMaxSemanticRequests, 20);
   assert.equal(contract.maxProfilerRequests, 16);
   assert.deepEqual(contract.requiredOperations, { 'deck-plan': 1, 'plan-review': 1, 'contextual-deck-audit': 1 });
+  assert.deepEqual(contract.optionalOperations, { 'deck-plan-revision': { min: 0, max: 1 } });
   assert.equal(contract.generationSemanticRequests, 0);
 });
 
 test('product CLI uses full qualification budget while the adapter separately caps core generation', () => {
   const core = ['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x'];
   const coreOptions = parseArgs(core);
-  assert.equal(coreOptions.maxSemanticRequests, 19);
+  assert.equal(coreOptions.maxSemanticRequests, 20);
   assert.equal(coreOptions.enableTemplateProfiler, true);
-  assert.equal(parseArgs([...core, '--max-semantic-requests', '19']).maxSemanticRequests, 19);
-  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '20']), /between 1 and 19/u);
+  assert.equal(parseArgs([...core, '--max-semantic-requests', '20']).maxSemanticRequests, 20);
+  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '21']), /between 1 and 20/u);
   assert.equal(parseArgs([...core, '--preflight-only']).preflightOnly, true);
   assert.throws(() => parseArgs(['--semantic-mode', 'fake', '--template', 'x.pptx', '--task', 'x', '--preflight-only']), /requires --semantic-mode external/u);
 });
@@ -159,18 +161,47 @@ test('release PPTX backend is office-kit across defaults, env example, runner an
   assert.match(testing, /qualification backend.*Office Kit|Office Kit.*qualification backend/iu);
 });
 
-test('core request budget hard-stops at three semantic completions', async () => {
+test('qualification operation accounting accepts both valid core paths', async () => {
+  async function runCorePath(coreOperations) {
+    const delegated = [];
+    const delegate = { async infer(request) { delegated.push(request.operation); return { value: {}, telemetry: {} }; } };
+    const budget = createRequestBudgetAdapter(delegate, 20);
+    const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
+    await budget.adapter.infer(request('template-semantic-profile'));
+    budget.markProfilePrepared();
+    for (const operation of coreOperations) await budget.adapter.infer(request(operation));
+    const accounting = validateQualificationSemanticOperationAccounting(budget.records);
+    assert.equal(accounting.coreRequestCount, coreOperations.length);
+    assert.equal(accounting.profileRequestCount, 1);
+    assert.equal(accounting.operationCounts.total, coreOperations.length + 1);
+    assert.deepEqual(delegated, ['template-semantic-profile', ...coreOperations]);
+    return accounting;
+  }
+
+  const withoutRevision = await runCorePath(['deck-plan', 'plan-review', 'contextual-deck-audit']);
+  assert.equal(withoutRevision.coreRequestCount, 3);
+  assert.equal(withoutRevision.rawOperationCounts['deck-plan-revision'] ?? 0, 0);
+
+  const withOneRevision = await runCorePath(['deck-plan', 'plan-review', 'deck-plan-revision', 'contextual-deck-audit']);
+  assert.equal(withOneRevision.coreRequestCount, 4);
+  assert.equal(withOneRevision.rawOperationCounts['deck-plan-revision'], 1);
+});
+
+test('qualification budget rejects a second revision and every unexpected operation before dispatch', async () => {
   const delegated = [];
   const delegate = { async infer(request) { delegated.push(request.operation); return { value: {}, telemetry: {} }; } };
-  const budget = createRequestBudgetAdapter(delegate, 17);
+  const budget = createRequestBudgetAdapter(delegate, 20);
   const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
   await budget.adapter.infer(request('template-semantic-profile'));
   budget.markProfilePrepared();
-  for (const operation of ['deck-plan', 'plan-review', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
-  await assert.rejects(budget.adapter.infer(request('unexpected-fourth-call')), (error) => error.code === 'RATE_LIMITED');
-  assert.deepEqual(delegated, ['template-semantic-profile', 'deck-plan', 'plan-review', 'contextual-deck-audit']);
-  assert.equal(budget.records.length, 4);
-  assert.equal(budget.rejectedAttempts, 1);
+  for (const operation of ['deck-plan', 'plan-review', 'deck-plan-revision']) await budget.adapter.infer(request(operation));
+  await assert.rejects(budget.adapter.infer(request('deck-plan-revision')), (error) => error.code === 'RATE_LIMITED');
+  await budget.adapter.infer(request('contextual-deck-audit'));
+  await assert.rejects(budget.adapter.infer(request('unexpected-operation')), (error) => error.code === 'RATE_LIMITED');
+  assert.deepEqual(delegated, ['template-semantic-profile', 'deck-plan', 'plan-review', 'deck-plan-revision', 'contextual-deck-audit']);
+  assert.equal(validateQualificationSemanticOperationAccounting(budget.records).coreRequestCount, 4);
+  assert.equal(budget.records.length, 5);
+  assert.equal(budget.rejectedAttempts, 2);
 });
 
 test('request budget retains only safe profiler validation diagnostics and token counts on failure', async () => {
@@ -182,7 +213,7 @@ test('request budget retains only safe profiler validation diagnostics and token
   };
   const budget = createRequestBudgetAdapter({ async infer() {
     throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'safe failure', { telemetry });
-  } }, 17);
+  } }, 20);
   await assert.rejects(budget.adapter.infer({
     role: 'worker', operation: 'template-semantic-profile', maxOutputTokens: 4096,
     messages: [{ role: 'user', content: 'private evidence must not be persisted' }],
@@ -197,10 +228,10 @@ test('request budget retains only safe profiler validation diagnostics and token
   assert.ok(!JSON.stringify(budget.records[0]).includes('private evidence'));
 });
 
-test('core cannot start before a prepared profile and profiler cannot run after core starts', async () => {
+test('profiler cannot run after Generate starts and core cannot start before a prepared profile', async () => {
   const delegated = [];
   const delegate = { async infer(request) { delegated.push(request.operation); return { value: {}, telemetry: {} }; } };
-  const budget = createRequestBudgetAdapter(delegate, 17);
+  const budget = createRequestBudgetAdapter(delegate, 20);
   const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
   await assert.rejects(budget.adapter.infer(request('deck-plan')), (error) => error.code === 'RATE_LIMITED');
   await budget.adapter.infer(request('template-semantic-profile'));
@@ -212,7 +243,7 @@ test('core cannot start before a prepared profile and profiler cannot run after 
   assert.equal(budget.rejectedAttempts, 2);
 });
 
-test('full product request budget allows at most sixteen profile batches plus three fixed stages', async () => {
+test('full product request budget allows sixteen profile batches plus four bounded core stages', async () => {
   const delegated = [];
   const delegate = {
     model: 'Qwen/Qwen3.8-27B',
@@ -222,15 +253,15 @@ test('full product request budget allows at most sixteen profile batches plus th
         finishReason: 'stop', promptTokens: 1, completionTokens: 1 } };
     },
   };
-  const budget = createRequestBudgetAdapter(delegate, 19);
+  const budget = createRequestBudgetAdapter(delegate, 20);
   const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
   for (let index = 0; index < 16; index += 1) await budget.adapter.infer(request('template-semantic-profile'));
   await assert.rejects(budget.adapter.infer(request('template-semantic-profile')), (error) => error.code === 'RATE_LIMITED');
   budget.markProfilePrepared();
-  for (const operation of ['deck-plan', 'plan-review', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
-  await assert.rejects(budget.adapter.infer(request('unexpected-twentieth-call')), (error) => error.code === 'RATE_LIMITED');
-  assert.equal(delegated.length, 19);
-  assert.equal(budget.records.length, 19);
+  for (const operation of ['deck-plan', 'plan-review', 'deck-plan-revision', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
+  await assert.rejects(budget.adapter.infer(request('unexpected-after-budget')), (error) => error.code === 'RATE_LIMITED');
+  assert.equal(delegated.length, 20);
+  assert.equal(budget.records.length, 20);
   assert.equal(budget.rejectedAttempts, 2);
 });
 
@@ -265,7 +296,7 @@ test('canonical fake E2E prepares the profile before Generate and runs no profil
       revisionWorker: 0, other: 0, generation: 0, total: manifest.workflow.templatePreparation.profileRequests + 3,
     });
     assert.equal(manifest.semantic.requestCount, manifest.workflow.templatePreparation.profileRequests + 3);
-    assert.equal(manifest.semantic.requestBudget, 19);
+    assert.equal(manifest.semantic.requestBudget, 20);
     assert.equal(manifest.workflow.templatePreparation.structuralStatus, 'ready');
     assert.equal(manifest.workflow.templatePreparation.semanticProfileStatus, 'ready');
     assert.equal(manifest.workflow.templatePreparation.cachedStatusRead, true);
@@ -323,7 +354,7 @@ test('profile batches remain bounded and run before all three downstream semanti
   const manifest = await runProductE2E(options, { startFakeSemanticEndpoint: endpointFactory });
   assert.equal(manifest.result, 'PASS', `failed at ${manifest.failure?.stage}: ${manifest.failure?.code}`);
   assert.equal(manifest.templateProfilerEnabled, true);
-  assert.equal(manifest.semantic.requestBudget, 19);
+  assert.equal(manifest.semantic.requestBudget, 20);
   assert.equal(manifest.semantic.requestCount, 6);
   assert.deepEqual(manifest.semantic.operationCounts, {
     profiler: 3, worker: 1, planningSupervisor: 1, contextualAudit: 1,

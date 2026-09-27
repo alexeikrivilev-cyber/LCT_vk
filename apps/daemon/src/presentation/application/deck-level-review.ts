@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { ContentIR, ContentUnit } from '../domain/content-ir.js';
 import { validateContentIR } from '../domain/content-ir.js';
 import type { DeckPlan } from '../domain/deck-plan.js';
@@ -20,6 +21,39 @@ export interface DeckReviewComposition {
   slideId: string;
   signature: string;
   archetype: string | null;
+}
+
+export interface DeckCompositionDistinctnessReport {
+  distinct: boolean;
+  deckSignatures: Record<PresentationVariantId, string>;
+  differingSlideCounts: { AB: number; AC: number; BC: number };
+}
+
+/** Compare ordered whole-deck projected composition signatures; per-slide reuse is allowed. */
+export function assessDeckCompositionDistinctness(
+  signaturesByVariant: Readonly<Record<PresentationVariantId, readonly string[]>>,
+): DeckCompositionDistinctnessReport {
+  const variants = ['A', 'B', 'C'] as const satisfies readonly PresentationVariantId[];
+  const slideCounts = variants.map((variant) => signaturesByVariant[variant].length);
+  if (slideCounts[0] === 0 || slideCounts.some((count) => count !== slideCounts[0])
+      || variants.some((variant) => signaturesByVariant[variant].some((signature) => typeof signature !== 'string' || !signature))) {
+    throw new TypeError('Deck composition comparison requires equally sized non-empty A/B/C signature tracks');
+  }
+  const deckSignatures = Object.fromEntries(variants.map((variant) => [variant,
+    `sha256:${createHash('sha256').update(JSON.stringify(signaturesByVariant[variant])).digest('hex')}`,
+  ])) as Record<PresentationVariantId, string>;
+  const differingSlides = (left: PresentationVariantId, right: PresentationVariantId): number =>
+    signaturesByVariant[left].reduce((count, signature, index) => count + Number(signature !== signaturesByVariant[right][index]), 0);
+  const differingSlideCounts = {
+    AB: differingSlides('A', 'B'),
+    AC: differingSlides('A', 'C'),
+    BC: differingSlides('B', 'C'),
+  };
+  return {
+    distinct: new Set(Object.values(deckSignatures)).size === variants.length,
+    deckSignatures,
+    differingSlideCounts,
+  };
 }
 
 export interface DeckLevelReviewReport {

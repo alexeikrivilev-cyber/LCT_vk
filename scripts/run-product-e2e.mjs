@@ -31,9 +31,12 @@ const liveQualificationContract = JSON.parse(readFileSync(path.join(path.dirname
 const requiredOperationTotal = liveQualificationContract.requiredOperations
   && Object.values(liveQualificationContract.requiredOperations).reduce((total, count) => total + count, 0);
 const requiredOperationNames = ['deck-plan', 'plan-review', 'contextual-deck-audit'];
-if (liveQualificationContract.schemaVersion !== 6 || liveQualificationContract.coreMaxSemanticRequests !== 3
+const optionalOperationNames = ['deck-plan-revision'];
+const optionalOperationMaximumTotal = liveQualificationContract.optionalOperations
+  && Object.values(liveQualificationContract.optionalOperations).reduce((total, limit) => total + limit.max, 0);
+if (liveQualificationContract.schemaVersion !== 7 || liveQualificationContract.coreMaxSemanticRequests !== 4
     || liveQualificationContract.profilePreparationMaxSemanticRequests !== 16
-    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 19
+    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 20
     || !Number.isSafeInteger(liveQualificationContract.profilerDiagnosticMaxSemanticRequests)
     || !Number.isSafeInteger(liveQualificationContract.maxProfilerRequests)
     || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 16
@@ -42,9 +45,15 @@ if (liveQualificationContract.schemaVersion !== 6 || liveQualificationContract.c
     || !liveQualificationContract.requiredOperations
     || Object.keys(liveQualificationContract.requiredOperations).length !== requiredOperationNames.length
     || requiredOperationNames.some((operation) => liveQualificationContract.requiredOperations[operation] !== 1)
+    || !liveQualificationContract.optionalOperations
+    || Object.keys(liveQualificationContract.optionalOperations).length !== optionalOperationNames.length
+    || optionalOperationNames.some((operation) => liveQualificationContract.optionalOperations[operation]?.min !== 0
+      || liveQualificationContract.optionalOperations[operation]?.max !== 1)
     || liveQualificationContract.generationSemanticRequests !== 0
     || !Number.isSafeInteger(requiredOperationTotal)
-    || liveQualificationContract.coreMaxSemanticRequests !== requiredOperationTotal + liveQualificationContract.generationSemanticRequests
+    || !Number.isSafeInteger(optionalOperationMaximumTotal)
+    || liveQualificationContract.coreMaxSemanticRequests !== requiredOperationTotal + optionalOperationMaximumTotal
+      + liveQualificationContract.generationSemanticRequests
     || liveQualificationContract.fullWorkflowMaxSemanticRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
       + liveQualificationContract.coreMaxSemanticRequests) {
   throw new TypeError('The versioned live qualification request budget contract is invalid.');
@@ -53,6 +62,11 @@ const CORE_MAX_SEMANTIC_REQUESTS = liveQualificationContract.coreMaxSemanticRequ
 const PROFILE_PREPARATION_MAX_SEMANTIC_REQUESTS = liveQualificationContract.profilePreparationMaxSemanticRequests;
 const FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS = liveQualificationContract.fullWorkflowMaxSemanticRequests;
 const PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS = liveQualificationContract.profilerDiagnosticMaxSemanticRequests;
+const CORE_OPERATION_LIMITS = Object.freeze({
+  ...liveQualificationContract.requiredOperations,
+  ...Object.fromEntries(Object.entries(liveQualificationContract.optionalOperations)
+    .map(([operation, limit]) => [operation, limit.max])),
+});
 const DEFAULT_MODEL = 'Qwen/Qwen3.8-27B';
 const RUNNER_ENV_KEYS = [
   'LCT_SEMANTIC_BASE_URL', 'LCT_SEMANTIC_MODEL', 'LCT_SEMANTIC_API_KEY', 'LCT_SEMANTIC_ENABLE_THINKING',
@@ -235,6 +249,7 @@ export function createRequestBudgetAdapter(delegate, limit = FULL_WORKFLOW_MAX_S
   let rejectedAttempts = 0;
   let profilePreparationRequests = 0;
   let coreRequests = 0;
+  const coreOperationCounts = new Map();
   let coreStarted = false;
   let profilePrepared = false;
   const reject = (message) => {
@@ -263,8 +278,13 @@ export function createRequestBudgetAdapter(delegate, limit = FULL_WORKFLOW_MAX_S
         } else {
           if (!profilePrepared) reject('Core generation requires a previously prepared READY semantic profile');
           if (coreRequests >= CORE_MAX_SEMANTIC_REQUESTS) reject('Qualification core-generation semantic request budget exhausted before dispatch');
+          const operationLimit = CORE_OPERATION_LIMITS[request.operation];
+          if (!Number.isSafeInteger(operationLimit)) reject('Unexpected semantic operation is forbidden by the qualification contract');
+          const operationCount = coreOperationCounts.get(request.operation) ?? 0;
+          if (operationCount >= operationLimit) reject('Qualification semantic operation limit exhausted before dispatch');
           coreStarted = true;
           coreRequests += 1;
+          coreOperationCounts.set(request.operation, operationCount + 1);
         }
         const started = performance.now();
         const profilerEvidence = isProfilePreparation ? request.messages.find((message) => message.role === 'user')?.content : null;
@@ -338,6 +358,42 @@ function semanticCounts(records) {
   for (const record of records) counts[normalizedOperation(record.operation)] += 1;
   counts.total = records.length;
   return counts;
+}
+
+export function validateQualificationSemanticOperationAccounting(records) {
+  if (!Array.isArray(records)) throw new TypeError('Qualification semantic operation records must be an array.');
+  const rawOperationCounts = Object.fromEntries([...new Set(records.map((record) => record.operation))]
+    .map((operation) => [operation, records.filter((record) => record.operation === operation).length]));
+  const counts = semanticCounts(records);
+  const requiredOperations = liveQualificationContract.requiredOperations;
+  const optionalOperations = liveQualificationContract.optionalOperations;
+  const unexpectedOperations = Object.keys(rawOperationCounts).filter((operation) => operation !== 'template-semantic-profile'
+    && !Object.hasOwn(requiredOperations, operation) && !Object.hasOwn(optionalOperations, operation));
+  const profileRequestCount = rawOperationCounts['template-semantic-profile'] ?? 0;
+  const optionalOperationTotal = Object.entries(optionalOperations)
+    .reduce((total, [operation]) => total + (rawOperationCounts[operation] ?? 0), 0);
+  const optionalCountsValid = Object.entries(optionalOperations).every(([operation, limit]) => {
+    const count = rawOperationCounts[operation] ?? 0;
+    return count >= limit.min && count <= limit.max;
+  });
+  const expectedTotal = profileRequestCount + requiredOperationTotal + optionalOperationTotal
+    + liveQualificationContract.generationSemanticRequests;
+  if (unexpectedOperations.length || profileRequestCount < 1
+      || profileRequestCount > liveQualificationContract.maxProfilerRequests
+      || Object.entries(requiredOperations).some(([operation, count]) => rawOperationCounts[operation] !== count)
+      || !optionalCountsValid
+      || counts.generation !== liveQualificationContract.generationSemanticRequests
+      || counts.total !== expectedTotal
+      || counts.total > FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS) {
+    throw errorWithCode('SEMANTIC_OPERATION_ACCOUNTING_MISMATCH', 'One-click semantic request operation counts differ from the bounded qualification workflow.');
+  }
+  return {
+    rawOperationCounts,
+    operationCounts: counts,
+    profileRequestCount,
+    coreRequestCount: counts.total - profileRequestCount,
+    optionalOperationTotal,
+  };
 }
 
 function requestRecords(records) {
@@ -759,22 +815,11 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     manifest.semantic.budgetRejectedAttempts = budget.rejectedAttempts;
     manifest.semantic.automaticRetries = 0;
     if (manifest.semantic.requestCount > options.maxSemanticRequests) throw errorWithCode('SEMANTIC_BUDGET_OVERRUN', 'Semantic request budget was exceeded.');
-    const expectedCounts = semanticCounts(budget.records);
-    const rawOperationCounts = Object.fromEntries([...new Set(budget.records.map((record) => record.operation))]
-      .map((operation) => [operation, budget.records.filter((record) => record.operation === operation).length]));
-    const requiredOperations = liveQualificationContract.requiredOperations;
-    const unexpectedOperations = Object.keys(rawOperationCounts).filter((operation) => operation !== 'template-semantic-profile'
-      && !Object.hasOwn(requiredOperations, operation));
-    const profilerRequestCount = rawOperationCounts['template-semantic-profile'] ?? 0;
-    const profilerCountsValid = profilerRequestCount >= 1 && profilerRequestCount <= liveQualificationContract.maxProfilerRequests;
-    if (unexpectedOperations.length || !profilerCountsValid
-        || Object.entries(requiredOperations).some(([operation, count]) => rawOperationCounts[operation] !== count)
-        || expectedCounts.generation !== liveQualificationContract.generationSemanticRequests
-        || expectedCounts.total !== profilerRequestCount + requiredOperationTotal + liveQualificationContract.generationSemanticRequests
-        || expectedCounts.total > options.maxSemanticRequests) {
-      throw errorWithCode('SEMANTIC_OPERATION_ACCOUNTING_MISMATCH', 'One-click semantic request operation counts differ from the bounded qualification workflow.');
+    const operationAccounting = validateQualificationSemanticOperationAccounting(budget.records);
+    if (operationAccounting.operationCounts.total > options.maxSemanticRequests) {
+      throw errorWithCode('SEMANTIC_OPERATION_ACCOUNTING_MISMATCH', 'One-click semantic request operation counts exceed the selected workflow budget.');
     }
-    manifest.semantic.rawOperationCounts = rawOperationCounts;
+    manifest.semantic.rawOperationCounts = operationAccounting.rawOperationCounts;
     manifest.timing.semanticTotalMs = budget.records.reduce((sum, request) => sum + (request.wallTimeMs ?? 0), 0);
     manifest.timing.totalMs = Math.round(performance.now() - flowStarted);
     manifest.timing.deterministicTotalMs = Math.max(0, manifest.timing.totalMs - manifest.timing.semanticTotalMs);

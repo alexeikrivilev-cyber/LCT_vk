@@ -13,12 +13,14 @@ import { compileContentIR } from '../src/presentation/application/content-compil
 import { CONTEXTUAL_AUDIT_RULES, CONTEXTUAL_AUDIT_MESSAGE_CODES, CONTEXTUAL_AUDIT_SCHEMA_VERSION, validateContextualDeckAuditResponse } from '../src/presentation/application/contextual-audit-port.ts';
 import { auditCompiledPresentation, canonicalDeterministicAuditSha256, repairCompiledPresentationOnce } from '../src/presentation/application/deterministic-audit.ts';
 import { buildPresentationQualityReport, PRESENTATION_QUALITY_CATEGORIES } from '../src/presentation/application/presentation-quality-report.ts';
+import { assessDeckCompositionDistinctness } from '../src/presentation/application/deck-level-review.ts';
 import { createTemplateIR } from '../src/presentation/application/template-mapper.ts';
 import { runOfflinePresentationMatrix } from '../src/presentation/application/offline-matrix-runner.ts';
 import { renderNativePptx } from '../src/presentation/application/native-pptx-renderer.ts';
 import { compilePresentation, extractCanonicalFactualPayload, VARIANT_POLICIES } from '../src/presentation/application/slide-compilation.ts';
 import {
   applyVariantCompositionAssignment,
+  assignSafeVariantCompositions,
   assessVariantCompositionDistinctness as assessVariantCompositionDistinctnessRaw,
   assessExemplarSelection as assessExemplarSelectionRaw,
   classifyExemplarArchetype,
@@ -492,7 +494,11 @@ test('PresentationQualityReport keeps the safety audit separate, flags tiny body
     contentIR,
     templateIR,
     composition: {
-      signaturesByVariant: { A: deckPlan.slides.map((_item, index) => `A-${index}`), B: deckPlan.slides.map((_item, index) => `B-${index}`), C: deckPlan.slides.map((_item, index) => `C-${index}`) },
+      signaturesByVariant: {
+        A: deckPlan.slides.map((_item, index) => index === 0 ? 'shared-slide-composition' : `A-${index}`),
+        B: deckPlan.slides.map((_item, index) => index === 0 ? 'shared-slide-composition' : `B-${index}`),
+        C: deckPlan.slides.map((_item, index) => index === 0 ? 'shared-slide-composition' : `C-${index}`),
+      },
       kindsByVariant: { A: ['layout-placeholder-backed'], B: ['exemplar-backed'], C: ['layout-placeholder-backed'] },
     },
     renderEvidence: {
@@ -511,6 +517,10 @@ test('PresentationQualityReport keeps the safety audit separate, flags tiny body
   assert.equal(report.categories.hierarchy.status, 'error', '8pt output is rejected relative to the observed body typography band');
   assert.equal(report.categories['source-content-residue'].status, 'error');
   assert.equal(report.categories['variant-distinctness'].status, 'pass');
+  const deckDistinctness = report.findings.find((finding) => finding.ruleId === 'variant-distinctness.deck-signatures-distinct');
+  assert.ok(deckDistinctness, 'a repeated corresponding slide is allowed when the ordered decks remain distinct');
+  assert.deepEqual({ AB: deckDistinctness.evidence.slidesDifferAB, AC: deckDistinctness.evidence.slidesDifferAC, BC: deckDistinctness.evidence.slidesDifferBC },
+    { AB: deckPlan.slides.length - 1, AC: deckPlan.slides.length - 1, BC: deckPlan.slides.length - 1 });
   assert.ok(report.trackStrategy.A.visualEvidenceSlides > 0, 'table/chart/KPI/process content contributes to track strategy evidence');
   assert.equal(report.categories.contrast.status, 'unknown', 'foreground alone does not prove contrast without the resolved background');
   assert.equal(report.categories['text-fit'].status, 'warning');
@@ -1334,7 +1344,9 @@ test('Office Kit fallback fills native title and body placeholders without dupli
   });
   const qualification = matrix.templateQualifications[0];
   assert.equal(qualification?.status, 'blocked', 'one native layout must not qualify A/B/C merely because generated placeholder geometry differs');
+  assert.equal(qualification?.slides[0]?.status, 'passed', 'every track still receives the one safe native composition');
   assert.equal(new Set(qualification?.slides[0]?.signatures ?? []).size, 1, 'the fallback signature represents native layout structure');
+  assert.equal(qualification?.deckCompositionDistinctness?.distinct, false, 'the complete one-slide tracks remain indistinguishable');
   assert.ok(qualification?.slides[0]?.variants.every((variant) => variant.compositionKind === 'layout-placeholder-backed'));
   assert.equal(matrix.outputCount, 0);
 });
@@ -1364,6 +1376,55 @@ test('exemplar projection is withheld when static sample text is inherited from 
   assert.equal(assessment.selection, null);
   assert.ok(assessment.candidateDiagnostics.some((candidate) => candidate.gate === 'inherited-source-text'),
     'a donor cannot preserve static text from a layout/master that the slide projection cannot edit');
+});
+
+test('A/B/C composition uniqueness is enforced across complete decks, allowing safe per-slide reuse', () => {
+  const option = (variantId, signature, layoutCandidateIndex = 0) => ({
+    variantId,
+    compositionKind: 'layout-placeholder-backed',
+    layoutCandidateIndex,
+    projectedCompositionSignature: signature,
+  });
+
+  const oneSafeSlide = assignSafeVariantCompositions([
+    [option('A', 'shared')], [option('B', 'shared')], [option('C', 'shared')],
+  ]);
+  assert.equal(oneSafeSlide.length, 3, 'a single safe choice is assigned to every variant without weakening projection safety');
+  assert.deepEqual(oneSafeSlide.map((assignment) => assignment.projectedCompositionSignature), ['shared', 'shared', 'shared']);
+  const oneSharedSlideDecks = assessDeckCompositionDistinctness({
+    A: ['shared', 'a-layout', 'a-ending'],
+    B: ['shared', 'b-layout', 'b-ending'],
+    C: ['shared', 'c-layout', 'c-ending'],
+  });
+  assert.equal(oneSharedSlideDecks.distinct, true, 'other slide compositions make all three complete tracks distinguishable');
+  assert.deepEqual(oneSharedSlideDecks.differingSlideCounts, { AB: 2, AC: 2, BC: 2 });
+
+  const twoSafeSlide = assignSafeVariantCompositions([
+    [option('A', 'one'), option('A', 'two', 1)],
+    [option('B', 'one'), option('B', 'two', 1)],
+    [option('C', 'one'), option('C', 'two', 1)],
+  ]);
+  assert.equal(twoSafeSlide.length, 3);
+  assert.equal(new Set(twoSafeSlide.map((assignment) => assignment.projectedCompositionSignature)).size, 2,
+    'three variants reuse one of two safe choices while maximizing available differences');
+  const twoChoiceDecks = assessDeckCompositionDistinctness({
+    A: [twoSafeSlide[0].projectedCompositionSignature, 'a-track'],
+    B: [twoSafeSlide[1].projectedCompositionSignature, 'b-track'],
+    C: [twoSafeSlide[2].projectedCompositionSignature, 'c-track'],
+  });
+  assert.equal(twoChoiceDecks.distinct, true);
+
+  assert.deepEqual(assignSafeVariantCompositions([
+    [option('A', 'one')], [], [option('C', 'two')],
+  ]), [], 'a track with no safe option prevents the complete slide assignment');
+
+  const sameDeck = assessDeckCompositionDistinctness({ A: ['same', 'same'], B: ['same', 'same'], C: ['same', 'same'] });
+  assert.equal(sameDeck.distinct, false, 'one possible ordered composition sequence fails closed');
+  assert.deepEqual(sameDeck.differingSlideCounts, { AB: 0, AC: 0, BC: 0 });
+
+  const distinctDecks = assessDeckCompositionDistinctness({ A: ['a-1', 'a-2'], B: ['b-1', 'b-2'], C: ['c-1', 'c-2'] });
+  assert.equal(distinctDecks.distinct, true);
+  assert.equal(new Set(Object.values(distinctDecks.deckSignatures)).size, 3);
 });
 
 test('Office Kit fallback fills a measured generic native body placeholder by index', async (t) => {
@@ -1860,7 +1921,7 @@ test('offline matrix withholds every output when fewer than three safe compositi
     templates: [{ ...exemplar, pptxPath: exemplar.templatePath }],
     outputRoot,
     backend: 'office-kit',
-  }), /availableDistinctFamilies=1/);
+  }), /complete A\/B\/C decks do not have pairwise distinct/);
   await assert.rejects(stat(path.join(outputRoot, 'template-1')), { code: 'ENOENT' },
     'the runner checks distinctness before it writes any A/B/C PPTX output');
 });

@@ -72,8 +72,12 @@ const failures = [];
 const liveQualificationContract = JSON.parse(await readFile(path.join(root, 'scripts/lib/live-qualification-contract.json'), 'utf8'));
 const requiredSemanticRequests = Object.values(liveQualificationContract.requiredOperations ?? {})
   .reduce((total, count) => total + count, liveQualificationContract.generationSemanticRequests ?? 0);
-if (liveQualificationContract.schemaVersion !== 6
-    || liveQualificationContract.coreMaxSemanticRequests !== requiredSemanticRequests
+const optionalSemanticRequests = Object.values(liveQualificationContract.optionalOperations ?? {})
+  .reduce((total, limit) => total + limit.max, 0);
+if (liveQualificationContract.schemaVersion !== 7
+    || liveQualificationContract.coreMaxSemanticRequests !== requiredSemanticRequests + optionalSemanticRequests
+    || liveQualificationContract.optionalOperations?.['deck-plan-revision']?.min !== 0
+    || liveQualificationContract.optionalOperations?.['deck-plan-revision']?.max !== 1
     || liveQualificationContract.profilePreparationMaxSemanticRequests !== 16
     || liveQualificationContract.fullWorkflowMaxSemanticRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
       + liveQualificationContract.coreMaxSemanticRequests

@@ -12,6 +12,7 @@ import {
   updatePresentationGeneration,
 } from '../../presentation-generation-store.js';
 import { resolvePresentationFilePath } from '../../presentation-files.js';
+import { assessDeckCompositionDistinctness, type DeckCompositionDistinctnessReport } from './deck-level-review.js';
 import type { PlanningResponse, PlanningService } from './planning-service.js';
 import { getTemplateCompilation, type TemplateCompilationResponse } from './template-compiler.js';
 import { compilePresentation, UnsupportedTemplateLayoutError, VARIANT_POLICIES, type CompiledPresentation, type CompiledSlide, type PresentationVariantId } from './slide-compilation.js';
@@ -22,6 +23,7 @@ import {
   assessVariantCompositionDistinctness,
   createCompositionVisualClassificationCache,
   exemplarSelectionReference,
+  generatedFallbackCompositionSignature,
   type ExemplarSelectionReference,
   type VariantCompositionAssignment,
 } from './exemplar-slide-selector.js';
@@ -218,6 +220,14 @@ function sourceContextFingerprint(input: {
   templateIRHash: string;
 }): string {
   return sha256(JSON.stringify(input));
+}
+
+function deckCompositionDistinctnessForState(state: PresentationGenerationState): DeckCompositionDistinctnessReport | null {
+  const signaturesByVariant = Object.fromEntries(VARIANT_IDS.map((variant) => [variant,
+    state.slides.map((slide) => slide.variants[variant].compositionChoice?.signature ?? ''),
+  ])) as Record<PresentationVariantId, string[]>;
+  if (Object.values(signaturesByVariant).some((signatures) => signatures.some((signature) => !signature))) return null;
+  return assessDeckCompositionDistinctness(signaturesByVariant);
 }
 
 function emptyVariant(): GeneratedVariantState {
@@ -1058,6 +1068,58 @@ export class PresentationGenerationService {
       // Template visual safety classification is immutable during this run; keep this
       // cache local to the generation so it cannot leak across templates/projects.
       const visualClassificationCache = createCompositionVisualClassificationCache();
+      const assignedSlidesById = new Map<string, CompiledSlide[]>();
+      const compositionSignatures: Record<PresentationVariantId, string[]> = { A: [], B: [], C: [] };
+      // Qualify all safe slide assignments first. A/B/C distinctness is a property
+      // of the ordered decks, so a safe per-slide composition may be reused.
+      for (const pack of initial.slides) {
+        if (pack.status === 'ready') {
+          for (const variant of VARIANT_IDS) {
+            const signature = pack.variants[variant].compositionChoice?.signature;
+            if (!signature) throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_MISSING', `Ready slide ${pack.index} has no persisted ${variant} composition signature.`, 422);
+            compositionSignatures[variant].push(signature);
+          }
+          continue;
+        }
+        const variantSlides = VARIANT_IDS.map((variant) => {
+          const presentation = variantsById(tracks, variant);
+          const slide = presentation.slides.find((candidate) => candidate.sourceDeckPlanSlideId === pack.slideId);
+          if (!slide) throw new PresentationGenerationError('PLAN_CHANGED', 'A planned slide is missing from the compiled output.', 409);
+          return slide;
+        });
+        const compositionStartedAt = performance.now();
+        const assessment = assessVariantCompositionDistinctness(variantSlides, context.templateIR, this.options.backend, context.semanticProfile,
+          this.options.performanceDiagnostics, visualClassificationCache);
+        recordElapsed(this.options.performanceDiagnostics, 'generation.resolveCompositions', compositionStartedAt);
+        this.options.performanceDiagnostics?.increment('generation.compositionResolverCallCount');
+        this.options.performanceDiagnostics?.increment('generation.compositionOptionCount', assessment.candidateCounts.safeExemplarOptions
+          + assessment.candidateCounts.safeLayoutOptions);
+        if (!assessment.hasSafeAssignments || assessment.assignments.length !== VARIANT_IDS.length) {
+          throw new PresentationGenerationError(
+            'VARIANTS_NOT_DISTINCT',
+            `Slide ${pack.index} has no complete safe A/B/C projected composition assignment. ${assessment.evidence.join('; ')}`,
+            422,
+          );
+        }
+        const assignmentStartedAt = performance.now();
+        const assigned = variantSlides.map((slide) => {
+          const assignment = assessment.assignments.find((candidate) => candidate.variantId === slide.variantId);
+          if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
+          compositionSignatures[slide.variantId].push(assignment.projectedCompositionSignature);
+          return applyVariantCompositionAssignment(slide, assignment, context.templateIR, context.semanticProfile);
+        });
+        recordElapsed(this.options.performanceDiagnostics, 'generation.applyCompositionAssignments', assignmentStartedAt);
+        assignedSlidesById.set(pack.slideId, assigned);
+      }
+      const deckDistinctness = assessDeckCompositionDistinctness(compositionSignatures);
+      if (!deckDistinctness.distinct) {
+        const counts = deckDistinctness.differingSlideCounts;
+        throw new PresentationGenerationError(
+          'VARIANTS_NOT_DISTINCT',
+          `The complete A/B/C decks do not have pairwise distinct projected composition signatures (slides differing: A/B=${counts.AB}, A/C=${counts.AC}, B/C=${counts.BC}).`,
+          422,
+        );
+      }
       for (const initialPack of initial.slides) {
         if (signal.aborted) return;
         const fresh = this.current(projectId);
@@ -1073,35 +1135,10 @@ export class PresentationGenerationService {
           updatedAt: this.now().toISOString(),
         }));
         if (!startUpdate) return;
-        stageStartedAt = performance.now();
-        const variantSlides = VARIANT_IDS.map((variant) => {
-          const presentation = variantsById(tracks, variant);
-          const slide = presentation.slides.find((candidate) => candidate.sourceDeckPlanSlideId === currentSlideId);
-          if (!slide) throw new PresentationGenerationError('PLAN_CHANGED', 'A planned slide is missing from the compiled output.', 409);
-          return slide;
-        });
-        let compositionStartedAt = performance.now();
-        const compositionDistinctness = assessVariantCompositionDistinctness(variantSlides, context.templateIR, this.options.backend, context.semanticProfile,
-          this.options.performanceDiagnostics, visualClassificationCache);
-        recordElapsed(this.options.performanceDiagnostics, 'generation.resolveCompositions', compositionStartedAt);
-        this.options.performanceDiagnostics?.increment('generation.compositionResolverCallCount');
-        this.options.performanceDiagnostics?.increment('generation.compositionOptionCount', compositionDistinctness.candidateCounts.safeExemplarOptions
-          + compositionDistinctness.candidateCounts.safeLayoutOptions);
-        if (!compositionDistinctness.distinct) {
-          throw new PresentationGenerationError(
-            'VARIANTS_NOT_DISTINCT',
-            `Slide ${pack.index} has only ${compositionDistinctness.availableDistinctFamilies} distinct safe projected composition(s); A/B/C were withheld. ${compositionDistinctness.evidence.join('; ')}`,
-            422,
-          );
+        const assignedVariantSlides = assignedSlidesById.get(pack.slideId);
+        if (!assignedVariantSlides || assignedVariantSlides.length !== VARIANT_IDS.length) {
+          throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_MISSING', 'A complete safe A/B/C composition assignment was not prepared for this slide.', 422);
         }
-        compositionStartedAt = performance.now();
-        const assignedVariantSlides = variantSlides.map((slide) => {
-          const assignment = compositionDistinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
-          if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
-          return applyVariantCompositionAssignment(slide, assignment, context.templateIR, context.semanticProfile);
-        });
-        recordElapsed(this.options.performanceDiagnostics, 'generation.applyCompositionAssignments', compositionStartedAt);
-        recordElapsed(this.options.performanceDiagnostics, 'generation.compositionAssignment', stageStartedAt);
         const audits = {} as Record<PresentationVariantId, DeterministicAuditReport>;
         stageStartedAt = performance.now();
         for (const variant of VARIANT_IDS) {
@@ -1290,14 +1327,14 @@ export class PresentationGenerationService {
       if (rendered.slideCount !== VARIANT_IDS.length || rendered.validationStatus === 'failed' || rendered.reopenStatus === 'failed') {
         throw new PresentationGenerationError('RENDER_VALIDATION_FAILED', 'Renderer output did not pass its A/B/C slide and validation checks.', 422);
       }
-      const renderedSignatures = new Set(rendered.projectedCompositions.map((item) => item.projectedCompositionSignature));
-      if (rendered.projectedCompositions.length !== VARIANT_IDS.length || renderedSignatures.size !== VARIANT_IDS.length) {
-        throw new PresentationGenerationError('VARIANTS_NOT_DISTINCT', 'Renderer output did not preserve three distinct qualified A/B/C compositions.', 422);
+      if (rendered.projectedCompositions.length !== VARIANT_IDS.length) {
+        throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_MISSING', 'Renderer did not return one projected composition record per A/B/C variant.', 422);
       }
       for (const slide of slides) {
         const assignment = rendered.projectedCompositions.find((item) => item.variantId === slide.variantId && item.slideId === slide.id);
-        if (!assignment || slide.exemplarSelection
-            && assignment.projectedCompositionSignature !== slide.exemplarSelection.projectedCompositionSignature) {
+        const expectedSignature = slide.exemplarSelection?.projectedCompositionSignature
+          ?? generatedFallbackCompositionSignature(slide, context.templateIR);
+        if (!assignment || assignment.projectedCompositionSignature !== expectedSignature) {
           throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_CHANGED', 'Renderer did not preserve the exact qualified composition assignment.', 422);
         }
       }
@@ -1604,6 +1641,7 @@ export class PresentationGenerationService {
         sources: context.contentIR.sources.map((source) => source.sha256),
         plan: state.planHash,
       },
+      compositionDistinctness: deckCompositionDistinctnessForState(state),
       selections: state.slides.map((slide) => ({
         slideId: slide.slideId,
         index: slide.index,

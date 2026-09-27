@@ -1286,12 +1286,61 @@ export function generatedFallbackCompositionSignature(compiled: CompiledSlide, t
 }
 
 export interface VariantCompositionDistinctness {
+  hasSafeAssignments: boolean;
+  /** Per-slide diagnostic only; deck-level distinctness is enforced after all slide assignments. */
   distinct: boolean;
   availableDistinctFamilies: number;
   candidateCounts: { sourceCandidates: number; safeExemplarOptions: number; safeLayoutOptions: number; distinctSafeSignatures: number };
   signatures: string[];
   assignments: VariantCompositionAssignment[];
   evidence: string[];
+}
+
+/** Pick one already-qualified safe option for each track, maximizing distinct signatures first. */
+export function assignSafeVariantCompositions(
+  optionsByVariant: readonly (readonly VariantCompositionAssignment[])[],
+): VariantCompositionAssignment[] {
+  if (optionsByVariant.length !== 3 || optionsByVariant.some((options) => options.length === 0)) return [];
+  let best: VariantCompositionAssignment[] | null = null;
+  let bestDistinctCount = -1;
+  let bestExemplarCount = -1;
+  let bestRankCost = Number.POSITIVE_INFINITY;
+  const chosen: Array<VariantCompositionAssignment | null> = [];
+  const usedSignatures = new Set<string>();
+
+  const visit = (variantIndex: number): void => {
+    if (variantIndex === optionsByVariant.length) {
+      const complete = chosen.map((option, index) => option ?? optionsByVariant[index]![0]!);
+      const distinctCount = new Set(complete.map((option) => option.projectedCompositionSignature)).size;
+      const exemplarCount = complete.filter((option) => option.compositionKind === 'exemplar-backed').length;
+      const rankCost = complete.reduce((cost, option, index) => cost + optionsByVariant[index]!.indexOf(option), 0);
+      if (distinctCount > bestDistinctCount
+          || distinctCount === bestDistinctCount && (exemplarCount > bestExemplarCount
+            || exemplarCount === bestExemplarCount && rankCost < bestRankCost)) {
+        best = complete;
+        bestDistinctCount = distinctCount;
+        bestExemplarCount = exemplarCount;
+        bestRankCost = rankCost;
+      }
+      return;
+    }
+
+    for (const option of optionsByVariant[variantIndex]!) {
+      if (usedSignatures.has(option.projectedCompositionSignature)) continue;
+      usedSignatures.add(option.projectedCompositionSignature);
+      chosen.push(option);
+      visit(variantIndex + 1);
+      chosen.pop();
+      usedSignatures.delete(option.projectedCompositionSignature);
+    }
+    // Unassigned tracks receive their highest-ranked safe option when the partial
+    // distinct assignment is completed at the leaf.
+    chosen.push(null);
+    visit(variantIndex + 1);
+    chosen.pop();
+  };
+  visit(0);
+  return best ?? [];
 }
 
 /** Check one planned slide across all three tracks before presenting them as A/B/C alternatives. */
@@ -1324,6 +1373,7 @@ export function assessVariantCompositionDistinctness(
     const availableDistinctFamilies = new Set(signatures).size;
     const distinct = signatures.length === variants.length && availableDistinctFamilies === variants.length;
     return {
+      hasSafeAssignments: assignments.length === variants.length,
       distinct, availableDistinctFamilies,
       candidateCounts: { sourceCandidates: 0, safeExemplarOptions: 0, safeLayoutOptions: 0, distinctSafeSignatures: availableDistinctFamilies },
       signatures, assignments,
@@ -1359,51 +1409,19 @@ export function assessVariantCompositionDistinctness(
         return true;
       });
     });
-    let best: Option[] = [];
-    let bestExemplarCount = -1;
-    let bestRankCost = Number.POSITIVE_INFINITY;
-    const chosen: Option[] = [];
-    const usedSignatures = new Set<string>();
-    const visit = (variantIndex: number, exemplarCount: number, rankCost: number): void => {
-      if (variantIndex === ordered.length) {
-        if (chosen.length > best.length || chosen.length === best.length
-            && (exemplarCount > bestExemplarCount || exemplarCount === bestExemplarCount && rankCost < bestRankCost)) {
-          best = [...chosen];
-          bestExemplarCount = exemplarCount;
-          bestRankCost = rankCost;
-        }
-        return;
-      }
-      if (chosen.length + ordered.length - variantIndex < best.length) return;
-      for (const [optionIndex, option] of optionsByVariant[variantIndex]!.entries()) {
-        if (usedSignatures.has(option.projectedCompositionSignature)) continue;
-        usedSignatures.add(option.projectedCompositionSignature);
-        chosen.push(option);
-        visit(variantIndex + 1, exemplarCount + Number(option.compositionKind === 'exemplar-backed'), rankCost + optionIndex);
-        chosen.pop();
-        usedSignatures.delete(option.projectedCompositionSignature);
-      }
-      visit(variantIndex + 1, exemplarCount, rankCost + optionsByVariant[variantIndex]!.length + 1);
-    };
-    visit(0, 0, 0);
-    const distinct = best.length === variants.length;
-    const proposedAssignments = distinct ? best
-      : optionsByVariant.every((options) => options.length > 0)
-        ? optionsByVariant.map((options) => options[0]!)
-        : best;
-    signatures = distinct ? best.map((option) => option.projectedCompositionSignature)
-      : optionsByVariant.every((options) => options.length > 0)
-        ? optionsByVariant.map((options) => options[0]!.projectedCompositionSignature)
-        : [];
-    const assignments = proposedAssignments;
+    const assignments = assignSafeVariantCompositions(optionsByVariant);
+    signatures = assignments.map((option) => option.projectedCompositionSignature);
+    const availableDistinctFamilies = new Set(signatures).size;
+    const distinct = assignments.length === variants.length && availableDistinctFamilies === variants.length;
     const safeExemplarSignatures = new Set(optionsByVariant.flat().filter((option) => option.compositionKind === 'exemplar-backed')
       .map((option) => option.projectedCompositionSignature));
     const safeLayoutSignatures = new Set(optionsByVariant.flat().filter((option) => option.compositionKind === 'layout-placeholder-backed')
       .map((option) => option.projectedCompositionSignature));
     const allSafeSignatures = new Set([...safeExemplarSignatures, ...safeLayoutSignatures]);
     return {
+      hasSafeAssignments: assignments.length === variants.length,
       distinct,
-      availableDistinctFamilies: best.length,
+      availableDistinctFamilies,
       candidateCounts: {
         sourceCandidates: assessments[0]?.candidateDiagnostics.length ?? 0,
         safeExemplarOptions: safeExemplarSignatures.size,
@@ -1412,12 +1430,15 @@ export function assessVariantCompositionDistinctness(
       },
       signatures,
       assignments,
-      evidence: distinct
-        ? ['A/B/C have three distinct post-projection compositions', ...assignments.map((assignment) => `${assignment.variantId}=${assignment.compositionKind}`)]
+      evidence: assignments.length === variants.length
+        ? [
+          `availableDistinctFamilies=${availableDistinctFamilies}; safe assignments are available for every track`,
+          ...(distinct ? ['A/B/C have three distinct post-projection compositions on this slide'] : ['Some tracks reuse a safe projected composition; distinctness is evaluated across the complete decks']),
+          ...assignments.map((assignment) => `${assignment.variantId}=${assignment.compositionKind}`),
+        ]
         : [
-          `availableDistinctFamilies=${best.length}`,
+          'No complete safe A/B/C assignment is available for this slide.',
           ...assessments.flatMap((assessment) => assessment.evidence).slice(0, 8),
-          'A/B/C could not be assigned three distinct safe exemplar/native-layout compositions.',
         ],
     };
   }

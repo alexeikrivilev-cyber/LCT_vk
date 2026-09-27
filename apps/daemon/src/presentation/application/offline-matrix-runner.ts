@@ -9,7 +9,7 @@ import type { TemplateIR } from '../domain/template-ir.js';
 import { validateTemplateSemanticProfile, type TemplateSemanticProfile } from './template-semantic-profiler.js';
 import { auditCompiledPresentation } from './deterministic-audit.js';
 import { buildPresentationQualityReport } from './presentation-quality-report.js';
-import { reviewDeckLevel, type DeckReviewComposition } from './deck-level-review.js';
+import { assessDeckCompositionDistinctness, reviewDeckLevel, type DeckCompositionDistinctnessReport, type DeckReviewComposition } from './deck-level-review.js';
 import {
   applyVariantCompositionAssignment,
   assessExemplarSelection,
@@ -63,12 +63,12 @@ export interface OfflineMatrixResult {
     diagnosticArtifactPath: string | null;
     deckReviewStatus: 'passed' | 'warning' | 'failed' | 'unknown' | 'not-run';
     deckReviewPath: string | null;
+    deckCompositionDistinctness: DeckCompositionDistinctnessReport | null;
     slides: Array<{
       plannedSlideIndex: number;
       intent: string;
       availableDistinctCompositions: number;
       candidateCounts: ReturnType<typeof assessVariantCompositionDistinctness>['candidateCounts'];
-      requiredDistinctCompositions: 3;
       status: 'passed' | 'blocked';
       signatures: string[];
       evidence: string[];
@@ -187,14 +187,14 @@ export async function runOfflinePresentationMatrix(input: {
       // but the qualification report still needs to show which donors were considered.
       const donorAssessments = variantSlides.map((slide) => assessExemplarSelection(slide, template.templateIR, semanticProfile,
         undefined, visualClassificationCache));
-      const assignedVariantSlides = distinctness.distinct
+      const assignedVariantSlides = distinctness.hasSafeAssignments
         ? variantSlides.map((slide) => {
           const assignment = distinctness.assignments.find((candidate) => candidate.variantId === slide.variantId);
           if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
           return applyVariantCompositionAssignment(slide, assignment, template.templateIR, semanticProfile);
         })
         : variantSlides;
-      if (distinctness.distinct) for (const assigned of assignedVariantSlides) {
+      if (distinctness.hasSafeAssignments) for (const assigned of assignedVariantSlides) {
         const presentation = compiledByVariant.get(assigned.variantId)!;
         compiledByVariant.set(assigned.variantId, {
           ...presentation,
@@ -233,14 +233,20 @@ export async function runOfflinePresentationMatrix(input: {
         intent: variantSlides[0]!.intent,
         availableDistinctCompositions: distinctness.availableDistinctFamilies,
         candidateCounts: distinctness.candidateCounts,
-        requiredDistinctCompositions: 3,
-        status: distinctness.distinct ? 'passed' : 'blocked',
+        status: distinctness.hasSafeAssignments ? 'passed' : 'blocked',
         signatures: distinctness.signatures,
         evidence: distinctness.evidence,
         variants,
       });
     }
-    const qualificationPassed = semanticProfileStatus !== 'failed' && qualifiedSlides.every((slide) => slide.status === 'passed');
+    const safeAssignmentsPassed = qualifiedSlides.every((slide) => slide.status === 'passed');
+    const signaturesByVariant = Object.fromEntries(policies.map((policy) => [policy.id,
+      qualifiedSlides.map((slide) => slide.variants.find((candidate) => candidate.variantId === policy.id)?.projectedCompositionSignature ?? ''),
+    ])) as Record<VariantPolicy['id'], string[]>;
+    const deckCompositionDistinctness = safeAssignmentsPassed
+      ? assessDeckCompositionDistinctness(signaturesByVariant)
+      : null;
+    const qualificationPassed = semanticProfileStatus !== 'failed' && safeAssignmentsPassed && deckCompositionDistinctness?.distinct === true;
     const qualification: OfflineMatrixResult['templateQualifications'][number] = {
       templateIndex: templateIndex + 1,
       templateIRHash: template.templateIR.hash,
@@ -254,6 +260,7 @@ export async function runOfflinePresentationMatrix(input: {
       diagnosticArtifactPath: null,
       deckReviewStatus: 'not-run',
       deckReviewPath: null,
+      deckCompositionDistinctness,
       slides: qualifiedSlides,
     };
     templateQualifications.push(qualification);
@@ -261,7 +268,9 @@ export async function runOfflinePresentationMatrix(input: {
       if (!input.continueOnBlocked) {
         const blocked = qualifiedSlides.find((slide) => slide.status === 'blocked');
         if (profileFailure) throw new TypeError(`Template ${templateIndex + 1} semantic profile failed: ${profileFailure}`);
-        throw new TypeError(`Template ${templateIndex + 1}, slide ${blocked?.plannedSlideIndex ?? 1} has only ${blocked?.availableDistinctCompositions ?? 0} distinct safe projected composition(s); A/B/C outputs were withheld. ${blocked?.evidence.join('; ') ?? 'semantic profile was not validated'}`);
+        if (blocked) throw new TypeError(`Template ${templateIndex + 1}, slide ${blocked.plannedSlideIndex} has no complete safe A/B/C composition assignment; outputs were withheld. ${blocked.evidence.join('; ')}`);
+        const differences = deckCompositionDistinctness?.differingSlideCounts;
+        throw new TypeError(`Template ${templateIndex + 1} complete A/B/C decks do not have pairwise distinct projected composition signatures; slides differing A/B=${differences?.AB ?? 0}, A/C=${differences?.AC ?? 0}, B/C=${differences?.BC ?? 0}.`);
       }
       continue;
     }
@@ -351,9 +360,6 @@ export async function runOfflinePresentationMatrix(input: {
         }
         const auditPath = path.join(variantDirectory, 'audit.json');
         const qualityPath = path.join(variantDirectory, 'quality.json');
-        const signaturesByVariant = Object.fromEntries(policies.map((item) => [item.id,
-          qualifiedSlides.map((slide) => slide.variants.find((candidate) => candidate.variantId === item.id)?.projectedCompositionSignature ?? ''),
-        ])) as Record<VariantPolicy['id'], string[]>;
         const kindsByVariant = Object.fromEntries(policies.map((item) => [item.id,
           qualifiedSlides.map((slide) => slide.variants.find((candidate) => candidate.variantId === item.id)?.compositionKind ?? 'unavailable'),
         ])) as Record<VariantPolicy['id'], string[]>;

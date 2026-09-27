@@ -1,6 +1,8 @@
 # Ограниченная live qualification
 
-**ТЕКУЩИЙ СТАТУС (2026-09-27): BLOCKED.** Fake lifecycle WorkSpace (3 output slides), VK Tech (12) и VK Education (3) проходил; AIOS остаётся отдельным held-out blocker (`VARIANTS_NOT_DISTINCT`). В новом sequential live WorkSpace profile run все 8 batch прошли HTTP 200, `finish_reason=stop` и runtime validation; batch 4 разрешил один cross-role conflict, профиль сохранён `READY`. Локальный runner успел записать ранний failure manifest, пока исходная profile preparation продолжалась; повторной подготовки не запускали. На том же проекте выполнен один Generate: cache read `READY`, `deck-plan` и `plan-review` прошли (1 вызов каждый), но review потребовал `deck-plan-revision`; бюджетный guard заблокировал этот дополнительный запрос до dispatch. `contextual-deck-audit` не запускался, export не выполнен. Profiler calls during Generate = 0. RunPod, image и serving runtime не менялись.
+**ТЕКУЩИЙ СТАТУС (2026-09-27): BLOCKED.** Qualification contract исправлен: core cap 4 (обязательные `deck-plan=1`, `plan-review=1`, `contextual-deck-audit=1`, optional `deck-plan-revision=0..1`), profile cap 16 и full cap 20. На уже существующем проекте с подтверждённым READY profile выполнен ровно один Generate без profiler requests. `deck-plan`, `plan-review` и одна `deck-plan-revision` прошли HTTP 200 и runtime validation, после чего deterministic A/B/C generation остановилась с `VARIANTS_NOT_DISTINCT`. Contextual audit и exports не запускались; повторов не было. Manifest 18:23, указанный в запросе, соответствует проекту со статусом профиля `failed` и без cache-файла. Использован более поздний уже существующий проект 18:44 с тем же template/profile fingerprint и подтверждённым daemon readback `READY`. Новый проект и новая подготовка не создавались. RunPod, image и serving runtime не менялись.
+
+После перехода на deck-level distinctness сделан один workflow POST на тот же проект: profile cache снова подтвердился READY, profiler calls=0, но operation snapshot остался `VARIANTS_NOT_DISTINCT` с прежним operation ID; semantic calls=0. Новая генерация фактически не подтверждена, contextual audit и exports не выполнялись. Следующий live запрос не отправлять до выяснения повторного использования terminal workflow state.
 
 Profiler batching доходит до провайдера только после планирования всех локальных batches и проверяет каждый ответ до merge. Не повторяйте автоматически ни один live run после отказа.
 
@@ -10,7 +12,7 @@ Canonical runner: [`scripts/run-product-e2e.mjs`](./scripts/run-product-e2e.mjs)
 
 - `--semantic-mode fake`: runner сам поднимает локальный deterministic OpenAI-compatible fake. Сеть внешнего inference не используется.
 - `--semantic-mode external`: используется production `OpenAICompatibleSemanticInferenceAdapter`, настроенный через environment. Runner не поднимает model server.
-- Нормальный путь в обоих режимах сначала подготавливает и сохраняет `TemplateSemanticProfile`, затем запускает one-click workflow. Generate делает только cache read и не вызывает profiler. Core cap `3` (deck-plan=1, plan-review=1, contextual-deck-audit=1; generation inference=0); profile preparation cap `16`; full workflow cap `19`. Profiler calls during Generate = `0`; retry = 0.
+- Нормальный путь в обоих режимах сначала подготавливает и сохраняет `TemplateSemanticProfile`, затем запускает one-click workflow. Generate делает только cache read и не вызывает profiler. Core cap `4`: обязательны deck-plan=1, plan-review=1, contextual-deck-audit=1; допускается deck-plan-revision=0..1; generation inference=0. Profile preparation cap `16`, полный предел `20`. Profiler calls during Generate = `0`; retry = 0.
 - `--enable-template-profiler` оставлен для совместимости CLI; profile preparation является частью normal flow. AIOS `VARIANTS_NOT_DISTINCT` остаётся held-out robustness blocker, но не запрещает ограниченный WorkSpace live run после локальных gate.
 
 ## Ограниченная WorkSpace live qualification (Windows PowerShell)
@@ -60,7 +62,7 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --template $WorkspaceTemplate --task $Task --slides 3 --preflight-only
 if ($LASTEXITCODE -ne 0) { throw 'Models preflight failed; do not start product qualification.' }
 
-# One canonical 3-slide WorkSpace run: profile prep cap 16, core cap 3, full workflow cap 19; profiler calls during Generate = 0.
+# One canonical 3-slide WorkSpace run: profile prep cap 16, core cap 4, full workflow cap 20; profiler calls during Generate = 0.
 pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --semantic-mode external --provider-label runpod `
   --template $WorkspaceTemplate --task $Task --slides 3
@@ -145,7 +147,7 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
 
 Для текущего profiler protocol каждый batch содержит не более 4 slides и 24 KiB evidence. Планировщик также ограничивает оценку полного запроса до 48 KiB: system prompt + evidence + фактическая сгенерированная strict JSON Schema + фиксированный запас 2 KiB + консервативный резерв 4 bytes на выходной token. Это byte heuristic, не точная оценка токенов конкретной модели. Профильная подготовка ограничена 16 batches, request timeout — 180000 ms. На этот qualification run задаётся `LCT_TEMPLATE_PROFILE_CONCURRENCY=1` через существующий configuration path (допустимые значения 1–2); это не provider-specific application behavior. `maxOutputTokens` остаётся 4 slides → 4096, 3 → 3072, 2 → 2048, 1 → минимум 2048; `thinking=false`, strict JSON Schema, retries=0.
 
-Нормальный run отправляет до 16 profile batch requests во время подготовки шаблона (profile preparation cap `16`), затем до трёх core requests: по одному deck-plan, plan-review и contextual-deck-audit (core cap `3`; generation inference `0`). Полный предел подготовки и Generate — `19` (full workflow cap `19`). profiler calls during Generate = `0`. Каждый batch фиксирует source slide indexes, evidence/schema/estimated-total bytes, `maxOutputTokens`, HTTP status, latency, token usage при наличии, `finish_reason`, JSON Schema и runtime-validation outcome. Timeout, 5xx/524, усечение, невалидный JSON/schema или runtime validation failure останавливают run без retry.
+Нормальный run отправляет до 16 profile batch requests во время подготовки шаблона (profile preparation cap `16`), затем core cap `4`: обязательные deck-plan=1, plan-review=1 и contextual-deck-audit=1 плюс optional deck-plan-revision=0..1; generation inference `0`. Оба пути валидны: без revision — 3 core calls, с одной revision — 4. Вторая revision и любая незаявленная semantic operation отклоняются до provider dispatch. Полный предел подготовки и Generate — `20` (full workflow cap `20`). profiler calls during Generate = `0`. Каждый batch фиксирует source slide indexes, evidence/schema/estimated-total bytes, `maxOutputTokens`, HTTP status, latency, token usage при наличии, `finish_reason`, JSON Schema и runtime-validation outcome. Timeout, 5xx/524, усечение, невалидный JSON/schema или runtime validation failure останавливают run без retry.
 
 Число downstream calls не зависит от числа output slides. Profile batching, byte/slide bounds, total budget и fake one-click flow покрыты regression tests.
 
@@ -168,7 +170,7 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
 
 ## Запросный бюджет и manifest
 
-[`scripts/lib/live-qualification-contract.json`](./scripts/lib/live-qualification-contract.json) задаёт core cap `3`, profile preparation cap `16` и full workflow cap `19`. Совместимое поле `profilerDiagnosticMaxSemanticRequests` — alias full workflow cap, а `maxProfilerRequests` — alias profile preparation cap. По умолчанию runner сохраняет в `.lct/product-e2e/<timestamp>-<mode>-<random-id>/manifest.json`; `--output-dir` задаёт отдельный пустой каталог:
+[`scripts/lib/live-qualification-contract.json`](./scripts/lib/live-qualification-contract.json) задаёт core cap `4` (три обязательных operation и не более одной `deck-plan-revision`), profile preparation cap `16` и full workflow cap `20`. Совместимое поле `profilerDiagnosticMaxSemanticRequests` — alias full workflow cap, а `maxProfilerRequests` — alias profile preparation cap. По умолчанию runner сохраняет в `.lct/product-e2e/<timestamp>-<mode>-<random-id>/manifest.json`; `--output-dir` задаёт отдельный пустой каталог:
 
 - semantic calls по `operation`, model alias, batch number/source indexes, HTTP status, timestamp, wall time, strict schema/runtime validation, finish reason и доступным token usage;
 - хеш запроса вместо prompt/context;
@@ -191,7 +193,7 @@ RunPod является только одним self-hosted runtime вариан
 3. Продолжать только при полном snapshot точной revision; затем отдельно запустить vLLM и дождаться model readiness.
 4. На локальном компьютере задать `LCT_SEMANTIC_BASE_URL`, `LCT_SEMANTIC_MODEL` и при необходимости secret `LCT_SEMANTIC_API_KEY`.
 5. Выполнить runner `--preflight-only`; это models GET без chat completion.
-6. После PASS WorkSpace, VK Tech и VK Education fake lifecycle и локальных gates выполнить одну WorkSpace template preparation, затем один Generate; core cap — 3, profile preparation cap — 16, full workflow cap — 19, profiler calls during Generate = 0. AIOS held-out `VARIANTS_NOT_DISTINCT` фиксируется отдельно и не блокирует этот ограниченный WorkSpace run.
+6. Последняя фактически выполненная semantic qualification использовала существующий проект с persisted READY profile и не вызывала profiler. `deck-plan=1`, `plan-review=1`, `deck-plan-revision=1` прошли; deterministic generation завершилась `VARIANTS_NOT_DISTINCT` до contextual audit/export. После локального deck-level distinctness fix один workflow POST вернул то же terminal состояние с прежним operation ID и без semantic calls; audit/export не достигнуты. Не отправлять следующий live POST, пока не установлено, как получить новую операцию для этого проекта. Contract caps: core 4, profile preparation 16, full 20.
 7. Если qualification завершена и нет активных запросов, безопасно остановить GPU.
 
 Переход self-hosted/RunPod → VK inference остаётся конфигурационным при совместимом OpenAI-compatible contract. Local model volume относится только к self-hosted container; remote VK endpoint локальное model storage не требует.
