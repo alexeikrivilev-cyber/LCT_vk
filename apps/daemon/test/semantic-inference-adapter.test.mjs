@@ -202,7 +202,7 @@ test('validates structured output and keeps Worker and Supervisor evidence in se
   assert.doesNotMatch(JSON.stringify(supervisor.telemetry), /WORKER_SENTINEL|SUPERVISOR_SENTINEL/);
 });
 
-test('accepts the fourteenth bounded template-profile batch in the full-product request budget', async (t) => {
+test('accepts the sixteenth bounded template-profile batch in the full-product request budget', async (t) => {
   let calls = 0;
   const { baseUrl } = await startServer(t, async (_request, reply) => {
     calls += 1;
@@ -213,7 +213,7 @@ test('accepts the fourteenth bounded template-profile batch in the full-product 
   });
   const request = workerSmokeRequest();
   request.operation = 'template-semantic-profile';
-  request.metadata = { templateProfilerBatch: { batchNumber: 14, totalBatches: 14, sourceSlideIndexes: [500] } };
+  request.metadata = { templateProfilerBatch: { batchNumber: 16, totalBatches: 16, sourceSlideIndexes: [500] } };
   const response = await adapter(baseUrl).infer(request);
   assert.equal(response.value.summary, WORKER_SENTINEL);
   assert.equal(calls, 1);

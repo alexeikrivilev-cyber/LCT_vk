@@ -1,10 +1,10 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "coreMaxSemanticRequests": 3,
-  "profilePreparationMaxSemanticRequests": 14,
-  "fullWorkflowMaxSemanticRequests": 17,
-  "profilerDiagnosticMaxSemanticRequests": 17,
-  "maxProfilerRequests": 14,
+  "profilePreparationMaxSemanticRequests": 16,
+  "fullWorkflowMaxSemanticRequests": 19,
+  "profilerDiagnosticMaxSemanticRequests": 19,
+  "maxProfilerRequests": 16,
   "requiredOperations": {
     "deck-plan": 1,
     "plan-review": 1,

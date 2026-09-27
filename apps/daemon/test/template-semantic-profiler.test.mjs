@@ -7,17 +7,22 @@ import test from 'node:test';
 import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 import { inspectPptx } from '../src/presentation/adapters/python-inspector.ts';
 import { OpenAICompatibleSemanticInferenceAdapter } from '../src/presentation/adapters/openai-compatible-semantic-inference.ts';
-import { planTemplateSemanticProfileBatches, projectTemplateSemanticProfileCache, templateSemanticProfileCacheKey, TemplateSemanticProfiler } from '../src/presentation/application/template-semantic-profiler.ts';
+import { planTemplateSemanticProfileBatches, projectTemplateSemanticProfileCache, templateSemanticProfileCacheKey, templateSemanticProfileJsonSchema, TemplateSemanticProfiler } from '../src/presentation/application/template-semantic-profiler.ts';
 import { createTemplateIR, derivePresentationDesignSystem } from '../src/presentation/application/template-mapper.ts';
 import { sha256Json, templateIRHashPayload } from '../src/presentation/domain/template-ir.ts';
 import { startFakeSemanticEndpoint, deterministicPlanningResponse } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
 
 const model = 'offline-fake-planner';
+const profilerPromptPath = path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md');
 
-async function fixture(root, { slideCount = 3 } = {}) {
+async function profilerPrompt() {
+  return (await readFile(profilerPromptPath, 'utf8')).replace(/\s+/gu, ' ').trim();
+}
+
+async function fixture(root, { slideCount = 3, groupTransform } = {}) {
   await mkdir(root, { recursive: true });
   const filePath = path.join(root, 'private-template-name.pptx');
-  const bytes = await makeSyntheticPptx({ slideCount, layoutCount: 4 });
+  const bytes = await makeSyntheticPptx({ slideCount, layoutCount: 4, groupTransform });
   await writeFile(filePath, bytes);
   const inspection = await inspectPptx(filePath);
   const templateIR = createTemplateIR(inspection, {
@@ -187,10 +192,10 @@ test('batch schema narrows profile references and runtime validation reports saf
       slide.preservedElementIds = slide.preservedElementIds.filter((id) => id !== nonTextId);
       slide.replaceableTextElementIds = [nonTextId];
     }],
-    ['duplicate-element-role', 'DUPLICATE_ELEMENT_ROLE', (value) => {
+    ['duplicate-within-one-role', 'DUPLICATE_ELEMENT_ROLE', (value) => {
       const slide = value.slides[0];
-      slide.titleElementId = firstTextId;
-      slide.bodyElementIds = [firstTextId];
+      slide.titleElementId = null;
+      slide.bodyElementIds = [firstTextId, firstTextId];
       slide.visualElementIds = slide.visualElementIds.filter((id) => id !== firstTextId);
       slide.preservedElementIds = slide.preservedElementIds.filter((id) => id !== firstTextId);
       slide.replaceableTextElementIds = slide.replaceableTextElementIds.filter((id) => id !== firstTextId);
@@ -233,14 +238,151 @@ test('batch schema narrows profile references and runtime validation reports saf
   }
 });
 
+test('profiler resolves only cross-role duplicates by deterministic precedence before strict validation', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-role-normalization-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root, { groupTransform: {} });
+  const firstSlide = templateIR.slides[0];
+  const textIds = firstSlide.elements.filter((element) => element.text?.trim()).map((element) => element.id);
+  const replaceableId = firstSlide.elements.find((element) => element.kind.toLowerCase() === 'shape'
+    && element.nativeId && element.text?.trim() && element.id !== textIds[0])?.id;
+  const nonTextId = firstSlide.elements.find((element) => !element.text?.trim())?.id;
+  const foreignSlideId = templateIR.slides[1].elements.find((element) => element.text?.trim())?.id;
+  assert.ok(textIds[0] && textIds[1] && replaceableId && nonTextId && foreignSlideId,
+    'fixture provides multiple text IDs, replaceable text, a non-text element, and a neighboring slide ID');
+
+  async function runScenario(mutate) {
+    const endpoint = await startFakeSemanticEndpoint({
+      model,
+      respond(request) {
+        const response = deterministicPlanningResponse(request);
+        const value = JSON.parse(response.choices[0].message.content);
+        mutate(value.slides[0]);
+        return completion(value);
+      },
+    });
+    try {
+      let batchTelemetry;
+      const logRecords = [];
+      const delegate = adapter(endpoint.baseUrl);
+      const recordingAdapter = {
+        model,
+        async infer(request) {
+          const previousLog = console.log;
+          console.log = (...values) => logRecords.push(...values);
+          try { return await delegate.infer(request); }
+          finally {
+            console.log = previousLog;
+            batchTelemetry = structuredClone(request.metadata.templateProfilerBatch);
+          }
+        },
+      };
+      const profiler = new TemplateSemanticProfiler(recordingAdapter);
+      try {
+        const profile = await profiler.profile(templateIR, presentationDesignSystem);
+        return { profile, batchTelemetry, logRecords };
+      } catch (error) {
+        return { error, batchTelemetry, logRecords };
+      }
+    } finally {
+      await endpoint.close();
+    }
+  }
+
+  const bodyAndPreserved = await runScenario((slide) => {
+    slide.titleElementId = null;
+    slide.bodyElementIds = [textIds[0]];
+    slide.visualElementIds = [];
+    slide.preservedElementIds = [textIds[0]];
+    slide.replaceableTextElementIds = [];
+  });
+  assert.ok(bodyAndPreserved.profile, 'body/preserved conflict passes the existing runtime validator after normalization');
+  assert.deepEqual(bodyAndPreserved.profile.slides[0].bodyElementIds, [textIds[0]]);
+  assert.deepEqual(bodyAndPreserved.profile.slides[0].preservedElementIds, []);
+  assert.equal(bodyAndPreserved.batchTelemetry.roleConflictResolved, true);
+  assert.equal(bodyAndPreserved.batchTelemetry.resolvedConflictCount, 1);
+  const safeLog = JSON.parse(bodyAndPreserved.logRecords[0]);
+  assert.equal(safeLog.roleConflictResolved, true);
+  assert.equal(safeLog.resolvedConflictCount, 1);
+  assert.ok(!JSON.stringify(safeLog).includes(textIds[0]), 'safe telemetry contains no element ID');
+  assert.ok(!JSON.stringify(safeLog).includes(firstSlide.elements.find((element) => element.id === textIds[0]).text),
+    'safe telemetry contains no slide text');
+
+  const preservedAndReplaceable = await runScenario((slide) => {
+    slide.titleElementId = null;
+    slide.bodyElementIds = [];
+    slide.visualElementIds = [];
+    slide.preservedElementIds = [replaceableId];
+    slide.replaceableTextElementIds = [replaceableId];
+  });
+  assert.ok(preservedAndReplaceable.profile, 'preserved/replaceable conflict passes after normalization');
+  assert.deepEqual(preservedAndReplaceable.profile.slides[0].preservedElementIds, [replaceableId]);
+  assert.deepEqual(preservedAndReplaceable.profile.slides[0].replaceableTextElementIds, []);
+  assert.equal(preservedAndReplaceable.batchTelemetry.resolvedConflictCount, 1);
+
+  const titleAndBody = await runScenario((slide) => {
+    slide.titleElementId = textIds[0];
+    slide.bodyElementIds = [textIds[0]];
+    slide.visualElementIds = [];
+    slide.preservedElementIds = [];
+    slide.replaceableTextElementIds = [];
+  });
+  assert.ok(titleAndBody.profile, 'title/body conflict passes after normalization');
+  assert.equal(titleAndBody.profile.slides[0].titleElementId, textIds[0]);
+  assert.deepEqual(titleAndBody.profile.slides[0].bodyElementIds, []);
+  assert.equal(titleAndBody.batchTelemetry.roleConflictResolved, true);
+  assert.equal(titleAndBody.batchTelemetry.resolvedConflictCount, 1);
+
+  const multipleConflicts = await runScenario((slide) => {
+    slide.titleElementId = textIds[0];
+    slide.bodyElementIds = [textIds[0], textIds[1]];
+    slide.visualElementIds = [textIds[1]];
+    slide.preservedElementIds = [replaceableId];
+    slide.replaceableTextElementIds = [replaceableId];
+  });
+  assert.ok(multipleConflicts.profile, 'multiple conflicts are normalized before the strict validator');
+  assert.deepEqual(multipleConflicts.profile.slides[0].bodyElementIds, [textIds[1]]);
+  assert.deepEqual(multipleConflicts.profile.slides[0].visualElementIds, []);
+  assert.deepEqual(multipleConflicts.profile.slides[0].preservedElementIds, [replaceableId]);
+  assert.deepEqual(multipleConflicts.profile.slides[0].replaceableTextElementIds, []);
+  assert.equal(multipleConflicts.batchTelemetry.roleConflictResolved, true);
+  assert.equal(multipleConflicts.batchTelemetry.resolvedConflictCount, 3);
+
+  for (const [name, invalidId, expectedCode, mutateInvalid] of [
+    ['unknown ID', 'invented-after-normalization', 'UNKNOWN_ELEMENT_ID', (slide) => { slide.visualElementIds.push('invented-after-normalization'); }],
+    ['wrong slide', foreignSlideId, 'ELEMENT_FROM_DIFFERENT_SLIDE', (slide) => { slide.visualElementIds.push(foreignSlideId); }],
+    ['invalid replaceable', nonTextId, 'INVALID_REPLACEABLE_ELEMENT', (slide) => { slide.replaceableTextElementIds = [nonTextId]; }],
+  ]) {
+    const invalidAfterNormalization = await runScenario((slide) => {
+      slide.titleElementId = textIds[0];
+      slide.bodyElementIds = [textIds[0]];
+      slide.visualElementIds = [];
+      slide.preservedElementIds = [];
+      slide.replaceableTextElementIds = [];
+      mutateInvalid(slide);
+    });
+    assert.ok(!invalidAfterNormalization.profile, `${name} must remain rejected after duplicate resolution`);
+    assert.equal(invalidAfterNormalization.error.telemetry.validationFailureCode, expectedCode, name);
+    assert.equal(invalidAfterNormalization.batchTelemetry.roleConflictResolved, true);
+    assert.equal(invalidAfterNormalization.batchTelemetry.resolvedConflictCount, 1);
+    assert.ok(!JSON.stringify(invalidAfterNormalization.batchTelemetry).includes(invalidId), 'safe telemetry contains no element IDs');
+  }
+});
+
 test('large templates use deterministic slide- and byte-bounded batches and merge in canonical order', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-batches-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 17 });
-  const plan = planTemplateSemanticProfileBatches(templateIR);
+  const plan = planTemplateSemanticProfileBatches(templateIR, await profilerPrompt());
   assert.ok(plan.batches.length > 1);
+  assert.ok(plan.batches.length <= 16);
   assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 4));
   assert.ok(plan.batches.every((batch) => batch.evidenceBytes <= 24 * 1024));
+  assert.ok(plan.batches.every((batch) => batch.estimatedTotalRequestBytes <= 48 * 1024));
+  assert.ok(plan.batches.every((batch) => batch.estimatedTotalRequestBytes === batch.systemPromptBytes + batch.evidenceBytes
+    + batch.schemaBytes + batch.envelopeOverheadBytes + batch.outputTokenReserveBytes));
+  assert.ok(plan.batches.every((batch) => batch.outputTokenReserveBytes === batch.maxOutputTokens * 4));
+  assert.ok(plan.batches.every((batch) => batch.maxOutputTokens === Math.max(2048, batch.sourceSlideIndexes.length * 1024)));
   assert.ok(plan.batches.every((batch) => batch.maxOutputTokens >= 2048 && batch.maxOutputTokens <= 4096));
   assert.ok(plan.batches.some((batch) => batch.sourceSlideIndexes.length === 4 && batch.maxOutputTokens === 4096));
   assert.deepEqual(plan.batches.flatMap((batch) => batch.sourceSlideIndexes), templateIR.slides.map((slide) => slide.index));
@@ -278,6 +420,14 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
       batchNumber: batch.batchNumber,
       totalBatches: batch.totalBatches,
       sourceSlideIndexes: batch.sourceSlideIndexes,
+      systemPromptBytes: batch.systemPromptBytes,
+      evidenceBytes: batch.evidenceBytes,
+      schemaBytes: batch.schemaBytes,
+      envelopeOverheadBytes: batch.envelopeOverheadBytes,
+      outputTokenReserveBytes: batch.outputTokenReserveBytes,
+      estimatedTotalRequestBytes: batch.estimatedTotalRequestBytes,
+      roleConflictResolved: false,
+      resolvedConflictCount: 0,
     });
     assert.equal(request.maxOutputTokens, batch.maxOutputTokens);
     assert.equal(request.timeoutMs, 180000);
@@ -297,7 +447,7 @@ test('profile preparation bounds concurrent batches, merges deterministically, a
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-concurrency-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 17 });
-  const plan = planTemplateSemanticProfileBatches(templateIR);
+  const plan = planTemplateSemanticProfileBatches(templateIR, await profilerPrompt());
   let active = 0;
   let maximumActive = 0;
   const requestBatchNumbers = [];
@@ -396,7 +546,7 @@ test('a single dense slide keeps every exposed element ID while shortening text 
   slide.designElementIds = [];
   templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
 
-  const plan = planTemplateSemanticProfileBatches(templateIR);
+  const plan = planTemplateSemanticProfileBatches(templateIR, await profilerPrompt());
   assert.equal(plan.batches.length, 1);
   assert.ok(plan.batches[0].evidenceBytes <= 24 * 1024);
   const evidence = JSON.parse(plan.batches[0].evidence);
@@ -404,6 +554,51 @@ test('a single dense slide keeps every exposed element ID while shortening text 
   assert.deepEqual(evidence.slides[0].elements.map((element) => element.id), slide.elements.map((element) => element.id));
   assert.equal(evidence.slides[0].textEvidenceTruncated, true);
   assert.ok(evidence.slides[0].elements.every((element) => !element.text || element.text.length <= 320));
+});
+
+test('dense schema makes the planner split a batch even when the evidence alone fits', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-schema-budget-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR } = await fixture(root, { slideCount: 4 });
+  for (const slide of templateIR.slides) {
+    const sourceElement = structuredClone(slide.elements[0]);
+    assert.ok(sourceElement, 'synthetic slide has a source element to clone');
+    slide.elements = Array.from({ length: 26 }, (_, index) => ({
+      ...structuredClone(sourceElement),
+      id: `schema_dense_slide_${slide.index}_element_${index}_${'x'.repeat(160)}`,
+      nativeId: String(index + 1), name: `Dense asset ${index + 1}`, order: index + 1, kind: 'picture', text: null, placeholder: null,
+    }));
+    slide.designElementIds = [];
+  }
+  templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
+  const prompt = await profilerPrompt();
+  const plan = planTemplateSemanticProfileBatches(templateIR, prompt);
+  const candidateSlides = templateIR.slides.slice(0, 3);
+  const candidateEvidence = {
+    templateIRHash: templateIR.hash,
+    canvas: { width: templateIR.slideSize.width, height: templateIR.slideSize.height },
+    slides: plan.batches.flatMap((batch) => JSON.parse(batch.evidence).slides)
+      .filter((slide) => candidateSlides.some((candidate) => candidate.index === slide.sourceSlideIndex)),
+  };
+  const evidenceBytes = Buffer.byteLength(JSON.stringify(candidateEvidence), 'utf8');
+  const generatedSchema = templateSemanticProfileJsonSchema(templateIR, candidateSlides);
+  const schemaBytes = Buffer.byteLength(JSON.stringify(generatedSchema), 'utf8');
+  const maxOutputTokens = Math.min(4096, Math.max(2048, candidateSlides.length * 1024));
+  const oversizedRequestBytes = Buffer.byteLength(prompt, 'utf8') + evidenceBytes + schemaBytes + 2048 + maxOutputTokens * 4;
+
+  assert.ok(evidenceBytes <= 24 * 1024, `the combined evidence alone fits the evidence ceiling (${evidenceBytes} bytes)`);
+  assert.ok(oversizedRequestBytes > 48 * 1024, 'the generated strict schema pushes the full request beyond budget');
+  assert.ok(plan.batches.length > 1, 'planner splits rather than emitting the oversized request');
+  assert.ok(plan.batches.length <= 16);
+  assert.deepEqual(plan.batches.flatMap((batch) => batch.sourceSlideIndexes), templateIR.slides.map((slide) => slide.index),
+    'all source slides are covered exactly once and in source order');
+  assert.equal(new Set(plan.batches.flatMap((batch) => batch.sourceSlideIndexes)).size, templateIR.slides.length);
+  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 4));
+  assert.ok(plan.batches.every((batch) => batch.evidenceBytes <= 24 * 1024));
+  assert.ok(plan.batches.every((batch) => batch.estimatedTotalRequestBytes <= 48 * 1024));
+  assert.ok(plan.batches.every((batch) => batch.schemaBytes === Buffer.byteLength(JSON.stringify(batch.schema), 'utf8')));
+  assert.ok(!plan.batches.some((batch) => batch.sourceSlideIndexes.join(',') === candidateSlides.map((slide) => slide.index).join(',')),
+    'the otherwise evidence-valid 3-slide candidate is split by the full-request ceiling');
 });
 
 test('a slide that still exceeds the byte cap after compact fallback fails locally', async (t) => {
@@ -422,7 +617,7 @@ test('a slide that still exceeds the byte cap after compact fallback fails local
   templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
 
   assert.throws(
-    () => planTemplateSemanticProfileBatches(templateIR),
+    () => planTemplateSemanticProfileBatches(templateIR, 'bounded synthetic profiler prompt'),
     (error) => error.code === 'REQUEST_TOO_LARGE' && /source slide 1/u.test(error.message),
   );
 });
@@ -491,10 +686,13 @@ test('profiler config version invalidates profiles produced from the previous ev
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root);
   const contract = JSON.parse(await readFile(path.join(process.cwd(), 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
-  assert.equal(contract.configVersion, 'template-profiler-config.v6');
+  assert.equal(contract.configVersion, 'template-profiler-config.v7');
   assert.equal(contract.maxSlidesPerBatch, 4);
   assert.equal(contract.maxBatchEvidenceBytes, 24 * 1024);
-  assert.equal(contract.maxBatches, 14);
+  assert.equal(contract.maxBatches, 16);
+  assert.equal(contract.maxEstimatedRequestBytes, 48 * 1024);
+  assert.equal(contract.requestEnvelopeOverheadBytes, 2048);
+  assert.equal(contract.outputTokenByteReserve, 4);
   assert.equal(contract.maxOutputTokens, 4096);
   assert.equal(contract.timeoutMs, 180000);
   const prompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8')).replace(/\s+/g, ' ').trim();
@@ -504,7 +702,7 @@ test('profiler config version invalidates profiles produced from the previous ev
     promptVersion: 'template-profiler.v2',
     promptSha256,
     schemaCompatibility: 'template_semantic_profile_v1',
-    configVersion: 'template-profiler-config.v2',
+    configVersion: 'template-profiler-config.v6',
   })).digest('hex');
   const cache = projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile');
   const legacyProfile = {

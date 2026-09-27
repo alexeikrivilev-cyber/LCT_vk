@@ -36,6 +36,14 @@ export interface SemanticRequestMetadata {
     batchNumber: number;
     totalBatches: number;
     sourceSlideIndexes: number[];
+    systemPromptBytes?: number;
+    evidenceBytes?: number;
+    schemaBytes?: number;
+    envelopeOverheadBytes?: number;
+    outputTokenReserveBytes?: number;
+    estimatedTotalRequestBytes?: number;
+    roleConflictResolved?: boolean;
+    resolvedConflictCount?: number;
   };
 }
 

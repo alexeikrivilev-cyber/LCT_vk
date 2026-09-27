@@ -24,7 +24,12 @@ const MAX_SCHEMA_BYTES = 64 * 1024;
 const MAX_SCHEMA_NODES = 8192;
 const MAX_SCHEMA_DEPTH = 64;
 const MAX_OUTPUT_TOKENS = 8192;
-const MAX_TEMPLATE_PROFILE_BATCHES = 14;
+const MAX_TEMPLATE_PROFILE_BATCHES = 16;
+const MAX_TEMPLATE_PROFILE_BATCH_SLIDES = 4;
+const MAX_TEMPLATE_PROFILE_EVIDENCE_BYTES = 24 * 1024;
+const MAX_TEMPLATE_PROFILE_PROMPT_BYTES = 16 * 1024;
+const MAX_TEMPLATE_PROFILE_REQUEST_BYTES = 48 * 1024;
+const MAX_TEMPLATE_PROFILE_ROLE_CONFLICTS = MAX_TEMPLATE_PROFILE_BATCH_SLIDES * 120;
 const MAX_TEXT_CHARS = 4 * 1024 * 1024;
 const OPERATION_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -140,9 +145,30 @@ function validateMetadata(metadata: SemanticRequestMetadata | undefined): void {
           || !isFiniteInteger(value.totalBatches, 1, MAX_TEMPLATE_PROFILE_BATCHES)
           || value.batchNumber > value.totalBatches
           || !Array.isArray(value.sourceSlideIndexes)
-          || value.sourceSlideIndexes.length === 0 || value.sourceSlideIndexes.length > 6
+          || value.sourceSlideIndexes.length === 0 || value.sourceSlideIndexes.length > MAX_TEMPLATE_PROFILE_BATCH_SLIDES
           || !value.sourceSlideIndexes.every((index) => isFiniteInteger(index, 1, 500))) {
         throw new SemanticInferenceError('INVALID_REQUEST', 'Semantic request metadata is invalid');
+      }
+      const sizeFields = [value.systemPromptBytes, value.evidenceBytes, value.schemaBytes, value.envelopeOverheadBytes,
+        value.outputTokenReserveBytes, value.estimatedTotalRequestBytes];
+      if (sizeFields.some((field) => field !== undefined)) {
+        if (!isFiniteInteger(value.systemPromptBytes, 0, MAX_TEMPLATE_PROFILE_PROMPT_BYTES)
+            || !isFiniteInteger(value.evidenceBytes, 0, MAX_TEMPLATE_PROFILE_EVIDENCE_BYTES)
+            || !isFiniteInteger(value.schemaBytes, 1, MAX_SCHEMA_BYTES)
+            || !isFiniteInteger(value.envelopeOverheadBytes, 0, 8 * 1024)
+            || !isFiniteInteger(value.outputTokenReserveBytes, 1, MAX_OUTPUT_TOKENS * 8)
+            || !isFiniteInteger(value.estimatedTotalRequestBytes, 1, MAX_TEMPLATE_PROFILE_REQUEST_BYTES)
+            || value.estimatedTotalRequestBytes !== value.systemPromptBytes + value.evidenceBytes + value.schemaBytes
+              + value.envelopeOverheadBytes + value.outputTokenReserveBytes) {
+          throw new SemanticInferenceError('INVALID_REQUEST', 'Semantic request metadata is invalid');
+        }
+      }
+      if (value.roleConflictResolved !== undefined || value.resolvedConflictCount !== undefined) {
+        if (typeof value.roleConflictResolved !== 'boolean'
+            || !isFiniteInteger(value.resolvedConflictCount, 0, MAX_TEMPLATE_PROFILE_ROLE_CONFLICTS)
+            || value.roleConflictResolved !== (value.resolvedConflictCount > 0)) {
+          throw new SemanticInferenceError('INVALID_REQUEST', 'Semantic request metadata is invalid');
+        }
       }
       continue;
     }
@@ -792,7 +818,16 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
         model: this.config.model, latencyMs: Date.now() - startedMs, finishReason: finishReason ?? null,
         httpStatus: httpStatus ?? null, maxOutputTokens: request.maxOutputTokens, responseFormat: 'json_schema', strictJsonSchema: true,
         templateProfilerBatch: request.metadata?.templateProfilerBatch ?? null,
+        ...(request.operation === 'template-semantic-profile' ? {
+          roleConflictResolved: request.metadata?.templateProfilerBatch?.roleConflictResolved ?? false,
+          resolvedConflictCount: request.metadata?.templateProfilerBatch?.resolvedConflictCount ?? 0,
+        } : {}),
         evidenceBytes,
+        systemPromptBytes: request.metadata?.templateProfilerBatch?.systemPromptBytes ?? null,
+        schemaBytes: request.metadata?.templateProfilerBatch?.schemaBytes ?? null,
+        envelopeOverheadBytes: request.metadata?.templateProfilerBatch?.envelopeOverheadBytes ?? null,
+        outputTokenReserveBytes: request.metadata?.templateProfilerBatch?.outputTokenReserveBytes ?? null,
+        estimatedTotalRequestBytes: request.metadata?.templateProfilerBatch?.estimatedTotalRequestBytes ?? null,
         promptTokens: promptTokens ?? null, completionTokens: completionTokens ?? null,
         runtimeSchemaValidation, status: outcome, errorCode: outcomeErrorCode,
         validationFailureCode: validationFailureCode ?? null }));

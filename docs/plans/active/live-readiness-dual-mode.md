@@ -1,6 +1,6 @@
 # Plan: prepared semantic profile and bounded live qualification
 
-> **Current scope (2026-09-27):** prepare and persist a complete `TemplateSemanticProfile` before Generate, then use cache-only reads during generation. Fake lifecycle passed for WorkSpace, VK Tech (12 slides), and VK Education; AIOS remains a separate held-out `VARIANTS_NOT_DISTINCT` blocker, not an absolute stop for WorkSpace live qualification. The profiler uses 4-slide batches, a 180 s timeout, concurrency 1 for the latest sequential qualification, and retries 0. The batch-aware JSON Schema binds the exact TemplateIR hash and per-slide element IDs; runtime validation remains fail-closed. A hard prompt rule now makes the five semantic roles mutually exclusive; prompt-content SHA-256 is part of the cache fingerprint, and the targeted test verified that changing the prompt changes the key. The latest WorkSpace attempt passed batches 1–2/8 and stopped on batch 3/8 with HTTP 400 / `PROVIDER_ERROR`, provider parameter `input_tokens`, latency 588 ms, because prompt plus requested output exceeded the provider context limit. Profile was not READY, so Generate did not run. No further live calls are authorized by this attempt; do not run VK Tech live or commit/push.
+> **Current scope (2026-09-27): BLOCKED after one Generate.** Prepare and persist a complete `TemplateSemanticProfile` before Generate; Generate reads the cached profile only. Fake lifecycle passed for WorkSpace, VK Tech (12 slides), and VK Education; AIOS remains a separate held-out `VARIANTS_NOT_DISTINCT` blocker. The profiler uses adaptive batches of at most 4 slides, a 48 KiB full-request estimate cap, a 180 s timeout, concurrency 1, and retries 0. The batch-aware schema and final runtime validator remain strict. Deterministic role normalization is applied only when the validator reports `DUPLICATE_ELEMENT_ROLE`, with precedence title > body > visual > preserved > replaceable; all eight latest WorkSpace batches passed and the persisted profile is READY. One Generate passed `deck-plan` and `plan-review`, then requested a `deck-plan-revision`; the call-budget guard blocked it before dispatch. No contextual audit/export ran. Profiler calls during Generate were 0. Do not send further live calls or run VK Tech; do not change the pod or commit/push.
 
 ## Goal
 
@@ -18,7 +18,7 @@
 
 - Template preparation may infer on cache miss, validates the complete profile, and persists it with the existing TemplateIR hash/prompt/config fingerprint.
 - Generate never calls the profiler; cache miss or invalid profile fails with `TEMPLATE_PROFILE_NOT_READY`. Structural fallback does not substitute for the normal quality path.
-- Profile preparation is bounded to 14 batches, at most 4 slides and 24 KiB evidence per batch, with profiler-only timeout 180000 ms; core cap is 3 and full preparation+generation cap is 17. Retries are zero.
+- Profile preparation is bounded to 16 batches, at most 4 slides and 24 KiB evidence per batch, plus a 48 KiB conservative full-request byte estimate (system prompt, evidence, generated strict schema, fixed envelope, and output reserve); profiler-only timeout is 180000 ms. Core cap is 3 and full preparation+generation cap is 19. Retries are zero.
 - WorkSpace, VK Tech and VK Education fake lifecycle passed; AIOS remains a held-out robustness blocker and does not gate this bounded WorkSpace run.
 - Targeted profiler/adapter/contract tests, `docs:check`, and `git diff --check` must pass before one WorkSpace live run. VK Tech live is not part of this follow-up.
 
@@ -31,10 +31,10 @@
 - [x] Exact AIOS preparation: 16 source slides / 4 batches; profile READY; Generate failed at `VARIANTS_NOT_DISTINCT` after Worker + planning Supervisor. No contextual audit/export. Manifest: `.lct/prepared-profile-fake-aios-20260927/manifest.json`.
 - [x] VK Tech 12-slide and VK Education 3-slide profile-before-Generate fake E2E — PASS in the follow-up lifecycle run; see ignored qualification manifests.
 - [x] Full repository gates passed on the prior code baseline; after the budget correction, `docs:check`, `git diff --check` and targeted contract/runner tests passed. Current profiler changes rerun the targeted profiler/adapter/runner tests and docs/diff gates.
-- [x] Recalculate the real WorkSpace 29-slide profile batch plan under 4-slide/24-KiB/14-batch limits; all 29 source indexes are covered exactly once in 8 batches.
+- [x] Recalculate the real WorkSpace 29-slide profile batch plan under 4-slide/24-KiB/48-KiB request-estimate/16-batch limits; all 29 source indexes are covered exactly once and in order in 8 batches.
 - [x] Make the profiler schema batch-aware: exact TemplateIR hash, expected slide branch, role-specific per-slide ID enums, bounded arrays; keep runtime validation fail-closed and report only safe invariant codes.
 - [x] Add runtime diagnostic/token logging for each semantic batch without storing content; targeted profiler/adapter tests 36/36 and runner contract tests 2/2 passed; daemon typecheck, `docs:check`, and `git diff --check` passed.
-- [x] Recompute WorkSpace with the generated schema: 8 batches cover slides 1–29 exactly once; max evidence 21,058 bytes, max schema 19,845 bytes (<64 KiB).
+- [x] Recompute WorkSpace with the generated schema: 8 batches cover slides 1–29 exactly once; max evidence 15,767 bytes, max schema 14,612 bytes, max estimated full request 47,237 bytes (<48 KiB). The previous oversized slides 9–12 batch now splits into slides 9–11 and 12–15.
 - [x] Run one fresh WorkSpace profile preparation with concurrency 2 after the schema fix. Batch 1/8 failed runtime validation as `DUPLICATE_ELEMENT_ROLE`; batch 2/8 was cancelled; no retries. Profile was not persisted READY; Generate and all core calls = 0. Historical attempt only; superseded by the role-prompt follow-up below.
 - [x] Add the role-exclusivity hard rule to the versioned profiler prompt; verify prompt-content changes produce a new profile cache fingerprint.
 - [x] Run one fresh WorkSpace preparation after the prompt fix. Models-only preflight passed. Batch 2/8 returned `SERVICE_UNAVAILABLE` after 10366 ms with no HTTP status; concurrent batch 1 was cancelled. Two profiler requests total, retries=0; profile not READY; Generate/core calls=0. Stop at first failure.
@@ -46,18 +46,18 @@ Sizing was measured with the deterministic local fake, not an inference call. Se
 
 ## Current WorkSpace plan (deterministic, before live inference)
 
-The organizer WorkSpace PPTX has 29 slides and 68,280 bytes of full compact evidence. The current planner creates 8 batches; all evidence is within 24 KiB, each batch has at most 4 slides, and source indexes 1–29 are covered exactly once.
+The organizer WorkSpace PPTX has 29 slides and 68,280 bytes of full compact evidence. The current planner creates 8 batches under the 48 KiB full-request estimate; all evidence is within 24 KiB, each batch has at most 4 slides, and source indexes 1–29 are covered exactly once. Batch 3—the previous provider rejection—now contains slides 9–11; slide 12 moves to the next batch.
 
-| Batch | Source slide indexes | Slides | Evidence bytes | maxOutputTokens |
-| ---: | --- | ---: | ---: | ---: |
-| 1 | 1–4 | 4 | 7,896 | 4,096 |
-| 2 | 5–8 | 4 | 9,735 | 4,096 |
-| 3 | 9–12 | 4 | 21,058 | 4,096 |
-| 4 | 13–16 | 4 | 8,304 | 4,096 |
-| 5 | 17–20 | 4 | 4,245 | 4,096 |
-| 6 | 21–24 | 4 | 7,632 | 4,096 |
-| 7 | 25–28 | 4 | 9,065 | 4,096 |
-| 8 | 29 | 1 | 1,332 | 2,048 |
+| Batch | Source slide indexes | Slides | Evidence bytes | Schema bytes | Estimated request bytes | maxOutputTokens |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1–4 | 4 | 7,896 | 11,219 | 40,066 | 4,096 |
+| 2 | 5–8 | 4 | 9,735 | 13,286 | 43,972 | 4,096 |
+| 3 | 9–11 | 3 | 15,767 | 14,612 | 47,234 | 3,072 |
+| 4 | 12–15 | 4 | 11,195 | 13,485 | 45,631 | 4,096 |
+| 5 | 16–19 | 4 | 6,119 | 10,283 | 37,353 | 4,096 |
+| 6 | 20–23 | 4 | 6,780 | 9,854 | 37,585 | 4,096 |
+| 7 | 24–27 | 4 | 10,158 | 12,664 | 43,773 | 4,096 |
+| 8 | 28–29 | 2 | 1,617 | 3,838 | 18,214 | 2,048 |
 
 ## Historical live profile qualification (earlier protocol)
 
@@ -123,3 +123,28 @@ After the local schema/diagnostic fix and green targeted gates, one fresh attemp
 After changing only the prompt guidance for mutually exclusive roles, targeted local gates passed and the prompt fingerprint was verified to change. Models-only preflight passed. The fresh WorkSpace preparation used 4 slides/batch, maxOutputTokens=4096, timeout=180000 ms, concurrency=2, thinking=false, retries=0. Batch 2/8 (slides 5–8, 9,735 evidence bytes) failed with `SERVICE_UNAVAILABLE` after 10,366 ms; no HTTP status, finish reason, token usage, or runtime validation result was received. Concurrent batch 1/8 (slides 1–4, 7,896 evidence bytes) was cancelled after 10,369 ms. Two profiler requests were dispatched, no automatic retries occurred, and batches 3–8 were not sent. Profile cache READY=false; Generate profiler/core calls=0. Manifest: `.lct/product-e2e/20260927174938-external-5ca326f5/manifest.json`. The exact cause is unknown because the provider response/status was unavailable; stop at this first failure and do not retry.
 
 A later one-off attempt used the same prompt and fixed profiler settings, with only the explicitly requested concurrency change to 1. Models-only preflight passed. Batch 1/8 (slides 1–4, 7,896 evidence bytes) passed: HTTP 200, `finish_reason=stop`, 70,743 ms, 4,799 prompt / 2,005 completion tokens, runtime validation passed. Batch 2/8 (slides 5–8, 9,735 bytes) passed: HTTP 200, `finish_reason=stop`, 78,579 ms, 5,645 prompt / 2,183 completion tokens, runtime validation passed. Batch 3/8 (slides 9–12, 21,058 bytes) was rejected with HTTP 400 after 588 ms; provider diagnostic: `BadRequestError`, parameter `input_tokens`, “The prompt and requested output exceed the provider context limit.” `finish_reason` and token usage were unavailable; runtime validation was not run. Retries=0; batches 4–8 were not sent; profile cache READY=false; Generate/core calls=0. Manifest: `.lct/product-e2e/20260927180249-external-cc346d39/manifest.json`. Stop at this first failure; no RunPod or model configuration was changed.
+
+Latest adaptive-request-budget run: after targeted profiler/adapter/qualification-runner tests, daemon typecheck, docs check and diff check passed, one models-only preflight passed (`/v1/models`: one GET, zero chat completions). The deterministic 29-slide WorkSpace plan had 8 batches; the prior 4-slide batch 9–12 split into 9–11 and 12–15, with max estimated request 47,234 bytes under 48 KiB. Sequential run used concurrency 1, profiler timeout 180000 ms, `thinking=false`, strict schema, retries 0. Batch 1/8, slides 1–4: HTTP 200, stop, 71,050 ms, 4,799/2,005 tokens, runtime PASS, estimate 40,066 bytes. Batch 2/8, slides 5–8: HTTP 200, stop, 77,240 ms, 5,645/2,183 tokens, runtime PASS, estimate 43,972 bytes. Batch 3/8, slides 9–11: HTTP 200, stop, 107,702 ms, 9,611/2,967 tokens, runtime PASS, estimate 47,234 bytes. Batch 4/8, slides 12–15: HTTP 200, stop, 80,321 ms, 6,698/2,220 tokens, runtime FAIL `DUPLICATE_ELEMENT_ROLE`, estimate 45,631 bytes. The first runtime failure stopped qualification: no retries, batches 5–8, or Generate/core calls followed. Profile cache is not READY. Manifest `.lct/product-e2e/20260927182307-external-b16a7020/manifest.json` was finalized before batch 4 telemetry arrived; it records that request as running and the outer preparation as `PRODUCT_E2E_FAILED`, while the adapter subsequently logged the batch's actual HTTP/runtime result above. No further live requests were sent.
+
+## Deterministic duplicate-role normalization and latest WorkSpace run
+
+The narrowly-scoped normalizer runs only when the batch validator diagnoses `DUPLICATE_ELEMENT_ROLE`. It removes cross-role repeats by precedence `title > body > visual > preserved > replaceable`, then invokes the existing validator. Same-role duplicates, unknown IDs, foreign-slide IDs and invalid replaceable IDs remain failures. Safe profiler telemetry adds only `roleConflictResolved` and a count.
+
+Targeted gates passed before live use: profiler 21/21, adapter 17/17, daemon typecheck, `docs:check` and `git diff --check`.
+
+One sequential WorkSpace preparation reused the existing 4-slide/24-KiB/48-KiB limits, 180,000 ms profiler timeout, concurrency 1, `thinking=false`, strict JSON Schema and retries 0. Every batch returned HTTP 200, `finish_reason=stop` and runtime validation PASS:
+
+| Batch | Source slides | Latency | Prompt/completion tokens | Resolved role conflict | Estimated request bytes |
+|---|---:|---:|---:|---:|---:|
+| 1/8 | 1–4 | 71,112 ms | 4,799 / 2,005 | no / 0 | 40,066 |
+| 2/8 | 5–8 | 78,341 ms | 5,645 / 2,183 | no / 0 | 43,972 |
+| 3/8 | 9–11 | 105,369 ms | 9,611 / 2,967 | no / 0 | 47,234 |
+| 4/8 | 12–15 | 78,893 ms | 6,698 / 2,220 | yes / 1 | 45,631 |
+| 5/8 | 16–19 | 62,248 ms | 3,662 / 1,737 | no / 0 | 37,353 |
+| 6/8 | 20–23 | 71,686 ms | 4,203 / 2,008 | no / 0 | 37,585 |
+| 7/8 | 24–27 | 82,720 ms | 6,175 / 2,294 | no / 0 | 43,773 |
+| 8/8 | 28–29 | 21,495 ms | 1,330 / 594 | no / 0 | 18,214 |
+
+The persisted profile is `READY`; preparation duration recorded in its status file is 571,927 ms. The first one-click runner manifest had already recorded `PRODUCT_E2E_FAILED` with batch 4 still `running`; the same in-flight server preparation continued after that manifest write and eventually validated batches 4–8 and persisted the complete profile. No second preparation was started.
+
+One Generate was then started on that same persisted project after confirming the cached profile was `READY`. Profiler calls during Generate were 0. `deck-plan` passed once (HTTP 200, stop, 22,242 ms, 2,946/483 tokens); `plan-review` passed once (HTTP 200, stop, 12,585 ms, 3,353/305 tokens). Planning requested a local revision; the bounded adapter guard rejected `deck-plan-revision` before dispatch because it was outside the authorized call cap. Workflow persisted `failed` at `planning`, with `LIVE_SEMANTIC_BUDGET_EXCEEDED`; `contextual-deck-audit` and exports were not run. Total live chat completions in this attempt: 10 (8 profile + 2 Generate); `/v1/models` preflight: one GET. No retry, VK Tech run, RunPod change, commit or push. Current status is **BLOCKED**, not `LIVE_WORKSPACE_READY_FOR_UI`.

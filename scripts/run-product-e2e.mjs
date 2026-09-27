@@ -31,12 +31,12 @@ const liveQualificationContract = JSON.parse(readFileSync(path.join(path.dirname
 const requiredOperationTotal = liveQualificationContract.requiredOperations
   && Object.values(liveQualificationContract.requiredOperations).reduce((total, count) => total + count, 0);
 const requiredOperationNames = ['deck-plan', 'plan-review', 'contextual-deck-audit'];
-if (liveQualificationContract.schemaVersion !== 5 || liveQualificationContract.coreMaxSemanticRequests !== 3
-    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 14
-    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 17
+if (liveQualificationContract.schemaVersion !== 6 || liveQualificationContract.coreMaxSemanticRequests !== 3
+    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 16
+    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 19
     || !Number.isSafeInteger(liveQualificationContract.profilerDiagnosticMaxSemanticRequests)
     || !Number.isSafeInteger(liveQualificationContract.maxProfilerRequests)
-    || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 14
+    || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 16
     || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.fullWorkflowMaxSemanticRequests
     || liveQualificationContract.maxProfilerRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
     || !liveQualificationContract.requiredOperations
@@ -279,6 +279,11 @@ export function createRequestBudgetAdapter(delegate, limit = FULL_WORKFLOW_MAX_S
           templateProfilerBatch: request.metadata?.templateProfilerBatch ?? null,
           evidenceBytes: isProfilePreparation && typeof profilerEvidence === 'string'
             ? Buffer.byteLength(profilerEvidence, 'utf8') : null,
+          systemPromptBytes: request.metadata?.templateProfilerBatch?.systemPromptBytes ?? null,
+          schemaBytes: request.metadata?.templateProfilerBatch?.schemaBytes ?? null,
+          envelopeOverheadBytes: request.metadata?.templateProfilerBatch?.envelopeOverheadBytes ?? null,
+          outputTokenReserveBytes: request.metadata?.templateProfilerBatch?.outputTokenReserveBytes ?? null,
+          estimatedTotalRequestBytes: request.metadata?.templateProfilerBatch?.estimatedTotalRequestBytes ?? null,
           startedAt: startedAt(),
           wallTimeMs: null,
           finishReason: null,
@@ -336,8 +341,8 @@ function semanticCounts(records) {
 }
 
 function requestRecords(records) {
-  return records.map(({ operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, evidenceBytes, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, validationFailureCode, status, errorCode }) => ({
-    operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, evidenceBytes, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, validationFailureCode, status, errorCode,
+  return records.map(({ operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, evidenceBytes, systemPromptBytes, schemaBytes, envelopeOverheadBytes, outputTokenReserveBytes, estimatedTotalRequestBytes, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, validationFailureCode, status, errorCode }) => ({
+    operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, evidenceBytes, systemPromptBytes, schemaBytes, envelopeOverheadBytes, outputTokenReserveBytes, estimatedTotalRequestBytes, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, validationFailureCode, status, errorCode,
   }));
 }
 

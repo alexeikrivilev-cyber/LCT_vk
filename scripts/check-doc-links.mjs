@@ -72,9 +72,9 @@ const failures = [];
 const liveQualificationContract = JSON.parse(await readFile(path.join(root, 'scripts/lib/live-qualification-contract.json'), 'utf8'));
 const requiredSemanticRequests = Object.values(liveQualificationContract.requiredOperations ?? {})
   .reduce((total, count) => total + count, liveQualificationContract.generationSemanticRequests ?? 0);
-if (liveQualificationContract.schemaVersion !== 5
+if (liveQualificationContract.schemaVersion !== 6
     || liveQualificationContract.coreMaxSemanticRequests !== requiredSemanticRequests
-    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 14
+    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 16
     || liveQualificationContract.fullWorkflowMaxSemanticRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
       + liveQualificationContract.coreMaxSemanticRequests
     || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.fullWorkflowMaxSemanticRequests
@@ -84,6 +84,8 @@ if (liveQualificationContract.schemaVersion !== 5
 const profilerContract = JSON.parse(await readFile(path.join(root, 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
 if (profilerContract.maxBatches !== liveQualificationContract.maxProfilerRequests
     || profilerContract.maxSlidesPerBatch !== 4 || profilerContract.maxBatchEvidenceBytes !== 24 * 1024
+    || profilerContract.maxEstimatedRequestBytes !== 48 * 1024
+    || profilerContract.requestEnvelopeOverheadBytes !== 2048 || profilerContract.outputTokenByteReserve !== 4
     || profilerContract.maxOutputTokens !== 4096 || profilerContract.timeoutMs !== 180000) {
   failures.push('template profiler batch limits differ from the hard request budget contract');
 }
