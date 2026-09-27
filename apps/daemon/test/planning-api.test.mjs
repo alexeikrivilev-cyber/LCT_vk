@@ -11,6 +11,7 @@ register();
 const { startServer } = await import('../src/server.ts');
 const { SemanticInferenceError } = await import('../src/presentation/application/semantic-inference-port.ts');
 const { planningInputFingerprint } = await import('../src/presentation/application/planning-service.ts');
+const { deckPlanHash } = await import('../src/presentation/domain/deck-plan.ts');
 const { AGENT_WORKFLOW_CONTRACT_SHA256, AGENT_WORKFLOW_VERSIONS } = await import('../src/presentation/application/workflow-versions.ts');
 
 const repoRoot = path.resolve(import.meta.dirname, '../../..');
@@ -508,4 +509,64 @@ test('planning input fingerprint changes when prompt assets or the agent workflo
   assert.equal(AGENT_WORKFLOW_VERSIONS.worker.schemaVersion, 'deck_plan_draft_v4');
   assert.equal(AGENT_WORKFLOW_VERSIONS.supervisor.schemaVersion, 'supervisor_plan_review_v1');
   assert.match(AGENT_WORKFLOW_CONTRACT_SHA256, /^[a-f0-9]{64}$/);
+});
+
+test('legacy v4 generated-copy title overflow invalidates only the saved plan and preserves inputs for replanning', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-planning-legacy-title-'));
+  const dataDir = path.join(temp, 'data');
+  const control = { reviewMode: 'pass', badWorker: null, workerFailure: false, calls: [], workerEvidence: [], schemas: [] };
+  const adapter = makeFakeAdapter(control);
+  const options = { host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true, semanticInferenceAdapter: adapter };
+  let started = await startServer(options);
+  const projectId = 'planning-legacy-title-overflow';
+  t.after(async () => {
+    await closeStartedServer(started);
+    await rm(temp, { recursive: true, force: true });
+  });
+
+  await createProject(started, projectId);
+  if (!await compileTemplate(started, projectId, await makeSyntheticPptx({ slideCount: 2, layoutCount: 2 }))) {
+    t.skip('Python 3.12 unavailable: local template fixture cannot be compiled');
+    return;
+  }
+  await upload(started, projectId, 'source.md', Buffer.from('# Retention\n\nRetention is the limiting factor for sustained growth.', 'utf8'));
+  const initial = await generate(started, projectId);
+  assert.equal(initial.status, 200, await initial.clone().text());
+  assert.equal((await responseJson(initial)).status, 'ready');
+
+  const savedPath = path.join(dataDir, 'projects', projectId, '.planning', 'state.json');
+  const legacy = JSON.parse(await readFile(savedPath, 'utf8'));
+  assert.equal(legacy.lastSuccessful.promptVersions.worker, 'worker-deck-plan.v5');
+  // Recreate the persisted v4 violation that existed before the generated title cap.
+  legacy.lastSuccessful.promptVersions.worker = 'worker-deck-plan.v4';
+  const longTitle = 'A legacy generated-copy title exceeding the current forty character limit';
+  for (const plan of [legacy.currentCheckpoint, legacy.lastSuccessful.checkpoint, legacy.lastSuccessful.deckPlan]) {
+    if (!plan) continue;
+    plan.slides[0].takeaway = longTitle;
+    const { hash: _oldHash, ...payload } = plan;
+    plan.hash = deckPlanHash(payload);
+  }
+  await writeFile(savedPath, JSON.stringify(legacy));
+  const callsBeforeReload = control.calls.length;
+
+  await closeStartedServer(started);
+  started = await startServer(options);
+  const recovered = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
+  assert.equal(recovered.status, 'ready_for_planning');
+  assert.equal(recovered.deckPlan, null);
+  assert.equal(recovered.contentIR.hash, legacy.inputs.contentIR.hash);
+  assert.equal(recovered.brief.purpose, legacy.inputs.brief.purpose);
+  assert.equal(control.calls.length, callsBeforeReload, 'state recovery must not make an inference request');
+
+  const migrated = JSON.parse(await readFile(savedPath, 'utf8'));
+  assert.equal(migrated.status, 'ready_for_planning');
+  assert.equal(migrated.lastSuccessful, null);
+  assert.equal(migrated.currentCheckpoint, null);
+  assert.deepEqual(migrated.inputs.contentFiles, legacy.inputs.contentFiles);
+  const replanned = await generate(started, projectId);
+  assert.equal(replanned.status, 200, await replanned.clone().text());
+  const fresh = await responseJson(replanned);
+  assert.equal(fresh.status, 'ready');
+  assert.ok(fresh.deckPlan.slides.every((slide) => slide.takeaway.length <= 40));
+  assert.equal(control.calls.filter((call) => call.operation === 'deck-plan').length, 2);
 });

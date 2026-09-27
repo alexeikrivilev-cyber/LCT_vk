@@ -9,6 +9,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
+import { createQualificationSemanticCapture } from './lib/qualification-semantic-capture.mjs';
 import {
   OpenAICompatibleSemanticInferenceAdapter,
   probeSemanticEndpoint,
@@ -560,6 +561,9 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
   const envBackup = Object.fromEntries(RUNNER_ENV_KEYS.map((key) => [key, env[key]]));
   const flowStarted = performance.now();
   const manifest = safeManifestBase(options, input, options.mode === 'fake' ? 'offline-fake-planner' : options.externalConfig.model);
+  const semanticCapture = createQualificationSemanticCapture(outputDir, {
+    forbiddenValues: [env.LCT_SEMANTIC_BASE_URL, env.LCT_SEMANTIC_API_KEY, options.externalConfig?.baseUrl, options.externalConfig?.apiKey],
+  });
   const semanticEndpointFactory = dependencies.startFakeSemanticEndpoint ?? startFakeSemanticEndpoint;
   let fakeEndpoint = null;
   let startedServer = null;
@@ -593,7 +597,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     const delegate = options.mode === 'fake'
       ? new OpenAICompatibleSemanticInferenceAdapter({ baseUrl: fakeEndpoint.baseUrl, model: 'offline-fake-planner', enableThinking: false })
       : new OpenAICompatibleSemanticInferenceAdapter(options.externalConfig);
-    budget = createRequestBudgetAdapter(delegate, options.maxSemanticRequests);
+    budget = createRequestBudgetAdapter(semanticCapture.wrap(delegate), options.maxSemanticRequests);
     const { startServer } = await import('../apps/daemon/src/server.ts');
     const { inspectOfficeKitPackage } = await import('../apps/daemon/src/presentation/adapters/office-kit-package-inspector.ts');
     const officePackageJson = daemonRequire.resolve('@office-kit/pptx/package.json');
@@ -845,6 +849,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     catch { if (manifest.result === 'PASS') { manifest.result = 'FAIL'; manifest.failure = { stage: 'shutdown', code: 'DAEMON_SHUTDOWN_FAILED' }; } }
     try { await fakeEndpoint?.close(); }
     catch { if (manifest.result === 'PASS') { manifest.result = 'FAIL'; manifest.failure = { stage: 'shutdown', code: 'FAKE_ENDPOINT_SHUTDOWN_FAILED' }; } }
+    manifest.semantic.localCapture = await semanticCapture.summary();
     for (const key of RUNNER_ENV_KEYS) {
       if (envBackup[key] === undefined) delete env[key];
       else env[key] = envBackup[key];

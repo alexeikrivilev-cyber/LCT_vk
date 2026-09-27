@@ -157,55 +157,96 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
+export interface ContextualAuditValidationDiagnostic {
+  code: string;
+  diagnostic: string;
+}
+
+class ContextualAuditValidationError extends TypeError {
+  constructor(readonly code: string, readonly diagnostic: string, message: string) {
+    super(message);
+    this.name = 'ContextualAuditValidationError';
+  }
+}
+
+function invalidAudit(code: string, diagnostic: string, message: string): never {
+  throw new ContextualAuditValidationError(code, diagnostic, message);
+}
+
+function missingOrUnexpectedField(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  path: string,
+): ContextualAuditValidationDiagnostic | null {
+  const actual = Object.keys(value);
+  const missing = expected.find((key) => !Object.hasOwn(value, key));
+  if (missing) return { code: 'MISSING_FIELD', diagnostic: `${path}.${missing}: required field is missing` };
+  if (actual.some((key) => !expected.includes(key))) return { code: 'UNEXPECTED_FIELD', diagnostic: `${path}: unexpected field` };
+  return null;
+}
+
 /** Strictly validate model output and bind citations to the slide they claim to support. */
 export function validateContextualDeckAuditResponse(
   value: unknown,
   context: ContextualDeckAuditValidationContext,
 ): ContextualDeckAuditResponse {
-  if (!isRecord(value) || !exactKeys(value, ['schemaVersion', 'findings']) || value.schemaVersion !== CONTEXTUAL_AUDIT_SCHEMA_VERSION
-      || !Array.isArray(value.findings) || value.findings.length !== CONTEXTUAL_AUDIT_RULES.length) {
-    throw new TypeError('Contextual deck audit response has an invalid shape');
+  if (!isRecord(value)) invalidAudit('INVALID_TOP_LEVEL_SHAPE', 'response: expected an object', 'Contextual deck audit response has an invalid shape');
+  const topLevelShape = missingOrUnexpectedField(value, ['schemaVersion', 'findings'], 'response');
+  if (topLevelShape) invalidAudit(topLevelShape.code, topLevelShape.diagnostic, 'Contextual deck audit response has an invalid shape');
+  if (value.schemaVersion !== CONTEXTUAL_AUDIT_SCHEMA_VERSION) {
+    invalidAudit('INVALID_SCHEMA_VERSION', 'schemaVersion: does not match the current contract', 'Contextual deck audit response has an invalid schema version');
+  }
+  if (!Array.isArray(value.findings)) invalidAudit('INVALID_FINDINGS', 'findings: expected an array', 'Contextual deck audit findings must be an array');
+  if (value.findings.length > CONTEXTUAL_AUDIT_RULES.length) {
+    invalidAudit('TOO_MANY_FINDINGS', 'findings: exceeds the required rule count', 'Contextual deck audit response has an invalid shape');
   }
   const seen = new Set<string>();
-  const findings = value.findings.map((item) => {
-    if (!isRecord(item) || !exactKeys(item, ['ruleId', 'slideId', 'severity', 'messageCode', 'evidenceRefs', 'repairable', 'suggestedActionCode'])) {
-      throw new TypeError('Contextual deck audit finding has an invalid shape');
-    }
+  const findings = value.findings.map((item, index) => {
+    const itemPath = `findings[${index}]`;
+    if (!isRecord(item)) invalidAudit('INVALID_FINDING_SHAPE', `${itemPath}: expected an object`, 'Contextual deck audit finding has an invalid shape');
+    const itemShape = missingOrUnexpectedField(item,
+      ['ruleId', 'slideId', 'severity', 'messageCode', 'evidenceRefs', 'repairable', 'suggestedActionCode'], itemPath);
+    if (itemShape) invalidAudit(itemShape.code, itemShape.diagnostic, 'Contextual deck audit finding has an invalid shape');
     const ruleId = item.ruleId;
-    if (typeof ruleId !== 'string' || !CONTEXTUAL_AUDIT_RULES.includes(ruleId as ContextualAuditRule) || seen.has(ruleId)) {
-      throw new TypeError('Contextual deck audit rule IDs must be known and unique');
+    if (typeof ruleId !== 'string' || !CONTEXTUAL_AUDIT_RULES.includes(ruleId as ContextualAuditRule)) {
+      invalidAudit('INVALID_RULE_ENUM', `${itemPath}.ruleId: unknown rule`, 'Contextual deck audit rule ID is unknown');
     }
+    if (seen.has(ruleId)) invalidAudit('DUPLICATE_RULE', `${itemPath}.ruleId: duplicate rule`, 'Contextual deck audit rule IDs must be known and unique');
     seen.add(ruleId);
     const rule = ruleId as ContextualAuditRule;
     const slideId = item.slideId;
     if (slideId !== null && (typeof slideId !== 'string' || !context.slideContentRefs.has(slideId))) {
-      throw new TypeError('Contextual deck audit refers to an unknown slide');
+      invalidAudit('INVALID_SLIDE_REF', `${itemPath}.slideId: unknown slide reference`, 'Contextual deck audit refers to an unknown slide');
     }
-    if (!['info', 'warning', 'error'].includes(String(item.severity))) throw new TypeError('Contextual deck audit severity is invalid');
+    if (!['info', 'warning', 'error'].includes(String(item.severity))) {
+      invalidAudit('INVALID_SEVERITY', `${itemPath}.severity: invalid enum`, 'Contextual deck audit severity is invalid');
+    }
     const codes = CONTEXTUAL_AUDIT_MESSAGE_CODES[rule];
     if (typeof item.messageCode !== 'string' || !(codes as readonly string[]).includes(item.messageCode)) {
-      throw new TypeError('Contextual deck audit message code does not match its rule');
+      invalidAudit('INVALID_MESSAGE_CODE', `${itemPath}.messageCode: invalid for rule`, 'Contextual deck audit message code does not match its rule');
     }
-    if (typeof item.repairable !== 'boolean') throw new TypeError('Contextual deck audit repairability is invalid');
+    if (typeof item.repairable !== 'boolean') {
+      invalidAudit('INVALID_REPAIRABLE', `${itemPath}.repairable: expected a boolean`, 'Contextual deck audit repairability is invalid');
+    }
     const action = item.suggestedActionCode;
     if (action !== null && (typeof action !== 'string' || !CONTEXTUAL_AUDIT_ACTION_CODES.includes(action as ContextualAuditActionCode))) {
-      throw new TypeError('Contextual deck audit action code is invalid');
+      invalidAudit('INVALID_ACTION_CODE', `${itemPath}.suggestedActionCode: invalid action code`, 'Contextual deck audit action code is invalid');
     }
     if (item.severity === 'info' && (item.messageCode !== codes[0] || item.repairable || action !== null)) {
-      throw new TypeError('Passing contextual checks cannot suggest a repair');
+      invalidAudit('INVALID_PASS_ACTION', `${itemPath}: passing check cannot suggest an action`, 'Passing contextual checks cannot suggest a repair');
     }
     if (item.severity !== 'info' && (item.messageCode !== codes[1] || item.repairable
         || action !== CONTEXTUAL_AUDIT_REVIEW_ACTIONS[rule])) {
-      throw new TypeError('Contextual findings require a matching message and bounded action code');
+      invalidAudit('INVALID_FINDING_ACTION', `${itemPath}: finding requires its matching bounded action`, 'Contextual findings require a matching message and bounded action code');
     }
     if (!Array.isArray(item.evidenceRefs) || item.evidenceRefs.length > 8
         || item.evidenceRefs.some((ref) => typeof ref !== 'string' || !context.knownEvidenceRefs.has(ref))
         || new Set(item.evidenceRefs).size !== item.evidenceRefs.length) {
-      throw new TypeError('Contextual deck audit cites unknown or duplicate evidence');
+      invalidAudit('INVALID_EVIDENCE_REF', `${itemPath}.evidenceRefs: unknown or duplicate reference`, 'Contextual deck audit cites unknown or duplicate evidence');
     }
     const allowedRefs = slideId === null ? context.knownEvidenceRefs : context.slideContentRefs.get(slideId)!;
     if (item.evidenceRefs.some((ref) => !allowedRefs.has(ref))) {
-      throw new TypeError('Contextual deck audit evidence does not belong to its slide');
+      invalidAudit('CROSS_SLIDE_EVIDENCE_REF', `${itemPath}.evidenceRefs: reference does not belong to this slide`, 'Contextual deck audit evidence does not belong to its slide');
     }
     return {
       ruleId: rule,
@@ -217,6 +258,21 @@ export function validateContextualDeckAuditResponse(
       suggestedActionCode: action as ContextualAuditActionCode | null,
     };
   });
-  if (seen.size !== CONTEXTUAL_AUDIT_RULES.length) throw new TypeError('Contextual deck audit omitted a required rule');
+  const missingRule = CONTEXTUAL_AUDIT_RULES.find((rule) => !seen.has(rule));
+  if (missingRule) invalidAudit('MISSING_RULE', `findings: missing required rule ${missingRule}`, 'Contextual deck audit response has an invalid shape');
   return { schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION, findings };
+}
+
+/** Returns only rule/schema paths and enum classes; never includes response values or source text. */
+export function diagnoseContextualDeckAuditFailure(
+  value: unknown,
+  context: ContextualDeckAuditValidationContext,
+): ContextualAuditValidationDiagnostic | undefined {
+  try {
+    validateContextualDeckAuditResponse(value, context);
+    return undefined;
+  } catch (error) {
+    if (error instanceof ContextualAuditValidationError) return { code: error.code, diagnostic: error.diagnostic };
+    return { code: 'INVALID_CONTEXTUAL_AUDIT', diagnostic: 'response: runtime validation failed' };
+  }
 }

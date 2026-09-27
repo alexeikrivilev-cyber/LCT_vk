@@ -624,6 +624,47 @@ function validateStoredState(value: unknown): StoredPlanningState {
   };
 }
 
+/**
+ * Replace only the saved v4 task-only plan shape that predates the current
+ * generated-title limit. Its user inputs remain trustworthy after validation;
+ * the incompatible plan itself must be regenerated rather than rewritten.
+ */
+function recoverLegacyGeneratedCopyTitleLimit(value: unknown, error: unknown): StoredPlanningState | null {
+  if (!(error instanceof TypeError)
+      || error.message !== 'DeckPlan title with generated body copy must not exceed 40 characters'
+      || !isRecord(value)
+      || !exactKeys(value, ['schemaVersion', 'updatedAt', 'status', 'inputs', 'lastSuccessful', 'failure', 'currentCheckpoint'])
+      || value.schemaVersion !== 1 || typeof value.updatedAt !== 'string' || !Number.isFinite(Date.parse(value.updatedAt))
+      || !isRecord(value.lastSuccessful) || !isRecord(value.lastSuccessful.promptVersions)
+      || value.lastSuccessful.promptVersions.worker !== 'worker-deck-plan.v4'
+      || !isRecord(value.inputs)
+      || !exactKeys(value.inputs, ['contentFiles', 'brief', 'contentIR', 'inputFingerprint'])
+      || !Array.isArray(value.inputs.contentFiles) || value.inputs.contentFiles.length > MAX_SELECTED_FILES
+      || value.inputs.contentFiles.some((item) => typeof item !== 'string')
+      || !isHexHash(value.inputs.inputFingerprint)) return null;
+  try {
+    const brief = validateBrief(value.inputs.brief);
+    const contentIR = validateContentIR(value.inputs.contentIR);
+    validateFailure(value.failure);
+    return {
+      schemaVersion: 1,
+      updatedAt: new Date().toISOString(),
+      status: 'ready_for_planning',
+      inputs: {
+        contentFiles: value.inputs.contentFiles as string[],
+        brief,
+        contentIR,
+        inputFingerprint: value.inputs.inputFingerprint,
+      },
+      lastSuccessful: null,
+      failure: null,
+      currentCheckpoint: null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function readStoredState(projectsRoot: string, projectId: string): Promise<StoredPlanningState | null> {
   let raw: string;
   try {
@@ -632,9 +673,17 @@ async function readStoredState(projectsRoot: string, projectId: string): Promise
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
+  let parsed: unknown;
   try {
-    return validateStoredState(JSON.parse(raw));
+    parsed = JSON.parse(raw);
+    return validateStoredState(parsed);
   } catch (error) {
+    const recovered = recoverLegacyGeneratedCopyTitleLimit(parsed, error);
+    if (recovered) {
+      await writeStoredState(projectsRoot, projectId, recovered);
+      console.warn(JSON.stringify({ event: 'planning.state_migrated', projectId, reason: 'LEGACY_GENERATED_TITLE_LIMIT', status: recovered.status }));
+      return recovered;
+    }
     throw new PlanningServiceError('PERSISTED_STATE_INVALID', 'Saved planning state is invalid; generate a new plan after checking project sources.', 500, { cause: error });
   }
 }

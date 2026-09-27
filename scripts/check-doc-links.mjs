@@ -25,7 +25,7 @@ const requiredFiles = [
   'decisions/ADR-006-shared-plan-variant-strategies.md', 'decisions/ADR-007-native-editable-output.md',
   'decisions/ADR-008-fake-offline-inference.md', 'decisions/ADR-009-versioned-runtime-prompts.md',
   'apps/daemon/prompts/worker-deck-plan.v2.md', 'apps/daemon/prompts/worker-deck-plan.v3.md', 'apps/daemon/prompts/worker-deck-plan.v4.md', 'apps/daemon/prompts/worker-deck-plan.v5.md', 'apps/daemon/prompts/supervisor-plan-review.v1.md',
-  'apps/daemon/prompts/contextual-deck-audit.v3.md',
+  'apps/daemon/prompts/contextual-deck-audit.v4.md',
   'apps/daemon/prompts/template-profiler.v1.md',
   'apps/daemon/prompts/template-profiler.v2.md',
   'skills/README.md',

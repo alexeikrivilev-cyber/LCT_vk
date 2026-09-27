@@ -22,10 +22,24 @@ export type SemanticJsonSchema = Readonly<Record<string, unknown>>;
 
 export interface SemanticOutputContract<T> {
   name: string;
+  schemaVersion?: string | number;
   schema: SemanticJsonSchema;
   validate(value: unknown): value is T;
   /** Optional safe enum-like diagnosis for logs; implementations must not include model output. */
   diagnoseValidationFailure?(value: unknown): string | undefined;
+  /** Safe structural detail for local qualification artifacts; never emitted to stdout. */
+  diagnoseValidationFailureDetail?(value: unknown): string | undefined;
+}
+
+export interface SemanticStructuredOutputDiagnostic {
+  operation: string;
+  schemaName: string;
+  schemaVersion: string | number | null;
+  requestId: string;
+  responseJsonValid: boolean;
+  parsedResponse: unknown | null;
+  validationFailureCode: string | null;
+  validationDiagnostic: string;
 }
 
 export interface SemanticRequestMetadata {
@@ -107,17 +121,24 @@ export class SemanticInferenceError extends Error {
   readonly code: SemanticInferenceErrorCode;
   readonly httpStatus?: number;
   readonly telemetry?: SemanticInferenceTelemetry;
+  readonly structuredOutputDiagnostic?: SemanticStructuredOutputDiagnostic;
 
   constructor(
     code: SemanticInferenceErrorCode,
     message: string,
-    options: { httpStatus?: number; telemetry?: SemanticInferenceTelemetry; cause?: unknown } = {},
+    options: {
+      httpStatus?: number;
+      telemetry?: SemanticInferenceTelemetry;
+      structuredOutputDiagnostic?: SemanticStructuredOutputDiagnostic;
+      cause?: unknown;
+    } = {},
   ) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = 'SemanticInferenceError';
     this.code = code;
     this.httpStatus = options.httpStatus;
     this.telemetry = options.telemetry;
+    this.structuredOutputDiagnostic = options.structuredOutputDiagnostic;
   }
 }
 

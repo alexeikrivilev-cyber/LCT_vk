@@ -10,6 +10,7 @@ const {
   CONTEXTUAL_AUDIT_SCHEMA_VERSION,
   CONTEXTUAL_AUDIT_VERSION_FINGERPRINT,
   buildContextualAuditVersionFingerprint,
+  diagnoseContextualDeckAuditFailure,
   validateContextualDeckAuditResponse,
 } = await import('../src/presentation/application/contextual-audit-port.ts');
 const { CONTEXTUAL_AUDITOR_WORKFLOW } = await import('../src/presentation/application/workflow-versions.ts');
@@ -75,6 +76,31 @@ test('contextual audit rejects unknown slide IDs, cross-slide evidence, mismatch
   assert.throws(() => validateContextualDeckAuditResponse(invalidRef, validationContext), /unknown or duplicate evidence/);
 });
 
+test('contextual audit failure diagnostics identify the first contract mismatch without echoing response text', () => {
+  const cases = [
+    ['missing rule', (value) => { value.findings.pop(); }, 'MISSING_RULE', /findings: missing required rule/u],
+    ['duplicate rule', (value) => { value.findings[1].ruleId = value.findings[0].ruleId; }, 'DUPLICATE_RULE', /findings\[1\]\.ruleId: duplicate rule/u],
+    ['invalid severity enum', (value) => { value.findings[0].severity = 'critical'; }, 'INVALID_SEVERITY', /findings\[0\]\.severity: invalid enum/u],
+    ['invalid slide ref', (value) => { value.findings[0].slideId = 'private-slide-value'; }, 'INVALID_SLIDE_REF', /findings\[0\]\.slideId: unknown slide reference/u],
+    ['invalid evidence ref', (value) => { value.findings[0].evidenceRefs = ['private-evidence-value']; }, 'INVALID_EVIDENCE_REF', /findings\[0\]\.evidenceRefs: unknown or duplicate reference/u],
+    ['invalid action code', (value) => {
+      value.findings[0].severity = 'warning';
+      value.findings[0].messageCode = CONTEXTUAL_AUDIT_MESSAGE_CODES.titleTakeaway[1];
+      value.findings[0].suggestedActionCode = 'PRIVATE_ACTION_VALUE';
+    }, 'INVALID_ACTION_CODE', /findings\[0\]\.suggestedActionCode: invalid action code/u],
+    ['unexpected field', (value) => { value.privateText = 'must not appear in diagnostics'; }, 'UNEXPECTED_FIELD', /response: unexpected field/u],
+  ];
+  for (const [label, mutate, code, expectedDiagnostic] of cases) {
+    const value = passingAudit();
+    mutate(value);
+    const diagnostic = diagnoseContextualDeckAuditFailure(value, validationContext);
+    assert.equal(diagnostic.code, code, label);
+    assert.match(diagnostic.diagnostic, expectedDiagnostic, label);
+    assert.doesNotMatch(diagnostic.diagnostic, /private-slide-value|private-evidence-value|PRIVATE_ACTION_VALUE|must not appear/u, label);
+    assert.throws(() => validateContextualDeckAuditResponse(value, validationContext), (error) => error.message.length > 0);
+  }
+});
+
 test('spelling and table/legend concerns use bounded actions and never request model repair', () => {
   const spelling = passingAudit();
   const spellingResult = spelling.findings.find((finding) => finding.ruleId === 'spelling');
@@ -100,14 +126,15 @@ test('spelling and table/legend concerns use bounded actions and never request m
 test('contextual auditor agent, skill, prompt hash, schema, and rule set are explicitly versioned together', async () => {
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.agentVersion, 'contextual-audit-supervisor.v1');
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.skillVersion, 'presentation-contextual-audit.v1');
-  assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.promptVersion, 'contextual-deck-audit.v3');
+  assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.promptVersion, 'contextual-deck-audit.v4');
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.schemaVersion, 'contextual_deck_audit_v2');
   assert.match(CONTEXTUAL_AUDIT_VERSION_FINGERPRINT, /^[a-f0-9]{64}$/u);
-  assert.notEqual(buildContextualAuditVersionFingerprint({ auditor: { ...CONTEXTUAL_AUDITOR_WORKFLOW, promptVersion: 'contextual-deck-audit.v4' } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
+  assert.notEqual(buildContextualAuditVersionFingerprint({ auditor: { ...CONTEXTUAL_AUDITOR_WORKFLOW, promptVersion: 'contextual-deck-audit.v5' } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
   assert.notEqual(buildContextualAuditVersionFingerprint({ schema: { type: 'object', required: ['newField'] } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-  const prompt = await readFile(path.join(repoRoot, 'apps/daemon/prompts/contextual-deck-audit.v3.md'));
+  const prompt = await readFile(path.join(repoRoot, 'apps/daemon/prompts/contextual-deck-audit.v4.md'));
   assert.equal(createHash('sha256').update(prompt).digest('hex'), CONTEXTUAL_AUDITOR_WORKFLOW.promptSha256);
+  assert.match(prompt.toString('utf8'), /exactly 11 objects[\s\S]*never emit one finding per slide/u);
   await readFile(path.join(repoRoot, 'skills/presentation-contextual-audit/SKILL.md'));
 });
 

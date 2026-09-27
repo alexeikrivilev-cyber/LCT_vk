@@ -27,8 +27,8 @@
       "agentVersion": "contextual-audit-supervisor.v1",
       "skillId": "presentation-contextual-audit",
       "skillVersion": "presentation-contextual-audit.v1",
-      "promptVersion": "contextual-deck-audit.v3",
-      "promptSha256": "8fd7807e6357955874b83b493c2ba68a4c447594953857cc54a3a821e87eee5e",
+      "promptVersion": "contextual-deck-audit.v4",
+      "promptSha256": "7db2334bb4c5a31ca2890826fbdaa2d4c4f4e25bb12b357d32c00377b3f2bcc7",
       "schemaVersion": "contextual_deck_audit_v2",
       "modelRole": "supervisor"
     }

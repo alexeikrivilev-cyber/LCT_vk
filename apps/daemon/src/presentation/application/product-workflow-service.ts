@@ -21,6 +21,7 @@ import {
   CONTEXTUAL_AUDIT_SCHEMA_NAME,
   CONTEXTUAL_AUDIT_VERSION_FINGERPRINT,
   contextualDeckAuditSchema,
+  diagnoseContextualDeckAuditFailure,
   validateContextualDeckAuditResponse,
   type ContextualDeckAuditFinding,
   type ContextualDeckAuditResponse,
@@ -517,9 +518,19 @@ export class ProductWorkflowService {
   async auditCurrentSelection(projectIdValue: string): Promise<ProductWorkflowSnapshot> {
     const projectId = assertSafeProjectId(projectIdValue);
     const saved = await this.read(projectId);
-    if (!saved || saved.status !== 'ready') throw new ProductWorkflowError('PRODUCT_WORKFLOW_NOT_READY', 'Generate the presentation before reviewing its meaning.', 409);
+    const recoveringAuditFailure = saved?.status === 'failed' && saved.stage === 'contextual_audit';
+    if (!saved || (saved.status !== 'ready' && !recoveringAuditFailure)) {
+      throw new ProductWorkflowError('PRODUCT_WORKFLOW_NOT_READY', 'Generate the presentation before reviewing its meaning.', 409);
+    }
     const generation = await this.options.generationService.getSnapshot(projectId);
     if (!generation || generation.status !== 'completed') throw new ProductWorkflowError('GENERATION_NOT_READY', 'Wait until slide generation finishes.', 409);
+    if (saved.generationId !== generation.generationId) {
+      throw new ProductWorkflowError('GENERATION_STATE_CHANGED', 'The saved review no longer matches the completed presentation.', 409);
+    }
+    const planningState = await this.options.planningService.get(projectId);
+    if (!samePlanningInputs(planningState, saved.inputs) || planningState.status !== 'ready') {
+      throw new ProductWorkflowError('PLANNING_STATE_CHANGED', 'The saved review no longer matches the current presentation plan.', 409);
+    }
     const deckFingerprint = selectedDeckFingerprint(generation);
     const operationKey = `audit:${deckFingerprint}`;
     const active = this.active.get(projectId);
@@ -533,7 +544,14 @@ export class ProductWorkflowService {
     }
     const task = Promise.resolve().then(async () => {
       const current = await this.read(projectId);
-      if (!current || current.operationId !== saved.operationId) return;
+      if (!current || current.operationId !== saved.operationId
+          || (current.status !== 'ready' && !(current.status === 'failed' && current.stage === 'contextual_audit'))) return;
+      const currentGeneration = await this.options.generationService.getSnapshot(projectId);
+      const currentPlanning = await this.options.planningService.get(projectId);
+      if (!currentGeneration || currentGeneration.status !== 'completed'
+          || currentGeneration.generationId !== generation.generationId
+          || selectedDeckFingerprint(currentGeneration) !== deckFingerprint
+          || currentPlanning.status !== 'ready' || !samePlanningInputs(currentPlanning, current.inputs)) return;
       await this.update(projectId, current, { status: 'running', stage: 'contextual_audit', failure: null });
       await this.performContextualAudit(projectId, current, generation, deckFingerprint);
       const afterAudit = await this.read(projectId);
@@ -713,11 +731,14 @@ export class ProductWorkflowService {
     };
     const contract = {
       name: CONTEXTUAL_AUDIT_SCHEMA_NAME,
+      schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION,
       schema: contextualDeckAuditSchema() as SemanticJsonSchema,
       validate: (value: unknown): value is ContextualDeckAuditResponse => {
         try { validateContextualDeckAuditResponse(value, validationContext); return true; }
         catch { return false; }
       },
+      diagnoseValidationFailure: (value: unknown) => diagnoseContextualDeckAuditFailure(value, validationContext)?.code,
+      diagnoseValidationFailureDetail: (value: unknown) => diagnoseContextualDeckAuditFailure(value, validationContext)?.diagnostic,
     };
     const prompt = await this.readAuditPrompt();
     const response = await this.options.getInferenceAdapter().infer({
@@ -807,6 +828,7 @@ export class ProductWorkflowService {
   }
 
   private async snapshotWithFreshness(projectId: string, saved: StoredProductWorkflow): Promise<ProductWorkflowSnapshot> {
+    if (saved.contextualAudit?.status === 'failed') return publicSnapshot(saved, true);
     if (!saved.contextualAudit || saved.contextualAudit.status !== 'ready') return publicSnapshot(saved);
     try {
       const current = await this.options.generationService.getSnapshot(projectId);

@@ -10,6 +10,7 @@ import {
   type SemanticMessage,
   type SemanticMessageRole,
   type SemanticRequestMetadata,
+  type SemanticStructuredOutputDiagnostic,
 } from '../application/semantic-inference-port.js';
 
 const DEFAULT_MODEL = 'Qwen/Qwen3.8-27B';
@@ -544,6 +545,7 @@ function withTelemetry(error: unknown, telemetry: SemanticInferenceTelemetry): S
     return new SemanticInferenceError(error.code, error.message, {
       httpStatus: error.httpStatus,
       telemetry: { ...telemetry, status: error.code === 'CANCELLED' ? 'cancelled' : 'error', errorCode: error.code },
+      ...(error.structuredOutputDiagnostic ? { structuredOutputDiagnostic: error.structuredOutputDiagnostic } : {}),
       cause: error,
     });
   }
@@ -749,7 +751,17 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       try {
         parsed = JSON.parse(content);
       } catch (error) {
-        throw new SemanticInferenceError('INVALID_JSON', 'Model returned invalid JSON content', { cause: error });
+        const structuredOutputDiagnostic: SemanticStructuredOutputDiagnostic = {
+          operation: request.operation,
+          schemaName: request.output.name,
+          schemaVersion: request.output.schemaVersion ?? null,
+          requestId,
+          responseJsonValid: false,
+          parsedResponse: null,
+          validationFailureCode: 'INVALID_JSON',
+          validationDiagnostic: 'assistant content is not valid JSON',
+        };
+        throw new SemanticInferenceError('INVALID_JSON', 'Model returned invalid JSON content', { structuredOutputDiagnostic, cause: error });
       }
       let valid = false;
       try {
@@ -759,13 +771,34 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       }
       if (!valid) {
         runtimeSchemaValidation = 'failed';
+        let validationDiagnostic: string | undefined;
         try {
           const diagnosis = request.output.diagnoseValidationFailure?.(parsed);
           if (typeof diagnosis === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(diagnosis)) validationFailureCode = diagnosis;
         } catch {
           // Diagnostics are best-effort and must never weaken runtime rejection.
         }
-        throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'Model output did not satisfy the requested runtime contract');
+        try {
+          const detail = request.output.diagnoseValidationFailureDetail?.(parsed);
+          if (typeof detail === 'string' && detail.length > 0 && detail.length <= 512 && !/[\r\n]/.test(detail)) {
+            validationDiagnostic = detail;
+          }
+        } catch {
+          // Detailed diagnostics are best-effort and must never weaken runtime rejection.
+        }
+        const structuredOutputDiagnostic: SemanticStructuredOutputDiagnostic = {
+          operation: request.operation,
+          schemaName: request.output.name,
+          schemaVersion: request.output.schemaVersion ?? null,
+          requestId,
+          responseJsonValid: true,
+          parsedResponse: parsed,
+          validationFailureCode: validationFailureCode ?? null,
+          validationDiagnostic: validationDiagnostic ?? validationFailureCode ?? 'response failed runtime validation',
+        };
+        throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'Model output did not satisfy the requested runtime contract', {
+          structuredOutputDiagnostic,
+        });
       }
       runtimeSchemaValidation = 'passed';
 
