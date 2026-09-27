@@ -421,7 +421,7 @@ function singleSlidePlan(deckPlan, contentIR, brief, slideIndex = 4) {
   return { brief: singleBrief, deckPlan: singlePlan };
 }
 
-test('brief-task instructions never become slide copy, process steps, or factual support', async (t) => {
+test('brief/task instructions never become slide copy, source evidence, or process steps', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-brief-task-not-slide-copy-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const projectDir = path.join(root, 'projects', 'brief-only');
@@ -437,12 +437,12 @@ test('brief-task instructions never become slide copy, process steps, or factual
   assert.ok(contextUnits.length > 0, 'fixture includes independently supplied context');
 
   const brief = { audience: 'Команда', purpose: task, expectedOutcome: 'Краткий обзор', preferences: [], requestedSlideCount: 1 };
-  const makePlan = (refs) => canonicalizeDeckPlan({
+  const makePlan = (refs, bodyPoints = undefined, takeaway = 'Результат составил 2025 единиц.') => canonicalizeDeckPlan({
     workingTitle: 'Поддержка обращений',
     narrativeSummary: 'Проверка разделения задачи и исходного контекста.',
     slides: [{
       narrativeRole: 'content', purpose: 'Показать подтверждённый контекст.',
-      takeaway: 'Результат составил 2025 единиц.', contentRefs: refs, mediaRefs: [],
+      takeaway, contentRefs: refs, ...(bodyPoints ? { bodyPoints } : {}), mediaRefs: [],
       semanticVisualType: 'process', targetDensity: 'balanced',
     }],
   }, {
@@ -464,8 +464,62 @@ test('brief-task instructions never become slide copy, process steps, or factual
   'a year present only in the task cannot support a visible factual claim');
 
   const withContext = compilePresentation(makePlan([...taskUnits, ...contextUnits].map((unit) => unit.id)), contentIR, template, VARIANT_POLICIES[0]).slides[0];
-  assert.deepEqual(withContext.body, [context], 'brief-context remains eligible as source-backed presentation copy');
-  assert.ok(!withContext.body.some((line) => line.includes('Покажи показатель')));
+  assert.deepEqual(withContext.body, [], 'brief context remains an instruction and does not become exported content');
+  assert.deepEqual(withContext.provenanceRefs, [], 'brief fields never become source provenance');
+
+  const generatedCopy = 'Сформулировать ключевую мысль и определить следующий шаг.';
+  const generatedPlan = makePlan([], [{ text: generatedCopy, origin: 'generated-from-brief', evidenceRefs: [] }], 'Ключевая мысль ведёт к следующему шагу.');
+  const generatedSlide = compilePresentation(generatedPlan, contentIR, template, VARIANT_POLICIES[0]).slides[0];
+  assert.deepEqual(generatedSlide.body, [generatedCopy], 'generated copy fills task-only slides without copying instructions');
+  assert.deepEqual(generatedSlide.provenanceRefs, []);
+  const generatedReport = auditCompiledPresentation({ schemaVersion: 1, variantId: 'A', variantPolicyVersion: VARIANT_POLICIES[0].version,
+    deckPlanId: generatedPlan.id, deckPlanHash: generatedPlan.hash, contentIRHash: contentIR.hash,
+    templateIRId: template.id, templateIRHash: template.hash, slides: [generatedSlide] }, contentIR, template);
+  assert.ok(!generatedReport.findings.some((finding) => finding.ruleId === 'integrity.generated-copy-provenance'));
+  assert.ok(!generatedReport.findings.some((finding) => finding.ruleId === 'fidelity.unsupported-number'),
+    'ordinary qualitative generated narrative is not treated as an unsupported fact');
+
+  const unsupportedGeneratedPlan = makePlan([], [{ text: 'Показатель вырос на 2025%.', origin: 'generated-from-brief', evidenceRefs: [] }], 'Показатель заметно вырос.');
+  const unsupportedGeneratedSlide = compilePresentation(unsupportedGeneratedPlan, contentIR, template, VARIANT_POLICIES[0]).slides[0];
+  const unsupportedGeneratedReport = auditCompiledPresentation({ schemaVersion: 1, variantId: 'A', variantPolicyVersion: VARIANT_POLICIES[0].version,
+    deckPlanId: unsupportedGeneratedPlan.id, deckPlanHash: unsupportedGeneratedPlan.hash, contentIRHash: contentIR.hash,
+    templateIRId: template.id, templateIRHash: template.hash, slides: [unsupportedGeneratedSlide] }, contentIR, template);
+  assert.ok(unsupportedGeneratedReport.findings.some((finding) => finding.ruleId === 'fidelity.unsupported-number'),
+    'generated numeric claims remain flagged unless their own evidence refs support them');
+
+  const namedOutcomePlan = makePlan([], [{ text: 'Клиент Север сократил расходы после внедрения решения.', origin: 'generated-from-brief', evidenceRefs: [] }], 'Решение меняет подход к работе.');
+  const namedOutcomeSlide = compilePresentation(namedOutcomePlan, contentIR, template, VARIANT_POLICIES[0]).slides[0];
+  const namedOutcomeReport = auditCompiledPresentation({ schemaVersion: 1, variantId: 'A', variantPolicyVersion: VARIANT_POLICIES[0].version,
+    deckPlanId: namedOutcomePlan.id, deckPlanHash: namedOutcomePlan.hash, contentIRHash: contentIR.hash,
+    templateIRId: template.id, templateIRHash: template.hash, slides: [namedOutcomeSlide] }, contentIR, template);
+  assert.ok(namedOutcomeReport.findings.some((finding) => finding.ruleId === 'fidelity.unsupported-specific-claim'
+    && finding.evidence.claimType === 'customer-outcome'),
+  'a concrete customer outcome without source refs remains visible as an audit warning');
+
+  const unrelatedEvidenceIR = structuredClone(contentIR);
+  unrelatedEvidenceIR.sources.push({ id: 'source:evidence', kind: 'text' });
+  const unrelatedSourceUnit = { id: 'unit:evidence', sourceId: 'source:evidence', kind: 'text', text: 'Процесс включает проверку и согласование следующего шага.' };
+  unrelatedEvidenceIR.units.push(unrelatedSourceUnit);
+  const unrelatedEvidenceSlide = structuredClone(generatedSlide);
+  unrelatedEvidenceSlide.provenanceRefs = [unrelatedSourceUnit.id];
+  unrelatedEvidenceSlide.body = ['Клиент Север сократил расходы после внедрения решения.'];
+  unrelatedEvidenceSlide.generatedBodyPoints = [{ text: unrelatedEvidenceSlide.body[0], origin: 'generated-from-brief', evidenceRefs: [unrelatedSourceUnit.id] }];
+  const unrelatedEvidenceReport = auditCompiledPresentation({ schemaVersion: 1, variantId: 'A', variantPolicyVersion: VARIANT_POLICIES[0].version,
+    deckPlanId: generatedPlan.id, deckPlanHash: generatedPlan.hash, contentIRHash: unrelatedEvidenceIR.hash,
+    templateIRId: template.id, templateIRHash: template.hash, slides: [unrelatedEvidenceSlide] }, unrelatedEvidenceIR, template);
+  assert.ok(unrelatedEvidenceReport.findings.some((finding) => finding.ruleId === 'fidelity.unsupported-specific-claim'
+    && finding.evidence.claimType === 'customer-outcome'),
+  'an unrelated evidence ref does not substantiate a specific generated customer outcome');
+
+  const supportedEvidenceIR = structuredClone(unrelatedEvidenceIR);
+  const supportedSourceUnit = supportedEvidenceIR.units.find((unit) => unit.id === unrelatedSourceUnit.id);
+  supportedSourceUnit.text = 'Клиент Север сократил расходы после внедрения решения.';
+  const supportedEvidenceReport = auditCompiledPresentation({ schemaVersion: 1, variantId: 'A', variantPolicyVersion: VARIANT_POLICIES[0].version,
+    deckPlanId: generatedPlan.id, deckPlanHash: generatedPlan.hash, contentIRHash: supportedEvidenceIR.hash,
+    templateIRId: template.id, templateIRHash: template.hash, slides: [unrelatedEvidenceSlide] }, supportedEvidenceIR, template);
+  assert.ok(!supportedEvidenceReport.findings.some((finding) => finding.ruleId === 'fidelity.unsupported-specific-claim'
+    && finding.evidence.claimType === 'customer-outcome'),
+  'matching source text can support the same specific claim category');
 });
 
 test('inherited title sizing is estimated relative to body typography and rejects overflowing headings', async (t) => {
@@ -2245,7 +2299,7 @@ test('persisted planning state replays offline and the manifest omits endpoint U
     localSemantic: true,
   });
   assert.equal(result.matrix.outputCount, 3);
-  assert.equal(result.manifest.requestSchema.worker, 'deck_plan_draft_v1');
+  assert.equal(result.manifest.requestSchema.worker, 'deck_plan_draft_v4');
   assert.equal(result.manifest.worker.temperature, 0.2);
   assert.equal(result.manifest.worker.maxOutputTokens, 4096);
   assert.equal(result.manifest.worker.finishReason, 'stop');
@@ -2267,7 +2321,7 @@ test('persisted planning state replays offline and the manifest omits endpoint U
   const serialized = await readFile(path.join(outputRoot, 'replay.json'), 'utf8');
   assert.ok(!serialized.includes('private.example'));
   assert.ok(!serialized.includes('never-copy-this'));
-  assert.ok(serialized.includes('deck_plan_draft_v1'));
+  assert.ok(serialized.includes('deck_plan_draft_v4'));
 });
 
 test('contextual deck audit validates all eleven text-only checks and rejects invalid slide/evidence references', () => {

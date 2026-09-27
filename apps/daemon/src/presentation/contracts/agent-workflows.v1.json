@@ -9,8 +9,8 @@
       "agentVersion": "deck-plan-worker.v1",
       "skillId": "presentation-planning",
       "skillVersion": "presentation-planning.v1",
-      "promptVersion": "worker-deck-plan.v2",
-      "schemaVersion": "deck_plan_draft_v1",
+      "promptVersion": "worker-deck-plan.v5",
+      "schemaVersion": "deck_plan_draft_v4",
       "modelRole": "worker"
     },
     "supervisor": {
@@ -27,8 +27,8 @@
       "agentVersion": "contextual-audit-supervisor.v1",
       "skillId": "presentation-contextual-audit",
       "skillVersion": "presentation-contextual-audit.v1",
-      "promptVersion": "contextual-deck-audit.v2",
-      "promptSha256": "de27539c70387b047ad4f225a600f40e36390c7a17d9107a167feea6c5890510",
+      "promptVersion": "contextual-deck-audit.v3",
+      "promptSha256": "8fd7807e6357955874b83b493c2ba68a4c447594953857cc54a3a821e87eee5e",
       "schemaVersion": "contextual_deck_audit_v2",
       "modelRole": "supervisor"
     }

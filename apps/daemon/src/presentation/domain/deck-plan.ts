@@ -3,6 +3,14 @@ import { createHash } from 'node:crypto';
 export type NarrativeRole = 'opening' | 'agenda' | 'section-divider' | 'content' | 'closing';
 export type SemanticVisualType = 'none' | 'image' | 'chart' | 'table' | 'diagram' | 'timeline' | 'process' | 'comparison' | 'kpi';
 export type TargetDensity = 'compact' | 'balanced' | 'detailed';
+export type GeneratedBodyOrigin = 'generated-from-brief';
+
+/** Generated copy is not source evidence; refs identify optional factual support. */
+export interface GeneratedBodyPoint {
+  text: string;
+  origin: GeneratedBodyOrigin;
+  evidenceRefs: string[];
+}
 
 /** The model-produced portion only. Slide IDs and order are app-authoritative. */
 export interface DeckPlanDraftSlide {
@@ -10,6 +18,8 @@ export interface DeckPlanDraftSlide {
   purpose: string;
   takeaway: string;
   contentRefs: string[];
+  /** Replaceable planning extension; origin is fixed and source refs stay separate. */
+  bodyPoints?: GeneratedBodyPoint[];
   /** Replaceable pre-TZ extension: optional visual-only ContentIR media IDs, never factual evidence. */
   mediaRefs?: string[];
   semanticVisualType: SemanticVisualType;
@@ -68,7 +78,12 @@ const LIMITS = {
   narrative: 1_000,
   slidePurpose: 1_000,
   takeaway: 1_000,
+  bodyPoint: 180,
 } as const;
+
+const MAX_BODY_POINTS = 4;
+const MAX_BODY_POINT_EVIDENCE_REFS = 8;
+const MAX_GENERATED_TITLE_LENGTH = 40;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -157,9 +172,46 @@ function canonicalJson(value: unknown): string {
   throw new TypeError('Cannot hash a value outside canonical JSON');
 }
 
-function validateDraftSlide(value: unknown, allowedContentIds: ReadonlySet<string>, allowedMediaIds: ReadonlySet<string>): DeckPlanDraftSlide {
+function validateBodyPoints(
+  value: unknown,
+  allowedContentIds: ReadonlySet<string>,
+  slideContentRefs: readonly string[],
+): GeneratedBodyPoint[] {
+  if (!isDenseArray(value) || value.length < 1 || value.length > MAX_BODY_POINTS) {
+    throw new TypeError(`DeckPlan bodyPoints must contain from 1 through ${MAX_BODY_POINTS} items`);
+  }
+  const slideRefs = new Set(slideContentRefs);
+  let totalCharacters = 0;
+  return value.map((item) => {
+    if (!exactDataRecord(item, ['text', 'origin', 'evidenceRefs'], ['text', 'origin', 'evidenceRefs'])
+        || !boundedText(item.text, LIMITS.bodyPoint) || item.origin !== 'generated-from-brief'
+        || !isDenseArray(item.evidenceRefs) || item.evidenceRefs.length > MAX_BODY_POINT_EVIDENCE_REFS) {
+      throw new TypeError('DeckPlan bodyPoints must be bounded generated-from-brief points with evidenceRefs');
+    }
+    totalCharacters += Array.from(item.text).length;
+    if (totalCharacters > 600) throw new TypeError('DeckPlan bodyPoints exceed their aggregate text limit');
+    const evidenceRefs: string[] = [];
+    const seenEvidence = new Set<string>();
+    for (const ref of item.evidenceRefs) {
+      if (typeof ref !== 'string' || !allowedContentIds.has(ref) || !slideRefs.has(ref)) {
+        throw new TypeError('DeckPlan body point evidenceRefs must resolve to source refs on the same slide');
+      }
+      if (seenEvidence.has(ref)) throw new TypeError('DeckPlan body point evidenceRefs must be unique');
+      seenEvidence.add(ref);
+      evidenceRefs.push(ref);
+    }
+    return { text: normalizedBoundedText(item.text), origin: 'generated-from-brief', evidenceRefs };
+  });
+}
+
+function validateDraftSlide(
+  value: unknown,
+  allowedContentIds: ReadonlySet<string>,
+  allowedMediaIds: ReadonlySet<string>,
+  requireGeneratedBody: boolean,
+): DeckPlanDraftSlide {
   if (!exactDataRecord(value,
-    ['narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'mediaRefs', 'semanticVisualType', 'targetDensity'],
+    ['narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'bodyPoints', 'mediaRefs', 'semanticVisualType', 'targetDensity'],
     ['narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'semanticVisualType', 'targetDensity'])) {
     throw new TypeError('Invalid DeckPlan draft slide fields');
   }
@@ -180,6 +232,15 @@ function validateDraftSlide(value: unknown, allowedContentIds: ReadonlySet<strin
     seen.add(ref);
     refs.push(ref);
   }
+  let bodyPoints: GeneratedBodyPoint[] | undefined;
+  if (Object.hasOwn(value, 'bodyPoints')) bodyPoints = validateBodyPoints(value.bodyPoints, allowedContentIds, refs);
+  if (requireGeneratedBody && bodyPoints === undefined) {
+    throw new TypeError('Each newly planned slide requires generated body copy');
+  }
+  if (bodyPoints !== undefined
+      && Array.from(value.takeaway as string).length > MAX_GENERATED_TITLE_LENGTH) {
+    throw new TypeError(`DeckPlan title with generated body copy must not exceed ${MAX_GENERATED_TITLE_LENGTH} characters`);
+  }
   let mediaRefs: string[] | undefined;
   if (Object.hasOwn(value, 'mediaRefs')) {
     if (!isDenseArray(value.mediaRefs) || value.mediaRefs.length > 20) throw new TypeError('DeckPlan mediaRefs must be a bounded dense array');
@@ -195,7 +256,7 @@ function validateDraftSlide(value: unknown, allowedContentIds: ReadonlySet<strin
     }
   }
   const role = value.narrativeRole as NarrativeRole;
-  if (refs.length === 0 && !NON_FACTUAL_ROLES.has(role)) {
+  if (refs.length === 0 && !NON_FACTUAL_ROLES.has(role) && bodyPoints === undefined) {
     throw new TypeError('DeckPlan content slides require at least one content reference');
   }
   if (typeof value.semanticVisualType !== 'string' || !VISUAL_TYPES.has(value.semanticVisualType)) {
@@ -209,6 +270,7 @@ function validateDraftSlide(value: unknown, allowedContentIds: ReadonlySet<strin
     purpose: normalizedBoundedText(value.purpose),
     takeaway: normalizedBoundedText(value.takeaway),
     contentRefs: refs,
+    ...(bodyPoints === undefined ? {} : { bodyPoints }),
     ...(mediaRefs === undefined ? {} : { mediaRefs }),
     semanticVisualType: value.semanticVisualType as SemanticVisualType,
     targetDensity: value.targetDensity as TargetDensity,
@@ -221,6 +283,7 @@ export function validateDeckPlanDraft(
   allowedContentIds: ReadonlySet<string>,
   requestedSlideCount?: number,
   allowedMediaIds?: ReadonlySet<string>,
+  requireGeneratedBody = false,
 ): DeckPlanDraft {
   validateAllowedContentIds(allowedContentIds);
   const mediaIds = validateAllowedMediaIds(allowedMediaIds);
@@ -241,7 +304,7 @@ export function validateDeckPlanDraft(
   return {
     workingTitle: normalizedBoundedText(value.workingTitle),
     narrativeSummary: normalizedBoundedText(value.narrativeSummary),
-    slides: value.slides.map((slide) => validateDraftSlide(slide, allowedContentIds, mediaIds)),
+    slides: value.slides.map((slide) => validateDraftSlide(slide, allowedContentIds, mediaIds, requireGeneratedBody)),
   };
 }
 
@@ -275,7 +338,7 @@ function hashPayloadFromPlan(value: unknown): DeckPlanHashPayload {
   }
   const slides: DeckPlanSlide[] = value.slides.map((entry, index) => {
     if (!exactDataRecord(entry,
-      ['id', 'order', 'narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'mediaRefs', 'semanticVisualType', 'targetDensity'],
+      ['id', 'order', 'narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'bodyPoints', 'mediaRefs', 'semanticVisualType', 'targetDensity'],
       ['id', 'order', 'narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'semanticVisualType', 'targetDensity'])) {
       throw new TypeError('Invalid DeckPlan hash payload slide fields');
     }
@@ -283,6 +346,8 @@ function hashPayloadFromPlan(value: unknown): DeckPlanHashPayload {
       || typeof entry.narrativeRole !== 'string' || !NARRATIVE_ROLES.has(entry.narrativeRole)
       || !boundedText(entry.purpose, LIMITS.slidePurpose) || !boundedText(entry.takeaway, LIMITS.takeaway)
       || !isDenseArray(entry.contentRefs) || !entry.contentRefs.every((ref) => typeof ref === 'string')
+      || (Object.hasOwn(entry, 'bodyPoints') && (!isDenseArray(entry.bodyPoints)
+        || entry.bodyPoints.length < 1 || entry.bodyPoints.length > MAX_BODY_POINTS))
       || (Object.hasOwn(entry, 'mediaRefs') && (!isDenseArray(entry.mediaRefs) || entry.mediaRefs.length > 20
         || !entry.mediaRefs.every((ref) => typeof ref === 'string')))
       || typeof entry.semanticVisualType !== 'string' || !VISUAL_TYPES.has(entry.semanticVisualType)
@@ -296,6 +361,9 @@ function hashPayloadFromPlan(value: unknown): DeckPlanHashPayload {
       purpose: entry.purpose.trim(),
       takeaway: entry.takeaway.trim(),
       contentRefs: [...entry.contentRefs] as string[],
+      ...(Object.hasOwn(entry, 'bodyPoints') ? {
+        bodyPoints: validateBodyPoints(entry.bodyPoints, new Set(entry.contentRefs as string[]), entry.contentRefs as string[]),
+      } : {}),
       ...(Object.hasOwn(entry, 'mediaRefs') ? { mediaRefs: [...entry.mediaRefs as string[]] } : {}),
       semanticVisualType: entry.semanticVisualType as SemanticVisualType,
       targetDensity: entry.targetDensity as TargetDensity,
@@ -394,6 +462,7 @@ export function validateDeckPlan(
     slides: payload.slides.map((slide) => ({
       ...slide,
       contentRefs: [...slide.contentRefs],
+      ...(slide.bodyPoints === undefined ? {} : { bodyPoints: slide.bodyPoints.map((point) => ({ ...point, evidenceRefs: [...point.evidenceRefs] })) }),
       ...(slide.mediaRefs === undefined ? {} : { mediaRefs: [...slide.mediaRefs] }),
     })),
     hash: value.hash,

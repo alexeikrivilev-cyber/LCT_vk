@@ -114,6 +114,56 @@ test('model draft guard enforces exact keys, slide limits, unique resolved refs,
   assert.throws(() => validateDeckPlanDraft(layoutField, allowedContentIds), /draft slide fields/);
 });
 
+test('new planning drafts require bounded generated copy with separate source provenance', () => {
+  const draft = {
+    workingTitle: 'Решение начинается с контекста',
+    narrativeSummary: 'Показать контекст, подтверждённый факт и следующий шаг.',
+    slides: [
+      {
+        narrativeRole: 'opening', purpose: 'Задать тему.', takeaway: 'Контекст задаёт решение.', contentRefs: [],
+        bodyPoints: [{ text: 'Сформулировать вопрос, который предстоит решить.', origin: 'generated-from-brief', evidenceRefs: [] }],
+        semanticVisualType: 'none', targetDensity: 'compact',
+      },
+      {
+        narrativeRole: 'content', purpose: 'Показать опору для решения.', takeaway: 'Выручка выросла на 18%.', contentRefs: ['unit:revenue'],
+        bodyPoints: [{ text: 'Подтверждённый рост поддерживает выбранное направление.', origin: 'generated-from-brief', evidenceRefs: ['unit:revenue'] }],
+        semanticVisualType: 'chart', targetDensity: 'balanced',
+      },
+      {
+        narrativeRole: 'closing', purpose: 'Предложить следующий шаг.', takeaway: 'Проверить решение на пилоте.', contentRefs: [],
+        bodyPoints: [{ text: 'Согласовать критерий следующей проверки.', origin: 'generated-from-brief', evidenceRefs: [] }],
+        semanticVisualType: 'none', targetDensity: 'compact',
+      },
+    ],
+  };
+  const parsed = validateDeckPlanDraft(draft, allowedContentIds, 3, new Set(), true);
+  assert.equal(parsed.slides[1].bodyPoints?.[0]?.origin, 'generated-from-brief');
+  assert.throws(() => validateDeckPlanDraft({ ...draft, slides: draft.slides.map(({ bodyPoints: _body, ...slide }) => slide) }, allowedContentIds, 3, new Set(), true), /requires generated body copy/);
+
+  const unsupportedRefs = structuredClone(draft);
+  unsupportedRefs.slides[1].bodyPoints[0].evidenceRefs = ['brief-context-unit'];
+  assert.throws(() => validateDeckPlanDraft(unsupportedRefs, allowedContentIds, 3, new Set(), true), /resolve to source refs/);
+  const tooLongPoint = structuredClone(draft);
+  tooLongPoint.slides[0].bodyPoints[0].text = 'x'.repeat(181);
+  assert.throws(() => validateDeckPlanDraft(tooLongPoint, allowedContentIds, 3, new Set(), true), /bounded generated-from-brief/);
+  const tooManyPoints = structuredClone(draft);
+  tooManyPoints.slides[0].bodyPoints = Array(5).fill(draft.slides[0].bodyPoints[0]);
+  assert.throws(() => validateDeckPlanDraft(tooManyPoints, allowedContentIds, 3, new Set(), true), /from 1 through 4/);
+  const overlongGeneratedTitle = structuredClone(draft);
+  overlongGeneratedTitle.slides[0].takeaway = 'x'.repeat(41);
+  assert.throws(() => validateDeckPlanDraft(overlongGeneratedTitle, allowedContentIds, 3, new Set(), true), /must not exceed 40 characters/);
+  assert.throws(() => validateDeckPlanDraft(overlongGeneratedTitle, allowedContentIds, 3), /must not exceed 40 characters/,
+    'any draft carrying generated body copy keeps the title geometry bound, including repaired drafts');
+
+  // Previously persisted plans without generated-copy fields can be loaded and marked stale;
+  // the stricter title bound applies to plans carrying generated body copy.
+  const legacyDraft = structuredClone(overlongGeneratedTitle);
+  legacyDraft.slides = legacyDraft.slides.map(({ bodyPoints: _body, ...slide }) => slide);
+  const legacyPlan = canonicalizeDeckPlan(legacyDraft, metadata);
+  assert.equal(legacyPlan.slides[0].takeaway.length, 41);
+  assert.equal(validateDeckPlan(legacyPlan, allowedContentIds, 3).hash, legacyPlan.hash);
+});
+
 test('canonicalizer assigns stable slide IDs and one-based order, and strict validator verifies the hash', () => {
   const first = canonicalizeDeckPlan(validDraft(), metadata);
   const second = canonicalizeDeckPlan(validDraft(), metadata);

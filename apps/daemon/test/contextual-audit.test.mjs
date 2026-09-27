@@ -100,19 +100,19 @@ test('spelling and table/legend concerns use bounded actions and never request m
 test('contextual auditor agent, skill, prompt hash, schema, and rule set are explicitly versioned together', async () => {
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.agentVersion, 'contextual-audit-supervisor.v1');
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.skillVersion, 'presentation-contextual-audit.v1');
-  assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.promptVersion, 'contextual-deck-audit.v2');
+  assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.promptVersion, 'contextual-deck-audit.v3');
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.schemaVersion, 'contextual_deck_audit_v2');
   assert.match(CONTEXTUAL_AUDIT_VERSION_FINGERPRINT, /^[a-f0-9]{64}$/u);
-  assert.notEqual(buildContextualAuditVersionFingerprint({ auditor: { ...CONTEXTUAL_AUDITOR_WORKFLOW, promptVersion: 'contextual-deck-audit.v3' } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
+  assert.notEqual(buildContextualAuditVersionFingerprint({ auditor: { ...CONTEXTUAL_AUDITOR_WORKFLOW, promptVersion: 'contextual-deck-audit.v4' } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
   assert.notEqual(buildContextualAuditVersionFingerprint({ schema: { type: 'object', required: ['newField'] } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-  const prompt = await readFile(path.join(repoRoot, 'apps/daemon/prompts/contextual-deck-audit.v2.md'));
+  const prompt = await readFile(path.join(repoRoot, 'apps/daemon/prompts/contextual-deck-audit.v3.md'));
   assert.equal(createHash('sha256').update(prompt).digest('hex'), CONTEXTUAL_AUDITOR_WORKFLOW.promptSha256);
   await readFile(path.join(repoRoot, 'skills/presentation-contextual-audit/SKILL.md'));
 });
 
 test('an all-clear contextual response cannot clear a deterministic blocking error', () => {
-  const contentIR = { units: [{ id: 'unit-1', kind: 'text', text: 'Source-backed statement.' }] };
+  const contentIR = { sources: [{ id: 'source-1', kind: 'text' }], units: [{ id: 'unit-1', sourceId: 'source-1', kind: 'text', text: 'Source-backed statement.' }] };
   const plan = { slides: [{ id: 'slide-1', contentRefs: ['unit-1'], narrativeRole: 'content', purpose: 'Review evidence.', takeaway: 'The source supports the statement.', semanticVisualType: 'none', targetDensity: 'balanced' }] };
   const generation = { slides: [{
     slideId: 'slide-1', index: 0, title: 'The source supports the statement.', selectedVariant: 'A',
@@ -126,11 +126,11 @@ test('an all-clear contextual response cannot clear a deterministic blocking err
 
 test('contextual audit receives rendered source text including table and numeric cell values', () => {
   const contentIR = { units: [
-    { id: 'heading', kind: 'heading', text: '## Итог' },
-    { id: 'statement', kind: 'text', text: 'Рост подтверждён таблицей.' },
-    { id: 'table-label', kind: 'table-cell', cellValue: 'Показатель' },
-    { id: 'table-value', kind: 'table-cell', cellValue: '27', numericLexeme: '27' },
-  ] };
+    { id: 'heading', sourceId: 'source-1', kind: 'heading', text: '## Итог' },
+    { id: 'statement', sourceId: 'source-1', kind: 'text', text: 'Рост подтверждён таблицей.' },
+    { id: 'table-label', sourceId: 'source-1', kind: 'table-cell', cellValue: 'Показатель' },
+    { id: 'table-value', sourceId: 'source-1', kind: 'table-cell', cellValue: '27', numericLexeme: '27' },
+  ], sources: [{ id: 'source-1', kind: 'text' }] };
   const plan = { slides: [{
     id: 'slide-1', contentRefs: ['heading', 'statement', 'table-label', 'table-value'],
     narrativeRole: 'content', purpose: 'Показать результат.', takeaway: 'Рост подтверждён таблицей.',
@@ -154,7 +154,7 @@ test('contextual audit receives rendered source text including table and numeric
 });
 
 test('contextual audit fails closed when a selected slide evidence ref is missing', () => {
-  const contentIR = { units: [{ id: 'unit-1', kind: 'text', text: 'Source-backed statement.' }] };
+  const contentIR = { sources: [{ id: 'source-1', kind: 'text' }], units: [{ id: 'unit-1', sourceId: 'source-1', kind: 'text', text: 'Source-backed statement.' }] };
   const plan = { slides: [{
     id: 'slide-1', contentRefs: ['unit-1', 'missing-unit'], narrativeRole: 'content', purpose: 'Review evidence.',
     takeaway: 'The source supports the statement.', semanticVisualType: 'none', targetDensity: 'balanced',

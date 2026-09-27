@@ -15,23 +15,16 @@ function deterministicPlanningResponse(request) {
     return completion(request.model, { status: 'ok', summary: 'Strict JSON response passed.', nextAction: 'Continue with planning.' });
   }
   const evidence = JSON.parse(request.messages.at(-1).content);
-  if (schemaName === 'deck_plan_draft_v1') {
+  if (schemaName === 'deck_plan_draft_v2' || schemaName === 'deck_plan_draft_v3' || schemaName === 'deck_plan_draft_v4') {
+    const sourceKinds = new Map((evidence.contentIR.sources ?? []).map((source) => [source.id, source.kind]));
+    const hasSourceInventory = sourceKinds.size > 0;
     const allTextUnits = evidence.contentIR.units.filter((unit) => unit.kind !== 'media-reference'
+      && (!hasSourceInventory || sourceKinds.get(unit.sourceId) === 'text')
       && typeof unit.text === 'string' && unit.text.trim());
-    const taskSourceIds = new Set((evidence.contentIR.sources ?? [])
-      .filter((source) => source.kind === 'brief-task').map((source) => source.id));
-    const contextSourceIds = new Set((evidence.contentIR.sources ?? [])
-      .filter((source) => source.kind === 'brief-context').map((source) => source.id));
-    const contextUnits = allTextUnits.filter((unit) => !taskSourceIds.has(unit.sourceId));
-    // A brief-task is instruction, not slide evidence. Use it as a grounded
-    // fallback only when no context/source material exists.
-    const textUnits = contextUnits.length ? contextUnits : allTextUnits;
+    const textUnits = allTextUnits;
     const hasHeadings = textUnits.some((unit) => unit.kind === 'heading');
-    // Task/context-only planning has no uploaded Markdown heading structure.
-    // Preserve user-authored task lines as separate evidence sections so the
-    // local fake can exercise task-only decks without repeating one claim.
     const sections = !hasHeadings ? textUnits.flatMap((unit) => {
-      if (!contextSourceIds.has(unit.sourceId) && !(taskSourceIds.has(unit.sourceId) && unit.text.includes('\n'))) {
+      if (!unit.text.includes('\n')) {
         return [{ heading: null, contentUnits: [unit] }];
       }
       const paragraphs = unit.text.split(/\r?\n+/u).map((text) => text.trim()).filter(Boolean);
@@ -49,37 +42,45 @@ function deterministicPlanningResponse(request) {
       section.contentUnits.push(unit);
     }
     if (section?.contentUnits.length) sections.push(section);
-    if (!sections.length) throw new Error('fake semantic endpoint requires at least one text evidence section');
+    if (!sections.length) sections.push({ heading: null, contentUnits: [] });
+    const generatedCopy = (takeaway, index) => [
+      `Раскрыть тему «${takeaway}» с точки зрения аудитории.`,
+      ['Показать связь этого тезиса с общей логикой презентации.', 'Уточнить роль этого блока в общей логике презентации.', 'Связать вывод с практическим контекстом.'][index % 3],
+      ['Сформулировать вывод, который ведёт к следующему шагу.', 'Зафиксировать изменение для пользователя.', 'Подвести аудиторию к следующему решению.'][index % 3],
+    ];
     const count = Math.max(1, Math.min(30, evidence.requestedSlideCount ?? 1));
     const slides = Array.from({ length: count }, (_, index) => {
       const sectionIndex = count === 1 ? 0 : Math.round(index * (sections.length - 1) / (count - 1));
       const selectedSection = sections[sectionIndex % sections.length];
       const heading = selectedSection.heading?.text.replace(/^#+\s*/, '').trim();
-      const firstContentText = selectedSection.contentUnits[0]?.text.trim();
-      const takeaway = (heading || firstContentText?.split(/(?<=[.!?])\s/u, 1)[0] || 'Source-backed content').slice(0, 180);
+      const proposedTakeaway = heading || [
+        'Главная мысль и контекст', 'Ключевые наблюдения и решение', 'Механизм и следующий шаг',
+      ][index % 3];
+      const takeaway = conciseTitle(proposedTakeaway, schemaName === 'deck_plan_draft_v4' ? 40 : 56, index);
       return {
         narrativeRole: count > 1 && index === 0 ? 'opening' : count > 1 && index === count - 1 ? 'closing' : 'content',
-        purpose: index === 0 ? 'Представить тему по исходным материалам.'
-          : index === count - 1 ? 'Подвести итог по последнему разделу источников.'
-            : 'Раскрыть раздел, на который ссылается источник.',
+        purpose: index === 0 ? 'Открыть тему и задать контекст.'
+          : index === count - 1 ? 'Сформулировать следующий шаг.'
+            : 'Раскрыть этап общей истории.',
         takeaway,
         contentRefs: [...(selectedSection.heading ? [selectedSection.heading] : []), ...selectedSection.contentUnits]
           .slice(0, 5).map((unit) => unit.id),
+        bodyPoints: generatedCopy(takeaway, index).map((text) => ({ text, origin: 'generated-from-brief', evidenceRefs: [] })),
         mediaRefs: [],
         semanticVisualType: 'none',
         targetDensity: 'balanced',
       };
     });
     return completion(request.model, {
-      workingTitle: 'Презентация по исходным материалам',
-      narrativeSummary: `Систематизировать материалы для задачи: ${evidence.brief.purpose}.`,
+      workingTitle: 'План и рекомендуемое решение',
+      narrativeSummary: 'Провести аудиторию от контекста через аргументы к практическому следующему шагу.',
       slides,
     });
   }
   if (schemaName === 'supervisor_plan_review_v1') {
     return completion(request.model, { checkpointVersion: evidence.checkpointVersion, outcome: 'pass', findings: [], operations: [] });
   }
-    if (schemaName === 'contextual_deck_audit_v2') {
+  if (schemaName === 'contextual_deck_audit_v2') {
       const rules = [
         ['titleTakeaway', 'TITLE_TAKEAWAY_CLEAR'],
         ['titleContentAlignment', 'TITLE_CONTENT_ALIGNED'],
@@ -200,6 +201,19 @@ function deterministicPlanningResponse(request) {
     return completion(request.model, { templateIRHash: evidence.templateIRHash, slides });
   }
   return completion(request.model, { unknown: true });
+}
+
+function conciseTitle(value, maxLength, index) {
+  const text = value.trim().replace(/\s+/gu, ' ');
+  if (Array.from(text).length <= maxLength) return text;
+  const words = text.split(' ');
+  let result = '';
+  for (const word of words) {
+    const candidate = result ? `${result} ${word}` : word;
+    if (Array.from(candidate).length > maxLength) break;
+    result = candidate;
+  }
+  return result || ['Главная мысль', 'Решение и подход', 'Следующий шаг'][index % 3];
 }
 
 async function readJson(request, limit = 4 * 1024 * 1024) {

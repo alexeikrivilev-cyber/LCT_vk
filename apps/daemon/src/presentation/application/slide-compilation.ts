@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { validateContentIR, type ContentIR, type ContentUnit } from '../domain/content-ir.js';
-import { validateDeckPlan, type DeckPlan, type DeckPlanSlide, type SemanticVisualType } from '../domain/deck-plan.js';
+import { validateDeckPlan, type DeckPlan, type DeckPlanSlide, type GeneratedBodyPoint, type SemanticVisualType } from '../domain/deck-plan.js';
 import { validateTemplateIR, type TemplateElement, type TemplateGeometry, type TemplateIR, type TemplateLayout, type TemplateSlide } from '../domain/template-ir.js';
 import type { ExemplarSlideSelection } from './exemplar-slide-selector.js';
 
@@ -85,6 +85,8 @@ export interface CompiledSlide {
   variantId: PresentationVariantId;
   title: string;
   body: string[];
+  /** Generated copy with origin and per-point factual support; absent on legacy plans. */
+  generatedBodyPoints?: GeneratedBodyPoint[];
   visualization: {
     type: SemanticVisualType;
     sourceRefs: string[];
@@ -135,6 +137,7 @@ export interface CanonicalFactualPayload {
   intent: SlideIntent;
   title: string;
   body: string[];
+  generatedBodyPoints: GeneratedBodyPoint[];
   provenanceRefs: string[];
   table: { values: string[][]; sourceRefs: string[][] } | null;
   chart: CompiledChartData | null;
@@ -674,16 +677,16 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
     if (!unit) throw new TypeError(`DeckPlan slide ${slide.id} refers to missing ContentIR unit ${id}`);
     return unit;
   });
-  // The brief-task source is an instruction to the planner, not slide copy or
-  // factual evidence. Plans may reference it, but projecting its imperative
-  // wording would put prompt text into the exported presentation.
-  const displayable = referenced.filter((unit) => sourceById.get(unit.sourceId)?.kind !== 'brief-task');
+  // Brief fields are planner instructions, not slide copy or factual evidence.
+  // Keep them out of projection even for previously persisted plans.
+  const displayable = referenced.filter((unit) => sourceById.get(unit.sourceId)?.kind === 'text');
+  const sourceBackedRefs = displayable.map((unit) => unit.id);
   const tableData = slide.semanticVisualType === 'table' ? tableDataFor(displayable) : null;
   const tableCellRefs = tableData ? tableCellRefsFor(displayable) : null;
   const chartData = slide.semanticVisualType === 'chart' ? chartDataFor(displayable, slide.takeaway) : null;
   const processSteps = slide.semanticVisualType === 'process' ? processStepsFor(displayable) : [];
   const kpi = slide.semanticVisualType === 'kpi' ? kpiFor(displayable) : null;
-  const body = displayable.flatMap((unit) => {
+  const body = slide.bodyPoints?.map((point) => point.text) ?? displayable.flatMap((unit) => {
     if ((tableData || chartData || kpi) && unit.kind === 'table-cell') return [];
     const value = textForUnit(unit);
     return value === null || !value.trim() || claimComparisonKey(value) === claimComparisonKey(slide.takeaway) ? [] : [value];
@@ -728,9 +731,10 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
     variantId: policy.id,
     title: slide.takeaway,
     body,
-    visualization: { type: slide.semanticVisualType, sourceRefs: [...slide.contentRefs], status: visualStatus, tableData, tableCellRefs, chartData, processSteps, kpi },
+    ...(slide.bodyPoints === undefined ? {} : { generatedBodyPoints: slide.bodyPoints.map((point) => ({ ...point, evidenceRefs: [...point.evidenceRefs] })) }),
+    visualization: { type: slide.semanticVisualType, sourceRefs: sourceBackedRefs, status: visualStatus, tableData, tableCellRefs, chartData, processSteps, kpi },
     imageRefs,
-    provenanceRefs: [...slide.contentRefs],
+    provenanceRefs: sourceBackedRefs,
     placements: { title: chosen.titleBox, body: chosen.bodyBox, visual: visualPlacement },
     layoutCandidates,
     selectedCandidateIndex: 0,
@@ -775,6 +779,7 @@ export function extractCanonicalFactualPayload(presentation: CompiledPresentatio
     intent: slide.intent,
     title: slide.title,
     body: [...slide.body],
+    generatedBodyPoints: (slide.generatedBodyPoints ?? []).map((point) => ({ ...point, evidenceRefs: [...point.evidenceRefs] })),
     provenanceRefs: [...slide.provenanceRefs],
     table: slide.visualization.tableData && slide.visualization.tableCellRefs
       ? { values: slide.visualization.tableData.map((row) => [...row]), sourceRefs: slide.visualization.tableCellRefs.map((row) => [...row]) }

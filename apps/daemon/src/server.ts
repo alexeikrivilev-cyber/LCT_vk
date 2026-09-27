@@ -60,6 +60,7 @@ import {
 import type { PptxRendererPort } from './presentation/application/pptx-backend-port.js';
 import type { PptxPreviewPort } from './presentation/application/pptx-preview-port.js';
 import { createPptxRenderer, resolvePptxBackend } from './presentation/adapters/pptx-renderer-factory.js';
+import { addEffectivePlaceholderTypography } from './presentation/adapters/office-kit-effective-typography.js';
 import type { PerformanceDiagnosticsPort } from './presentation/performance-diagnostics.js';
 import {
   compileTemplate,
@@ -592,7 +593,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     const preparationStartedAt = performance.now();
     try {
       const structuralStartedAt = performance.now();
-      const compiled = await compileTemplate(projectsRoot, req.params.id, filePath);
+      const compiled = await compileTemplate(projectsRoot, req.params.id, filePath, addEffectivePlaceholderTypography);
       const templateStructuralMs = Math.max(0, Math.round(performance.now() - structuralStartedAt));
       if (!semanticProfilingEnabled) {
         res.json({ ...compiled, semanticProfile: { status: 'disabled', cached: false } });

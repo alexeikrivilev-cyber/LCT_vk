@@ -31,12 +31,14 @@ function planDraft(contentId, override = {}) {
     narrativeSummary: 'The supplied evidence points to a growth opportunity constrained by retention.',
     slides: [
       {
-        narrativeRole: 'opening', purpose: 'Frame the decision.', takeaway: 'Growth requires a clear retention decision.',
-        contentRefs: [], semanticVisualType: 'none', targetDensity: 'compact',
+        narrativeRole: 'opening', purpose: 'Frame the decision.', takeaway: 'Retention requires a clear decision.',
+        contentRefs: [], bodyPoints: [{ text: 'Задать контекст и сформулировать центральную мысль.', origin: 'generated-from-brief', evidenceRefs: [] }], semanticVisualType: 'none', targetDensity: 'compact',
       },
       {
-        narrativeRole: 'content', purpose: 'Present supplied evidence.', takeaway: 'The source highlights the retention constraint.',
-        contentRefs: [contentId], semanticVisualType: 'diagram', targetDensity: 'balanced',
+        narrativeRole: 'content', purpose: 'Present supplied evidence.', takeaway: 'Source highlights retention constraint.',
+        contentRefs: contentId === 'unknown-content' ? [] : [contentId],
+        bodyPoints: [{ text: 'Показать логику решения и следующий шаг.', origin: 'generated-from-brief', evidenceRefs: [] }],
+        semanticVisualType: 'diagram', targetDensity: 'balanced',
       },
     ],
     ...override,
@@ -58,7 +60,7 @@ function reviewResult(checkpointVersion, mode) {
       findings: [{ ...finding, slideId: 'slide_dp_placeholder_2' }],
       operations: [{
         type: 'replace_takeaway', slideId: mode === 'repair' ? 'slide_dp_placeholder_2' : 'missing-slide',
-        takeaway: 'Retention is the source identified growth constraint.', purpose: null, contentRef: null, semanticVisualType: null,
+        takeaway: 'Retention is the growth constraint.', purpose: null, contentRef: null, semanticVisualType: null,
       }],
     };
   }
@@ -75,6 +77,7 @@ function makeFakeAdapter(control) {
     async infer(request) {
       requestNumber += 1;
       control.calls?.push({ role: request.role, operation: request.operation });
+      control.schemas?.push({ operation: request.operation, name: request.output.name, schema: request.output.schema });
       const text = request.messages.at(-1).content;
       const evidence = JSON.parse(text);
       if (request.role === 'worker') control.workerEvidence?.push(evidence.contentIR);
@@ -166,7 +169,7 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-planning-api-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const dataDir = path.join(temp, 'data');
-  const control = { reviewMode: 'pass', badWorker: null, workerFailure: false, calls: [], workerEvidence: [] };
+  const control = { reviewMode: 'pass', badWorker: null, workerFailure: false, calls: [], workerEvidence: [], schemas: [] };
   const adapter = makeFakeAdapter(control);
   const options = { host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true, semanticInferenceAdapter: adapter };
   let started = await startServer(options);
@@ -200,7 +203,10 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     assert.equal(saved.lastSuccessful.telemetry.worker.model, 'fake-planner-v1');
     assert.equal(saved.lastSuccessful.telemetry.worker.finishReason, 'stop');
     assert.equal(saved.lastSuccessful.telemetry.supervisor.finishReason, 'stop');
-    assert.equal(saved.lastSuccessful.agentWorkflowVersions.worker.schemaVersion, 'deck_plan_draft_v1');
+    assert.equal(saved.lastSuccessful.agentWorkflowVersions.worker.schemaVersion, 'deck_plan_draft_v4');
+    const workerSchema = control.schemas.find((item) => item.operation === 'deck-plan');
+    assert.equal(workerSchema?.name, 'deck_plan_draft_v4');
+    assert.equal(workerSchema?.schema.properties.slides.items.properties.takeaway.maxLength, 40);
     // Older schemaVersion=1 planning states did not store finishReason.
     delete saved.lastSuccessful.telemetry.worker.finishReason;
     delete saved.lastSuccessful.telemetry.supervisor.finishReason;
@@ -238,7 +244,7 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
     const repaired = await responseJson(repairedResponse);
     assert.equal(repaired.review.outcome, 'repair');
     assert.equal(repaired.deckPlan.version, 2);
-    assert.match(repaired.deckPlan.slides[1].takeaway, /source identified growth constraint/);
+    assert.match(repaired.deckPlan.slides[1].takeaway, /Retention is the growth constraint/);
 
     control.reviewMode = 'invalid-target';
     const invalidRepair = await generate(started, projectId);
@@ -336,7 +342,12 @@ test('Planning API accepts a task and optional context with zero uploaded source
     assert.deepEqual(planned.contentFiles, []);
     assert.deepEqual(planned.contentIR.sources.map((source) => source.kind), ['brief-task', 'brief-context']);
     assert.equal(planned.contentIR.hash, control.workerEvidence[0].hash);
-    assert.ok(planned.deckPlan.slides[1].contentRefs.every((id) => planned.contentIR.units.some((unit) => unit.id === id)));
+    assert.deepEqual(control.workerEvidence[0].sources, [], 'brief instructions are not sent as source evidence');
+    assert.deepEqual(control.workerEvidence[0].units, [], 'brief instructions are not sent as source content units');
+    assert.ok(planned.deckPlan.slides.every((slide) => slide.contentRefs.length === 0));
+    assert.ok(planned.deckPlan.slides.every((slide) => slide.bodyPoints?.length > 0
+      && slide.bodyPoints.every((point) => point.origin === 'generated-from-brief')));
+    assert.ok(!JSON.stringify(planned.deckPlan).includes(brief.purpose));
     assert.deepEqual(control.calls.map(({ role }) => role), ['worker', 'supervisor']);
 
     await closeStartedServer(started);
@@ -344,6 +355,59 @@ test('Planning API accepts a task and optional context with zero uploaded source
     const reloaded = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
     assert.equal(reloaded.status, 'ready');
     assert.equal(reloaded.contentIR.hash, planned.contentIR.hash, 'task/context provenance is deterministic across reload');
+  } finally {
+    await closeStartedServer(started);
+  }
+});
+
+test('legacy task-backed review references stay readable only for a saved plan so it can be replaced', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-planning-legacy-task-review-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const control = { reviewMode: 'pass', badWorker: null, workerFailure: false, calls: [], workerEvidence: [] };
+  const options = {
+    host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
+    serveWeb: false, returnServer: true, semanticInferenceAdapter: makeFakeAdapter(control),
+  };
+  const started = await startServer(options);
+  const projectId = 'planning-legacy-task-review';
+  try {
+    await createProject(started, projectId);
+    if (!await compileTemplate(started, projectId, await makeSyntheticPptx({ slideCount: 2, layoutCount: 2 }))) {
+      t.skip('Python 3.12 unavailable: local template fixture cannot be compiled');
+      return;
+    }
+    const brief = { purpose: 'Explain the onboarding objective.', preferences: [], requestedSlideCount: 2 };
+    const generated = await generate(started, projectId, brief, []);
+    assert.equal(generated.status, 200, await generated.clone().text());
+
+    const statePath = path.join(temp, 'data', 'projects', projectId, '.planning', 'state.json');
+    const saved = JSON.parse(await readFile(statePath, 'utf8'));
+    const taskSource = saved.lastSuccessful.contentIR.sources.find((source) => source.kind === 'brief-task');
+    const taskUnit = saved.lastSuccessful.contentIR.units.find((unit) => unit.sourceId === taskSource.id);
+    assert.ok(taskUnit);
+    saved.lastSuccessful.promptVersions.worker = 'worker-deck-plan.v2';
+    saved.lastSuccessful.agentWorkflowVersions.worker.promptVersion = 'worker-deck-plan.v2';
+    saved.lastSuccessful.agentWorkflowVersions.worker.schemaVersion = 'deck_plan_draft_v1';
+    saved.lastSuccessful.review = {
+      checkpointVersion: saved.lastSuccessful.checkpoint.version,
+      outcome: 'warn',
+      findings: [{ targetType: 'deck', slideId: null, severity: 'medium', reason: 'Legacy saved review cited the task instruction.', evidenceRefs: [taskUnit.id] }],
+      operations: [],
+    };
+    await writeFile(statePath, `${JSON.stringify(saved, null, 2)}\n`);
+
+    const readable = await responseJson(await fetch(`${started.url}/api/projects/${projectId}/planning`));
+    assert.equal(readable.status, 'ready', 'old persisted plan can be loaded for stale-state recovery');
+    assert.deepEqual(readable.review.findings[0].evidenceRefs, [taskUnit.id]);
+
+    const replaced = await generate(started, projectId, brief, []);
+    assert.equal(replaced.status, 200, await replaced.clone().text());
+    const current = await responseJson(replaced);
+    assert.equal(current.status, 'ready');
+    assert.equal(current.deckPlan.slides.every((slide) => slide.bodyPoints?.length > 0), true);
+    assert.equal(current.deckPlan.slides.every((slide) => slide.contentRefs.length === 0), true);
+    assert.deepEqual(control.calls.slice(-2).map(({ role }) => role), ['worker', 'supervisor']);
+    assert.deepEqual(control.workerEvidence.at(-1).units, [], 'new planning never sends task text as source evidence');
   } finally {
     await closeStartedServer(started);
   }
@@ -440,7 +504,8 @@ test('planning input fingerprint changes when prompt assets or the agent workflo
   assert.notEqual(planningInputFingerprint({ ...input, workerPromptSha256: '1'.repeat(64) }), baseline);
   assert.notEqual(planningInputFingerprint({ ...input, supervisorPromptSha256: '2'.repeat(64) }), baseline);
   assert.notEqual(planningInputFingerprint({ ...input, agentWorkflowContractSha256: '3'.repeat(64) }), baseline);
-  assert.equal(AGENT_WORKFLOW_VERSIONS.worker.promptVersion, 'worker-deck-plan.v2');
+  assert.equal(AGENT_WORKFLOW_VERSIONS.worker.promptVersion, 'worker-deck-plan.v5');
+  assert.equal(AGENT_WORKFLOW_VERSIONS.worker.schemaVersion, 'deck_plan_draft_v4');
   assert.equal(AGENT_WORKFLOW_VERSIONS.supervisor.schemaVersion, 'supervisor_plan_review_v1');
   assert.match(AGENT_WORKFLOW_CONTRACT_SHA256, /^[a-f0-9]{64}$/);
 });

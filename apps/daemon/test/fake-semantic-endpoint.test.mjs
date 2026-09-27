@@ -10,7 +10,7 @@ function request(schemaName, evidence) {
   };
 }
 
-test('local fake plans a contentful three-slide deck from source sections and passes Supervisor review', () => {
+test('local fake returns bounded generated copy alongside source-backed planning refs', () => {
   const units = [
     { id: 'unit-product-title', kind: 'heading', text: '# Presentation compiler' },
     { id: 'unit-product-description', kind: 'text', text: 'LCT creates editable presentations from corporate PowerPoint templates.' },
@@ -27,7 +27,7 @@ test('local fake plans a contentful three-slide deck from source sections and pa
     contentIR: { units },
   };
 
-  const worker = deterministicPlanningResponse(request('deck_plan_draft_v1', evidence));
+  const worker = deterministicPlanningResponse(request('deck_plan_draft_v4', evidence));
   const draft = JSON.parse(worker.choices[0].message.content);
   assert.equal(draft.slides.length, 3);
   assert.deepEqual(draft.slides.map((slide) => slide.narrativeRole), ['opening', 'content', 'closing']);
@@ -38,6 +38,9 @@ test('local fake plans a contentful three-slide deck from source sections and pa
     assert.ok(slide.contentRefs.some((id) => unitsById.get(id)?.kind === 'heading'));
     assert.ok(slide.contentRefs.some((id) => unitsById.get(id)?.text.trim().length > 20));
     assert.ok(slide.takeaway.length > 0);
+    assert.ok(slide.bodyPoints.length >= 1 && slide.bodyPoints.length <= 4);
+    assert.ok(slide.bodyPoints.every((point) => point.origin === 'generated-from-brief'
+      && point.text.length <= 180 && Array.isArray(point.evidenceRefs)));
   }
   assert.deepEqual(draft.slides.map((slide) => slide.takeaway), ['Presentation compiler', 'Solution', 'Output']);
 
@@ -46,7 +49,7 @@ test('local fake plans a contentful three-slide deck from source sections and pa
   assert.deepEqual(review, { checkpointVersion: 7, outcome: 'pass', findings: [], operations: [] });
 });
 
-test('local fake treats task as instruction and grounds task/context-only slides in context units', () => {
+test('local fake keeps task/context instructions out of references and uses only uploaded-source units', () => {
   const units = [
     { id: 'task', sourceId: 'task-source', kind: 'text', text: 'Prepare a short deck about reliable automation.' },
     { id: 'context-heading-1', sourceId: 'context-source', kind: 'heading', text: '## Verification' },
@@ -56,10 +59,13 @@ test('local fake treats task as instruction and grounds task/context-only slides
     { id: 'context-heading-3', sourceId: 'context-source', kind: 'heading', text: '## Reproducibility' },
     { id: 'context-3', sourceId: 'context-source', kind: 'text', text: 'Reproducibility supports later verification. The same inputs produce a checkable result.' },
   ];
-  const response = deterministicPlanningResponse(request('deck_plan_draft_v1', {
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
     brief: { purpose: 'Present reliable automation.' },
     requestedSlideCount: 3,
-    contentIR: { sources: [{ id: 'task-source', kind: 'brief-task' }, { id: 'context-source', kind: 'brief-context' }], units },
+    contentIR: { sources: [{ id: 'task-source', kind: 'brief-task' }, { id: 'context-source', kind: 'brief-context' }, { id: 'source', kind: 'text' }], units: [
+      ...units.filter((unit) => unit.sourceId === 'context-source').map((unit) => ({ ...unit, sourceId: 'source' })),
+      ...units.filter((unit) => unit.sourceId === 'task-source'),
+    ] },
   }));
   const draft = JSON.parse(response.choices[0].message.content);
   assert.equal(new Set(draft.slides.map((slide) => slide.takeaway)).size, 3);
@@ -67,11 +73,12 @@ test('local fake treats task as instruction and grounds task/context-only slides
   assert.deepEqual(draft.slides.map((slide) => slide.takeaway), ['Verification', 'Rules', 'Reproducibility']);
   assert.ok(draft.slides.every((slide) => slide.contentRefs.length === 2
     && slide.contentRefs.every((id) => units.some((unit) => unit.id === id))
-    && !slide.contentRefs.includes('task')));
+    && !slide.contentRefs.includes('task')
+    && slide.bodyPoints.every((point) => point.origin === 'generated-from-brief')));
 });
 
-test('local fake still accepts task-only planning without inventing content units', () => {
-  const response = deterministicPlanningResponse(request('deck_plan_draft_v1', {
+test('local fake task-only planning generates copy without exporting task wording or citing it', () => {
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
     brief: { purpose: 'Prepare a short deck about reliable automation.' },
     requestedSlideCount: 1,
     contentIR: { sources: [{ id: 'task-source', kind: 'brief-task' }], units: [
@@ -80,13 +87,28 @@ test('local fake still accepts task-only planning without inventing content unit
   }));
   const draft = JSON.parse(response.choices[0].message.content);
   assert.equal(draft.slides.length, 1);
-  assert.deepEqual(draft.slides[0].contentRefs, ['task']);
-  assert.equal(draft.slides[0].takeaway, 'Prepare a short deck about reliable automation.');
+  assert.deepEqual(draft.slides[0].contentRefs, []);
+  assert.equal(draft.slides[0].takeaway, 'Главная мысль и контекст');
+  assert.equal(draft.slides[0].bodyPoints[0].origin, 'generated-from-brief');
+  assert.ok(!JSON.stringify(draft.slides[0]).includes('Prepare a short deck about reliable automation.'));
+});
+
+test('local fake keeps new planning titles within the v4 limit without cutting a word', () => {
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
+    requestedSlideCount: 1,
+    contentIR: { sources: [{ id: 'source', kind: 'text' }], units: [
+      { id: 'long-heading', sourceId: 'source', kind: 'heading', text: '# This is a deliberately long product title where last word should not be truncated' },
+      { id: 'supporting-text', sourceId: 'source', kind: 'text', text: 'A real section has body content under its heading.' },
+    ] },
+  }));
+  const draft = JSON.parse(response.choices[0].message.content);
+  assert.equal(draft.slides[0].takeaway, 'This is a deliberately long product');
+  assert.ok(draft.slides[0].takeaway.length <= 40);
 });
 
 test('local fake preserves distinct task-only steps as one grounded source', () => {
   const task = 'Подготовить краткий план запуска презентации.\nПроверить готовность исходных материалов.\nСогласовать следующий проверяемый шаг команды.';
-  const response = deterministicPlanningResponse(request('deck_plan_draft_v1', {
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
     brief: { purpose: task },
     requestedSlideCount: 3,
     contentIR: { sources: [{ id: 'task-source', kind: 'brief-task' }], units: [
@@ -94,12 +116,10 @@ test('local fake preserves distinct task-only steps as one grounded source', () 
     ] },
   }));
   const draft = JSON.parse(response.choices[0].message.content);
-  assert.deepEqual(draft.slides.map((slide) => slide.takeaway), [
-    'Подготовить краткий план запуска презентации.',
-    'Проверить готовность исходных материалов.',
-    'Согласовать следующий проверяемый шаг команды.',
-  ]);
-  assert.ok(draft.slides.every((slide) => slide.contentRefs.length === 1 && slide.contentRefs[0] === 'task'));
+  assert.deepEqual(draft.slides.map((slide) => slide.contentRefs), [[], [], []]);
+  assert.ok(draft.slides.every((slide) => slide.bodyPoints.length >= 3 && slide.bodyPoints.length <= 4
+    && slide.bodyPoints.every((point) => point.origin === 'generated-from-brief'
+      && !point.text.includes('Проверить готовность исходных материалов'))));
 });
 
 test('local fake returns generic strict-schema template role mappings from supplied evidence', () => {

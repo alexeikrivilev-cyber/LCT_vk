@@ -211,16 +211,18 @@ async function main() {
     const contextSourceIds = new Set(planning.contentIR.sources.filter((source) => source.kind === 'brief-context').map((source) => source.id));
     const deckPlanEvidence = fake.state.inference.find((item) => item.operation === 'deck-plan')?.request.messages.at(-1)?.content;
     const deckPlanEvidenceContentIR = typeof deckPlanEvidence === 'string' ? JSON.parse(deckPlanEvidence).contentIR : null;
-    const fakePlannerTaskSourceIds = new Set((deckPlanEvidenceContentIR?.sources ?? [])
-      .filter((source) => source.kind === 'brief-task').map((source) => source.id));
+    const instructionSourceIds = new Set((deckPlanEvidenceContentIR?.sources ?? [])
+      .filter((source) => source.kind === 'brief-task' || source.kind === 'brief-context').map((source) => source.id));
     report.planningDiagnostics = {
       contentUnitCount: planning.contentIR.units.length,
       contextUnitCount: planning.contentIR.units.filter((unit) => contextSourceIds.has(unit.sourceId)).length,
       fakePlannerContextUnitCount: Array.isArray(deckPlanEvidenceContentIR?.units)
-        ? deckPlanEvidenceContentIR.units.filter((unit) => !fakePlannerTaskSourceIds.has(unit.sourceId)).length
+        ? deckPlanEvidenceContentIR.units.length
         : null,
       distinctTakeawayCount: new Set(planning.deckPlan.slides.map((slide) => slide.takeaway.trim().toLocaleLowerCase())).size,
       distinctContentReferenceSetCount: new Set(planning.deckPlan.slides.map((slide) => [...slide.contentRefs].sort().join('|'))).size,
+      generatedBodyPointCount: planning.deckPlan.slides.reduce((total, slide) => total + (slide.bodyPoints?.length ?? 0), 0),
+      sourceBackedSlideCount: planning.deckPlan.slides.filter((slide) => slide.contentRefs.length > 0).length,
       plannedSlideCount: planning.deckPlan.slides.length,
     };
     await ensure(report);
@@ -237,11 +239,17 @@ async function main() {
     report.deckLevelPlanReview = planDeckReview;
     report.gates.planDeckReview = 'passed';
     const contentUnitsById = new Map(planning.contentIR.units.map((unit) => [unit.id, unit]));
-    assert.ok(planning.deckPlan.slides.every((slide) => slide.contentRefs.length > 0
+    assert.ok(planning.deckPlan.slides.every((slide) => slide.bodyPoints?.length > 0
+      && slide.bodyPoints.every((point) => point.origin === 'generated-from-brief')
       && slide.contentRefs.every((id) => {
         const unit = contentUnitsById.get(id);
-        return unit && unit.kind !== 'media-reference' && typeof unit.text === 'string' && unit.text.trim().length > 0;
-      })), 'every synthetic plan slide must cite non-empty source text');
+        const source = planning.contentIR.sources.find((candidate) => candidate.id === unit?.sourceId);
+        return unit && unit.kind !== 'media-reference' && source?.kind === 'text'
+          && typeof unit.text === 'string' && unit.text.trim().length > 0;
+      })), 'each synthetic plan slide needs generated presentation copy and any refs must resolve to uploaded source text');
+    assert.deepEqual(deckPlanEvidenceContentIR?.sources?.map((source) => source.kind) ?? [],
+      sourceName ? ['text'] : [], 'brief/task instructions must stay outside source evidence sent to the Worker');
+    assert.ok(![...(deckPlanEvidenceContentIR?.units ?? [])].some((unit) => instructionSourceIds.has(unit.sourceId)));
     assert.equal(new Set(planning.deckPlan.slides.map((slide) => slide.takeaway.trim().toLocaleLowerCase())).size,
       planning.deckPlan.slides.length, 'synthetic long-deck plan must not repeat takeaways');
     assert.equal(new Set(planning.deckPlan.slides.map((slide) => [...slide.contentRefs].sort().join('|'))).size,

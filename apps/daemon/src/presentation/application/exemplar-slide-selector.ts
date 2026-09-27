@@ -188,7 +188,7 @@ function geometryOf(element: TemplateElement): TemplateGeometry | null {
 }
 
 function maxFont(element: TemplateElement): number {
-  return Math.max(0, ...(element.directStyles.fontSizesPt ?? []));
+  return Math.max(0, ...(element.effectiveFontSizesPt ?? element.directStyles.fontSizesPt ?? []));
 }
 
 function normalizedText(element: TemplateElement): string {
@@ -218,13 +218,13 @@ function geometryBand(value: number, unit: number): number {
   return Math.round(value / unit);
 }
 
-function estimatedLineFit(text: string, element: TemplateElement, minimumFontSizePt = 8): number {
+function estimatedLineFit(text: string, element: TemplateElement, minimumFontSizePt = 8, averageGlyphWidthEm = 0.52): number {
   const box = geometryOf(element);
   if (!box) return 0;
   const fontSizePt = Math.max(8, minimumFontSizePt, maxFont(element));
   const widthPt = box.width / 12700;
   const heightPt = box.height / 12700;
-  const charactersPerLine = Math.max(6, widthPt / (fontSizePt * 0.52));
+  const charactersPerLine = Math.max(6, widthPt / (fontSizePt * averageGlyphWidthEm));
   const lineHeightPt = fontSizePt * 1.2;
   const requiredLines = Math.max(1, text.split(/\r?\n/).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charactersPerLine)), 0));
   const availableLines = Math.max(0.25, heightPt / lineHeightPt);
@@ -232,14 +232,15 @@ function estimatedLineFit(text: string, element: TemplateElement, minimumFontSiz
 }
 
 function projectedTitleFit(text: string, title: TemplateElement, body: TemplateElement): { fit: number; minimum: number } {
-  const hasDirectTitleSize = maxFont(title) > 0;
+  const hasMeasuredTitleSize = maxFont(title) > 0;
   const inheritedSizeEstimate = Math.max(18, maxFont(body) * 2);
   return {
-    fit: estimatedLineFit(text, title, hasDirectTitleSize ? 8 : inheritedSizeEstimate),
-    // TemplateIR does not always expose placeholder/master typography. A local
-    // preview showed that .72 can still admit inherited titles that visibly
-    // overflow their boxes, so unknown inherited sizes require extra headroom.
-    minimum: hasDirectTitleSize ? 0.72 : 0.9,
+    // Approximate title width conservatively: the previous 0.52-em average
+    // marked real WorkSpace titles as fitting even when PowerPoint clipped them.
+    fit: estimatedLineFit(text, title, hasMeasuredTitleSize ? 8 : inheritedSizeEstimate, 0.68),
+    // Direct and Office Kit resolved placeholder sizes use the ordinary fit
+    // threshold. Only genuinely unknown inheritance needs extra headroom.
+    minimum: hasMeasuredTitleSize ? 0.72 : 0.9,
   };
 }
 

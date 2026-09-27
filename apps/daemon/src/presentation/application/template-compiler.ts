@@ -1,7 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-
 import {
   derivePresentationDesignSystem,
   createTemplateIR,
@@ -13,6 +12,8 @@ import {
 } from './template-mapper.js';
 import { inspectPptx } from '../adapters/python-inspector.js';
 import { resolvePresentationFilePath } from '../../presentation-files.js';
+
+export type TemplateTypographyResolver = (templateIR: TemplateIR, sourceBytes: Uint8Array) => Promise<void>;
 
 const COMPILER_VERSION = 'lct-template-compiler/1';
 const MAX_TEMPLATE_BYTES = 64 * 1024 * 1024;
@@ -197,6 +198,7 @@ export async function compileTemplate(
   projectsRoot: string,
   projectId: string,
   requestedFilePath: string,
+  resolveEffectiveTypography?: TemplateTypographyResolver,
 ): Promise<TemplateCompilationResponse> {
   const filePath = typeof requestedFilePath === 'string' ? requestedFilePath.trim() : '';
   if (!filePath || path.posix.extname(filePath.replaceAll('\\', '/')).toLowerCase() !== '.pptx') {
@@ -217,7 +219,8 @@ export async function compileTemplate(
     if (!info.isFile()) throw new TemplateCompilerError('TEMPLATE_NOT_FOUND', 'The selected template file was not found.', 404);
     if (info.size > MAX_TEMPLATE_BYTES) throw new TemplateCompilerError('TEMPLATE_TOO_LARGE', 'The PPTX exceeds the 64 MiB template limit.', 413);
 
-    const beforeHash = await sourceHash(resolved.absolute);
+    const sourceBytes = await readFile(resolved.absolute);
+    const beforeHash = hashBytes(sourceBytes);
     source = { ...source, filePath: resolved.name, sha256: beforeHash };
     const compiledAt = new Date().toISOString();
     const templateSource: TemplateSource = {
@@ -233,7 +236,16 @@ export async function compileTemplate(
       throw new TemplateCompilerError('SOURCE_CHANGED_DURING_COMPILE', 'The PPTX changed during inspection. Compile it again.', 409);
     }
 
-    const templateIR = validateTemplateIR(createTemplateIR(inspection, templateSource));
+    const mappedTemplateIR = createTemplateIR(inspection, templateSource);
+    if (resolveEffectiveTypography) {
+      try {
+        await resolveEffectiveTypography(mappedTemplateIR, sourceBytes);
+      } catch (error) {
+        const code = isRecord(error) && typeof error.code === 'string' ? error.code : 'TEMPLATE_TYPOGRAPHY_RESOLUTION_FAILED';
+        console.warn(`Template typography resolution unavailable (${code}); conservative fit gates remain active.`);
+      }
+    }
+    const templateIR = validateTemplateIR(mappedTemplateIR);
     const presentationDesignSystem = validatePresentationDesignSystem(derivePresentationDesignSystem(templateIR), templateIR);
     const snapshot: SuccessfulCompilation = { source: templateSource, templateIR, presentationDesignSystem };
     await writeState(projectsRoot, projectId, {

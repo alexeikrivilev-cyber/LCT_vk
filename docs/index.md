@@ -37,4 +37,5 @@
 - [Финальная оценка release acceptance](../RELEASE_READINESS.md), [release notes](../RELEASE_NOTES.md)
 - [7-минутный сценарий демонстрации](./DEMO_RUNBOOK.md), [план выступления](./PITCH_OUTLINE.md)
 - [Активный план P0 core generation fix](./plans/active/core-generation-fix.md)
+- [Task-only generated copy and WorkSpace qualification](./plans/active/task-only-generated-copy.md)
 - [Superseded release acceptance plan](./plans/active/final-release-acceptance.md)

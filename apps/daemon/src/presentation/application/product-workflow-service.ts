@@ -326,10 +326,6 @@ function safeFailureCode(error: unknown): { code: string; status: number } {
   return { code: 'PRODUCT_WORKFLOW_FAILED', status: 500 };
 }
 
-function slideRefs(plan: DeckPlan): Map<string, ReadonlySet<string>> {
-  return new Map(plan.slides.map((slide) => [slide.id, new Set(slide.contentRefs)]));
-}
-
 function selectedDeckFingerprint(generation: PublicPresentationGeneration): string {
   return sha256(canonicalJson({
     generationId: generation.generationId,
@@ -355,8 +351,28 @@ function auditTextForUnit(unit: ContentIR['units'][number]): string | null {
 export function auditEvidence(contentIR: ContentIR, plan: DeckPlan, generation: PublicPresentationGeneration) {
   const units = new Map(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => [unit.id, unit]));
   const slideById = new Map(plan.slides.map((slide) => [slide.id, slide]));
-  const slideContentRefs = slideRefs(plan);
-  const knownEvidenceRefs = new Set(plan.slides.flatMap((slide) => slide.contentRefs));
+  const sources = new Map((contentIR.sources ?? []).map((source) => [source.id, source]));
+  const isSourceBacked = (ref: string) => {
+    const unit = units.get(ref);
+    return Boolean(unit && sources.get(unit.sourceId)?.kind === 'text');
+  };
+  const slideContentRefs = new Map(plan.slides.map((slide) => {
+    const refs = new Set<string>();
+    for (const ref of slide.contentRefs) {
+      const unit = units.get(ref);
+      if (!unit) {
+        throw new ProductWorkflowError('CONTEXTUAL_AUDIT_EVIDENCE_MISSING', 'The selected slide refers to source evidence that is no longer available.', 409);
+      }
+      const sourceKind = sources.get(unit.sourceId)?.kind;
+      if (sourceKind === 'brief-task' || sourceKind === 'brief-context') continue;
+      if (sourceKind !== 'text') {
+        throw new ProductWorkflowError('CONTEXTUAL_AUDIT_EVIDENCE_MISSING', 'The selected slide refers to source evidence that is not available for review.', 409);
+      }
+      refs.add(ref);
+    }
+    return [slide.id, refs] as const;
+  }));
+  const knownEvidenceRefs = new Set([...slideContentRefs.values()].flatMap((refs) => [...refs]));
   const slides = generation.slides.map((pack) => {
     const planSlide = slideById.get(pack.slideId);
     const variant = pack.variants[pack.selectedVariant];
@@ -369,7 +385,8 @@ export function auditEvidence(contentIR: ContentIR, plan: DeckPlan, generation: 
     if (variant.audit.findings.some((finding) => finding.severity === 'error')) {
       throw new ProductWorkflowError('DETERMINISTIC_AUDIT_FAILED', 'The selected slide has a deterministic error. Resolve it before contextual review.', 409);
     }
-    const bodyText = planSlide.contentRefs.flatMap((ref) => {
+    const sourceRefs = planSlide.contentRefs.filter(isSourceBacked);
+    const bodyText = sourceRefs.flatMap((ref) => {
       const unit = units.get(ref);
       if (!unit) {
         throw new ProductWorkflowError('CONTEXTUAL_AUDIT_EVIDENCE_MISSING', 'The selected slide refers to source evidence that is no longer available.', 409);
@@ -382,7 +399,8 @@ export function auditEvidence(contentIR: ContentIR, plan: DeckPlan, generation: 
       order: pack.index,
       title: pack.title,
       bodyText,
-      evidenceRefs: [...planSlide.contentRefs],
+      generatedBodyPoints: planSlide.bodyPoints ?? [],
+      evidenceRefs: sourceRefs,
       narrativeRole: planSlide.narrativeRole,
       purpose: planSlide.purpose,
       takeaway: planSlide.takeaway,

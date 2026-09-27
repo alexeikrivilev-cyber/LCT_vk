@@ -296,6 +296,12 @@ function allowedContentIds(contentIR: ContentIR): Set<string> {
   return new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => unit.id));
 }
 
+function allowedPlanningContentIds(contentIR: ContentIR): Set<string> {
+  const sourceKinds = new Map(contentIR.sources.map((source) => [source.id, source.kind]));
+  return new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference'
+    && sourceKinds.get(unit.sourceId) === 'text').map((unit) => unit.id));
+}
+
 function allowedMediaIds(contentIR: ContentIR): Set<string> {
   return new Set(contentIR.units.filter((unit) => unit.kind === 'media-reference').map((unit) => unit.id));
 }
@@ -356,7 +362,7 @@ function validateOperation(value: unknown, plan: DeckPlan, contentIds: ReadonlyS
   throw new TypeError('Supervisor repair operation is outside the bounded allowlist');
 }
 
-export function validatePlanReview(value: unknown, checkpoint: DeckPlan, contentIR: ContentIR): PlanReview {
+function validatePlanReviewAgainstContentIds(value: unknown, checkpoint: DeckPlan, contentIds: ReadonlySet<string>): PlanReview {
   if (!isRecord(value) || !exactKeys(value, ['checkpointVersion', 'outcome', 'findings', 'operations'])) {
     throw new TypeError('Supervisor output has an invalid shape');
   }
@@ -364,7 +370,6 @@ export function validatePlanReview(value: unknown, checkpoint: DeckPlan, content
   if (!['pass', 'warn', 'repair', 'local-replan'].includes(String(value.outcome))) throw new TypeError('Supervisor decision is invalid');
   if (!Array.isArray(value.findings) || value.findings.length > MAX_FINDINGS) throw new TypeError('Supervisor findings exceed the limit');
   if (!Array.isArray(value.operations) || value.operations.length > MAX_REPAIR_OPERATIONS) throw new TypeError('Supervisor operations exceed the limit');
-  const contentIds = allowedContentIds(contentIR);
   const findings = value.findings.map((finding) => validateFinding(finding, checkpoint, contentIds));
   const operations = value.operations.map((operation) => validateOperation(operation, checkpoint, contentIds));
   if ((value.outcome === 'pass' || value.outcome === 'warn' || value.outcome === 'local-replan') && operations.length !== 0) {
@@ -380,6 +385,10 @@ export function validatePlanReview(value: unknown, checkpoint: DeckPlan, content
   };
 }
 
+export function validatePlanReview(value: unknown, checkpoint: DeckPlan, contentIR: ContentIR): PlanReview {
+  return validatePlanReviewAgainstContentIds(value, checkpoint, allowedPlanningContentIds(contentIR));
+}
+
 export function applyPlanRepair(
   checkpoint: DeckPlan,
   review: PlanReview,
@@ -390,7 +399,9 @@ export function applyPlanRepair(
   if (review.checkpointVersion !== checkpoint.version || review.outcome !== 'repair') {
     throw new TypeError('Repair is not bound to the current checkpoint');
   }
-  const slides = checkpoint.slides.map((slide) => ({ ...slide, contentRefs: [...slide.contentRefs] }));
+  const slides = checkpoint.slides.map((slide) => ({ ...slide, contentRefs: [...slide.contentRefs],
+    ...(slide.bodyPoints === undefined ? {} : { bodyPoints: slide.bodyPoints.map((point) => ({ ...point, evidenceRefs: [...point.evidenceRefs] })) }),
+  }));
   for (const operation of review.operations) {
     const index = slides.findIndex((slide) => slide.id === operation.slideId);
     if (index < 0) throw new TypeError('Repair target no longer exists');
@@ -408,13 +419,14 @@ export function applyPlanRepair(
   const draft: DeckPlanDraft = {
     workingTitle: checkpoint.workingTitle,
     narrativeSummary: checkpoint.narrativeSummary,
-    slides: slides.map(({ narrativeRole, purpose, takeaway, contentRefs, mediaRefs, semanticVisualType, targetDensity }) => ({
+    slides: slides.map(({ narrativeRole, purpose, takeaway, contentRefs, bodyPoints, mediaRefs, semanticVisualType, targetDensity }) => ({
       narrativeRole, purpose, takeaway, contentRefs,
+      ...(bodyPoints === undefined ? {} : { bodyPoints }),
       ...(mediaRefs === undefined ? {} : { mediaRefs }),
       semanticVisualType, targetDensity,
     })),
   };
-  const contentIds = allowedContentIds(contentIR);
+  const contentIds = allowedPlanningContentIds(contentIR);
   const mediaIds = allowedMediaIds(contentIR);
   const validDraft = validateDeckPlanDraft(draft, contentIds, brief.requestedSlideCount, mediaIds);
   return canonicalizeDeckPlan(validDraft, {
@@ -511,8 +523,16 @@ function validateTelemetrySummary(value: unknown): TelemetrySummary {
   return { ...value, finishReason: value.finishReason ?? null } as unknown as TelemetrySummary;
 }
 
-function validatePlanReviewState(value: unknown, plan: DeckPlan, contentIR: ContentIR): PlanReview {
-  return validatePlanReview(value, plan, contentIR);
+function validatePlanReviewState(
+  value: unknown,
+  plan: DeckPlan,
+  contentIR: ContentIR,
+  allowLegacyInstructionRefs: boolean,
+): PlanReview {
+  // Earlier planning snapshots allowed brief/task units in review evidence. They remain
+  // readable for stale-state recovery, while all new Worker/Supervisor calls stay source-only.
+  return validatePlanReviewAgainstContentIds(value, plan,
+    allowLegacyInstructionRefs ? allowedContentIds(contentIR) : allowedPlanningContentIds(contentIR));
 }
 
 function validateStoredState(value: unknown): StoredPlanningState {
@@ -548,7 +568,7 @@ function validateStoredState(value: unknown): StoredPlanningState {
         || !Array.isArray(saved.contentFiles) || saved.contentFiles.length > MAX_SELECTED_FILES
         || saved.contentFiles.some((item) => typeof item !== 'string') || !isHexHash(saved.inputFingerprint)
         || !isRecord(saved.promptVersions) || !exactKeys(saved.promptVersions, ['worker', 'supervisor'])
-        || !['worker-deck-plan.v1', WORKER_PLAN_PROMPT_VERSION].includes(String(saved.promptVersions.worker))
+        || !['worker-deck-plan.v1', 'worker-deck-plan.v2', 'worker-deck-plan.v3', 'worker-deck-plan.v4', WORKER_PLAN_PROMPT_VERSION].includes(String(saved.promptVersions.worker))
         || saved.promptVersions.supervisor !== SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION
         || !(saved.agentWorkflowVersions === undefined || isAgentWorkflowVersions(saved.agentWorkflowVersions))
         || typeof saved.model !== 'string' || saved.model.length > 256
@@ -584,7 +604,8 @@ function validateStoredState(value: unknown): StoredPlanningState {
       inputFingerprint: saved.inputFingerprint,
       checkpoint,
       deckPlan,
-      review: validatePlanReviewState(saved.review, checkpoint, contentIR),
+      review: validatePlanReviewState(saved.review, checkpoint, contentIR,
+        saved.promptVersions.worker === 'worker-deck-plan.v1' || saved.promptVersions.worker === 'worker-deck-plan.v2'),
       telemetry,
       promptVersions: { worker: String(saved.promptVersions.worker), supervisor: String(saved.promptVersions.supervisor) },
       agentWorkflowVersions: saved.agentWorkflowVersions === undefined ? LEGACY_UNRECORDED_WORKFLOW_VERSIONS : saved.agentWorkflowVersions,
@@ -674,15 +695,17 @@ function scopedDesignSystem(pds: TemplateCompilationResponse['presentationDesign
 }
 
 function compactContentIR(contentIR: ContentIR): unknown {
+  const instructionSourceIds = new Set(contentIR.sources
+    .filter((source) => source.kind === 'brief-task' || source.kind === 'brief-context').map((source) => source.id));
   return {
     schemaVersion: contentIR.schemaVersion,
     id: contentIR.id,
     hash: contentIR.hash,
-    sources: contentIR.sources.filter((source) => source.kind === 'text' || source.kind === 'brief-task' || source.kind === 'brief-context')
+    sources: contentIR.sources.filter((source) => source.kind === 'text')
       .map(({ id, sourcePath, originalName, mediaType, sha256, order, byteLength, warnings, kind }) => ({
       id, sourcePath, originalName, mediaType, sha256, order, byteLength, kind, warnings,
     })),
-    units: contentIR.units.filter((unit) => unit.kind !== 'media-reference'),
+    units: contentIR.units.filter((unit) => unit.kind !== 'media-reference' && !instructionSourceIds.has(unit.sourceId)),
     // Visual references are selectors only. The text model sees no image pixels
     // and must not use asset metadata as evidence for factual claims.
     mediaAssets: contentIR.sources.filter((source) => source.kind === 'image').map(({ id, originalName, mediaType, sha256, order }) => ({
@@ -718,7 +741,7 @@ function telemetryModel(response: { telemetry: SemanticInferenceTelemetry }): st
 
 function isDraft(value: unknown, contentIR: ContentIR, brief: Brief): value is DeckPlanDraft {
   try {
-    validateDeckPlanDraft(value, allowedContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR));
+    validateDeckPlanDraft(value, allowedPlanningContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR), true);
     return true;
   } catch {
     return false;
@@ -730,7 +753,7 @@ function workerDraftSchema(): SemanticJsonSchema {
     type: 'object', additionalProperties: false,
     properties: {
       workingTitle: { type: 'string', minLength: 1, maxLength: 240 },
-      narrativeSummary: { type: 'string', minLength: 1, maxLength: 1200 },
+      narrativeSummary: { type: 'string', minLength: 1, maxLength: 1000 },
       slides: {
         type: 'array', minItems: 1, maxItems: 30,
         items: {
@@ -738,13 +761,25 @@ function workerDraftSchema(): SemanticJsonSchema {
           properties: {
             narrativeRole: { type: 'string', enum: [...ROLE_VALUES] },
             purpose: { type: 'string', minLength: 1, maxLength: 1000 },
-            takeaway: { type: 'string', minLength: 1, maxLength: 1000 },
+            takeaway: { type: 'string', minLength: 1, maxLength: 40 },
             contentRefs: { type: 'array', maxItems: 20, items: { type: 'string' } },
+            bodyPoints: {
+              type: 'array', minItems: 1, maxItems: 4,
+              items: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  text: { type: 'string', minLength: 1, maxLength: 180 },
+                  origin: { type: 'string', enum: ['generated-from-brief'] },
+                  evidenceRefs: { type: 'array', maxItems: 8, items: { type: 'string' } },
+                },
+                required: ['text', 'origin', 'evidenceRefs'],
+              },
+            },
             mediaRefs: { type: 'array', maxItems: 20, items: { type: 'string' } },
             semanticVisualType: { type: 'string', enum: [...VISUAL_VALUES] },
             targetDensity: { type: 'string', enum: [...DENSITY_VALUES] },
           },
-          required: ['narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'mediaRefs', 'semanticVisualType', 'targetDensity'],
+          required: ['narrativeRole', 'purpose', 'takeaway', 'contentRefs', 'bodyPoints', 'mediaRefs', 'semanticVisualType', 'targetDensity'],
         },
       },
     },
@@ -753,7 +788,7 @@ function workerDraftSchema(): SemanticJsonSchema {
 }
 
 function asDraft(value: unknown, contentIR: ContentIR, brief: Brief): DeckPlanDraft {
-  return validateDeckPlanDraft(value, allowedContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR));
+  return validateDeckPlanDraft(value, allowedPlanningContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR), true);
 }
 
 function outcomeMessage(error: unknown): PlanningFailure {
@@ -930,7 +965,7 @@ export class PlanningService {
         throw new PlanningServiceError('PLANNING_CONTEXT_TOO_LARGE', 'Selected source evidence exceeds the planning context limit. Select fewer or shorter source files.', 413);
       }
       const workerContract = {
-        name: 'deck_plan_draft_v1',
+        name: 'deck_plan_draft_v4',
         schema: workerDraftSchema(),
         validate: (value: unknown): value is DeckPlanDraft => isDraft(value, contentIR, brief),
       };

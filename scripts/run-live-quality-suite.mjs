@@ -459,7 +459,7 @@ export async function runLiveQualification(options) {
     profile: options.profile ?? null,
     thinkingEnabled: false,
     inferenceSettings: { worker: { temperature: 0.2, maxOutputTokens: 4096 }, supervisor: { temperature: 0, maxOutputTokens: 2048 } },
-    requestSchema: { worker: 'deck_plan_draft_v1', supervisor: 'supervisor_plan_review_v1' },
+    requestSchema: { worker: 'deck_plan_draft_v4', supervisor: 'supervisor_plan_review_v1' },
     compilerVersion: 'lct-template-compiler/1',
     auditVersion: 'deterministic-audit.v1',
     sourceRevision: sourceRevision(),

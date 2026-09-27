@@ -26,7 +26,7 @@ function planningResponse(request, options = {}) {
     return completion(request.model, { status: 'ok', summary: 'Strict JSON response passed.', nextAction: 'Continue with planning.' });
   }
   const evidence = JSON.parse(request.messages.at(-1).content);
-  if (schemaName === 'deck_plan_draft_v1') {
+  if (schemaName === 'deck_plan_draft_v2' || schemaName === 'deck_plan_draft_v3' || schemaName === 'deck_plan_draft_v4') {
     const unit = evidence.contentIR.units.find((candidate) => candidate.kind !== 'media-reference');
     const count = Math.max(1, evidence.requestedSlideCount ?? 1);
     const ordinals = ['first', 'second', 'third', 'fourth', 'fifth'];
@@ -36,8 +36,11 @@ function planningResponse(request, options = {}) {
       slides: Array.from({ length: count }, (_, index) => ({
         narrativeRole: 'content',
         purpose: `Summarize the ${ordinals[index] ?? 'next'} source segment.`,
-        takeaway: `The supplied source supports the ${ordinals[index] ?? 'next'} section${options.unsupportedNumber ? ' with value 99999' : ''}.`,
-        contentRefs: [options.runtimeInvalidPlan ? 'invented-content-unit' : unit.id],
+        takeaway: (options.unsupportedNumber
+          ? `Unsupported source claim ${index + 1}: 99999.`
+          : `Source supports ${ordinals[index] ?? 'next'} section`),
+        contentRefs: options.runtimeInvalidPlan ? ['invented-content-unit'] : unit ? [unit.id] : [],
+        bodyPoints: [{ text: 'Связать исходный контекст с выбранным следующим шагом.', origin: 'generated-from-brief', evidenceRefs: [] }],
         mediaRefs: [],
         semanticVisualType: 'none',
         targetDensity: 'balanced',

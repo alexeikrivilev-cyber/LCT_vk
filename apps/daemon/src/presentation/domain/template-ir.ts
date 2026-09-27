@@ -69,6 +69,8 @@ export interface TemplateElement {
   };
   /** Explicit OOXML style facts only; this does not contain resolved style cascade. */
   directStyles: DirectElementStyles;
+  /** Replaceable Office Kit observation of effective text-run sizes for layout fit; bound to source SHA. */
+  effectiveFontSizesPt?: number[];
   relationshipIds: string[];
   warnings: TemplateWarning[];
 }
@@ -290,10 +292,12 @@ function isRelationship(value: unknown): value is TemplateRelationship {
 }
 
 function isElement(value: unknown): value is TemplateElement {
-  if (!isRecord(value) || !exactKeys(value, [
+  const requiredKeys = [
     'id', 'kind', 'nativeId', 'name', 'order', 'parentId', 'nativeParentId', 'text', 'placeholder',
     'geometry', 'directStyles', 'relationshipIds', 'warnings',
-  ])) return false;
+  ];
+  if (!isRecord(value) || !(exactKeys(value, requiredKeys)
+      || exactKeys(value, [...requiredKeys, 'effectiveFontSizesPt']))) return false;
   const placeholder = value.placeholder;
   const geometry = value.geometry;
   const placeholderValid = placeholder === null || (isRecord(placeholder)
@@ -305,7 +309,10 @@ function isElement(value: unknown): value is TemplateElement {
   return isString(value.id) && isString(value.kind) && isNullableString(value.nativeId) && isNullableString(value.name)
     && isSafeInteger(value.order) && value.order >= 0 && isNullableString(value.parentId)
     && isNullableString(value.nativeParentId) && isNullableString(value.text) && placeholderValid && geometryValid
-    && isDirectStyles(value.directStyles) && Array.isArray(value.relationshipIds)
+    && isDirectStyles(value.directStyles)
+    && (!Object.hasOwn(value, 'effectiveFontSizesPt') || (Array.isArray(value.effectiveFontSizesPt)
+      && value.effectiveFontSizesPt.length <= 64 && value.effectiveFontSizesPt.every((size) => isFiniteNumber(size) && size > 0 && size <= 1000)))
+    && Array.isArray(value.relationshipIds)
     && value.relationshipIds.every(isString) && isWarnings(value.warnings);
 }
 
@@ -434,6 +441,17 @@ export function templateIRHashPayload(templateIR: Omit<TemplateIR, 'hash'> | Tem
   delete payload.hash;
   const source = payload.source;
   if (isRecord(source)) delete source.compiledAt;
+  // Effective font sizes are derived by the pinned Office Kit resolver from
+  // this immutable source SHA. Keep this replaceable observation out of the
+  // structural/profile identity so existing semantic mappings remain reusable.
+  for (const groupName of ['masters', 'layouts', 'slides']) {
+    const groups = payload[groupName];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!isRecord(group) || !Array.isArray(group.elements)) continue;
+      for (const element of group.elements) if (isRecord(element)) delete element.effectiveFontSizesPt;
+    }
+  }
   return payload;
 }
 

@@ -71,6 +71,23 @@ function numericFacts(value: string): string[] {
   return facts;
 }
 
+function specificClaimMarkers(value: string): string[] {
+  const markers: string[] = [];
+  if (/(?:\b(?:customer|client)\b[^.!?]{0,80}\b(?:result|outcome|saved|reduced|increased|grew|achieved)\b|\b(?:result|outcome|saved|reduced|increased|grew|achieved)\b[^.!?]{0,80}\b(?:customer|client)\b|(?:клиент\p{L}*|заказчик\p{L}*)[^.!?]{0,80}(?:результат\p{L}*|снизил\p{L}*|увеличил\p{L}*|вырос\p{L}*|достиг\p{L}*|сэкономил\p{L}*|сократил\p{L}*)|(?:результат\p{L}*|снизил\p{L}*|увеличил\p{L}*|вырос\p{L}*|достиг\p{L}*|сэкономил\p{L}*|сократил\p{L}*)[^.!?]{0,80}(?:клиент\p{L}*|заказчик\p{L}*))/iu.test(value)) {
+    markers.push('customer-outcome');
+  }
+  if (/\b(?:benchmarks?|leaderboards?|state[- ]of[- ]the[- ]art)\b|(?:бенчмарк\p{L}*|лидерборд\p{L}*|сравнительн\p{L}* испытан\p{L}*)/iu.test(value)) {
+    markers.push('benchmark');
+  }
+  if (/\b(?:GDPR|SOC\s*2|ISO\s*\d{4,5}|certified|certification|regulatory approval|compliant with|ФЗ-\d+)\b|(?:соответств\p{L}* требованиям|сертифиц\p{L}*|регуляторн\p{L}* одобр\p{L}*)/iu.test(value)) {
+    markers.push('regulatory-or-certification');
+  }
+  if (/(?:\b(?:revenue|costs?|savings|profit|margin|ROI)\b[^.!?]{0,48}\b(?:increased|grew|raised|reduced|cut|saved|improved|rose|fell)\b|\b(?:increased|grew|raised|reduced|cut|saved|improved|rose|fell)\b[^.!?]{0,48}\b(?:revenue|costs?|savings|profit|margin|ROI)\b|(?:выручк\p{L}*|затрат\p{L}*|расход\p{L}*|экономи\p{L}*|прибыл\p{L}*)[^.!?]{0,48}(?:снизил\p{L}*|увеличил\p{L}*|сократил\p{L}*|вырос\p{L}*|повысил\p{L}*|сэкономил\p{L}*)|(?:снизил\p{L}*|увеличил\p{L}*|сократил\p{L}*|вырос\p{L}*|повысил\p{L}*|сэкономил\p{L}*)[^.!?]{0,48}(?:выручк\p{L}*|затрат\p{L}*|расход\p{L}*|экономи\p{L}*|прибыл\p{L}*))/iu.test(value)) {
+    markers.push('financial-effect');
+  }
+  return markers;
+}
+
 function addFinding(
   findings: DeterministicAuditFinding[],
   input: Omit<DeterministicAuditFinding, 'id' | 'elementIds'> & { elementIds?: string[] },
@@ -87,7 +104,7 @@ export function auditCompiledPresentation(
   const unitIds = new Set(contentIR.units.map((unit) => unit.id));
   const sourceById = new Map(contentIR.sources.map((source) => [source.id, source]));
   const sourceTextByUnit = new Map(contentIR.units
-    .filter((unit) => sourceById.get(unit.sourceId)?.kind !== 'brief-task')
+    .filter((unit) => sourceById.get(unit.sourceId)?.kind === 'text')
     .map((unit) => [unit.id, unit.text ?? unit.cellValue ?? unit.numericLexeme ?? '']));
   const seenContent = new Map<string, string>();
 
@@ -183,9 +200,11 @@ export function auditCompiledPresentation(
         suggestedRepair: null,
       });
     }
-    const supported = new Set(slide.provenanceRefs.flatMap((id) => numericFacts(sourceTextByUnit.get(id) ?? '')));
-    for (const fact of [...numericFacts(slide.title), ...slide.body.flatMap(numericFacts), ...(slide.visualization.tableData ?? []).flatMap((row) => row.flatMap(numericFacts))]) {
-      if (!supported.has(fact)) {
+    const supportedFor = (refs: readonly string[]) => new Set(refs.flatMap((id) => numericFacts(sourceTextByUnit.get(id) ?? '')));
+    const checkFacts = (text: string, refs: readonly string[]) => {
+      const supported = supportedFor(refs);
+      for (const fact of numericFacts(text)) {
+        if (supported.has(fact)) continue;
         addFinding(findings, {
           slideId: slide.id,
           ruleId: 'fidelity.unsupported-number',
@@ -196,7 +215,44 @@ export function auditCompiledPresentation(
           suggestedRepair: null,
         });
       }
+    };
+    const checkSpecificClaims = (text: string, refs: readonly string[]) => {
+      const supportedClaimTypes = new Set(refs.flatMap((id) => specificClaimMarkers(sourceTextByUnit.get(id) ?? '')));
+      for (const claimType of specificClaimMarkers(text)) {
+        if (supportedClaimTypes.has(claimType)) continue;
+        addFinding(findings, {
+          slideId: slide.id,
+          ruleId: 'fidelity.unsupported-specific-claim',
+          severity: 'warning',
+          message: 'A customer outcome, benchmark, regulatory/certification assertion, or exact financial effect has no source-backed evidence reference.',
+          evidence: { claimType },
+          autofixAvailable: false,
+          suggestedRepair: null,
+        });
+      }
+    };
+    checkFacts(slide.title, slide.provenanceRefs);
+    checkSpecificClaims(slide.title, slide.provenanceRefs);
+    for (let index = 0; index < slide.body.length; index += 1) {
+      const point = slide.generatedBodyPoints?.[index];
+      if (point) {
+        const invalidRefs = point.evidenceRefs.filter((ref) => !slide.provenanceRefs.includes(ref) || !sourceTextByUnit.has(ref));
+        if (point.origin !== 'generated-from-brief' || invalidRefs.length) {
+          addFinding(findings, {
+            slideId: slide.id,
+            ruleId: 'integrity.generated-copy-provenance',
+            severity: 'error',
+            message: 'Generated presentation copy has an invalid origin or source reference.',
+            evidence: { invalidReferenceCount: invalidRefs.length },
+            autofixAvailable: false,
+            suggestedRepair: null,
+          });
+        }
+      }
+      checkFacts(slide.body[index]!, point?.evidenceRefs ?? slide.provenanceRefs);
+      checkSpecificClaims(slide.body[index]!, point?.evidenceRefs ?? slide.provenanceRefs);
     }
+    for (const row of slide.visualization.tableData ?? []) for (const value of row) checkFacts(value, slide.provenanceRefs);
     const bullets = slide.body.filter((line) => /^\s*(?:[-*•]|\d+[.)])\s+/.test(line));
     if (bullets.length > 6) {
       addFinding(findings, {

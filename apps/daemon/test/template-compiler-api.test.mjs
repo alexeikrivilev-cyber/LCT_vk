@@ -7,6 +7,7 @@ import test from 'node:test';
 import { register } from 'tsx/esm/api';
 
 import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
+import { createHybridExemplarTemplate } from './exemplar-template-fixtures.mjs';
 import { startFakeSemanticEndpoint } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
 
 register();
@@ -150,6 +151,37 @@ test('Template Compiler API persists understanding, detects source changes, and 
     assert.equal(reloadedBody.semanticProfile.status, 'ready', 'profile readiness survives daemon restart');
     assert.equal(reloadedBody.semanticProfile.cached, true);
     assert.equal(Object.hasOwn(reloadedBody, 'semanticProfileData'), false, 'GET exposes status, not profile contents');
+
+    const inheritedProjectId = 'inherited-placeholder-typography';
+    assert.equal((await fetch(`${started.url}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: inheritedProjectId, name: 'Inherited placeholder typography' }),
+    })).status, 201);
+    const inheritedPath = path.join(temp, 'inherited-placeholder.pptx');
+    await createHybridExemplarTemplate(inheritedPath, { masterName: 'Inherited typography test' });
+    const inheritedBytes = await readFile(inheritedPath);
+    const inheritedUpload = new FormData();
+    inheritedUpload.append('files', new Blob([inheritedBytes]), 'inherited-placeholder.pptx');
+    assert.equal((await fetch(`${started.url}/api/projects/${inheritedProjectId}/upload`, { method: 'POST', body: inheritedUpload })).status, 200);
+    const inferred = await json(await fetch(`${started.url}/api/projects/${inheritedProjectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'inherited-placeholder.pptx' }),
+    }));
+    assert.equal(inferred.status, 'ready');
+    const inheritedTitle = inferred.templateIR.slides.flatMap((slide) => slide.elements)
+      .find((element) => element.text === 'Native source title sample');
+    assert.ok(inheritedTitle, 'the test title placeholder is inspected');
+    assert.ok(inheritedTitle.effectiveFontSizesPt?.includes(30),
+      'the pinned Office Kit style cascade resolves the master-inherited 30pt title font');
+    const profilerCalls = endpoint.state.inference.filter((item) => item.operation === 'template-semantic-profile').length;
+    const inheritedAgain = await json(await fetch(`${started.url}/api/projects/${inheritedProjectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'inherited-placeholder.pptx' }),
+    }));
+    assert.equal(inheritedAgain.templateIR.hash, inferred.templateIR.hash, 'derived typography does not perturb structural template identity');
+    assert.equal(inheritedAgain.semanticProfile.cached, true, 'the derived style observation does not invalidate the profile cache');
+    assert.equal(endpoint.state.inference.filter((item) => item.operation === 'template-semantic-profile').length, profilerCalls,
+      'recompilation reuses the READY profile without another semantic request');
 
     const missingProject = await fetch(`${started.url}/api/projects/does-not-exist/template`);
     assert.equal(missingProject.status, 404);
