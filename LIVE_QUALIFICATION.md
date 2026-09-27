@@ -1,6 +1,8 @@
 # Ограниченная live qualification
 
-Этот runbook — инструкция для будущего запуска, не разрешение на inference. Этот documentation pass не обращался к RunPod, GPU, Qwen, VK или внешнему endpoint. Перед любым `--semantic-mode external` требуется отдельная явная команда пользователя.
+Этот runbook описывает ограниченный qualification path, но сам по себе не является разрешением на inference. Предыдущий monolithic WorkSpace profiler получил HTTP 400 `input_tokens` context overflow. После реализации batching выполнен один разрешённый canonical WorkSpace E2E: первый из пяти batches вернул HTTP 200, но `finish_reason=length` при `maxOutputTokens=1024`; provider usage отсутствует, runtime schema validation не запускалась. Повторять запрос нельзя. Подробности и manifest указаны в [READY_FOR_QWEN.md](./docs/READY_FOR_QWEN.md). Serving context не менялся.
+
+Profiler batching доходит до провайдера только после планирования всех локальных batches и проверяет каждый ответ до merge. Не повторяйте автоматически ни один live run после отказа.
 
 ## Единый product path и режимы
 
@@ -55,16 +57,16 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --template $WorkspaceTemplate --task $Task --slides 3 --preflight-only
 if ($LASTEXITCODE -ne 0) { throw 'Models preflight failed; do not start product qualification.' }
 
-# First live test: exactly one 3-slide WorkSpace workflow, at most four semantic calls.
+# One canonical 3-slide WorkSpace workflow; hard ceiling includes profiler batches.
 pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --semantic-mode external --provider-label runpod `
-  --template $WorkspaceTemplate --task $Task --slides 3 --max-semantic-requests 4
+  --template $WorkspaceTemplate --task $Task --slides 3 --max-semantic-requests 16
 if ($LASTEXITCODE -ne 0) { throw '3-slide live qualification failed; stop without retry.' }
 
 # Run only after the first test passes the schema, quality, audit, export, and Office checks below.
 pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --semantic-mode external --provider-label runpod `
-  --template $VkTechTemplate --task $Task --slides 12 --max-semantic-requests 4
+  --template $VkTechTemplate --task $Task --slides 12 --max-semantic-requests 16
 if ($LASTEXITCODE -ne 0) { throw '12-slide live qualification failed; stop without retry.' }
 ```
 
@@ -136,12 +138,12 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --template "C:\path\to\organizer-or-held-out-template.pptx" `
   --task "Подготовить презентацию по предоставленной задаче" `
   --slides 3 `
-  --max-semantic-requests 4
+  --max-semantic-requests 16
 ```
 
-Это один one-click run: profiler 1, Worker 1, planning Supervisor 1, contextual deck audit 1, generation 0. Hard cap берётся из [`scripts/lib/live-qualification-contract.json`](./scripts/lib/live-qualification-contract.json); пятый semantic request блокируется до вызова adapter. При timeout, 5xx/524, невалидной схеме, `finish_reason=length` или пустом ответе runner сохраняет failure и останавливается без retry.
+Один логический Template Profiler stage может выполнить 1–13 последовательных provider calls; каждый batch ограничен шестью source slides и 24 KiB сериализованного evidence. Внешний контракт profiler остаётся одним полным validated profile; partial batches не кешируются. Deck-plan, plan-review и contextual-deck-audit вызываются не более одного раза каждый; generation inference остаётся 0. Жёсткий общий потолок — 16 semantic requests из [`scripts/lib/live-qualification-contract.json`](./scripts/lib/live-qualification-contract.json). Runner фиксирует для каждого вызова batch number/indexes, HTTP status, latency, prompt/completion tokens, `maxOutputTokens`, `finish_reason`, strict JSON Schema и runtime-validation outcome. При timeout, 5xx/524, context overflow, `finish_reason=length`, невалидном JSON/schema или runtime validation failure run останавливается без retry.
 
-Ожидаемый запросный профиль не зависит от числа слайдов: и 3-slide, и 12-slide product flow делают те же 4 semantic calls; число слайдов влияет на generation/render/export, но не создаёт inference call на каждый slide. Это покрыто runner regression tests и fake E2E.
+Число profiler calls зависит от размера и плотности source template, но ограничено 13. Число запрошенных output slides не создаёт inference call на каждый slide. Batching, byte/slide bounds, budget accounting и fake one-click flow с двумя profiler batches покрыты regression tests.
 
 ### 3. Измерение рабочего объёма
 
@@ -154,7 +156,7 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --template "C:\path\to\same-template.pptx" `
   --task "Подготовить презентацию по предоставленной задаче" `
   --slides 12 `
-  --max-semantic-requests 4
+  --max-semantic-requests 16
 ```
 
 Фиксируйте полный elapsed time и отдельно `semanticTotalMs`/`deterministicTotalMs`. Пять минут для live Qwen/VK не считаются выполненными до измеренного product run.
@@ -163,9 +165,9 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
 
 ## Запросный бюджет и manifest
 
-`scripts/lib/live-qualification-contract.json` задаёт cap `4` и ожидаемые операции. По умолчанию runner сохраняет в `.lct/product-e2e/<timestamp>-<mode>-<random-id>/manifest.json`; `--output-dir` задаёт отдельный пустой каталог:
+`scripts/lib/live-qualification-contract.json` задаёт общий cap `16`: максимум 13 profiler batches плюс по одному deck-plan, plan-review и contextual-deck-audit. По умолчанию runner сохраняет в `.lct/product-e2e/<timestamp>-<mode>-<random-id>/manifest.json`; `--output-dir` задаёт отдельный пустой каталог:
 
-- semantic calls по `operation`, model alias, timestamp, wall time, finish reason и доступным token usage;
+- semantic calls по `operation`, model alias, batch number/source indexes, HTTP status, timestamp, wall time, strict schema/runtime validation, finish reason и доступным token usage;
 - хеш запроса вместо prompt/context;
 - counts profiler/Worker/planning Supervisor/contextual audit/generation и отдельные health/models requests;
 - реальные наблюдённые стадии product workflow и времена template analysis, planning, generation, contextual audit и exports;
@@ -186,7 +188,7 @@ RunPod является только одним self-hosted runtime вариан
 3. Продолжать только при полном snapshot точной revision; затем отдельно запустить vLLM и дождаться model readiness.
 4. На локальном компьютере задать `LCT_SEMANTIC_BASE_URL`, `LCT_SEMANTIC_MODEL` и при необходимости secret `LCT_SEMANTIC_API_KEY`.
 5. Выполнить runner `--preflight-only`; это models GET без chat completion.
-6. После отдельного разрешения выполнить один 3-slide external product E2E с hard cap 4.
+6. После прохождения локальных gates выполнить один разрешённый 3-slide WorkSpace external product E2E с hard cap 16; profiler batches выполняются внутри этого же workflow.
 7. Если qualification завершена и нет активных запросов, безопасно остановить GPU.
 
 Переход self-hosted/RunPod → VK inference остаётся конфигурационным при совместимом OpenAI-compatible contract. Local model volume относится только к self-hosted container; remote VK endpoint локальное model storage не требует.

@@ -1,7 +1,11 @@
 # Готовность к ограниченной Qwen qualification
 
-**STATUS: READY_FOR_REAL_QWEN_TOMORROW**
-**OFFLINE ENGINEERING: PASS. LIVE MODEL: PENDING.** Это готовность только к ограниченной live qualification; `CASE_COMPLIANCE_STATUS: BLOCKED` по отдельным organizer требованиям остаётся и описан в [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md). RunPod, GPU, Qwen, VK и внешний inference в этом offline pass не запускались. Полный отчёт: [RELEASE_READINESS.md](../RELEASE_READINESS.md); точная последовательность live-команд и рубрика: [LIVE_QUALIFICATION.md](../LIVE_QUALIFICATION.md).
+**STATUS: LIVE_MODEL_OUTPUT_BLOCKED**
+**ОФЛАЙН-ПРОВЕРКИ: PASS. LIVE BATCHED WORKSPACE E2E: BLOCKED ON FIRST PROFILER BATCH.** 2026-09-27 canonical WorkSpace E2E на 3 слайда вернул HTTP 200 для batch 1/5 (исходные слайды 1–6), `maxOutputTokens=1024`, `finish_reason=length`, `runtimeSchemaValidation=not-run` и `errorCode=INVALID_STRUCTURED_OUTPUT`. Provider не вернул prompt/completion token usage; latency запроса — 38,017 ms, всего workflow — 41,352 ms, поэтому context headroom неизвестен. Semantic request был один, retries — 0. Worker, planning Supervisor, generation, audit и export не запускались; VK Tech E2E пропущен, так как WorkSpace не прошёл. Manifest: `.lct/product-e2e/20260927141926-external-7ba30e40/manifest.json`. Pod не останавливался и не перезапускался. `CASE_COMPLIANCE_STATUS: BLOCKED`; RunPod не подтверждает обязательный VK inference. Подробности: [RELEASE_READINESS.md](../RELEASE_READINESS.md), [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md), [LIVE_QUALIFICATION.md](../LIVE_QUALIFICATION.md).
+
+Предыдущая попытка с монолитным profiler остаётся историческим evidence: HTTP 400 `input_tokens` context overflow при запрошенных 2,784 output tokens. В текущем run наблюдалось усечение ответа; qualification не завершена.
+
+Profiler evidence boundary сократила сериализованный WorkSpace evidence с 134,049 до 69,034 байт (−48.5%), но этого недостаточно для текущего context window. Данные provider usage для отклонённого запроса отсутствуют; нижняя граница по заданному output budget — более 13,600 input tokens. Это не точный tokenizer estimate.
 
 ## Последний offline freeze
 
@@ -44,19 +48,18 @@ PPTX прошли structural reopen и содержат редактируемы
 
 ## Offline checks
 
-Предыдущие repository gates от 2026-09-26 дали 207 тестов; это исторический набор. В текущем final offline acceptance: frozen install без package downloads; **219/219 tests**; workspace typecheck; web/daemon build; boundary; craft lint; docs check (55 required files); `git diff --check`. Точные команды и результаты указаны в [RELEASE_READINESS.md](../RELEASE_READINESS.md). Сам этот документ не запускает inference автоматически.
+Предыдущие repository gates от 2026-09-26 дали 207 и 229 тестов; это исторические наборы. В текущем bounded-profiler pass: **233/233 tests**; profiler targeted suite **11/11**; web и daemon typecheck/build; boundary; craft lint; docs check (56 required files); `git diff --check`. Эти проверки не запускают inference автоматически. Точные команды и результаты указаны в [RELEASE_READINESS.md](../RELEASE_READINESS.md).
 
 ## Dual-mode runner
 
-`LIVE_PATH_STATUS: LIVE_PATH_READY` означает только готовность инструмента к отдельно разрешённой qualification. Canonical runner вызывает тот же one-click workflow endpoint, fake и external mode имеют hard cap 4, generation model calls — 0, пятый запрос блокируется до adapter. Regression tests подтверждают ровно четыре семантических запроса для 3 и 12 слайдов. External dry-run не выполняет сетевых запросов; preflight проверен на локальном test double и отправляет только models GET, без completion. В этой сессии настоящий external inference не запускался.
+`LIVE_PATH_STATUS: LIVE_PATH_READY` означает готовность runner и его request cap, не успешный model workflow. Текущий внешний run выполнил один profiler batch, получил HTTP 200, но завершился `finish_reason=length`; token usage отсутствует, а runtime schema validation не запускалась. Автоматических retry не было. Локальные fake runs подтверждают wiring/schema, но не live model output.
 
 ## Live-only risks
 
-1. Qwen classification/semantic quality.
-2. Strict schema compliance на целевом runtime.
-3. Реальная inference latency.
-4. VK endpoint auth/configuration и revision.
+1. Причина усечения profiler batch при `maxOutputTokens=1024` неизвестна; prompt/completion usage и context headroom не предоставлены.
+2. Worker/Supervisor production schemas, Qwen semantic quality и live latency не квалифицированы.
+3. Auth/configuration и revision VK endpoint не проверены в этом RunPod run.
 
 ## Следующее действие
 
-Одна ограниченная live qualification: profiler 1, Worker 1, planning Supervisor 1, contextual audit 1; generation inference requests — 0; максимум четыре semantic requests. Для этого нужны отдельные пользовательские инструкции на целевой endpoint.
+Остановиться после первого усечённого profiler batch. В рамках этой qualification не повторять inference; сначала офлайн исследовать, почему bounded batch из 6 слайдов исчерпал лимит 1,024 output tokens, не меняя serving context. Новый live run требует отдельного запроса; VK Tech 12-slide run допускается только после полного WorkSpace PASS.

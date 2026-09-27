@@ -29,7 +29,7 @@ function configEnv(overrides = {}) {
   };
 }
 
-async function makeTemplate(filePath) {
+async function makeTemplate(filePath, { slideCount = 3 } = {}) {
   const PptxGenJS = require('pptxgenjs');
   const deck = new PptxGenJS();
   deck.layout = 'LAYOUT_WIDE';
@@ -39,7 +39,8 @@ async function makeTemplate(filePath) {
     { title: 'LCT_E2E_SPLIT', titleBox: { x: 0.6, y: 0.35, w: 12, h: 0.8 }, bodyBoxes: [{ x: 0.75, y: 1.65, w: 5.4, h: 4.5 }, { x: 6.95, y: 1.65, w: 5.4, h: 4.5 }] },
     { title: 'LCT_E2E_SPACIOUS', titleBox: { x: 1.1, y: 0.7, w: 10.8, h: 1.05 }, bodyBoxes: [{ x: 1.1, y: 2.2, w: 8.2, h: 3.55 }] },
   ];
-  for (const [index, master] of masters.entries()) {
+  for (let index = 0; index < slideCount; index += 1) {
+    const master = masters[index % masters.length];
     deck.defineSlideMaster({
       title: master.title,
       background: { color: 'FFFFFF' },
@@ -59,7 +60,7 @@ async function makeTemplate(filePath) {
 
 function workflowOptions(templatePath, outputDir, slides, task) {
   return { mode: 'fake', templatePath, task, context: '', sources: [], slides, providerLabel: 'local-test', outputDir,
-    maxSemanticRequests: 4, dryRun: false, preflightOnly: false };
+    maxSemanticRequests: 16, dryRun: false, preflightOnly: false };
 }
 
 test('CLI validates external dry-run config without making any network request or printing secrets', async (t) => {
@@ -97,8 +98,9 @@ test('external preflight sends only one models GET and never sends chat completi
   assert.ok(!serialized.includes(env.LCT_SEMANTIC_BASE_URL));
 });
 
-test('external CLI requires explicit model alias and caps configured request budgets at four', () => {
-  assert.throws(() => parseArgs(['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x', '--max-semantic-requests', '5']), /between 1 and 4/u);
+test('external CLI caps configured request budgets at the versioned hard limit', () => {
+  assert.throws(() => parseArgs(['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x', '--max-semantic-requests', '17']), /between 1 and 16/u);
+  assert.equal(parseArgs(['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x', '--max-semantic-requests', '16']).maxSemanticRequests, 16);
   assert.equal(parseArgs(['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x', '--preflight-only']).preflightOnly, true);
   assert.throws(() => parseArgs(['--semantic-mode', 'fake', '--template', 'x.pptx', '--task', 'x', '--preflight-only']), /requires --semantic-mode external/u);
 });
@@ -136,7 +138,7 @@ test('release PPTX backend is office-kit across defaults, env example, runner an
   assert.match(testing, /qualification backend.*Office Kit|Office Kit.*qualification backend/iu);
 });
 
-test('request budget rejects the fifth inference before calling the production adapter', async () => {
+test('request budget allows at most thirteen profiler batches plus one request per fixed stage', async () => {
   const delegated = [];
   const delegate = {
     model: 'Qwen/Qwen3.8-27B',
@@ -146,20 +148,21 @@ test('request budget rejects the fifth inference before calling the production a
         finishReason: 'stop', promptTokens: 1, completionTokens: 1 } };
     },
   };
-  const budget = createRequestBudgetAdapter(delegate, 4);
+  const budget = createRequestBudgetAdapter(delegate, 16);
   const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
-  for (const operation of ['template-semantic-profile', 'deck-plan', 'plan-review', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
-  await assert.rejects(budget.adapter.infer(request('unexpected-fifth-call')), (error) => error.code === 'RATE_LIMITED');
-  assert.equal(delegated.length, 4);
-  assert.equal(budget.records.length, 4);
+  for (let index = 0; index < 13; index += 1) await budget.adapter.infer(request('template-semantic-profile'));
+  for (const operation of ['deck-plan', 'plan-review', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
+  await assert.rejects(budget.adapter.infer(request('unexpected-seventeenth-call')), (error) => error.code === 'RATE_LIMITED');
+  assert.equal(delegated.length, 16);
+  assert.equal(budget.records.length, 16);
   assert.equal(budget.rejectedAttempts, 1);
 });
 
-test('same one-click ProductWorkflow API uses four fake semantic requests for 3 and 12 requested slides', async (t) => {
+test('canonical one-click fake E2E accounts variable profiler batches for 3 and 12 requested slides', async (t) => {
   const scratch = await mkdtemp(path.join(repoRoot, '.lct', 'product-e2e-test-'));
   t.after(() => rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }));
   const templatePath = path.join(scratch, 'синтетический шаблон.pptx');
-  await makeTemplate(templatePath);
+  await makeTemplate(templatePath, { slideCount: 9 });
   const endpoints = [];
   const endpointFactory = async (options) => {
     const endpoint = await startFakeSemanticEndpoint(options);
@@ -178,10 +181,20 @@ test('same one-click ProductWorkflow API uses four fake semantic requests for 3 
     assert.equal(manifest.requestedSlides, slides);
     assert.equal(manifest.actualSlides, slides);
     assert.deepEqual(manifest.semantic.operationCounts, {
-      profiler: 1, worker: 1, planningSupervisor: 1, contextualAudit: 1,
-      revisionWorker: 0, other: 0, generation: 0, total: 4,
+      profiler: 2, worker: 1, planningSupervisor: 1, contextualAudit: 1,
+      revisionWorker: 0, other: 0, generation: 0, total: 5,
     });
-    assert.equal(manifest.semantic.requestCount, 4);
+    assert.equal(manifest.semantic.requestCount, 5);
+    assert.ok(manifest.semantic.requests.every((request) => request.responseFormat === 'json_schema'
+      && request.strictJsonSchema === true && request.httpStatus === 200
+      && request.runtimeSchemaValidation === 'passed'));
+    assert.deepEqual(manifest.semantic.requests[0].templateProfilerBatch, {
+      batchNumber: 1, totalBatches: 2, sourceSlideIndexes: [1, 2, 3, 4, 5, 6],
+    });
+    assert.equal(manifest.semantic.requests[0].maxOutputTokens, 1024);
+    assert.deepEqual(manifest.semantic.requests[1].templateProfilerBatch, {
+      batchNumber: 2, totalBatches: 2, sourceSlideIndexes: [7, 8, 9],
+    });
     assert.equal(manifest.semantic.automaticRetries, 0);
     assert.equal(manifest.generation.variantsReady, slides * 3);
     assert.equal(manifest.generation.deterministicAudit.status, 'passed');
@@ -206,7 +219,7 @@ test('same one-click ProductWorkflow API uses four fake semantic requests for 3 
     assert.equal(persisted.result, 'PASS');
   }
   assert.equal(endpoints.length, 2);
-  assert.deepEqual(endpoints.map((endpoint) => endpoint.state.inference.length), [4, 4]);
+  assert.deepEqual(endpoints.map((endpoint) => endpoint.state.inference.length), [5, 5]);
 });
 
 test('a fake semantic request failure stops the product run without retrying', async (t) => {
@@ -227,5 +240,7 @@ test('a fake semantic request failure stops the product run without retrying', a
   assert.equal(manifest.failure?.code, 'SERVICE_UNAVAILABLE');
   assert.equal(manifest.semantic.requestCount, 1);
   assert.equal(manifest.semantic.automaticRetries, 0);
+  assert.equal(manifest.semantic.requests[0].httpStatus, 524);
+  assert.equal(manifest.semantic.requests[0].runtimeSchemaValidation, 'not-run');
   assert.equal(endpoints[0].state.inference.length, 1);
 });

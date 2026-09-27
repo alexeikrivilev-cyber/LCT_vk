@@ -26,6 +26,7 @@ const requiredFiles = [
   'decisions/ADR-008-fake-offline-inference.md', 'decisions/ADR-009-versioned-runtime-prompts.md',
   'apps/daemon/prompts/worker-deck-plan.v2.md', 'apps/daemon/prompts/supervisor-plan-review.v1.md',
   'apps/daemon/prompts/template-profiler.v1.md',
+  'apps/daemon/prompts/template-profiler.v2.md',
   'skills/README.md',
   'apps/daemon/src/presentation/contracts/agent-workflows.v1.json',
   'apps/daemon/src/presentation/contracts/template-profiler.v1.json',
@@ -69,10 +70,17 @@ function localTargets(markdown) {
 
 const failures = [];
 const liveQualificationContract = JSON.parse(await readFile(path.join(root, 'scripts/lib/live-qualification-contract.json'), 'utf8'));
-const expectedSemanticRequests = Object.values(liveQualificationContract.expectedOperations)
-  .reduce((total, count) => total + count, liveQualificationContract.generationSemanticRequests);
-if (liveQualificationContract.maxSemanticRequests !== expectedSemanticRequests) {
-  failures.push('live qualification contract: semantic operation counts do not equal the hard request cap');
+const requiredSemanticRequests = Object.values(liveQualificationContract.requiredOperations ?? {})
+  .reduce((total, count) => total + count, liveQualificationContract.generationSemanticRequests ?? 0);
+if (liveQualificationContract.schemaVersion !== 2
+    || liveQualificationContract.maxSemanticRequests !== liveQualificationContract.maxProfilerRequests + requiredSemanticRequests
+    || liveQualificationContract.maxProfilerRequests !== 13) {
+  failures.push('live qualification contract: bounded profiler and fixed semantic operation counts do not equal the hard request cap');
+}
+const profilerContract = JSON.parse(await readFile(path.join(root, 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
+if (profilerContract.maxBatches !== liveQualificationContract.maxProfilerRequests
+    || profilerContract.maxSlidesPerBatch !== 6 || profilerContract.maxBatchEvidenceBytes !== 24 * 1024) {
+  failures.push('template profiler batch limits differ from the hard request budget contract');
 }
 const liveQualificationGuide = await readFile(path.join(root, 'LIVE_QUALIFICATION.md'), 'utf8');
 if (!liveQualificationGuide.includes(`cap \`${liveQualificationContract.maxSemanticRequests}\``)) {

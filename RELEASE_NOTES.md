@@ -21,7 +21,7 @@
 - TemplateIR / ContentIR / DeckPlan schema: `1`.
 - Worker prompt: `worker-deck-plan.v2`.
 - Supervisor prompt: `supervisor-plan-review.v1`.
-- Template profiler prompt: `template-profiler.v1`.
+- Template profiler prompt/config: `template-profiler.v2` / `template-profiler-config.v2`; semantic output schema remains `template_semantic_profile_v1`.
 - Worker output schema: `deck_plan_draft_v1`.
 - Supervisor output schema: `supervisor_plan_review_v1`.
 

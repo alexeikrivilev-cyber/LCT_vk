@@ -28,8 +28,21 @@ import {
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const daemonRequire = createRequire(path.join(repoRoot, 'apps/daemon/package.json'));
 const liveQualificationContract = JSON.parse(readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'lib/live-qualification-contract.json'), 'utf8'));
-if (liveQualificationContract.schemaVersion !== 1 || !Number.isSafeInteger(liveQualificationContract.maxSemanticRequests)
-    || liveQualificationContract.maxSemanticRequests < 1 || liveQualificationContract.maxSemanticRequests > 4) {
+const requiredOperationTotal = liveQualificationContract.requiredOperations
+  && Object.values(liveQualificationContract.requiredOperations).reduce((total, count) => total + count, 0);
+const requiredOperationNames = ['deck-plan', 'plan-review', 'contextual-deck-audit'];
+if (liveQualificationContract.schemaVersion !== 2 || !Number.isSafeInteger(liveQualificationContract.maxSemanticRequests)
+    || liveQualificationContract.maxSemanticRequests < 1 || liveQualificationContract.maxSemanticRequests > 16
+    || !Number.isSafeInteger(liveQualificationContract.maxProfilerRequests)
+    || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 13
+    || liveQualificationContract.maxSemanticRequests !== 16 || liveQualificationContract.maxProfilerRequests !== 13
+    || !liveQualificationContract.requiredOperations
+    || Object.keys(liveQualificationContract.requiredOperations).length !== requiredOperationNames.length
+    || requiredOperationNames.some((operation) => liveQualificationContract.requiredOperations[operation] !== 1)
+    || liveQualificationContract.generationSemanticRequests !== 0
+    || !Number.isSafeInteger(requiredOperationTotal)
+    || liveQualificationContract.maxSemanticRequests !== liveQualificationContract.maxProfilerRequests
+      + requiredOperationTotal + liveQualificationContract.generationSemanticRequests) {
   throw new TypeError('The versioned live qualification request budget contract is invalid.');
 }
 const MAX_SEMANTIC_REQUESTS = liveQualificationContract.maxSemanticRequests;
@@ -96,7 +109,7 @@ export function helpText() {
     '  --slides <number>                Requested slide count, 1..30 (default 3)',
     '  --provider-label <label>         Manifest label only, e.g. runpod or vk',
     '  --output-dir <directory>         New or empty output directory',
-    '  --max-semantic-requests <1..4>    External/fake semantic request ceiling (default 4)',
+    `  --max-semantic-requests <1..${MAX_SEMANTIC_REQUESTS}>   External/fake semantic request ceiling (hard cap ${MAX_SEMANTIC_REQUESTS})`,
     '  --dry-run                        Validate inputs/config only; no daemon or network',
     '  --preflight-only                 External mode: GET /v1/models only; no chat completion',
   ].join('\n');
@@ -214,9 +227,15 @@ export function createRequestBudgetAdapter(delegate, limit = MAX_SEMANTIC_REQUES
           accounting: normalizedOperation(request.operation),
           model: delegate.model ?? null,
           requestHash: canonicalMessageFingerprint(request),
+          maxOutputTokens: request.maxOutputTokens,
+          responseFormat: 'json_schema',
+          strictJsonSchema: true,
+          templateProfilerBatch: request.metadata?.templateProfilerBatch ?? null,
           startedAt: startedAt(),
           wallTimeMs: null,
           finishReason: null,
+          httpStatus: null,
+          runtimeSchemaValidation: 'not-run',
           promptTokens: null,
           completionTokens: null,
           status: 'running',
@@ -229,6 +248,8 @@ export function createRequestBudgetAdapter(delegate, limit = MAX_SEMANTIC_REQUES
           record.startedAt = response.telemetry.startedAt;
           record.wallTimeMs = response.telemetry.wallTimeMs;
           record.finishReason = response.telemetry.finishReason ?? null;
+          record.httpStatus = response.telemetry.httpStatus ?? null;
+          record.runtimeSchemaValidation = response.telemetry.runtimeSchemaValidation ?? 'passed';
           record.promptTokens = response.telemetry.promptTokens ?? null;
           record.completionTokens = response.telemetry.completionTokens ?? null;
           record.status = 'success';
@@ -239,6 +260,8 @@ export function createRequestBudgetAdapter(delegate, limit = MAX_SEMANTIC_REQUES
           record.startedAt = telemetry?.startedAt ?? record.startedAt;
           record.wallTimeMs = telemetry?.wallTimeMs ?? Math.max(0, Math.round(performance.now() - started));
           record.finishReason = telemetry?.finishReason ?? null;
+          record.httpStatus = telemetry?.httpStatus ?? (error instanceof SemanticInferenceError ? error.httpStatus : null);
+          record.runtimeSchemaValidation = telemetry?.runtimeSchemaValidation ?? 'not-run';
           record.promptTokens = telemetry?.promptTokens ?? null;
           record.completionTokens = telemetry?.completionTokens ?? null;
           record.status = 'error';
@@ -262,8 +285,8 @@ function semanticCounts(records) {
 }
 
 function requestRecords(records) {
-  return records.map(({ operation, model, requestHash, startedAt, wallTimeMs, finishReason, promptTokens, completionTokens, status, errorCode }) => ({
-    operation, model, requestHash, startedAt, wallTimeMs, finishReason, promptTokens, completionTokens, status, errorCode,
+  return records.map(({ operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, status, errorCode }) => ({
+    operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, status, errorCode,
   }));
 }
 
@@ -631,12 +654,16 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     const expectedCounts = semanticCounts(budget.records);
     const rawOperationCounts = Object.fromEntries([...new Set(budget.records.map((record) => record.operation))]
       .map((operation) => [operation, budget.records.filter((record) => record.operation === operation).length]));
-    const expectedOperations = liveQualificationContract.expectedOperations;
-    const unexpectedOperations = Object.keys(rawOperationCounts).filter((operation) => !Object.hasOwn(expectedOperations, operation));
-    if (unexpectedOperations.length || Object.entries(expectedOperations).some(([operation, count]) => rawOperationCounts[operation] !== count)
+    const requiredOperations = liveQualificationContract.requiredOperations;
+    const unexpectedOperations = Object.keys(rawOperationCounts).filter((operation) => operation !== 'template-semantic-profile'
+      && !Object.hasOwn(requiredOperations, operation));
+    const profilerRequestCount = rawOperationCounts['template-semantic-profile'] ?? 0;
+    if (unexpectedOperations.length || profilerRequestCount < 1 || profilerRequestCount > liveQualificationContract.maxProfilerRequests
+        || Object.entries(requiredOperations).some(([operation, count]) => rawOperationCounts[operation] !== count)
         || expectedCounts.generation !== liveQualificationContract.generationSemanticRequests
-        || expectedCounts.total !== MAX_SEMANTIC_REQUESTS) {
-      throw errorWithCode('SEMANTIC_OPERATION_ACCOUNTING_MISMATCH', 'One-click semantic request operation counts differ from the four-call product workflow.');
+        || expectedCounts.total !== profilerRequestCount + requiredOperationTotal + liveQualificationContract.generationSemanticRequests
+        || expectedCounts.total > options.maxSemanticRequests) {
+      throw errorWithCode('SEMANTIC_OPERATION_ACCOUNTING_MISMATCH', 'One-click semantic request operation counts differ from the bounded qualification workflow.');
     }
     manifest.semantic.rawOperationCounts = rawOperationCounts;
     manifest.timing.semanticTotalMs = budget.records.reduce((sum, request) => sum + (request.wallTimeMs ?? 0), 0);

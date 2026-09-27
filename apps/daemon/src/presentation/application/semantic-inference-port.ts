@@ -30,6 +30,11 @@ export interface SemanticRequestMetadata {
   projectId?: string;
   generationId?: string;
   checkpointId?: string;
+  templateProfilerBatch?: {
+    batchNumber: number;
+    totalBatches: number;
+    sourceSlideIndexes: number[];
+  };
 }
 
 export interface SemanticInferenceRequest<T> {
@@ -72,7 +77,9 @@ export interface SemanticInferenceTelemetry {
   wallTimeMs: number;
   promptTokens?: number;
   completionTokens?: number;
+  httpStatus?: number;
   finishReason?: string;
+  runtimeSchemaValidation?: 'passed' | 'failed' | 'not-run';
   ttftMs?: number;
   cacheSignal?: string;
   status: 'success' | 'error' | 'cancelled';

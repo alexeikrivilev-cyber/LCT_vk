@@ -1,8 +1,8 @@
 {
-  "schemaVersion": 1,
-  "maxSemanticRequests": 4,
-  "expectedOperations": {
-    "template-semantic-profile": 1,
+  "schemaVersion": 2,
+  "maxSemanticRequests": 16,
+  "maxProfilerRequests": 13,
+  "requiredOperations": {
     "deck-plan": 1,
     "plan-review": 1,
     "contextual-deck-audit": 1

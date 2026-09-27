@@ -1,14 +1,14 @@
 # Готовность продукта к live qualification
 
-**STATUS: READY_FOR_REAL_QWEN_TOMORROW**
-**OFFLINE ENGINEERING: PASS. LIVE MODEL: PENDING.** Статус означает готовность только к одному ограниченному live qualification; это не полная organizer acceptance. `CASE_COMPLIANCE_STATUS: BLOCKED` остаётся по незакрытым требованиям, включая image-generation path и live VK/300-second qualification — см. [CASE_REQUIREMENTS.md](./docs/compliance/CASE_REQUIREMENTS.md). Финальная offline проверка: 2026-09-27, Windows, Office Kit и local fake endpoint. RunPod, GPU, Qwen, VK inference и любые внешние inference-запросы не запускались. Commit/push не выполнялись.
+**STATUS: LIVE_MODEL_OUTPUT_BLOCKED**
+**ОФЛАЙН-ПРОВЕРКИ: PASS. БАТЧЕВАЯ LIVE WORKSPACE E2E: BLOCKED НА ПЕРВОМ PROFILER BATCH.** 2026-09-27 один canonical external WorkSpace E2E вернул HTTP 200 для batch 1/5 (исходные слайды 1–6), но `finish_reason=length` при `maxOutputTokens=1024`; runtime schema validation не запускалась, запрос завершился `INVALID_STRUCTURED_OUTPUT`. Provider не вернул prompt/completion usage: headroom относительно serving context 16,384 неизвестен. Batch latency — 38.017 s; полный workflow завершился за 41.352 s; retries — 0. Worker/Supervisor/generation/audit/export не запускались; VK Tech E2E пропущен по условию полного WorkSpace PASS. Manifest: `.lct/product-e2e/20260927141926-external-7ba30e40/manifest.json`. Предыдущий monolithic HTTP 400 context overflow сохранён как историческое evidence в `.lct/live-qwen-qualification/workspace-profiler-fix-20260927-164121/manifest.json`. Pod не останавливался и не перезапускался. `CASE_COMPLIANCE_STATUS: BLOCKED`; RunPod не подтверждает обязательный VK inference. Commit/push не выполнялись.
 
 ## CASE COMPLIANCE
 
 - Этот отчёт подтверждает локальный product flow и не переобъявляет полную organizer acceptance. Трассировка требований и статусы находятся в [CASE_REQUIREMENTS.md](./docs/compliance/CASE_REQUIREMENTS.md); unknown/partial строки остаются таковыми до отдельных доказательств.
 - Organizer source: официальный 7-страничный PDF прочитан ранее; SHA-256 и provenance без выдуманной ссылки записаны в CASE_REQUIREMENTS.md. Самого PDF в Git нет; organizer source/version ещё нужно закрепить в tracked source register.
 - В qualification использованы обязательная задача без загруженных source files; для VK Tech добавлен явно синтетический контекст. WorkSpace, Education и held-out AIOS проверены task-only. Контекст и файлы остаются optional.
-- VK inference, фактическое качество Qwen и open-weight image-provider deployment остаются вне этой локальной проверки.
+- Qwen был вызван только один раз на template-profile stage и запрос отклонён по context limit; содержательное качество модели не проверялось. VK inference и open-weight image-provider deployment остаются неподтверждёнными.
 
 ## ONE-CLICK FLOW / STATE
 
@@ -49,7 +49,7 @@
 
 ## DUAL-MODE RUNNER
 
-**LIVE_PATH_STATUS: LIVE_PATH_READY** — это статус canonical qualification runner, не результат live Qwen/VK acceptance. Fake и external modes входят через один `/api/projects/:id/workflow/generate`; неиспользованный fifth semantic request отклоняется до adapter; automatic inference retry отсутствует. Regression E2E подтверждает 4 запроса для 3- и 12-слайдового workflow и 0 generation calls. External dry-run дал 0 network requests; models-only preflight проверен на локальном fake test double: один `/v1/models` GET, 0 chat completions. API key и URL проверены на отсутствие в reports/manifests. Настоящий endpoint не вызывался.
+**LIVE_PATH_STATUS: LIVE_PATH_READY** — это готовность canonical runner и его лимита, не успешная live acceptance. Последний внешний WorkSpace workflow прошёл через `/api/projects/:id/workflow/generate`, отправил один Qwen profiler batch и остановился на `finish_reason=length` (`maxOutputTokens=1024`). Runtime validation не запускалась; provider usage отсутствует. Ретраев не было; Worker/Supervisor/contextual-audit/generation calls — 0. Endpoint URL и credentials в manifest отсутствуют. Предшествовавший HTTP 400 `input_tokens` context overflow был на monolithic profiler до batching.
 
 ## UI / DOCUMENTATION
 
@@ -63,9 +63,9 @@
 
 Qualification machine report: `.lct/product-completion-final-acceptance-2026-09-26/qualification.json`; `status=PASS`, `noExternalCalls=true`, 16 fake requests. Файлы артефактов остаются в ignored `.lct`.
 
-## FINAL PRE-LIVE COMPLIANCE HARDENING (2026-09-27)
+## Исторический результат: pre-live compliance hardening (2026-09-27)
 
-**STATUS: PRE_LIVE_HARDENING_READY** — только для следующей ограниченной live qualification. Это не полная organizer compliance и не доказательство качества/latency реальной модели. Deterministic audit остался чистой функцией заданных PPTX/ContentIR/TemplateIR inputs; regression проверяет повторяемость report/hash, независимые копии, неизменность входов и изменение audit/hash при blocking geometry change. Contextual auditor versioned, требует ровно 11 правил v2, а legacy 9-rule result не может считаться current. UI показывает раздельные labels; contextual suggestions не запускают ремонт и не отменяют deterministic safety errors.
+Этот offline pass был завершён до текущей live попытки и не является актуальным overall status из шапки документа. Его статус `PRE_LIVE_HARDENING_READY` означал готовность только к ограниченной qualification, не полную organizer compliance и не доказательство качества/latency реальной модели. Deterministic audit остался чистой функцией заданных PPTX/ContentIR/TemplateIR inputs; regression проверяет повторяемость report/hash, независимые копии, неизменность входов и изменение audit/hash при blocking geometry change. Contextual auditor versioned, требует ровно 11 правил v2, а legacy 9-rule result не может считаться current. UI показывает раздельные labels; contextual suggestions не запускают ремонт и не отменяют deterministic safety errors.
 
 Свежие local fake runs после hardening: VK Tech 12 слайдов — 78.820 s, 4 requests, 36/36 variants, 11/11 contextual rules; WorkSpace 3 слайда — PASS, 4 requests, 11 rules; held-out AIOS на ранее квалифицированной task-only задаче — PASS, 4 requests, 11 rules. AIOS с другой общей формулировкой завершился на `VARIANTS_NOT_DISTINCT` до audit; он не маскируется успешным запуском. Для AIOS PASS ограничен конкретным template/task input.
 
@@ -84,9 +84,9 @@ Repository gates в этом pass:
 
 Вызов root `typecheck` wrapper через `corepack pnpm@10.33.2 typecheck` сначала упёрся в PATH, где вложенный `pnpm` разрешился в 11.19.0; та же workspace-команда `-r --filter @lct/web --filter @lct/daemon run typecheck` выполнена напрямую через pnpm 10.33.2 и прошла. Build package scripts также выполнены напрямую через pnpm 10.33.2, последовательно. Ни один из этих gates не запускал внешний inference. Commit/push не выполнялись; pre-existing untracked `test-content.md` сохранён без чтения или изменения.
 
-## FINAL OFFLINE PRODUCT FREEZE (2026-09-27)
+## Исторический результат: final offline product freeze (2026-09-27)
 
-**STATUS: OFFLINE_PRODUCT_FROZEN_FOR_LIVE.** Этот итоговый pass supersedes предыдущие локальные readiness labels. RunPod, GPU, настоящий Qwen, VK inference и любые внешние inference-запросы не запускались.
+Этот раздел фиксирует offline baseline перед внешней попыткой, а не текущую готовность. На момент этого freeze RunPod, GPU, настоящий Qwen, VK inference и внешние inference-запросы ещё не запускались. Последнее состояние указано в шапке документа.
 
 ### Backend и конфигурация
 
@@ -120,20 +120,20 @@ Request budget для этого run: profiler 1, Worker 1, planning Supervisor 
 ### Репозиторные gates
 
 - `pnpm dlx pnpm@10.33.2 install --frozen-lockfile --offline` — PASS; lockfile актуален, 0 downloaded.
-- `pnpm dlx pnpm@10.33.2 test` — **219/219 PASS**.
-- `pnpm dlx pnpm@10.33.2 typecheck` — PASS для web и daemon.
-- `pnpm dlx pnpm@10.33.2 build` — PASS для Next.js web и daemon.
-- `pnpm dlx pnpm@10.33.2 check:boundary`, `lint:craft`, `docs:check` — PASS; docs check: 55 required files, local links resolved.
+- `pnpm dlx pnpm@10.33.2 test` — **233/233 PASS**; profiler/adapter/runner targeted suite — **34/34 PASS**; целевой profiler suite после final guard — **11/11 PASS**.
+- `corepack pnpm@10.33.2 --filter @lct/web run typecheck` и аналогичная команда для daemon — PASS.
+- Web и daemon build через pnpm 10.33.2 — PASS; пользовательские изменения `apps/web/next-env.d.ts` и `apps/web/tsconfig.json` сохранены после сборки.
+- `check:boundary`, `lint:craft`, `docs:check` — PASS; docs check: 56 required files, локальные ссылки разрешаются.
 - `git diff --check` — PASS.
 
-Эти локальные fake checks не подтверждают реальное качество Qwen, strict-schema behavior целевого serving runtime, latency <300 s или VK endpoint integration.
+Offline/fake checks не подтверждают Qwen quality или latency. Один live profiler completion завершился `finish_reason=length` до runtime schema validation, поэтому Worker/Supervisor contracts и <300-second target остаются непроверенными; VK integration не запускалась.
 
-### Handoff — следующая работа только на live evidence
+### Handoff — после остановки live qualification
 
-1. Выполнить сохранённую в [LIVE_QUALIFICATION.md](./LIVE_QUALIFICATION.md) PowerShell-последовательность: RunPod console/startup по текущему runbook, `--dry-run`, один models-only preflight.
-2. Только после PASS preflight — один WorkSpace 3-slide Qwen product run (предел 4 semantic calls, без retry); применить опубликованный live rubric.
-3. Только если первый run PASS — VK Tech 12-slide run и ручной PowerPoint open/edit/save/reopen.
-4. До появления реальных Qwen/VK evidence не делать новых offline feature, selector, UI, audit, T2I, CI или renderer изменений.
+1. Не повторять live запрос в рамках этой qualification: WorkSpace batch 1/5 исчерпал лимит вывода в 1,024 tokens.
+2. Следующий технический шаг — offline установить, почему completion усёкся при текущем bounded output budget; не менять serving context/runtime.
+3. Новый WorkSpace run возможен только в отдельной задаче; VK Tech 12-slide run допустим после полного WorkSpace PASS.
+4. RunPod результат не закрывает обязательный VK inference requirement; отдельная VK endpoint qualification остаётся необходимой.
 
 Текущий RunPod runbook намеренно не закрепляет registry image tag: перед стартом оператор должен выбрать уже опубликованный immutable tag в console. Этот репозиторий не содержит значения, поэтому tag не выдуман и не записывается в документацию.
 
@@ -146,4 +146,4 @@ Request budget для этого run: profiler 1, Worker 1, planning Supervisor 
 
 ## NEXT ACTION
 
-Выполнить одну ограниченную live qualification через выбранный provider-neutral endpoint: profiler 1, Worker 1, planning Supervisor 1, contextual audit 1; generation inference requests — 0. Общий бюджет — не более четырёх semantic requests. До отдельной задачи live calls не запускались.
+Остановлена после одного truncated WorkSpace profiler batch. Нового live запроса в рамках этого pass нет. До следующего запуска offline разберите output truncation; serving context и runtime не менялись. Worker, Supervisor и contextual audit в live не проверялись; generation calls — 0.

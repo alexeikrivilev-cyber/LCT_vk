@@ -133,6 +133,18 @@ export function semanticInferenceConfigFromEnvironment(
 function validateMetadata(metadata: SemanticRequestMetadata | undefined): void {
   if (metadata === undefined) return;
   for (const [name, value] of Object.entries(metadata)) {
+    if (name === 'templateProfilerBatch') {
+      if (!isRecord(value)
+          || !isFiniteInteger(value.batchNumber, 1, 13)
+          || !isFiniteInteger(value.totalBatches, 1, 13)
+          || value.batchNumber > value.totalBatches
+          || !Array.isArray(value.sourceSlideIndexes)
+          || value.sourceSlideIndexes.length === 0 || value.sourceSlideIndexes.length > 6
+          || !value.sourceSlideIndexes.every((index) => isFiniteInteger(index, 1, 500))) {
+        throw new SemanticInferenceError('INVALID_REQUEST', 'Semantic request metadata is invalid');
+      }
+      continue;
+    }
     if (!['projectId', 'generationId', 'checkpointId'].includes(name)
         || (value !== undefined && (typeof value !== 'string' || !SAFE_ID_PATTERN.test(value)))) {
       throw new SemanticInferenceError('INVALID_REQUEST', 'Semantic request metadata is invalid');
@@ -626,6 +638,8 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
     }, timeoutMs);
     let outcome: SemanticInferenceTelemetry['status'] = 'error';
     let outcomeErrorCode: string | null = null;
+    let httpStatus: number | undefined;
+    let runtimeSchemaValidation: SemanticInferenceTelemetry['runtimeSchemaValidation'] = 'not-run';
 
     try {
       let response: Response;
@@ -653,6 +667,7 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
         }
         throw new SemanticInferenceError('SERVICE_UNAVAILABLE', 'Could not reach the semantic inference endpoint', { cause: error });
       }
+      httpStatus = response.status;
 
       if (!response.ok) {
         const diagnostic = await readProviderDiagnostic(response, controller.signal,
@@ -710,8 +725,10 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
         valid = false;
       }
       if (!valid) {
+        runtimeSchemaValidation = 'failed';
         throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'Model output did not satisfy the requested runtime contract');
       }
+      runtimeSchemaValidation = 'passed';
 
       const providerRequestId = typeof envelope.id === 'string' && envelope.id.length <= 256
         ? envelope.id : undefined;
@@ -721,7 +738,9 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
         value: parsed as T,
         telemetry: finishTelemetry(baseTelemetry, 'success', startedMs, {
           ...(providerRequestId ? { providerRequestId } : {}),
+          httpStatus,
           ...(finishReason ? { finishReason } : {}),
+          runtimeSchemaValidation,
           ...usage,
         }),
       };
@@ -741,7 +760,9 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       const telemetry = finishTelemetry(baseTelemetry, normalizedError instanceof SemanticInferenceError && normalizedError.code === 'CANCELLED'
         ? 'cancelled' : 'error', startedMs, {
         ...(normalizedError instanceof SemanticInferenceError ? { errorCode: normalizedError.code } : { errorCode: 'PROVIDER_ERROR' }),
+        ...(httpStatus === undefined ? {} : { httpStatus }),
         ...(finishReason ? { finishReason } : {}),
+        runtimeSchemaValidation,
       });
       outcome = telemetry.status;
       outcomeErrorCode = telemetry.errorCode ?? null;

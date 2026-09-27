@@ -15,6 +15,7 @@ import type {
   SemanticJsonSchema,
   SemanticOutputContract,
 } from './semantic-inference-port.js';
+import { SemanticInferenceError as InferenceError } from './semantic-inference-port.js';
 import { resolvePresentationFilePath } from '../../presentation-files.js';
 
 export const TEMPLATE_SLIDE_ARCHETYPES = [
@@ -98,6 +99,9 @@ const PROFILE_MAX_SLIDES = TEMPLATE_PROFILE_WORKFLOW.maxSlides;
 const PROFILE_MAX_ELEMENTS_PER_SLIDE = TEMPLATE_PROFILE_WORKFLOW.maxElementsPerSlide;
 const TEMPLATE_PROFILE_VERSION = TEMPLATE_PROFILE_WORKFLOW.promptVersion;
 const DEFAULT_PROMPT_DIRECTORY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../prompts');
+const PROFILE_BATCH_SLIDE_LIMIT = TEMPLATE_PROFILE_WORKFLOW.maxSlidesPerBatch;
+const PROFILE_BATCH_EVIDENCE_BYTE_LIMIT = TEMPLATE_PROFILE_WORKFLOW.maxBatchEvidenceBytes;
+const PROFILE_BATCH_COUNT_LIMIT = TEMPLATE_PROFILE_WORKFLOW.maxBatches;
 
 export function templateSemanticProfileCacheKey(templateIRHash: string, promptSha256: string): string {
   if (!/^[a-f0-9]{64}$/.test(templateIRHash) || !/^[a-f0-9]{64}$/.test(promptSha256)) {
@@ -142,19 +146,23 @@ function isTemplateSemanticSlideProfile(value: unknown): value is TemplateSemant
     && isStringArray(value.reasonCodes, 8) && value.reasonCodes.every((code) => /^[a-z0-9][a-z0-9._-]{0,63}$/.test(code));
 }
 
-export function templateSemanticProfileJsonSchema(): SemanticJsonSchema {
+export function templateSemanticProfileJsonSchema(sourceSlideIndexes?: readonly number[]): SemanticJsonSchema {
   const stringArray = { type: 'array', maxItems: PROFILE_MAX_ELEMENTS_PER_SLIDE, items: { type: 'string', minLength: 1 } };
+  const slideCount = sourceSlideIndexes?.length;
   return {
     type: 'object',
     additionalProperties: false,
     properties: {
       templateIRHash: { type: 'string', pattern: '^[a-f0-9]{64}$' },
       slides: {
-        type: 'array', maxItems: PROFILE_MAX_SLIDES,
+        type: 'array',
+        ...(slideCount === undefined ? { maxItems: PROFILE_MAX_SLIDES } : { minItems: slideCount, maxItems: slideCount }),
         items: {
           type: 'object', additionalProperties: false,
           properties: {
-            sourceSlideIndex: { type: 'integer', minimum: 1 },
+            sourceSlideIndex: sourceSlideIndexes
+              ? { type: 'integer', enum: [...sourceSlideIndexes] }
+              : { type: 'integer', minimum: 1 },
             archetype: { type: 'string', enum: [...TEMPLATE_SLIDE_ARCHETYPES] },
             supportedContentModes: { type: 'array', maxItems: TEMPLATE_CONTENT_MODES.length, items: { type: 'string', enum: [...TEMPLATE_CONTENT_MODES] } },
             titleElementId: { type: ['string', 'null'] },
@@ -216,65 +224,210 @@ export function validateTemplateSemanticProfile(value: unknown, templateIR: Temp
   };
 }
 
-function profileEvidence(templateIR: TemplateIR, presentationDesignSystem: PresentationDesignSystem): Record<string, unknown> {
-  if (templateIR.slides.length > PROFILE_MAX_SLIDES) throw new TypeError(`Template semantic profiling is limited to ${PROFILE_MAX_SLIDES} slides.`);
+function profileEvidenceSlide(
+  slide: TemplateIR['slides'][number],
+  textLimit = 320,
+  compactFallback = false,
+): Record<string, unknown> {
   return {
-    templateIRHash: templateIR.hash,
-    canvas: { width: templateIR.slideSize.width, height: templateIR.slideSize.height, unit: templateIR.slideSize.unit },
-    presentationDesignSystem: {
-      typography: {
-        observedFonts: presentationDesignSystem.typography.observedFonts.slice(0, 32),
-        observedSizesPt: presentationDesignSystem.typography.observedSizesPt.slice(0, 32),
-        theme: presentationDesignSystem.typography.theme,
-      },
-      colors: { theme: presentationDesignSystem.colors.theme.slice(0, 24) },
-      layoutSummaries: presentationDesignSystem.layouts.slice(0, 120).map((layout) => ({
-        placeholderRoles: layout.placeholderRoles.slice(0, 16),
-        elementCounts: layout.elementCounts,
-        usageCount: layout.usageCount,
-      })),
-    },
-    slides: templateIR.slides.map((slide) => ({
-      sourceSlideIndex: slide.index,
-      elements: slide.elements.slice(0, PROFILE_MAX_ELEMENTS_PER_SLIDE).map((element) => ({
+    sourceSlideIndex: slide.index,
+    elements: slide.elements.slice(0, PROFILE_MAX_ELEMENTS_PER_SLIDE).map((element) => {
+      const rawText = typeof element.text === 'string' ? element.text.trim() : '';
+      const text = rawText && textLimit > 0 ? rawText.slice(0, textLimit) : null;
+      const textBearing = text !== null || element.placeholder !== null;
+      const geometry = element.geometry.resolved ?? element.geometry.direct;
+      const evidence: Record<string, unknown> = {
         id: element.id,
         order: element.order,
         kind: element.kind,
-        text: element.text?.slice(0, 320) ?? null,
-        placeholderRole: element.placeholder?.role ?? null,
-        placeholderType: element.placeholder?.type ?? null,
-        parentId: element.parentId,
-        relationshipCount: element.relationshipIds.length,
-        geometry: element.geometry.resolved ?? element.geometry.direct,
-        styles: {
-          fonts: element.directStyles.fonts?.slice(0, 4) ?? null,
-          fontSizesPt: element.directStyles.fontSizesPt?.slice(0, 6) ?? null,
-          bold: element.directStyles.bold,
-          fillColor: element.directStyles.fillColor,
-        },
-      })),
-      evidenceTruncated: slide.elements.length > PROFILE_MAX_ELEMENTS_PER_SLIDE,
-    })),
+        ...(text === null ? {} : { text }),
+        ...(element.placeholder?.role ? { placeholderRole: element.placeholder.role } : {}),
+        ...(element.parentId === null ? {} : { parentId: element.parentId }),
+        ...(geometry === null ? {} : compactFallback
+          ? { box: [geometry.x, geometry.y, geometry.width, geometry.height] }
+          : { geometry: { x: geometry.x, y: geometry.y, width: geometry.width, height: geometry.height } }),
+        ...(!compactFallback && element.placeholder?.type ? { placeholderType: element.placeholder.type } : {}),
+      };
+      if (textBearing && !compactFallback) {
+        const styles = {
+          ...(element.directStyles.fontSizesPt?.length
+            ? { fontSizesPt: [...new Set(element.directStyles.fontSizesPt)].slice(0, 4) }
+            : {}),
+          ...(element.directStyles.bold === null ? {} : { bold: element.directStyles.bold }),
+        };
+        if (Object.keys(styles).length) evidence.styles = styles;
+      }
+      return evidence;
+    }),
+    ...(slide.elements.length > PROFILE_MAX_ELEMENTS_PER_SLIDE ? { evidenceTruncated: true } : {}),
+    ...(slide.elements.some((element) => typeof element.text === 'string' && element.text.trim().length > textLimit)
+      ? { textEvidenceTruncated: true } : {}),
   };
 }
 
-function requestFor(templateIR: TemplateIR, presentationDesignSystem: PresentationDesignSystem, systemPrompt: string): SemanticInferenceRequest<TemplateSemanticProfile> {
+function profileEvidence(
+  templateIR: TemplateIR,
+  slides: readonly TemplateIR['slides'][number][],
+  textLimit = 320,
+  compactFallback = false,
+): Record<string, unknown> {
+  if (templateIR.slides.length > PROFILE_MAX_SLIDES) throw new TypeError(`Template semantic profiling is limited to ${PROFILE_MAX_SLIDES} slides.`);
+  return profileEvidenceEnvelope(templateIR, slides.map((slide) => profileEvidenceSlide(slide, textLimit, compactFallback)));
+}
+
+function profileEvidenceEnvelope(templateIR: TemplateIR, slides: readonly Record<string, unknown>[]): Record<string, unknown> {
+  return {
+    templateIRHash: templateIR.hash,
+    canvas: { width: templateIR.slideSize.width, height: templateIR.slideSize.height },
+    slides,
+  };
+}
+
+function boundedBatchEvidence(
+  templateIR: TemplateIR,
+  slides: readonly TemplateIR['slides'][number][],
+): { evidence: Record<string, unknown>; evidenceJson: string; evidenceBytes: number } | null {
+  for (const textLimit of [320, 160, 80, 32, 0]) {
+    for (const compactFallback of [false, true]) {
+      const slideEvidence = slides.map((slide) => profileEvidenceSlide(slide, textLimit, compactFallback));
+      const evidence = profileEvidenceEnvelope(templateIR, slideEvidence);
+      const evidenceJson = JSON.stringify(evidence);
+      const evidenceBytes = Buffer.byteLength(evidenceJson, 'utf8');
+      if (evidenceBytes <= PROFILE_BATCH_EVIDENCE_BYTE_LIMIT) return { evidence, evidenceJson, evidenceBytes };
+    }
+  }
+  return null;
+}
+
+export interface TemplateSemanticProfileBatchPlan {
+  batchNumber: number;
+  totalBatches: number;
+  sourceSlideIndexes: number[];
+  evidence: string;
+  evidenceBytes: number;
+  maxOutputTokens: number;
+}
+
+/** Plans deterministic, byte- and slide-bounded profiler requests without inference. */
+export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR): {
+  totalEvidenceBytes: number;
+  batches: TemplateSemanticProfileBatchPlan[];
+} {
+  const templateIR = validateTemplateIR(templateIRInput);
+  if (templateIR.slides.length > PROFILE_MAX_SLIDES) throw new TypeError(`Template semantic profiling is limited to ${PROFILE_MAX_SLIDES} slides.`);
+  const totalEvidenceBytes = Buffer.byteLength(JSON.stringify(profileEvidence(templateIR, templateIR.slides)), 'utf8');
+  const batches: Array<{ slides: TemplateIR['slides'][number][]; evidence: Record<string, unknown>; evidenceJson: string }> = [];
+  let currentSlides: TemplateIR['slides'][number][] = [];
+  let currentEvidence: { evidence: Record<string, unknown>; evidenceJson: string; evidenceBytes: number } | null = null;
+  for (const slide of templateIR.slides) {
+    const candidateSlides = [...currentSlides, slide];
+    const candidate = candidateSlides.length <= PROFILE_BATCH_SLIDE_LIMIT
+      ? boundedBatchEvidence(templateIR, candidateSlides)
+      : null;
+    if (candidate) {
+      currentSlides = candidateSlides;
+      currentEvidence = candidate;
+      continue;
+    }
+    if (currentSlides.length > 0 && currentEvidence) {
+      batches.push({ slides: currentSlides, evidence: currentEvidence.evidence, evidenceJson: currentEvidence.evidenceJson });
+    }
+    const single = boundedBatchEvidence(templateIR, [slide]);
+    if (!single) {
+      throw new InferenceError('REQUEST_TOO_LARGE', `Template profiler evidence for source slide ${slide.index} exceeds the safe batch byte limit.`);
+    }
+    currentSlides = [slide];
+    currentEvidence = single;
+  }
+  if (currentSlides.length > 0 && currentEvidence) {
+    batches.push({ slides: currentSlides, evidence: currentEvidence.evidence, evidenceJson: currentEvidence.evidenceJson });
+  }
+  if (batches.length > PROFILE_BATCH_COUNT_LIMIT) {
+    throw new InferenceError('REQUEST_TOO_LARGE', `Template requires ${batches.length} profiler batches; the configured safe maximum is ${PROFILE_BATCH_COUNT_LIMIT}.`);
+  }
+  const totalBatches = batches.length;
+  return {
+    totalEvidenceBytes,
+    batches: batches.map((batch, index) => {
+      const sourceSlideIndexes = batch.slides.map((slide) => slide.index);
+      const evidenceBytes = Buffer.byteLength(batch.evidenceJson, 'utf8');
+      return {
+        batchNumber: index + 1,
+        totalBatches,
+        sourceSlideIndexes,
+        evidence: batch.evidenceJson,
+        evidenceBytes,
+        maxOutputTokens: Math.min(TEMPLATE_PROFILE_WORKFLOW.maxOutputTokens, Math.max(
+          TEMPLATE_PROFILE_WORKFLOW.minOutputTokens,
+          sourceSlideIndexes.length * TEMPLATE_PROFILE_WORKFLOW.outputTokensPerSlide,
+        )),
+      };
+    }),
+  };
+}
+
+function isValidTemplateSemanticProfileBatch(
+  value: unknown,
+  templateIR: TemplateIR,
+  expectedSlides: readonly TemplateIR['slides'][number][],
+): value is TemplateSemanticProfile {
+  if (!isRecord(value) || !exactKeys(value, ['templateIRHash', 'slides']) || value.templateIRHash !== templateIR.hash
+      || !Array.isArray(value.slides) || value.slides.length !== expectedSlides.length) return false;
+  const expectedByIndex = new Map(expectedSlides.map((slide) => [slide.index, slide]));
+  const seen = new Set<number>();
+  for (const candidate of value.slides) {
+    if (!isTemplateSemanticSlideProfile(candidate) || seen.has(candidate.sourceSlideIndex)) return false;
+    const sourceSlide = expectedByIndex.get(candidate.sourceSlideIndex);
+    if (!sourceSlide) return false;
+    seen.add(candidate.sourceSlideIndex);
+    const allElements = new Map(sourceSlide.elements.map((element) => [element.id, element]));
+    const selectedIds = [
+      ...(candidate.titleElementId ? [candidate.titleElementId] : []),
+      ...candidate.bodyElementIds,
+      ...candidate.visualElementIds,
+      ...(candidate.preservedElementIds ?? []),
+      ...(candidate.replaceableTextElementIds ?? []),
+    ];
+    if (new Set(selectedIds).size !== selectedIds.length || selectedIds.some((id) => !allElements.has(id))) return false;
+    if (candidate.titleElementId && !allElements.get(candidate.titleElementId)?.text?.trim()) return false;
+    if (candidate.bodyElementIds.some((id) => !allElements.get(id)?.text?.trim())) return false;
+    if ((candidate.replaceableTextElementIds ?? []).some((id) => {
+      const element = allElements.get(id)!;
+      return element.kind.toLowerCase() !== 'shape' || !element.nativeId || !element.text?.trim();
+    })) return false;
+  }
+  return seen.size === expectedSlides.length;
+}
+
+function requestFor(
+  templateIR: TemplateIR,
+  systemPrompt: string,
+  batch: TemplateSemanticProfileBatchPlan,
+  batchSlides: readonly TemplateIR['slides'][number][],
+): SemanticInferenceRequest<TemplateSemanticProfile> {
   const contract: SemanticOutputContract<TemplateSemanticProfile> = {
     name: TEMPLATE_PROFILE_WORKFLOW.schemaCompatibility,
-    schema: templateSemanticProfileJsonSchema(),
-    validate: (value): value is TemplateSemanticProfile => isValidTemplateSemanticProfile(value, templateIR),
+    schema: templateSemanticProfileJsonSchema(batch.sourceSlideIndexes),
+    validate: (value): value is TemplateSemanticProfile => isValidTemplateSemanticProfileBatch(value, templateIR, batchSlides),
   };
   return {
     role: 'worker',
     operation: 'template-semantic-profile',
     messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: JSON.stringify(profileEvidence(templateIR, presentationDesignSystem)) },
+      { role: 'user', content: batch.evidence },
     ],
     output: contract,
-    maxOutputTokens: Math.min(TEMPLATE_PROFILE_WORKFLOW.maxOutputTokens, Math.max(TEMPLATE_PROFILE_WORKFLOW.minOutputTokens, templateIR.slides.length * TEMPLATE_PROFILE_WORKFLOW.outputTokensPerSlide)),
+    maxOutputTokens: batch.maxOutputTokens,
     temperature: TEMPLATE_PROFILE_WORKFLOW.temperature,
     timeoutMs: TEMPLATE_PROFILE_WORKFLOW.timeoutMs,
+    metadata: {
+      templateProfilerBatch: {
+        batchNumber: batch.batchNumber,
+        totalBatches: batch.totalBatches,
+        sourceSlideIndexes: [...batch.sourceSlideIndexes],
+      },
+    },
   };
 }
 
@@ -311,7 +464,7 @@ export class TemplateSemanticProfiler {
 
   async profile(templateIRInput: TemplateIR, designSystemInput: PresentationDesignSystem, signal?: AbortSignal): Promise<TemplateSemanticProfile> {
     const templateIR = validateTemplateIR(templateIRInput);
-    const presentationDesignSystem = validatePresentationDesignSystem(designSystemInput, templateIR);
+    validatePresentationDesignSystem(designSystemInput, templateIR);
     const prompt = await this.loadPromptAsset();
     const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, prompt.sha256);
     const cached = this.cache.get(cacheKey);
@@ -330,8 +483,19 @@ export class TemplateSemanticProfiler {
           await this.persistentCache?.invalidate?.(cacheKey);
         }
       }
-      const response = await this.inference.infer({ ...requestFor(templateIR, presentationDesignSystem, prompt.content), signal });
-      const profile = validateTemplateSemanticProfile(response.value, templateIR);
+      const plan = planTemplateSemanticProfileBatches(templateIR);
+      const mergedSlides: TemplateSemanticSlideProfile[] = [];
+      for (const batch of plan.batches) {
+        if (signal?.aborted) throw new InferenceError('CANCELLED', 'Template profiler was cancelled before the next batch.');
+        const batchIndexes = new Set(batch.sourceSlideIndexes);
+        const batchSlides = templateIR.slides.filter((slide) => batchIndexes.has(slide.index));
+        const response = await this.inference.infer({ ...requestFor(templateIR, prompt.content, batch, batchSlides), signal });
+        mergedSlides.push(...response.value.slides);
+      }
+      const expectedIndexOrder = new Map(templateIR.slides.map((slide, index) => [slide.index, index]));
+      mergedSlides.sort((left, right) => (expectedIndexOrder.get(left.sourceSlideIndex) ?? Number.MAX_SAFE_INTEGER)
+        - (expectedIndexOrder.get(right.sourceSlideIndex) ?? Number.MAX_SAFE_INTEGER));
+      const profile = validateTemplateSemanticProfile({ templateIRHash: templateIR.hash, slides: mergedSlides }, templateIR);
       await this.persistentCache?.write(profile, cacheKey);
       this.cache.set(cacheKey, profile);
       return profile;
