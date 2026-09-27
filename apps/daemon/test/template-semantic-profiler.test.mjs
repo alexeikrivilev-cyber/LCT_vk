@@ -36,6 +36,7 @@ function completion(value) {
   return {
     id: 'offline-profile-response', model,
     choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: JSON.stringify(value) } }],
+    usage: { prompt_tokens: 17, completion_tokens: 23 },
   };
 }
 
@@ -65,6 +66,28 @@ test('semantic template profile loads its versioned prompt, validates references
   assert.equal(request.response_format.type, 'json_schema');
   assert.equal(request.response_format.json_schema.strict, true);
   assert.equal(request.response_format.json_schema.name, 'template_semantic_profile_v1');
+  const profileSchema = request.response_format.json_schema.schema;
+  assert.deepEqual(profileSchema.properties.templateIRHash.enum, [templateIR.hash], 'the schema binds responses to this exact TemplateIR');
+  assert.equal(profileSchema.properties.slides.minItems, templateIR.slides.length);
+  assert.equal(profileSchema.properties.slides.maxItems, templateIR.slides.length);
+  const slideSchemaBranches = profileSchema.properties.slides.items.anyOf;
+  assert.equal(slideSchemaBranches.length, templateIR.slides.length);
+  for (const sourceSlide of templateIR.slides) {
+    const branch = slideSchemaBranches.find((candidate) => candidate.properties.sourceSlideIndex.enum[0] === sourceSlide.index);
+    assert.ok(branch, `schema has a branch for source slide ${sourceSlide.index}`);
+    const textIds = sourceSlide.elements.filter((element) => element.text?.trim()).map((element) => element.id);
+    const allIds = sourceSlide.elements.map((element) => element.id);
+    const replaceableIds = sourceSlide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+      && element.nativeId && element.text?.trim()).map((element) => element.id);
+    assert.deepEqual(branch.properties.titleElementId.enum, [null, ...textIds]);
+    for (const [field, allowedIds] of [['bodyElementIds', textIds], ['visualElementIds', allIds],
+      ['preservedElementIds', allIds], ['replaceableTextElementIds', replaceableIds]]) {
+      const arraySchema = branch.properties[field];
+      assert.equal(arraySchema.maxItems, allowedIds.length);
+      if (allowedIds.length) assert.deepEqual(arraySchema.items.enum, allowedIds, `${field} is limited to IDs valid for this slide and role`);
+      else assert.equal('items' in arraySchema, false, `${field} is restricted to an empty list when no IDs qualify`);
+    }
+  }
   const configuredPrompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8')).replace(/\s+/g, ' ').trim();
   assert.equal(request.messages[0].content, configuredPrompt, 'the runtime sends the versioned Markdown prompt without rewriting its content');
   const evidence = JSON.parse(request.messages.at(-1).content);
@@ -125,25 +148,86 @@ test('semantic template profile loads its versioned prompt, validates references
   assert.equal(endpoint.state.inference.length, 2, 'a different validated TemplateIR hash gets a different cached profile');
 });
 
-test('semantic template profile rejects unknown slide indexes and element IDs through adapter validation', async (t) => {
+test('batch schema narrows profile references and runtime validation reports safe invariant codes', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-invalid-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root);
-  for (const invalid of ['slide-index', 'element-id']) {
+  const firstSlide = templateIR.slides[0];
+  const firstTextId = firstSlide.elements.find((element) => element.text?.trim())?.id;
+  const otherSlideTextId = templateIR.slides[1].elements.find((element) => element.text?.trim())?.id;
+  const nonTextId = firstSlide.elements.find((element) => !element.text?.trim())?.id;
+  assert.ok(firstTextId && otherSlideTextId && nonTextId, 'synthetic fixture provides text and non-text references across slides');
+  const cases = [
+    ['invented-element-id', 'UNKNOWN_ELEMENT_ID', (value) => { value.slides[0].bodyElementIds = ['invented-element-id']; }],
+    ['element-from-another-slide', 'ELEMENT_FROM_DIFFERENT_SLIDE', (value) => { value.slides[0].bodyElementIds = [otherSlideTextId]; }],
+    ['wrong-hash', 'HASH_MISMATCH', (value) => { value.templateIRHash = '0'.repeat(64); }],
+    ['duplicate-slide-index', 'DUPLICATE_SLIDE_INDEX', (value) => { value.slides[1].sourceSlideIndex = value.slides[0].sourceSlideIndex; }],
+    ['unexpected-slide-index', 'UNEXPECTED_SLIDE_INDEX', (value) => { value.slides[0].sourceSlideIndex = 999999; }],
+    ['non-text-title', 'TITLE_NOT_TEXT', (value) => {
+      const slide = value.slides[0];
+      slide.bodyElementIds = slide.bodyElementIds.filter((id) => id !== nonTextId);
+      slide.visualElementIds = slide.visualElementIds.filter((id) => id !== nonTextId);
+      slide.preservedElementIds = slide.preservedElementIds.filter((id) => id !== nonTextId);
+      slide.replaceableTextElementIds = slide.replaceableTextElementIds.filter((id) => id !== nonTextId);
+      slide.titleElementId = nonTextId;
+    }],
+    ['non-text-body', 'BODY_NOT_TEXT', (value) => {
+      const slide = value.slides[0];
+      slide.titleElementId = null;
+      slide.visualElementIds = slide.visualElementIds.filter((id) => id !== nonTextId);
+      slide.preservedElementIds = slide.preservedElementIds.filter((id) => id !== nonTextId);
+      slide.replaceableTextElementIds = slide.replaceableTextElementIds.filter((id) => id !== nonTextId);
+      slide.bodyElementIds = [nonTextId];
+    }],
+    ['invalid-replaceable-element', 'INVALID_REPLACEABLE_ELEMENT', (value) => {
+      const slide = value.slides[0];
+      slide.titleElementId = null;
+      slide.bodyElementIds = slide.bodyElementIds.filter((id) => id !== nonTextId);
+      slide.visualElementIds = slide.visualElementIds.filter((id) => id !== nonTextId);
+      slide.preservedElementIds = slide.preservedElementIds.filter((id) => id !== nonTextId);
+      slide.replaceableTextElementIds = [nonTextId];
+    }],
+    ['duplicate-element-role', 'DUPLICATE_ELEMENT_ROLE', (value) => {
+      const slide = value.slides[0];
+      slide.titleElementId = firstTextId;
+      slide.bodyElementIds = [firstTextId];
+      slide.visualElementIds = slide.visualElementIds.filter((id) => id !== firstTextId);
+      slide.preservedElementIds = slide.preservedElementIds.filter((id) => id !== firstTextId);
+      slide.replaceableTextElementIds = slide.replaceableTextElementIds.filter((id) => id !== firstTextId);
+    }],
+  ];
+  for (const [invalid, validationFailureCode, mutate] of cases) {
     await t.test(invalid, async (subtest) => {
+      let observedSchema;
       const endpoint = await startFakeSemanticEndpoint({
         model,
         respond(request) {
+          observedSchema = request.response_format.json_schema.schema;
           const normal = deterministicPlanningResponse(request);
           const content = JSON.parse(normal.choices[0].message.content);
-          if (invalid === 'slide-index') content.slides[0].sourceSlideIndex = 999999;
-          else content.slides[0].bodyElementIds = ['invented-element-id'];
+          if (invalid === 'invented-element-id') {
+            const textIds = firstSlide.elements.filter((element) => element.text?.trim()).map((element) => element.id);
+            const schemaBranch = observedSchema.properties.slides.items.anyOf.find((branch) => branch.properties.sourceSlideIndex.enum[0] === firstSlide.index);
+            assert.ok(!schemaBranch.properties.bodyElementIds.items.enum.includes('invented-element-id'), 'the provider schema excludes an invented ID before runtime validation');
+            assert.ok(!schemaBranch.properties.bodyElementIds.items.enum.includes(otherSlideTextId), 'the provider schema excludes an ID belonging to another slide');
+            assert.ok(textIds.includes(firstTextId));
+          }
+          mutate(content);
           return completion(content);
         },
       });
       subtest.after(() => endpoint.close());
       const profiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl));
-      await assert.rejects(profiler.profile(templateIR, presentationDesignSystem), (error) => error.code === 'INVALID_STRUCTURED_OUTPUT');
+      await assert.rejects(profiler.profile(templateIR, presentationDesignSystem), (error) => {
+        assert.equal(error.code, 'INVALID_STRUCTURED_OUTPUT');
+        assert.equal(error.telemetry.runtimeSchemaValidation, 'failed');
+        assert.equal(error.telemetry.validationFailureCode, validationFailureCode);
+        assert.equal(error.telemetry.promptTokens, 17);
+        assert.equal(error.telemetry.completionTokens, 23);
+        assert.ok(!JSON.stringify(error.telemetry).includes('invented-element-id'), 'diagnostics contain no raw model output');
+        return true;
+      });
+      assert.ok(observedSchema, 'batch-specific schema was sent to the provider');
       assert.equal(endpoint.state.inference.length, 1);
     });
   }
@@ -155,10 +239,10 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
   const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 17 });
   const plan = planTemplateSemanticProfileBatches(templateIR);
   assert.ok(plan.batches.length > 1);
-  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 5));
+  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 4));
   assert.ok(plan.batches.every((batch) => batch.evidenceBytes <= 24 * 1024));
   assert.ok(plan.batches.every((batch) => batch.maxOutputTokens >= 2048 && batch.maxOutputTokens <= 4096));
-  assert.ok(plan.batches.some((batch) => batch.sourceSlideIndexes.length === 5 && batch.maxOutputTokens === 4096));
+  assert.ok(plan.batches.some((batch) => batch.sourceSlideIndexes.length === 4 && batch.maxOutputTokens === 4096));
   assert.deepEqual(plan.batches.flatMap((batch) => batch.sourceSlideIndexes), templateIR.slides.map((slide) => slide.index));
 
   const endpoint = await startFakeSemanticEndpoint({
@@ -196,9 +280,10 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
       sourceSlideIndexes: batch.sourceSlideIndexes,
     });
     assert.equal(request.maxOutputTokens, batch.maxOutputTokens);
+    assert.equal(request.timeoutMs, 180000);
     assert.equal(request.output.schema.properties.slides.minItems, batch.sourceSlideIndexes.length);
     assert.equal(request.output.schema.properties.slides.maxItems, batch.sourceSlideIndexes.length);
-    assert.deepEqual(request.output.schema.properties.slides.items.properties.sourceSlideIndex.enum, batch.sourceSlideIndexes);
+    assert.deepEqual(request.output.schema.properties.slides.items.anyOf.map((branch) => branch.properties.sourceSlideIndex.enum[0]), batch.sourceSlideIndexes);
   });
   assert.ok(observedRequests.every((request) => request.output.name === 'template_semantic_profile_v1'));
   assert.ok(endpoint.state.inference.every((entry) => entry.request.response_format.type === 'json_schema'
@@ -396,7 +481,12 @@ test('profiler config version invalidates profiles produced from the previous ev
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root);
   const contract = JSON.parse(await readFile(path.join(process.cwd(), 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
-  assert.equal(contract.configVersion, 'template-profiler-config.v5');
+  assert.equal(contract.configVersion, 'template-profiler-config.v6');
+  assert.equal(contract.maxSlidesPerBatch, 4);
+  assert.equal(contract.maxBatchEvidenceBytes, 24 * 1024);
+  assert.equal(contract.maxBatches, 14);
+  assert.equal(contract.maxOutputTokens, 4096);
+  assert.equal(contract.timeoutMs, 180000);
   const prompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8')).replace(/\s+/g, ' ').trim();
   const promptSha256 = createHash('sha256').update(prompt, 'utf8').digest('hex');
   const oldCacheKey = createHash('sha256').update(JSON.stringify({

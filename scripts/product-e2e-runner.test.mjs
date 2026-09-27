@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
@@ -7,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
 import { assertQualificationPptxBackend, createRequestBudgetAdapter, parseArgs, runCli, runProductE2E } from './run-product-e2e.mjs';
 import { DEFAULT_PPTX_BACKEND, QUALIFICATION_PPTX_BACKEND, parsePptxBackend } from '../apps/daemon/src/presentation/application/pptx-backend-port.ts';
+import { SemanticInferenceError } from '../apps/daemon/src/presentation/application/semantic-inference-port.ts';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(path.join(repoRoot, 'apps/daemon/package.json'));
@@ -98,7 +100,19 @@ test('external preflight sends only one models GET and never sends chat completi
   assert.ok(!serialized.includes(env.LCT_SEMANTIC_BASE_URL));
 });
 
-test('product CLI uses a bounded profile-preparation and generation budget by default', () => {
+test('versioned qualification contract separates core, profile preparation, and full workflow budgets', () => {
+  const contract = JSON.parse(readFileSync(path.join(repoRoot, 'scripts/lib/live-qualification-contract.json'), 'utf8'));
+  assert.equal(contract.schemaVersion, 5);
+  assert.equal(contract.coreMaxSemanticRequests, 3);
+  assert.equal(contract.profilePreparationMaxSemanticRequests, 14);
+  assert.equal(contract.fullWorkflowMaxSemanticRequests, 17);
+  assert.equal(contract.profilerDiagnosticMaxSemanticRequests, 17);
+  assert.equal(contract.maxProfilerRequests, 14);
+  assert.deepEqual(contract.requiredOperations, { 'deck-plan': 1, 'plan-review': 1, 'contextual-deck-audit': 1 });
+  assert.equal(contract.generationSemanticRequests, 0);
+});
+
+test('product CLI uses full qualification budget while the adapter separately caps core generation', () => {
   const core = ['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x'];
   const coreOptions = parseArgs(core);
   assert.equal(coreOptions.maxSemanticRequests, 17);
@@ -148,13 +162,54 @@ test('release PPTX backend is office-kit across defaults, env example, runner an
 test('core request budget hard-stops at three semantic completions', async () => {
   const delegated = [];
   const delegate = { async infer(request) { delegated.push(request.operation); return { value: {}, telemetry: {} }; } };
-  const budget = createRequestBudgetAdapter(delegate, 3);
+  const budget = createRequestBudgetAdapter(delegate, 17);
   const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
+  await budget.adapter.infer(request('template-semantic-profile'));
+  budget.markProfilePrepared();
   for (const operation of ['deck-plan', 'plan-review', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
   await assert.rejects(budget.adapter.infer(request('unexpected-fourth-call')), (error) => error.code === 'RATE_LIMITED');
-  assert.deepEqual(delegated, ['deck-plan', 'plan-review', 'contextual-deck-audit']);
-  assert.equal(budget.records.length, 3);
+  assert.deepEqual(delegated, ['template-semantic-profile', 'deck-plan', 'plan-review', 'contextual-deck-audit']);
+  assert.equal(budget.records.length, 4);
   assert.equal(budget.rejectedAttempts, 1);
+});
+
+test('request budget retains only safe profiler validation diagnostics and token counts on failure', async () => {
+  const telemetry = {
+    role: 'worker', operation: 'template-semantic-profile', model: 'Qwen/Qwen3.8-27B', requestId: 'safe-test-id',
+    startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), wallTimeMs: 10,
+    promptTokens: 42, completionTokens: 13, httpStatus: 200, finishReason: 'stop',
+    runtimeSchemaValidation: 'failed', validationFailureCode: 'HASH_MISMATCH', status: 'error', errorCode: 'INVALID_STRUCTURED_OUTPUT',
+  };
+  const budget = createRequestBudgetAdapter({ async infer() {
+    throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'safe failure', { telemetry });
+  } }, 17);
+  await assert.rejects(budget.adapter.infer({
+    role: 'worker', operation: 'template-semantic-profile', maxOutputTokens: 4096,
+    messages: [{ role: 'user', content: 'private evidence must not be persisted' }],
+    output: { name: 'template_semantic_profile_v1', schema: {}, validate: () => false },
+    metadata: { templateProfilerBatch: { batchNumber: 1, totalBatches: 1, sourceSlideIndexes: [1] } },
+  }), (error) => error.code === 'INVALID_STRUCTURED_OUTPUT');
+  assert.equal(budget.records[0].validationFailureCode, 'HASH_MISMATCH');
+  assert.equal(budget.records[0].promptTokens, 42);
+  assert.equal(budget.records[0].completionTokens, 13);
+  assert.equal(budget.records[0].runtimeSchemaValidation, 'failed');
+  assert.equal(budget.records[0].evidenceBytes, Buffer.byteLength('private evidence must not be persisted', 'utf8'));
+  assert.ok(!JSON.stringify(budget.records[0]).includes('private evidence'));
+});
+
+test('core cannot start before a prepared profile and profiler cannot run after core starts', async () => {
+  const delegated = [];
+  const delegate = { async infer(request) { delegated.push(request.operation); return { value: {}, telemetry: {} }; } };
+  const budget = createRequestBudgetAdapter(delegate, 17);
+  const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
+  await assert.rejects(budget.adapter.infer(request('deck-plan')), (error) => error.code === 'RATE_LIMITED');
+  await budget.adapter.infer(request('template-semantic-profile'));
+  budget.markProfilePrepared();
+  await budget.adapter.infer(request('deck-plan'));
+  await assert.rejects(budget.adapter.infer(request('template-semantic-profile')), (error) => error.code === 'RATE_LIMITED');
+  assert.deepEqual(delegated, ['template-semantic-profile', 'deck-plan']);
+  assert.equal(budget.records.length, 2);
+  assert.equal(budget.rejectedAttempts, 2);
 });
 
 test('full product request budget allows at most fourteen profile batches plus three fixed stages', async () => {
@@ -170,11 +225,13 @@ test('full product request budget allows at most fourteen profile batches plus t
   const budget = createRequestBudgetAdapter(delegate, 17);
   const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
   for (let index = 0; index < 14; index += 1) await budget.adapter.infer(request('template-semantic-profile'));
+  await assert.rejects(budget.adapter.infer(request('template-semantic-profile')), (error) => error.code === 'RATE_LIMITED');
+  budget.markProfilePrepared();
   for (const operation of ['deck-plan', 'plan-review', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
   await assert.rejects(budget.adapter.infer(request('unexpected-eighteenth-call')), (error) => error.code === 'RATE_LIMITED');
   assert.equal(delegated.length, 17);
   assert.equal(budget.records.length, 17);
-  assert.equal(budget.rejectedAttempts, 1);
+  assert.equal(budget.rejectedAttempts, 2);
 });
 
 test('canonical fake E2E prepares the profile before Generate and runs no profiler requests during Generate', async (t) => {
@@ -201,6 +258,8 @@ test('canonical fake E2E prepares the profile before Generate and runs no profil
     assert.equal(manifest.actualSlides, slides);
     assert.equal(manifest.templateProfilerEnabled, true);
     assert.ok(manifest.workflow.templatePreparation.profileRequests > 0);
+    assert.equal(manifest.workflow.templatePreparation.profileRequests,
+      manifest.semantic.requests.filter((request) => request.operation === 'template-semantic-profile').length);
     assert.deepEqual(manifest.semantic.operationCounts, {
       profiler: manifest.workflow.templatePreparation.profileRequests, worker: 1, planningSupervisor: 1, contextualAudit: 1,
       revisionWorker: 0, other: 0, generation: 0, total: manifest.workflow.templatePreparation.profileRequests + 3,
@@ -215,6 +274,8 @@ test('canonical fake E2E prepares the profile before Generate and runs no profil
     assert.ok(manifest.semantic.requests.every((request) => request.responseFormat === 'json_schema'
       && request.strictJsonSchema === true && request.httpStatus === 200
       && request.runtimeSchemaValidation === 'passed'));
+    assert.ok(manifest.semantic.requests.filter((request) => request.operation === 'template-semantic-profile')
+      .every((request) => Number.isSafeInteger(request.evidenceBytes) && request.evidenceBytes > 0 && request.evidenceBytes <= 24 * 1024));
     assert.deepEqual(manifest.semantic.requests.slice(-3).map((request) => request.operation), [
       'deck-plan', 'plan-review', 'contextual-deck-audit',
     ]);
@@ -263,14 +324,14 @@ test('profile batches remain bounded and run before all three downstream semanti
   assert.equal(manifest.result, 'PASS', `failed at ${manifest.failure?.stage}: ${manifest.failure?.code}`);
   assert.equal(manifest.templateProfilerEnabled, true);
   assert.equal(manifest.semantic.requestBudget, 17);
-  assert.equal(manifest.semantic.requestCount, 5);
+  assert.equal(manifest.semantic.requestCount, 6);
   assert.deepEqual(manifest.semantic.operationCounts, {
-    profiler: 2, worker: 1, planningSupervisor: 1, contextualAudit: 1,
-    revisionWorker: 0, other: 0, generation: 0, total: 5,
+    profiler: 3, worker: 1, planningSupervisor: 1, contextualAudit: 1,
+    revisionWorker: 0, other: 0, generation: 0, total: 6,
   });
-  assert.deepEqual(manifest.semantic.requests.slice(0, 2).map((request) => request.templateProfilerBatch?.batchNumber), [1, 2]);
+  assert.deepEqual(manifest.semantic.requests.slice(0, 3).map((request) => request.templateProfilerBatch?.batchNumber), [1, 2, 3]);
   assert.equal(manifest.generation.variantsReady, 9);
-  assert.equal(endpoints[0].state.inference.length, 5);
+  assert.equal(endpoints[0].state.inference.length, 6);
 });
 
 test('fake profile preparation stops after one failure and does not retry', async (t) => {

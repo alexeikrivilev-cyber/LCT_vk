@@ -1,5 +1,5 @@
 {
-  "configVersion": "template-profiler-config.v5",
+  "configVersion": "template-profiler-config.v6",
   "agentId": "template-profiler",
   "agentVersion": "template-profiler.v1",
   "skillId": "template-semantics",
@@ -11,7 +11,7 @@
   "modelRole": "worker",
   "maxSlides": 500,
   "maxElementsPerSlide": 120,
-  "maxSlidesPerBatch": 5,
+  "maxSlidesPerBatch": 4,
   "maxBatchEvidenceBytes": 24576,
   "maxBatches": 14,
   "maxPromptBytes": 16384,
@@ -19,5 +19,5 @@
   "maxOutputTokens": 4096,
   "outputTokensPerSlide": 1024,
   "temperature": 0,
-  "timeoutMs": 90000
+  "timeoutMs": 180000
 }

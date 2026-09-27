@@ -31,23 +31,27 @@ const liveQualificationContract = JSON.parse(readFileSync(path.join(path.dirname
 const requiredOperationTotal = liveQualificationContract.requiredOperations
   && Object.values(liveQualificationContract.requiredOperations).reduce((total, count) => total + count, 0);
 const requiredOperationNames = ['deck-plan', 'plan-review', 'contextual-deck-audit'];
-if (liveQualificationContract.schemaVersion !== 4 || liveQualificationContract.coreMaxSemanticRequests !== 17
+if (liveQualificationContract.schemaVersion !== 5 || liveQualificationContract.coreMaxSemanticRequests !== 3
+    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 14
+    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 17
     || !Number.isSafeInteger(liveQualificationContract.profilerDiagnosticMaxSemanticRequests)
-    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests < liveQualificationContract.coreMaxSemanticRequests
-    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests > 17
     || !Number.isSafeInteger(liveQualificationContract.maxProfilerRequests)
     || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 14
-    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== 17 || liveQualificationContract.maxProfilerRequests !== 14
+    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.fullWorkflowMaxSemanticRequests
+    || liveQualificationContract.maxProfilerRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
     || !liveQualificationContract.requiredOperations
     || Object.keys(liveQualificationContract.requiredOperations).length !== requiredOperationNames.length
     || requiredOperationNames.some((operation) => liveQualificationContract.requiredOperations[operation] !== 1)
     || liveQualificationContract.generationSemanticRequests !== 0
     || !Number.isSafeInteger(requiredOperationTotal)
-    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.maxProfilerRequests
-      + requiredOperationTotal + liveQualificationContract.generationSemanticRequests) {
+    || liveQualificationContract.coreMaxSemanticRequests !== requiredOperationTotal + liveQualificationContract.generationSemanticRequests
+    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
+      + liveQualificationContract.coreMaxSemanticRequests) {
   throw new TypeError('The versioned live qualification request budget contract is invalid.');
 }
 const CORE_MAX_SEMANTIC_REQUESTS = liveQualificationContract.coreMaxSemanticRequests;
+const PROFILE_PREPARATION_MAX_SEMANTIC_REQUESTS = liveQualificationContract.profilePreparationMaxSemanticRequests;
+const FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS = liveQualificationContract.fullWorkflowMaxSemanticRequests;
 const PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS = liveQualificationContract.profilerDiagnosticMaxSemanticRequests;
 const DEFAULT_MODEL = 'Qwen/Qwen3.8-27B';
 const RUNNER_ENV_KEYS = [
@@ -105,7 +109,7 @@ export function parseArgs(argv) {
   }
   if (options.dryRun && options.preflightOnly) throw new TypeError('--dry-run and --preflight-only cannot be combined');
   if (options.preflightOnly && options.mode !== 'external') throw new TypeError('--preflight-only requires --semantic-mode external');
-  const requestCeiling = CORE_MAX_SEMANTIC_REQUESTS;
+  const requestCeiling = FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS;
   if (options.maxSemanticRequestsExplicit && options.maxSemanticRequests > requestCeiling) {
     throw new TypeError(`--max-semantic-requests must be between 1 and ${requestCeiling}`);
   }
@@ -122,7 +126,7 @@ export function helpText() {
     '  --slides <number>                Requested slide count, 1..30 (default 3)',
     '  --provider-label <label>         Manifest label only; does not change transport',
     '  --output-dir <directory>         New or empty output directory',
-    `  --max-semantic-requests <1..${CORE_MAX_SEMANTIC_REQUESTS}>   Bounded preparation and generation request cap; default ${CORE_MAX_SEMANTIC_REQUESTS}`,
+    `  --max-semantic-requests <1..${FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS}>   Full qualification cap; core ${CORE_MAX_SEMANTIC_REQUESTS}, profile preparation ${PROFILE_PREPARATION_MAX_SEMANTIC_REQUESTS}; default ${FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS}`,
     `  --enable-template-profiler       Accepted for compatibility; template profile preparation is part of the normal flow (up to ${liveQualificationContract.maxProfilerRequests} batches)`,
     '  --dry-run                        Validate inputs/config only; no daemon or network',
     '  --preflight-only                 External mode: GET /v1/models only; no chat completion',
@@ -222,22 +226,48 @@ function normalizedOperation(operation) {
   return 'other';
 }
 
-export function createRequestBudgetAdapter(delegate, limit = CORE_MAX_SEMANTIC_REQUESTS, startedAt = () => nowIso()) {
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS) {
+export function createRequestBudgetAdapter(delegate, limit = FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS, startedAt = () => nowIso()) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS
+      || PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS !== FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS) {
     throw new TypeError(`Semantic request budget must be between 1 and ${PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS}.`);
   }
   const records = [];
   let rejectedAttempts = 0;
+  let profilePreparationRequests = 0;
+  let coreRequests = 0;
+  let coreStarted = false;
+  let profilePrepared = false;
+  const reject = (message) => {
+    rejectedAttempts += 1;
+    throw new SemanticInferenceError('RATE_LIMITED', message);
+  };
   return {
     records,
     get rejectedAttempts() { return rejectedAttempts; },
+    markProfilePrepared() {
+      if (profilePrepared || coreStarted || profilePreparationRequests < 1) {
+        throw new TypeError('A READY semantic profile must be confirmed once, after preparation and before core generation.');
+      }
+      profilePrepared = true;
+    },
     adapter: {
       async infer(request) {
-        if (records.length >= limit) {
-          rejectedAttempts += 1;
-          throw new SemanticInferenceError('RATE_LIMITED', 'Qualification semantic request budget exhausted before dispatch');
+        const isProfilePreparation = request.operation === 'template-semantic-profile';
+        if (records.length >= limit) reject('Qualification full-workflow semantic request budget exhausted before dispatch');
+        if (isProfilePreparation) {
+          if (coreStarted) reject('Template profiling is forbidden after core generation starts');
+          if (profilePreparationRequests >= PROFILE_PREPARATION_MAX_SEMANTIC_REQUESTS) {
+            reject('Qualification profile-preparation semantic request budget exhausted before dispatch');
+          }
+          profilePreparationRequests += 1;
+        } else {
+          if (!profilePrepared) reject('Core generation requires a previously prepared READY semantic profile');
+          if (coreRequests >= CORE_MAX_SEMANTIC_REQUESTS) reject('Qualification core-generation semantic request budget exhausted before dispatch');
+          coreStarted = true;
+          coreRequests += 1;
         }
         const started = performance.now();
+        const profilerEvidence = isProfilePreparation ? request.messages.find((message) => message.role === 'user')?.content : null;
         const record = {
           operation: request.operation,
           accounting: normalizedOperation(request.operation),
@@ -247,11 +277,14 @@ export function createRequestBudgetAdapter(delegate, limit = CORE_MAX_SEMANTIC_R
           responseFormat: 'json_schema',
           strictJsonSchema: true,
           templateProfilerBatch: request.metadata?.templateProfilerBatch ?? null,
+          evidenceBytes: isProfilePreparation && typeof profilerEvidence === 'string'
+            ? Buffer.byteLength(profilerEvidence, 'utf8') : null,
           startedAt: startedAt(),
           wallTimeMs: null,
           finishReason: null,
           httpStatus: null,
           runtimeSchemaValidation: 'not-run',
+          validationFailureCode: null,
           promptTokens: null,
           completionTokens: null,
           status: 'running',
@@ -266,6 +299,7 @@ export function createRequestBudgetAdapter(delegate, limit = CORE_MAX_SEMANTIC_R
           record.finishReason = response.telemetry.finishReason ?? null;
           record.httpStatus = response.telemetry.httpStatus ?? null;
           record.runtimeSchemaValidation = response.telemetry.runtimeSchemaValidation ?? 'passed';
+          record.validationFailureCode = response.telemetry.validationFailureCode ?? null;
           record.promptTokens = response.telemetry.promptTokens ?? null;
           record.completionTokens = response.telemetry.completionTokens ?? null;
           record.status = 'success';
@@ -278,6 +312,7 @@ export function createRequestBudgetAdapter(delegate, limit = CORE_MAX_SEMANTIC_R
           record.finishReason = telemetry?.finishReason ?? null;
           record.httpStatus = telemetry?.httpStatus ?? (error instanceof SemanticInferenceError ? error.httpStatus : null);
           record.runtimeSchemaValidation = telemetry?.runtimeSchemaValidation ?? 'not-run';
+          record.validationFailureCode = telemetry?.validationFailureCode ?? null;
           record.promptTokens = telemetry?.promptTokens ?? null;
           record.completionTokens = telemetry?.completionTokens ?? null;
           record.status = 'error';
@@ -301,8 +336,8 @@ function semanticCounts(records) {
 }
 
 function requestRecords(records) {
-  return records.map(({ operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, status, errorCode }) => ({
-    operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, status, errorCode,
+  return records.map(({ operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, evidenceBytes, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, validationFailureCode, status, errorCode }) => ({
+    operation, model, requestHash, maxOutputTokens, responseFormat, strictJsonSchema, templateProfilerBatch, evidenceBytes, startedAt, wallTimeMs, httpStatus, finishReason, promptTokens, completionTokens, runtimeSchemaValidation, validationFailureCode, status, errorCode,
   }));
 }
 
@@ -549,6 +584,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
         || Object.hasOwn(preparedStatus, 'semanticProfileData')) {
       throw errorWithCode('TEMPLATE_STATUS_INVALID', 'Structural or semantic template preparation status was not safely read back.');
     }
+    budget.markProfilePrepared();
     const profilerCountBeforeGenerate = budget.records.filter((record) => record.operation === 'template-semantic-profile').length;
     if (profilerCountBeforeGenerate < 1 || profilerCountBeforeGenerate > liveQualificationContract.maxProfilerRequests) {
       throw errorWithCode('TEMPLATE_PROFILE_REQUEST_COUNT_INVALID', 'Template profile preparation exceeded its configured batch limit.');
@@ -770,7 +806,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
 
 export async function runProductE2E(options, dependencies = {}) {
   const enableTemplateProfiler = true;
-  const requestCeiling = CORE_MAX_SEMANTIC_REQUESTS;
+  const requestCeiling = FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS;
   const resolvedOptions = { ...options, enableTemplateProfiler,
     maxSemanticRequests: options.maxSemanticRequests ?? requestCeiling };
   if (!Number.isSafeInteger(resolvedOptions.maxSemanticRequests) || resolvedOptions.maxSemanticRequests < 1

@@ -641,6 +641,9 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
     let outcomeErrorCode: string | null = null;
     let httpStatus: number | undefined;
     let runtimeSchemaValidation: SemanticInferenceTelemetry['runtimeSchemaValidation'] = 'not-run';
+    let validationFailureCode: string | undefined;
+    let promptTokens: number | undefined;
+    let completionTokens: number | undefined;
 
     try {
       let response: Response;
@@ -695,6 +698,9 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       if (!isRecord(envelope)) {
         throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'Inference endpoint returned an invalid response envelope');
       }
+      const usage = countUsage(envelope.usage);
+      promptTokens = usage.promptTokens;
+      completionTokens = usage.completionTokens;
       const providerModel = typeof envelope.model === 'string' ? envelope.model : undefined;
       if (providerModel && providerModel !== this.config.model) {
         throw new SemanticInferenceError('CONFIGURATION_ERROR', 'Inference endpoint returned a different model identifier');
@@ -727,13 +733,18 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       }
       if (!valid) {
         runtimeSchemaValidation = 'failed';
+        try {
+          const diagnosis = request.output.diagnoseValidationFailure?.(parsed);
+          if (typeof diagnosis === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(diagnosis)) validationFailureCode = diagnosis;
+        } catch {
+          // Diagnostics are best-effort and must never weaken runtime rejection.
+        }
         throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'Model output did not satisfy the requested runtime contract');
       }
       runtimeSchemaValidation = 'passed';
 
       const providerRequestId = typeof envelope.id === 'string' && envelope.id.length <= 256
         ? envelope.id : undefined;
-      const usage = countUsage(envelope.usage);
       outcome = 'success';
       return {
         value: parsed as T,
@@ -764,6 +775,9 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
         ...(httpStatus === undefined ? {} : { httpStatus }),
         ...(finishReason ? { finishReason } : {}),
         runtimeSchemaValidation,
+        ...(validationFailureCode ? { validationFailureCode } : {}),
+        ...(promptTokens === undefined ? {} : { promptTokens }),
+        ...(completionTokens === undefined ? {} : { completionTokens }),
       });
       outcome = telemetry.status;
       outcomeErrorCode = telemetry.errorCode ?? null;
@@ -771,9 +785,17 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
     } finally {
       clearTimeout(timer);
       request.signal?.removeEventListener('abort', onAbort);
+      const profilerEvidence = request.messages[request.messages.length - 1]?.content;
+      const evidenceBytes = request.operation === 'template-semantic-profile' && typeof profilerEvidence === 'string'
+        ? Buffer.byteLength(profilerEvidence, 'utf8') : null;
       console.log(JSON.stringify({ event: 'semantic.request', requestId, role: request.role, operation: request.operation,
         model: this.config.model, latencyMs: Date.now() - startedMs, finishReason: finishReason ?? null,
-        status: outcome, errorCode: outcomeErrorCode }));
+        httpStatus: httpStatus ?? null, maxOutputTokens: request.maxOutputTokens, responseFormat: 'json_schema', strictJsonSchema: true,
+        templateProfilerBatch: request.metadata?.templateProfilerBatch ?? null,
+        evidenceBytes,
+        promptTokens: promptTokens ?? null, completionTokens: completionTokens ?? null,
+        runtimeSchemaValidation, status: outcome, errorCode: outcomeErrorCode,
+        validationFailureCode: validationFailureCode ?? null }));
     }
   }
 }

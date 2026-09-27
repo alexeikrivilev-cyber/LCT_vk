@@ -1,6 +1,8 @@
 {
-  "schemaVersion": 4,
-  "coreMaxSemanticRequests": 17,
+  "schemaVersion": 5,
+  "coreMaxSemanticRequests": 3,
+  "profilePreparationMaxSemanticRequests": 14,
+  "fullWorkflowMaxSemanticRequests": 17,
   "profilerDiagnosticMaxSemanticRequests": 17,
   "maxProfilerRequests": 14,
   "requiredOperations": {

@@ -1,6 +1,6 @@
 # Ограниченная live qualification
 
-**ТЕКУЩИЙ СТОП (2026-09-27):** новый profile-before-Generate fake E2E прошёл WorkSpace (29 source slides, 6 batches; 3/3 output slides, A/B/C 9/9, audits и PPTX/PDF/HTML), затем остановился на exact held-out AIOS: профиль READY после 4 batches, Worker и planning Supervisor прошли, Generate завершился `VARIANTS_NOT_DISTINCT` до contextual audit/export. VK Tech 12-slide fake matrix не запускалась. По условию fake gate live WorkSpace запрещён; новых live requests и действий с Pod в этом pass не было. Ранее завершённая structural-only qualification superseded. Исторический live profile batch получил HTTP 200, но `finish_reason=length` при `maxOutputTokens=1024` за 38.017 s; runtime schema validation не запускалась. Подробности: [READY_FOR_QWEN.md](./docs/READY_FOR_QWEN.md). Serving context не менялся.
+**ТЕКУЩИЙ СТАТУС (2026-09-27):** профиль-before-Generate fake lifecycle прошёл WorkSpace (3 output slides), VK Tech (12) и VK Education (3): у всех A/B/C готовы, audit/export PASS, исходный PPTX не изменён. AIOS остаётся отдельным held-out robustness blocker (`VARIANTS_NOT_DISTINCT`), но не является абсолютным stop-критерием для WorkSpace live qualification. Предыдущий 90-секундный timeout подтверждён как client-side: RunPod logs показывали Running (~28.4 tok/s, KV cache ~4%, Waiting=0), без provider 5xx. После расширения batch schema под точные hash/slide/element IDs и добавления safe diagnostics один свежий WorkSpace run остановился на batch 1: HTTP 200, `finish_reason=stop`, 106,640 ms, 4,661 prompt / 3,014 completion tokens, runtime failure `DUPLICATE_ELEMENT_ROLE`. Параллельный batch 2 отменён, остальные batches не запускались; профиль не стал READY, Generate не запускался. Serving runtime не менялся. Больше live-запросов после этого failure не выполнялись.
 
 Profiler batching доходит до провайдера только после планирования всех локальных batches и проверяет каждый ответ до merge. Не повторяйте автоматически ни один live run после отказа.
 
@@ -10,10 +10,10 @@ Canonical runner: [`scripts/run-product-e2e.mjs`](./scripts/run-product-e2e.mjs)
 
 - `--semantic-mode fake`: runner сам поднимает локальный deterministic OpenAI-compatible fake. Сеть внешнего inference не используется.
 - `--semantic-mode external`: используется production `OpenAICompatibleSemanticInferenceAdapter`, настроенный через environment. Runner не поднимает model server.
-- Нормальный путь в обоих режимах сначала подготавливает и сохраняет `TemplateSemanticProfile`, затем запускает one-click workflow. Generate делает только cache read и не вызывает profiler. Full budget — не более 14 profile batches + Worker + planning Supervisor + contextual audit (17 semantic calls total); retry = 0.
-- `--enable-template-profiler` оставлен для совместимости CLI; profile preparation является частью normal flow. Текущий real-template fake gate не пройден на AIOS, поэтому external inference запрещён.
+- Нормальный путь в обоих режимах сначала подготавливает и сохраняет `TemplateSemanticProfile`, затем запускает one-click workflow. Generate делает только cache read и не вызывает profiler. Core cap `3` (deck-plan=1, plan-review=1, contextual-deck-audit=1; generation inference=0); profile preparation cap `14`; full workflow cap `17`. Profiler calls during Generate = `0`; retry = 0.
+- `--enable-template-profiler` оставлен для совместимости CLI; profile preparation является частью normal flow. AIOS `VARIANTS_NOT_DISTINCT` остаётся held-out robustness blocker, но не запрещает ограниченный WorkSpace live run после локальных gate.
 
-## Последовательность после снятия блокера (Windows PowerShell)
+## Ограниченная WorkSpace live qualification (Windows PowerShell)
 
 Выполнять только после отдельного разрешения на внешний inference. RunPod resource этим pass не создавался. Для консоли следуйте [startup runbook](./docs/RUNPOD_STARTUP_RUNBOOK.md): self-hosted profile `A100_BF16`, persistent volume смонтирован до старта, `LCT_MODEL_STORAGE_ROOT=/workspace/lct-models`, сначала `LCT_INFERENCE_OFFLINE_PREFLIGHT=1`. Только после exit `0` и полного exact snapshot PASS отключите offline-preflight env в настройках контейнера и перезапустите serving container. Затем container-local:
 
@@ -44,6 +44,7 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $VkTechTemplate).Hash.ToLowerIn
 $env:LCT_SEMANTIC_BASE_URL = Read-Host 'OpenAI-compatible endpoint base URL ending in /v1'
 $env:LCT_SEMANTIC_MODEL = 'Qwen/Qwen3.8-27B'
 $env:LCT_SEMANTIC_ENABLE_THINKING = 'false'
+$env:LCT_TEMPLATE_PROFILE_CONCURRENCY = '2'
 $env:LCT_PPTX_BACKEND = 'office-kit'
 # If the endpoint requires a key, load LCT_SEMANTIC_API_KEY from the local secret store for this process only.
 
@@ -59,7 +60,7 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --template $WorkspaceTemplate --task $Task --slides 3 --preflight-only
 if ($LASTEXITCODE -ne 0) { throw 'Models preflight failed; do not start product qualification.' }
 
-# One canonical 3-slide WorkSpace run: prepare/cache profile, then Generate; hard cap is 17.
+# One canonical 3-slide WorkSpace run: profile prep cap 14, core cap 3, full workflow cap 17; profiler calls during Generate = 0.
 pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --semantic-mode external --provider-label runpod `
   --template $WorkspaceTemplate --task $Task --slides 3
@@ -142,7 +143,9 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
   --slides 3
 ```
 
-Нормальный run отправляет до 14 profile batch requests во время подготовки шаблона, затем по одному запросу deck-plan, plan-review и contextual-deck-audit; весь budget ограничен 17 вызовами. Во время Generate profiler calls должны быть 0. Каждый вызов фиксирует HTTP status, latency, token usage при наличии, `maxOutputTokens`, `finish_reason`, JSON Schema и runtime-validation outcome. Timeout, 5xx/524, усечение, невалидный JSON/schema или runtime validation failure останавливают run без retry.
+Для текущего profiler protocol каждый batch содержит не более 4 slides и 24 KiB evidence; WorkSpace profile preparation ограничена 14 batches, request timeout — 180000 ms. На этот qualification run задаётся `LCT_TEMPLATE_PROFILE_CONCURRENCY=2` через уже существующий configuration path (допустимые значения 1–2); это не provider-specific application behavior. `maxOutputTokens` остаётся до 4096, `thinking=false`, strict JSON Schema, retries=0.
+
+Нормальный run отправляет до 14 profile batch requests во время подготовки шаблона (profile preparation cap `14`), затем до трёх core requests: по одному deck-plan, plan-review и contextual-deck-audit (core cap `3`; generation inference `0`). Полный предел подготовки и Generate — `17` (full workflow cap `17`). profiler calls during Generate = `0`. Каждый batch фиксирует source slide indexes, размер evidence в bytes, `maxOutputTokens`, HTTP status, latency, token usage при наличии, `finish_reason`, JSON Schema и runtime-validation outcome. Timeout, 5xx/524, усечение, невалидный JSON/schema или runtime validation failure останавливают run без retry.
 
 Число downstream calls не зависит от числа output slides. Profile batching, byte/slide bounds, total budget и fake one-click flow покрыты regression tests.
 
@@ -165,7 +168,7 @@ pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
 
 ## Запросный бюджет и manifest
 
-[`scripts/lib/live-qualification-contract.json`](./scripts/lib/live-qualification-contract.json) задаёт полный профильный cap `17` (не более 14 profiler batches плюс три фиксированных этапа). По умолчанию runner сохраняет в `.lct/product-e2e/<timestamp>-<mode>-<random-id>/manifest.json`; `--output-dir` задаёт отдельный пустой каталог:
+[`scripts/lib/live-qualification-contract.json`](./scripts/lib/live-qualification-contract.json) задаёт core cap `3`, profile preparation cap `14` и full workflow cap `17`. Совместимое поле `profilerDiagnosticMaxSemanticRequests` — alias full workflow cap, а `maxProfilerRequests` — alias profile preparation cap. По умолчанию runner сохраняет в `.lct/product-e2e/<timestamp>-<mode>-<random-id>/manifest.json`; `--output-dir` задаёт отдельный пустой каталог:
 
 - semantic calls по `operation`, model alias, batch number/source indexes, HTTP status, timestamp, wall time, strict schema/runtime validation, finish reason и доступным token usage;
 - хеш запроса вместо prompt/context;
@@ -188,7 +191,7 @@ RunPod является только одним self-hosted runtime вариан
 3. Продолжать только при полном snapshot точной revision; затем отдельно запустить vLLM и дождаться model readiness.
 4. На локальном компьютере задать `LCT_SEMANTIC_BASE_URL`, `LCT_SEMANTIC_MODEL` и при необходимости secret `LCT_SEMANTIC_API_KEY`.
 5. Выполнить runner `--preflight-only`; это models GET без chat completion.
-6. После прохождения всех real-template fake acceptance и локальных gates выполнить одну разрешённую WorkSpace template preparation, затем один Generate; суммарный hard cap — 17, профильных вызовов во время Generate — 0.
+6. После PASS WorkSpace, VK Tech и VK Education fake lifecycle и локальных gates выполнить одну WorkSpace template preparation, затем один Generate; core cap — 3, profile preparation cap — 14, full workflow cap — 17, profiler calls during Generate = 0. AIOS held-out `VARIANTS_NOT_DISTINCT` фиксируется отдельно и не блокирует этот ограниченный WorkSpace run.
 7. Если qualification завершена и нет активных запросов, безопасно остановить GPU.
 
 Переход self-hosted/RunPod → VK inference остаётся конфигурационным при совместимом OpenAI-compatible contract. Local model volume относится только к self-hosted container; remote VK endpoint локальное model storage не требует.

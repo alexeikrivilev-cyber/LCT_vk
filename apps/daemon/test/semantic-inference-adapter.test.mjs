@@ -109,6 +109,50 @@ test('semantic telemetry logs role, operation, latency, and finish reason withou
   assert.doesNotMatch(JSON.stringify(record), new RegExp(`${secret}|${baseUrl}|${WORKER_SENTINEL}`));
 });
 
+test('profiler failure telemetry preserves safe batch diagnostics and available usage without evidence text', async (t) => {
+  const evidence = 'private template evidence must not appear in logs';
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    reply.writeHead(200, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify(openAIResponse(JSON.stringify({ unexpected: evidence }))));
+  });
+  const client = adapter(baseUrl);
+  const logs = [];
+  const previous = console.log;
+  console.log = (...values) => logs.push(values);
+  try {
+    await assert.rejects(client.infer({
+      role: 'worker',
+      operation: 'template-semantic-profile',
+      messages: [{ role: 'user', content: evidence }],
+      output: {
+        name: 'template_semantic_profile_v1', schema: { type: 'object' }, validate: () => false,
+        diagnoseValidationFailure: () => 'UNKNOWN_ELEMENT_ID',
+      },
+      maxOutputTokens: 4096,
+      metadata: { templateProfilerBatch: { batchNumber: 1, totalBatches: 8, sourceSlideIndexes: [1, 2, 3, 4] } },
+    }), (error) => {
+      assert.equal(error.code, 'INVALID_STRUCTURED_OUTPUT');
+      assert.equal(error.telemetry.runtimeSchemaValidation, 'failed');
+      assert.equal(error.telemetry.validationFailureCode, 'UNKNOWN_ELEMENT_ID');
+      assert.equal(error.telemetry.promptTokens, 42);
+      assert.equal(error.telemetry.completionTokens, 13);
+      return true;
+    });
+  } finally { console.log = previous; }
+  const record = JSON.parse(logs[0][0]);
+  assert.equal(record.httpStatus, 200);
+  assert.equal(record.maxOutputTokens, 4096);
+  assert.equal(record.responseFormat, 'json_schema');
+  assert.equal(record.strictJsonSchema, true);
+  assert.deepEqual(record.templateProfilerBatch, { batchNumber: 1, totalBatches: 8, sourceSlideIndexes: [1, 2, 3, 4] });
+  assert.equal(record.evidenceBytes, Buffer.byteLength(evidence, 'utf8'));
+  assert.equal(record.promptTokens, 42);
+  assert.equal(record.completionTokens, 13);
+  assert.equal(record.runtimeSchemaValidation, 'failed');
+  assert.equal(record.validationFailureCode, 'UNKNOWN_ELEMENT_ID');
+  assert.doesNotMatch(JSON.stringify(record), /private template evidence|UNKNOWN_ELEMENT_ID.*private template/iu);
+});
+
 test('validates structured output and keeps Worker and Supervisor evidence in separate requests', async (t) => {
   const received = [];
   const { baseUrl } = await startServer(t, async (request, reply) => {

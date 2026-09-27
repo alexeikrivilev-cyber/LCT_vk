@@ -48,6 +48,19 @@ export interface TemplateSemanticProfile {
   slides: TemplateSemanticSlideProfile[];
 }
 
+export type TemplateSemanticProfileValidationFailureCode =
+  | 'HASH_MISMATCH'
+  | 'INVALID_PROFILE_SHAPE'
+  | 'UNEXPECTED_SLIDE_INDEX'
+  | 'DUPLICATE_SLIDE_INDEX'
+  | 'MISSING_SLIDE_INDEX'
+  | 'UNKNOWN_ELEMENT_ID'
+  | 'ELEMENT_FROM_DIFFERENT_SLIDE'
+  | 'DUPLICATE_ELEMENT_ROLE'
+  | 'TITLE_NOT_TEXT'
+  | 'BODY_NOT_TEXT'
+  | 'INVALID_REPLACEABLE_ELEMENT';
+
 export interface TemplateSemanticProfileCache {
   read(cacheKey: string): Promise<unknown | null>;
   write(profile: TemplateSemanticProfile, cacheKey?: string): Promise<void>;
@@ -208,35 +221,51 @@ function isTemplateSemanticSlideProfile(value: unknown): value is TemplateSemant
     && isStringArray(value.reasonCodes, 8) && value.reasonCodes.every((code) => /^[a-z0-9][a-z0-9._-]{0,63}$/.test(code));
 }
 
-export function templateSemanticProfileJsonSchema(sourceSlideIndexes?: readonly number[]): SemanticJsonSchema {
-  const stringArray = { type: 'array', maxItems: PROFILE_MAX_ELEMENTS_PER_SLIDE, items: { type: 'string', minLength: 1 } };
-  const slideCount = sourceSlideIndexes?.length;
+export function templateSemanticProfileJsonSchema(
+  templateIR: TemplateIR,
+  expectedSlides: readonly TemplateIR['slides'][number][],
+): SemanticJsonSchema {
+  if (expectedSlides.length === 0 || expectedSlides.length > PROFILE_BATCH_SLIDE_LIMIT) {
+    throw new TypeError(`Template profile schema requires between 1 and ${PROFILE_BATCH_SLIDE_LIMIT} expected slides.`);
+  }
+  const idArray = (ids: readonly string[]) => ({
+    type: 'array',
+    maxItems: Math.min(PROFILE_MAX_ELEMENTS_PER_SLIDE, ids.length),
+    ...(ids.length > 0 ? { items: { type: 'string', enum: [...ids] } } : {}),
+  });
+  const slideSchemas = expectedSlides.map((slide) => {
+    const allIds = slide.elements.map((element) => element.id);
+    const textIds = slide.elements.filter((element) => Boolean(element.text?.trim())).map((element) => element.id);
+    const replaceableTextIds = slide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+      && Boolean(element.nativeId) && Boolean(element.text?.trim())).map((element) => element.id);
+    return {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        sourceSlideIndex: { type: 'integer', enum: [slide.index] },
+        archetype: { type: 'string', enum: [...TEMPLATE_SLIDE_ARCHETYPES] },
+        supportedContentModes: { type: 'array', maxItems: TEMPLATE_CONTENT_MODES.length, items: { type: 'string', enum: [...TEMPLATE_CONTENT_MODES] } },
+        titleElementId: { type: ['string', 'null'], enum: [null, ...textIds] },
+        bodyElementIds: idArray(textIds),
+        visualElementIds: idArray(allIds),
+        preservedElementIds: idArray(allIds),
+        replaceableTextElementIds: idArray(replaceableTextIds),
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+        reasonCodes: { type: 'array', maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9._-]*$' } },
+      },
+      required: ['sourceSlideIndex', 'archetype', 'supportedContentModes', 'titleElementId', 'bodyElementIds', 'visualElementIds', 'preservedElementIds', 'replaceableTextElementIds', 'confidence', 'reasonCodes'],
+    };
+  });
   return {
     type: 'object',
     additionalProperties: false,
     properties: {
-      templateIRHash: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+      templateIRHash: { type: 'string', enum: [templateIR.hash] },
       slides: {
         type: 'array',
-        ...(slideCount === undefined ? { maxItems: PROFILE_MAX_SLIDES } : { minItems: slideCount, maxItems: slideCount }),
-        items: {
-          type: 'object', additionalProperties: false,
-          properties: {
-            sourceSlideIndex: sourceSlideIndexes
-              ? { type: 'integer', enum: [...sourceSlideIndexes] }
-              : { type: 'integer', minimum: 1 },
-            archetype: { type: 'string', enum: [...TEMPLATE_SLIDE_ARCHETYPES] },
-            supportedContentModes: { type: 'array', maxItems: TEMPLATE_CONTENT_MODES.length, items: { type: 'string', enum: [...TEMPLATE_CONTENT_MODES] } },
-            titleElementId: { type: ['string', 'null'] },
-            bodyElementIds: stringArray,
-            visualElementIds: stringArray,
-            preservedElementIds: stringArray,
-            replaceableTextElementIds: stringArray,
-            confidence: { type: 'number', minimum: 0, maximum: 1 },
-            reasonCodes: { type: 'array', maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9._-]*$' } },
-          },
-          required: ['sourceSlideIndex', 'archetype', 'supportedContentModes', 'titleElementId', 'bodyElementIds', 'visualElementIds', 'preservedElementIds', 'replaceableTextElementIds', 'confidence', 'reasonCodes'],
-        },
+        minItems: expectedSlides.length,
+        maxItems: expectedSlides.length,
+        items: { anyOf: slideSchemas },
       },
     },
     required: ['templateIRHash', 'slides'],
@@ -428,19 +457,24 @@ export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR):
   };
 }
 
-function isValidTemplateSemanticProfileBatch(
+export function diagnoseTemplateSemanticProfileBatch(
   value: unknown,
   templateIR: TemplateIR,
   expectedSlides: readonly TemplateIR['slides'][number][],
-): value is TemplateSemanticProfile {
-  if (!isRecord(value) || !exactKeys(value, ['templateIRHash', 'slides']) || value.templateIRHash !== templateIR.hash
-      || !Array.isArray(value.slides) || value.slides.length !== expectedSlides.length) return false;
+): TemplateSemanticProfileValidationFailureCode | null {
+  if (!isRecord(value) || !exactKeys(value, ['templateIRHash', 'slides'])
+      || typeof value.templateIRHash !== 'string' || !Array.isArray(value.slides)) return 'INVALID_PROFILE_SHAPE';
+  if (value.templateIRHash !== templateIR.hash) return 'HASH_MISMATCH';
+  if (value.slides.length < expectedSlides.length) return 'MISSING_SLIDE_INDEX';
+  if (value.slides.length > expectedSlides.length) return 'INVALID_PROFILE_SHAPE';
   const expectedByIndex = new Map(expectedSlides.map((slide) => [slide.index, slide]));
+  const allTemplateElementIds = new Set(templateIR.slides.flatMap((slide) => slide.elements.map((element) => element.id)));
   const seen = new Set<number>();
   for (const candidate of value.slides) {
-    if (!isTemplateSemanticSlideProfile(candidate) || seen.has(candidate.sourceSlideIndex)) return false;
+    if (!isTemplateSemanticSlideProfile(candidate)) return 'INVALID_PROFILE_SHAPE';
+    if (seen.has(candidate.sourceSlideIndex)) return 'DUPLICATE_SLIDE_INDEX';
     const sourceSlide = expectedByIndex.get(candidate.sourceSlideIndex);
-    if (!sourceSlide) return false;
+    if (!sourceSlide) return 'UNEXPECTED_SLIDE_INDEX';
     seen.add(candidate.sourceSlideIndex);
     const allElements = new Map(sourceSlide.elements.map((element) => [element.id, element]));
     const selectedIds = [
@@ -450,15 +484,26 @@ function isValidTemplateSemanticProfileBatch(
       ...(candidate.preservedElementIds ?? []),
       ...(candidate.replaceableTextElementIds ?? []),
     ];
-    if (new Set(selectedIds).size !== selectedIds.length || selectedIds.some((id) => !allElements.has(id))) return false;
-    if (candidate.titleElementId && !allElements.get(candidate.titleElementId)?.text?.trim()) return false;
-    if (candidate.bodyElementIds.some((id) => !allElements.get(id)?.text?.trim())) return false;
+    if (new Set(selectedIds).size !== selectedIds.length) return 'DUPLICATE_ELEMENT_ROLE';
+    for (const id of selectedIds) {
+      if (!allElements.has(id)) return allTemplateElementIds.has(id) ? 'ELEMENT_FROM_DIFFERENT_SLIDE' : 'UNKNOWN_ELEMENT_ID';
+    }
+    if (candidate.titleElementId && !allElements.get(candidate.titleElementId)?.text?.trim()) return 'TITLE_NOT_TEXT';
+    if (candidate.bodyElementIds.some((id) => !allElements.get(id)?.text?.trim())) return 'BODY_NOT_TEXT';
     if ((candidate.replaceableTextElementIds ?? []).some((id) => {
       const element = allElements.get(id)!;
       return element.kind.toLowerCase() !== 'shape' || !element.nativeId || !element.text?.trim();
-    })) return false;
+    })) return 'INVALID_REPLACEABLE_ELEMENT';
   }
-  return seen.size === expectedSlides.length;
+  return seen.size === expectedSlides.length ? null : 'MISSING_SLIDE_INDEX';
+}
+
+function isValidTemplateSemanticProfileBatch(
+  value: unknown,
+  templateIR: TemplateIR,
+  expectedSlides: readonly TemplateIR['slides'][number][],
+): value is TemplateSemanticProfile {
+  return diagnoseTemplateSemanticProfileBatch(value, templateIR, expectedSlides) === null;
 }
 
 function requestFor(
@@ -469,8 +514,9 @@ function requestFor(
 ): SemanticInferenceRequest<TemplateSemanticProfile> {
   const contract: SemanticOutputContract<TemplateSemanticProfile> = {
     name: TEMPLATE_PROFILE_WORKFLOW.schemaCompatibility,
-    schema: templateSemanticProfileJsonSchema(batch.sourceSlideIndexes),
+    schema: templateSemanticProfileJsonSchema(templateIR, batchSlides),
     validate: (value): value is TemplateSemanticProfile => isValidTemplateSemanticProfileBatch(value, templateIR, batchSlides),
+    diagnoseValidationFailure: (value) => diagnoseTemplateSemanticProfileBatch(value, templateIR, batchSlides) ?? undefined,
   };
   return {
     role: 'worker',

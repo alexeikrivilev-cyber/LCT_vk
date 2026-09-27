@@ -24,6 +24,8 @@ export interface SemanticOutputContract<T> {
   name: string;
   schema: SemanticJsonSchema;
   validate(value: unknown): value is T;
+  /** Optional safe enum-like diagnosis for logs; implementations must not include model output. */
+  diagnoseValidationFailure?(value: unknown): string | undefined;
 }
 
 export interface SemanticRequestMetadata {
@@ -80,6 +82,7 @@ export interface SemanticInferenceTelemetry {
   httpStatus?: number;
   finishReason?: string;
   runtimeSchemaValidation?: 'passed' | 'failed' | 'not-run';
+  validationFailureCode?: string;
   ttftMs?: number;
   cacheSignal?: string;
   status: 'success' | 'error' | 'cancelled';
