@@ -20,35 +20,12 @@ import { renderPresentation, resolvePptxBackend } from '../adapters/pptx-rendere
 import type { PptxBackendId, PptxRenderResult } from './pptx-backend-port.js';
 import type { PptxPreviewPort } from './pptx-preview-port.js';
 import { compilePresentation, extractCanonicalFactualPayload, VARIANT_POLICIES, type VariantPolicy } from './slide-compilation.js';
+import { classifySourceTemplateBleed } from './preview-layout-evidence.js';
 
 type MatrixPreviewStatus = 'passed' | 'passed-with-warnings' | 'failed' | 'unknown';
 
-function classifySourceTemplateBleed(issue: unknown, compiledSlide: ReturnType<typeof compilePresentation>['slides'][number], template: TemplateIR, profile?: TemplateSemanticProfile): unknown {
-  if (typeof issue !== 'object' || issue === null || !('shapeName' in issue) || !('bounds' in issue)) return issue;
-  const shapeName = typeof issue.shapeName === 'string' ? issue.shapeName : null;
-  const bounds = issue.bounds;
-  if (!shapeName || typeof bounds !== 'object' || bounds === null || !('x' in bounds) || !('y' in bounds) || !('width' in bounds) || !('height' in bounds)) return issue;
-  const selection = assessExemplarSelection(compiledSlide, template, profile).selection;
-  if (!selection) return issue;
-  const sourceSlide = template.slides.find((slide) => slide.sourcePart === selection.sourcePart);
-  const layout = template.layouts.find((candidate) => candidate.id === selection.layoutId);
-  const master = layout?.masterId ? template.masters.find((candidate) => candidate.id === layout.masterId) : null;
-  const candidates = [...(sourceSlide?.elements ?? []), ...(layout?.elements ?? []), ...(master?.elements ?? [])].filter((element) => {
-    const geometry = element.geometry.resolved ?? element.geometry.direct;
-    return element.name === shapeName && geometry
-      && Math.abs(geometry.x - Number(bounds.x)) <= 1 && Math.abs(geometry.y - Number(bounds.y)) <= 1
-      && Math.abs(geometry.width - Number(bounds.width)) <= 1 && Math.abs(geometry.height - Number(bounds.height)) <= 1;
-  });
-  if (candidates.length !== 1) return issue;
-  const origin = sourceSlide?.elements.includes(candidates[0]!) ? sourceSlide.sourcePart : layout?.sourcePart ?? master?.sourcePart ?? null;
-  return {
-    ...(issue as Record<string, unknown>),
-    classification: 'SOURCE_TEMPLATE_BLEED',
-    severity: 'warning',
-    source: origin ? `TemplateIR:${origin}` : 'TemplateIR source geometry',
-    confidence: 'high',
-    message: 'The exact out-of-canvas object is inherited from the selected source template; retained as a visible template-bleed warning.',
-  };
+function classifyMatrixSourceTemplateBleed(issue: unknown, compiledSlide: ReturnType<typeof compilePresentation>['slides'][number], template: TemplateIR, profile?: TemplateSemanticProfile): unknown {
+  return classifySourceTemplateBleed(issue, template, assessExemplarSelection(compiledSlide, template, profile).selection);
 }
 
 function matrixPreviewStatus(preview: Awaited<ReturnType<NonNullable<PptxPreviewPort>['preview']>>, geometryIssues: readonly unknown[]): MatrixPreviewStatus {
@@ -351,7 +328,7 @@ export async function runOfflinePresentationMatrix(input: {
             const preview = await input.previewAdapter.preview(previewBytes, slideIndex);
             timings.preview = (timings.preview ?? 0) + performance.now() - previewStarted;
             const compiledSlide = compiled.slides[slideIndex]!;
-            const geometryIssues = (preview.geometryIssues ?? []).map((issue) => classifySourceTemplateBleed(issue, compiledSlide, template.templateIR, semanticProfile));
+            const geometryIssues = (preview.geometryIssues ?? []).map((issue) => classifyMatrixSourceTemplateBleed(issue, compiledSlide, template.templateIR, semanticProfile));
             const fileStem = `slide-${String(slideIndex + 1).padStart(2, '0')}`;
             await Promise.all([
               writeFile(path.join(previewDirectory, `${fileStem}.svg`), preview.svg, 'utf8'),

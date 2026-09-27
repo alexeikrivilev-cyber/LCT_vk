@@ -240,7 +240,14 @@ export const ru = {
     noPreview: 'Предпросмотр пока недоступен',
     textSlide: 'Текстовый слайд',
     visual: (status: string) => `Визуальный блок: ${status}`,
-    layoutNotes: (count: number) => `Проблем макета: ${count}`,
+    blockingLayoutNotes: (count: number) => `Блокирующих проблем макета: ${count}`,
+    layoutWarnings: (count: number) => `Замечаний макета: ${count}`,
+    approximateLayoutNotes: (count: number) => `Предупреждения предпросмотра: ${count}`,
+    unclassifiedLayoutNotes: (count: number) => `Непроверенных замечаний предпросмотра: ${count}`,
+    approximateLayoutDetail: 'Метрики текста в предпросмотре приблизительны и сами по себе не подтверждают переполнение PPTX.',
+    templateBleedDetail: 'Элемент унаследован из исходного шаблона и слегка выходит за границы холста; это замечание сохранено отдельно от ошибок генерации.',
+    blockingLayoutDetail: 'Проверка предпросмотра отметила возможную проблему геометрии. Проверьте этот слайд перед экспортом.',
+    genericLayoutWarningDetail: 'Предпросмотр обнаружил замечание к макету. Проверьте слайд визуально.',
     auditCounts: (count: number) => `Проблем аудита: ${count}`,
     auditSummary: (errors: number, warnings: number) => errors === 0 && warnings === 0
       ? 'Проверка пройдена'

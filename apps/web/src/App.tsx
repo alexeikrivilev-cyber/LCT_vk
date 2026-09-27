@@ -81,11 +81,25 @@ type PlanningResponse = {
 };
 
 type GenerationVariantId = 'A' | 'B' | 'C';
+type LayoutIssueSummary = {
+  total: number;
+  blocking: number;
+  warnings: number;
+  approximate: number;
+  details: Array<{
+    category: 'blocking' | 'warning' | 'approximate';
+    classification: string;
+    severity: string;
+    approximate: boolean;
+    message: string | null;
+  }>;
+};
 type GenerationVariant = {
   status: string;
   version: number;
   previewUrl: string | null;
   layoutIssueCount: number;
+  layoutIssueSummary?: LayoutIssueSummary;
   visualSlotStatus: string;
   audit: { findings?: unknown[] } | null;
 };
@@ -102,6 +116,31 @@ type GenerationPack = {
   failure: { code: string; message: string } | null;
   variants: Record<GenerationVariantId, GenerationVariant>;
 };
+
+function LayoutEvidenceNotes({ item }: { item: GenerationVariant }) {
+  const summary = item.layoutIssueSummary;
+  if (!summary) return item.layoutIssueCount > 0
+    ? <span>{ru.generation.unclassifiedLayoutNotes(item.layoutIssueCount)}</span>
+    : null;
+  if (summary.total === 0) return null;
+  const notes = [
+    summary.blocking > 0 ? ru.generation.blockingLayoutNotes(summary.blocking) : null,
+    summary.warnings > 0 ? ru.generation.layoutWarnings(summary.warnings) : null,
+    summary.approximate > 0 ? ru.generation.approximateLayoutNotes(summary.approximate) : null,
+  ].filter((note): note is string => note !== null);
+  return <details className="generation-layout-evidence">
+    <summary>{notes.join(' · ')}</summary>
+    <ul>
+      {summary.details.map((issue, index) => <li key={`${issue.classification}-${index}`}>
+        <span>{issue.category === 'approximate' ? ru.generation.approximateLayoutDetail
+          : issue.classification === 'SOURCE_TEMPLATE_BLEED' ? ru.generation.templateBleedDetail
+            : issue.category === 'blocking' ? ru.generation.blockingLayoutDetail
+              : ru.generation.genericLayoutWarningDetail}</span>
+        <code>{issue.classification}</code>
+      </li>)}
+    </ul>
+  </details>;
+}
 type GenerationState = {
   generationId: string;
   idempotencyKey: string;
@@ -1820,7 +1859,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
                     : <div className="generation-preview-empty" role="status">{unavailablePack ? ru.generation.withheldReason : pack.status === 'rendering' ? ru.generation.preparingPreview : item.status === 'failed' ? ru.generation.noPreview : variantStatusLabel(item.status)}</div>}
                   <div className="generation-variant-meta">
                     <span>{item.visualSlotStatus === 'not-applicable' ? ru.generation.textSlide : ru.generation.visual(ru.status[item.visualSlotStatus as keyof typeof ru.status] ?? ru.status.unknown)}</span>
-                    {item.layoutIssueCount ? <span>{ru.generation.layoutNotes(item.layoutIssueCount)}</span> : null}
+                    <LayoutEvidenceNotes item={item} />
                     <span>{ru.generation.auditCounts(audit.length)}</span>
                   </div>
                   <button className={pack.selectedVariant === variant ? 'primary generation-select' : 'quiet generation-select'}

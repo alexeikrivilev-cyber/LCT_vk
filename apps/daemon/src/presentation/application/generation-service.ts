@@ -37,6 +37,7 @@ import type { DeckPlan } from '../domain/deck-plan.js';
 import type { TemplateIR } from '../domain/template-ir.js';
 import type { TemplateSemanticProfile } from './template-semantic-profiler.js';
 import { recordElapsed, type PerformanceDiagnosticsPort } from '../../presentation/performance-diagnostics.js';
+import { isPreviewLayoutIssueSummary, summarizePreviewLayoutEvidence, type PreviewLayoutIssueSummary } from './preview-layout-evidence.js';
 
 export type GenerationStatus = 'preparing' | 'generating' | 'completed' | 'failed' | 'cancelled' | 'stale';
 export type SlideGenerationStatus = 'pending' | 'rendering' | 'ready' | 'failed';
@@ -58,6 +59,8 @@ export interface GeneratedVariantState {
   } | null;
   previewRef: string | null;
   layoutIssueCount: number;
+  /** Additive, replaceable preview diagnostics; omitted on older saved generations. */
+  layoutIssueSummary?: PreviewLayoutIssueSummary;
   visualSlotStatus: VisualSlotStatus;
   audit: DeterministicAuditReport | null;
   renderCheck: Pick<PptxRenderResult, 'backend' | 'slideCount' | 'reopenStatus' | 'validationStatus' | 'templatePreservationStatus' | 'unresolvedVisualTypes'> | null;
@@ -220,7 +223,7 @@ function sourceContextFingerprint(input: {
 function emptyVariant(): GeneratedVariantState {
   return {
     status: 'pending', version: 0, layoutCandidateIndex: 0, nativeLayoutFallback: false, compositionChoice: null,
-    previewRef: null, layoutIssueCount: 0,
+    previewRef: null, layoutIssueCount: 0, layoutIssueSummary: { total: 0, blocking: 0, warnings: 0, approximate: 0, details: [] },
     visualSlotStatus: 'unresolved', audit: null, renderCheck: null,
   };
 }
@@ -272,6 +275,7 @@ function validateStoredGeneration(value: unknown): PresentationGenerationState {
             && generated.previewRef.startsWith(`${state.generationId}/slides/`)
             && !generated.previewRef.includes('..') && !path.isAbsolute(generated.previewRef))
           || !Number.isSafeInteger(generated.layoutIssueCount) || generated.layoutIssueCount < 0
+          || !(generated.layoutIssueSummary === undefined || isPreviewLayoutIssueSummary(generated.layoutIssueSummary))
           || !['not-applicable', 'ready', 'unresolved'].includes(String(generated.visualSlotStatus))
           || !(generated.audit === null || isRecord(generated.audit) && Array.isArray(generated.audit.findings))
           || !(generated.renderCheck === null || isRecord(generated.renderCheck))) {
@@ -1213,6 +1217,7 @@ export class PresentationGenerationService {
         throw new PresentationGenerationError('PREVIEW_FAILED', 'The slide preview could not be rendered.', 422);
       }
       await this.writeArtifact(previewPath.absolute, preview.png);
+      const layoutIssueSummary = summarizePreviewLayoutEvidence(preview, context.templateIR, slide);
       const unresolved = rendered.unresolvedVisualTypes.length > 0 || slide.visualization.status === 'unresolved';
       return {
         previewRef,
@@ -1224,6 +1229,7 @@ export class PresentationGenerationService {
           exemplar: exemplarSelectionReference(slide.exemplarSelection),
         },
         layoutIssueCount: preview.textLayoutIssues.length,
+        layoutIssueSummary,
         visualSlotStatus: slide.visualization.type === 'none' ? 'not-applicable' : unresolved ? 'unresolved' : 'ready',
         audit: auditForSlide(sourcePresentation, context.contentIR, context.templateIR, slide),
         renderCheck: {
@@ -1315,6 +1321,7 @@ export class PresentationGenerationService {
         const previewWriteStartedAt = performance.now();
         await this.writeArtifact(previewPath.absolute, preview.png);
         recordElapsed(this.options.performanceDiagnostics, 'preview.writeArtifact', previewWriteStartedAt);
+        const layoutIssueSummary = summarizePreviewLayoutEvidence(preview, context.templateIR, slide);
         const unresolvedVisualTypes = rendered.unresolvedVisualTypes.filter((type) => type === slide.visualization.type);
         const unresolved = unresolvedVisualTypes.length > 0 || slide.visualization.status === 'unresolved';
         results[variant] = {
@@ -1327,6 +1334,7 @@ export class PresentationGenerationService {
             exemplar: exemplarSelectionReference(slide.exemplarSelection),
           },
           layoutIssueCount: preview.textLayoutIssues.length,
+          layoutIssueSummary,
           visualSlotStatus: slide.visualization.type === 'none' ? 'not-applicable' : unresolved ? 'unresolved' : 'ready',
           audit: audits[variant],
           renderCheck: {

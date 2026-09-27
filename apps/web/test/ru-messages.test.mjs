@@ -64,6 +64,20 @@ test('customer-facing messages are centralized and known English labels do not l
   assert.match(ru.template.unsupportedSummary(2), /[А-Яа-яЁё]/u);
 });
 
+test('preview metrics, inherited template warnings, and blocking layout issues are presented separately', () => {
+  const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  assert.match(appSource, /ru\.generation\.approximateLayoutNotes\(summary\.approximate\)/u);
+  assert.match(appSource, /ru\.generation\.layoutWarnings\(summary\.warnings\)/u);
+  assert.match(appSource, /ru\.generation\.blockingLayoutNotes\(summary\.blocking\)/u);
+  assert.match(appSource, /unclassifiedLayoutNotes\(item\.layoutIssueCount\)/u, 'legacy rows are not mislabeled as clean or approximate');
+  assert.equal(ru.generation.approximateLayoutNotes(1), 'Предупреждения предпросмотра: 1');
+  assert.match(ru.generation.approximateLayoutDetail, /сами по себе не подтверждают переполнение PPTX/u);
+  assert.match(ru.generation.templateBleedDetail, /унаследован/u);
+  assert.match(ru.generation.blockingLayoutDetail, /Проверьте этот слайд/u);
+  assert.doesNotMatch(ru.generation.approximateLayoutNotes(1), /Проблем макета/u);
+  assert.equal(ru.generation.auditSummary(0, 0), 'Проверка пройдена', 'deterministic safety audit remains separate');
+});
+
 test('every deterministic audit rule uses a Russian customer-facing message', () => {
   const auditSource = readFileSync(new URL('../../daemon/src/presentation/application/deterministic-audit.ts', import.meta.url), 'utf8');
   const ruleIds = [...auditSource.matchAll(/ruleId:\s*'([^']+)'/gu)].map((match) => match[1]);
