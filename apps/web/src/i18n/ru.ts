@@ -464,8 +464,9 @@ export function friendlyErrorMessage(code: string | undefined, status: number, o
   if (/UNSUPPORTED_FORMAT|UNSUPPORTED_FILE|INVALID_UTF8|NOT_PARSED/.test(normalized)) return ru.errors.unsupportedFile;
   if (/VARIANTS_NOT_DISTINCT|VARIANT_NOT_READY/.test(normalized)) return ru.errors.variant;
   if (/EXPORT|POWERPOINT_ASSEMBLY/.test(normalized) || operation === 'export') return ru.errors.export;
+  if (/SEMANTIC|INFERENCE|PROVIDER|TIMEOUT|DEADLINE|CONFIGURATION|STRUCTURED_OUTPUT|INVALID_JSON|EMPTY_RESPONSE|SERVICE_UNAVAILABLE|AUTH_ERROR|RATE_LIMIT/.test(normalized)
+      || status === 502 || status === 503 || status === 504) return ru.errors.semantic;
   if (/TEMPLATE|PPTX|OOXML/.test(normalized) || operation === 'template') return ru.errors.template;
-  if (/SEMANTIC|INFERENCE|PROVIDER|TIMEOUT|DEADLINE|CONFIGURATION/.test(normalized) || status === 502 || status === 503 || status === 504) return ru.errors.semantic;
   if (/PLAN|BRIEF|CONTENT|SUPERVISOR|SCHEMA/.test(normalized) || operation === 'planning') return ru.errors.plan;
   if (/RENDER|PREVIEW|AUDIT/.test(normalized) || operation === 'generation') return ru.errors.render;
   if (status === 404 || /NOT_FOUND/.test(normalized)) return ru.errors.notFound;

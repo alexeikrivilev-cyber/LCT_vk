@@ -18,6 +18,7 @@ const MAX_TIMEOUT_MS = 300_000;
 const MAX_MESSAGES = 128;
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+const MAX_PROVIDER_ERROR_BYTES = 16 * 1024;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const MAX_SCHEMA_BYTES = 64 * 1024;
 const MAX_SCHEMA_NODES = 8192;
@@ -28,6 +29,14 @@ const OPERATION_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const MESSAGE_ROLES = new Set<SemanticMessageRole>(['system', 'developer', 'user', 'assistant']);
 const IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+interface ProviderDiagnostic {
+  status: number;
+  type?: string;
+  code?: string;
+  param?: string;
+  message?: string;
+}
 
 export interface SemanticInferenceConfig {
   baseUrl: string;
@@ -310,7 +319,7 @@ function toProviderMessage(message: SemanticMessage): Record<string, unknown> {
   };
 }
 
-async function readBoundedText(response: Response, signal: AbortSignal): Promise<string> {
+async function readBoundedText(response: Response, signal: AbortSignal, maxBytes = MAX_RESPONSE_BYTES): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) return '';
   const chunks: Uint8Array[] = [];
@@ -320,7 +329,7 @@ async function readBoundedText(response: Response, signal: AbortSignal): Promise
       const { done, value } = await reader.read();
       if (done) break;
       byteLength += value.byteLength;
-      if (byteLength > MAX_RESPONSE_BYTES) {
+      if (byteLength > maxBytes) {
         await reader.cancel().catch(() => undefined);
         throw new SemanticInferenceError('RESPONSE_TOO_LARGE', 'Inference response exceeded its byte limit');
       }
@@ -331,6 +340,113 @@ async function readBoundedText(response: Response, signal: AbortSignal): Promise
   }
   if (signal.aborted) throw new SemanticInferenceError('SERVICE_UNAVAILABLE', 'Inference response ended after transport abort');
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), byteLength).toString('utf8');
+}
+
+function echoedSensitiveValue(value: string, sensitiveValues: readonly string[]): boolean {
+  return sensitiveValues.some((sensitive) => sensitive.length > 0
+    && (sensitive === value || (value.length >= 8 && sensitive.includes(value))));
+}
+
+function safeProviderToken(value: unknown, sensitiveValues: readonly string[]): string | undefined {
+  return typeof value === 'string' && value.length <= 80
+    && /^[A-Za-z][A-Za-z0-9_.:/-]*$/.test(value)
+    && !echoedSensitiveValue(value, sensitiveValues)
+    ? value
+    : undefined;
+}
+
+function safeProviderParam(value: unknown, sensitiveValues: readonly string[]): string | undefined {
+  return typeof value === 'string' && value.length <= 100
+    && /^[A-Za-z][A-Za-z0-9_.:-]*$/.test(value)
+    && !echoedSensitiveValue(value, sensitiveValues)
+    ? value
+    : undefined;
+}
+
+function providerDiagnosticMessage(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 4096) return undefined;
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (/extra (?:inputs?|fields?) (?:are )?not permitted|extra fields? not allowed/.test(normalized)) {
+    return 'Unsupported request field.';
+  }
+  if (/field required|missing required (?:field|parameter)/.test(normalized)) {
+    return 'A required request field is missing.';
+  }
+  if (/input[_ ]tokens?/.test(normalized)
+      && /(context|maximum|max(?:imum)?|limit|exceed|total|reduce|length)/.test(normalized)) {
+    return 'The prompt and requested output exceed the provider context limit.';
+  }
+  if (/chat_template_kwargs|enable_thinking|chat template/.test(normalized)) {
+    return 'The chat-template option was rejected.';
+  }
+  if (/response_format|json.?schema|structured output/.test(normalized)) {
+    return 'The structured-output option was rejected.';
+  }
+  if (/max_tokens|max_completion_tokens/.test(normalized)) {
+    return 'The token-limit option was rejected.';
+  }
+  if (/unsupported|not supported|unrecognized|unexpected keyword|unknown field/.test(normalized)) {
+    return 'The request uses an unsupported field or option.';
+  }
+  if (/model.{0,40}(not found|unknown|unavailable|invalid)/.test(normalized)) {
+    return 'The requested model is unavailable.';
+  }
+  return 'The provider rejected the request.';
+}
+
+function parseProviderDiagnostic(status: number, bodyText: string, sensitiveValues: readonly string[]): ProviderDiagnostic {
+  const diagnostic: ProviderDiagnostic = { status };
+  let body: unknown;
+  try { body = JSON.parse(bodyText); } catch { return diagnostic; }
+  if (!isRecord(body)) return diagnostic;
+
+  const error = isRecord(body.error) ? body.error : body;
+  let detail: Record<string, unknown> | undefined;
+  if (Array.isArray(body.detail) && body.detail.length > 0 && isRecord(body.detail[0])) {
+    detail = body.detail[0];
+  } else if (isRecord(body.detail)) {
+    detail = body.detail;
+  }
+
+  const type = safeProviderToken(error.type ?? detail?.type, sensitiveValues);
+  const code = safeProviderToken(error.code ?? detail?.code, sensitiveValues);
+  const directParam = safeProviderParam(error.param ?? detail?.param, sensitiveValues);
+  const location = Array.isArray(detail?.loc)
+    ? detail.loc.map((part) => typeof part === 'number' ? String(part) : safeProviderParam(part, sensitiveValues)).filter(Boolean).join('.')
+    : undefined;
+  const param = directParam ?? safeProviderParam(location, sensitiveValues);
+  const rawMessage = error.message ?? detail?.msg ?? (typeof body.detail === 'string' ? body.detail : undefined);
+  const message = providerDiagnosticMessage(rawMessage);
+  return {
+    status,
+    ...(type ? { type } : {}),
+    ...(code ? { code } : {}),
+    ...(param ? { param } : {}),
+    ...(message ? { message } : {}),
+  };
+}
+
+function sensitiveRequestValues<T>(request: SemanticInferenceRequest<T>, apiKey?: string): string[] {
+  const values = apiKey ? [apiKey] : [];
+  for (const message of request.messages) {
+    if (typeof message.content === 'string') values.push(message.content);
+    else for (const part of message.content) if (part.type === 'text') values.push(part.text);
+  }
+  return values;
+}
+
+async function readProviderDiagnostic(
+  response: Response,
+  signal: AbortSignal,
+  sensitiveValues: readonly string[],
+): Promise<ProviderDiagnostic> {
+  try {
+    const body = await readBoundedText(response, signal, MAX_PROVIDER_ERROR_BYTES);
+    return parseProviderDiagnostic(response.status, body, sensitiveValues);
+  } catch {
+    return { status: response.status };
+  }
 }
 
 function countUsage(usage: unknown): { promptTokens?: number; completionTokens?: number } {
@@ -539,8 +655,17 @@ export class OpenAICompatibleSemanticInferenceAdapter implements SemanticInferen
       }
 
       if (!response.ok) {
-        await response.body?.cancel().catch(() => undefined);
-        throw httpFailure(response.status);
+        const diagnostic = await readProviderDiagnostic(response, controller.signal,
+          sensitiveRequestValues(request, this.config.apiKey));
+        const failure = httpFailure(response.status);
+        if (Object.keys(diagnostic).length > 1) {
+          console.error(JSON.stringify({
+            event: 'semantic.provider_error', requestId, role: request.role, operation: request.operation,
+            model: this.config.model, latencyMs: Date.now() - startedMs, errorCode: failure.code,
+            providerDiagnostic: diagnostic,
+          }));
+        }
+        throw failure;
       }
       const responseText = await readBoundedText(response, controller.signal);
       if (!responseText) throw new SemanticInferenceError('EMPTY_RESPONSE', 'Inference endpoint returned an empty response');

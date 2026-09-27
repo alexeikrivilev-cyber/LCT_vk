@@ -10,6 +10,7 @@ import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 
 register();
 const { startServer } = await import('../src/server.ts');
+const { SemanticInferenceError } = await import('../src/presentation/application/semantic-inference-port.ts');
 
 const repoRoot = path.resolve(import.meta.dirname, '../../..');
 
@@ -200,5 +201,47 @@ test('Template Compiler API persists understanding, detects source changes, and 
       'a failed attempt must not overwrite the last successful canonical result');
   } finally {
     await closeStartedServer(started);
+  }
+});
+
+test('semantic profiler failure is not reported or persisted as structural PPTX corruption', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profiler-error-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const started = await startServer({
+    host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
+    serveWeb: false, returnServer: true, enableSemanticProfiling: true,
+    semanticInferenceAdapter: {
+      async infer() { throw new SemanticInferenceError('PROVIDER_ERROR', 'unsafe raw provider message'); },
+    },
+  });
+  const projectId = 'semantic-profile-boundary';
+  try {
+    const created = await fetch(`${started.url}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: projectId, name: 'Semantic profile boundary test' }),
+    });
+    assert.equal(created.status, 201);
+    const pptx = await makeSyntheticPptx({ slideCount: 1, layoutCount: 2 });
+    const upload = new FormData();
+    upload.append('files', new Blob([pptx]), 'Шаблон.pptx');
+    assert.equal((await fetch(`${started.url}/api/projects/${projectId}/upload`, { method: 'POST', body: upload })).status, 200);
+
+    const response = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'Шаблон.pptx' }),
+    });
+    assert.equal(response.status, 502);
+    const failure = await response.json();
+    assert.equal(failure.status, 'failed');
+    assert.equal(failure.failure.code, 'PROVIDER_ERROR');
+    assert.match(failure.failure.message, /Сервис анализа/u);
+    assert.doesNotMatch(JSON.stringify(failure), /unsafe raw provider message|C:\\\\|node_modules/u);
+
+    const saved = await fetch(`${started.url}/api/projects/${projectId}/template`);
+    assert.equal(saved.status, 200);
+    assert.equal((await saved.json()).status, 'ready', 'successful structural compilation stays available for retrying semantic profiling');
+  } finally {
+    await new Promise((resolve, reject) => started.server.close((error) => error ? reject(error) : resolve()));
+    await started.shutdown();
   }
 });

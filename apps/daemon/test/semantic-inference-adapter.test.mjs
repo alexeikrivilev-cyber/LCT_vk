@@ -225,6 +225,131 @@ test('maps authentication, model, capacity, and service errors without returning
   }
 });
 
+test('retains only bounded, sanitized provider diagnostics for server logs', async (t) => {
+  const promptSecret = 'PRIVATE_TEMPLATE_CONTENT_981273';
+  const apiKey = 'provider-key-must-never-appear-123456';
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    reply.writeHead(400, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify({
+      error: {
+        type: 'BadRequestError',
+        code: 'invalid_request_error',
+        param: 'response_format',
+        message: `response_format JSON schema rejected ${promptSecret}; bearer ${apiKey}`,
+      },
+      raw: `full-provider-body ${promptSecret} ${apiKey}`,
+    }));
+  });
+  const request = workerSmokeRequest();
+  request.messages = [{ role: 'user', content: promptSecret }];
+  const client = adapter(baseUrl, { apiKey });
+  const logs = [];
+  const previousError = console.error;
+  const previousLog = console.log;
+  console.error = (...values) => logs.push(values.join(' '));
+  console.log = (...values) => logs.push(values.join(' '));
+  let caught;
+  try {
+    await client.infer(request);
+  } catch (error) {
+    caught = error;
+  } finally {
+    console.error = previousError;
+    console.log = previousLog;
+  }
+
+  assert.ok(caught instanceof SemanticInferenceError);
+  assert.equal(caught.code, 'PROVIDER_ERROR');
+  assert.equal(caught.httpStatus, 400);
+  const diagnosticLog = logs.map((line) => JSON.parse(line)).find((record) => record.event === 'semantic.provider_error');
+  assert.deepEqual(diagnosticLog.providerDiagnostic, {
+    status: 400,
+    type: 'BadRequestError',
+    code: 'invalid_request_error',
+    param: 'response_format',
+    message: 'The structured-output option was rejected.',
+  });
+  const logged = logs.join('\n');
+  assert.match(logged, /semantic\.provider_error/u);
+  assert.match(logged, /response_format/u);
+  assert.doesNotMatch(logged, new RegExp(`${promptSecret}|${apiKey}|full-provider-body`));
+  assert.doesNotMatch(caught.message, new RegExp(`${promptSecret}|${apiKey}|full-provider-body`));
+});
+
+test('classifies a provider input-token context overflow without exposing its raw message', async (t) => {
+  const promptSecret = 'PRIVATE_WORKSPACE_TEXT_63821';
+  const apiKey = 'provider-key-context-test-8291';
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    reply.writeHead(400, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify({ error: {
+      type: 'BadRequestError',
+      code: 400,
+      param: 'input_tokens',
+      message: `This model's maximum context length is 16384 tokens; requested 2784 output tokens and at least 13601 input tokens for a total of 16385. Prompt excerpt: ${promptSecret}. Bearer ${apiKey}`,
+    } }));
+  });
+  const request = workerSmokeRequest();
+  request.messages = [{ role: 'user', content: promptSecret }];
+  const logs = [];
+  const previousError = console.error;
+  const previousLog = console.log;
+  console.error = (...values) => logs.push(values.join(' '));
+  console.log = (...values) => logs.push(values.join(' '));
+  try {
+    await assert.rejects(adapter(baseUrl, { apiKey }).infer(request), (error) => {
+      assert.equal(error.code, 'PROVIDER_ERROR');
+      assert.equal(error.httpStatus, 400);
+      assert.doesNotMatch(error.message, new RegExp(`${promptSecret}|${apiKey}|16384|13601`));
+      return true;
+    });
+  } finally {
+    console.error = previousError;
+    console.log = previousLog;
+  }
+  const diagnostic = logs.map((line) => JSON.parse(line)).find((record) => record.event === 'semantic.provider_error');
+  assert.deepEqual(diagnostic.providerDiagnostic, {
+    status: 400,
+    type: 'BadRequestError',
+    param: 'input_tokens',
+    message: 'The prompt and requested output exceed the provider context limit.',
+  });
+  assert.doesNotMatch(logs.join('\n'), new RegExp(`${promptSecret}|${apiKey}|16384|13601|Prompt excerpt|Bearer`));
+});
+
+test('provider diagnostic fields are omitted when a provider echoes request content or its bearer key', async (t) => {
+  const promptSecret = 'PRIVATE_CONTENT_TOKEN_982417';
+  const apiKey = 'BearerKeyEcho_782341';
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    reply.writeHead(400, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify({ error: {
+      type: promptSecret,
+      code: apiKey,
+      param: promptSecret,
+      message: `unsupported response_format ${promptSecret}`,
+    } }));
+  });
+  const request = workerSmokeRequest();
+  request.messages = [{ role: 'user', content: promptSecret }];
+  const logs = [];
+  const previousError = console.error;
+  const previousLog = console.log;
+  console.error = (...values) => logs.push(values.join(' '));
+  console.log = (...values) => logs.push(values.join(' '));
+  try {
+    await assert.rejects(adapter(baseUrl, { apiKey }).infer(request), errorCode('PROVIDER_ERROR'));
+  } finally {
+    console.error = previousError;
+    console.log = previousLog;
+  }
+  const records = logs.map((line) => JSON.parse(line));
+  const diagnosticLog = records.find((record) => record.event === 'semantic.provider_error');
+  assert.deepEqual(diagnosticLog.providerDiagnostic, {
+    status: 400,
+    message: 'The structured-output option was rejected.',
+  });
+  assert.doesNotMatch(JSON.stringify(records), new RegExp(`${promptSecret}|${apiKey}`));
+});
+
 test('fails closed for malformed JSON, wrong schemas, empty answers, and wrong model ids', async (t) => {
   const cases = [
     ['not-json', {}, 'INVALID_JSON'],

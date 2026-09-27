@@ -44,7 +44,7 @@ import {
   probeSemanticEndpoint,
   semanticInferenceConfigFromEnvironment,
 } from './presentation/adapters/openai-compatible-semantic-inference.js';
-import type { SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
+import { SemanticInferenceError, type SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
 import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
 import { ProductWorkflowError, ProductWorkflowService } from './presentation/application/product-workflow-service.js';
 import { projectTemplateSemanticProfileCache, TemplateSemanticProfiler } from './presentation/application/template-semantic-profiler.js';
@@ -111,6 +111,14 @@ function apiError(res: express.Response, status: number, error: unknown): void {
   const code = status === 404 ? 'NOT_FOUND' : 'PRESENTATION_CORE_ERROR';
   res.locals.errorCode = code;
   res.status(status).json({ error: { code, message } });
+}
+
+function semanticFailureStatus(error: SemanticInferenceError): number {
+  if (error.code === 'CONFIGURATION_ERROR' || error.code === 'SERVICE_UNAVAILABLE') return 503;
+  if (error.code === 'TIMEOUT' || error.code === 'DEADLINE_EXCEEDED') return 504;
+  if (error.code === 'RATE_LIMITED') return 429;
+  if (error.code === 'CANCELLED') return 409;
+  return 502;
 }
 
 function safeProjectId(value: unknown): string | null {
@@ -482,6 +490,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       if (profileTemplate) await profileTemplate(req.params.id, compiled);
       res.json(compiled);
     } catch (error) {
+      if (error instanceof SemanticInferenceError) {
+        res.locals.errorCode = error.code;
+        return res.status(semanticFailureStatus(error)).json({
+          status: 'failed',
+          failure: { code: error.code, message: 'Сервис анализа временно не смог обработать шаблон.' },
+        });
+      }
       if (error instanceof TemplateCompilerError) {
         return res.status(error.status).json({ status: 'failed', failure: { code: error.code, message: error.message } });
       }

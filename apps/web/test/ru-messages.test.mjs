@@ -158,6 +158,8 @@ test('known design-system names use Russian display labels while preserving thei
 
 test('API failures map to safe user messages without echoing raw server details', () => {
   assert.match(friendlyErrorMessage('TEMPLATE_COMPILE_FAILED', 500, 'template'), /шаблон/i);
+  assert.equal(friendlyErrorMessage('PROVIDER_ERROR', 502, 'template'), ru.errors.semantic,
+    'semantic profiling failures during template analysis must not be described as damaged PPTX');
   assert.match(friendlyErrorMessage('LIMIT_FILE_SIZE', 413, 'upload'), /файл превышает/i);
   assert.match(friendlyErrorMessage('PLANNING_CONTEXT_TOO_LARGE', 413, 'planning'), /план/i);
   assert.match(friendlyErrorMessage('DEADLINE_EXCEEDED', 504, 'planning'), /сервис анализа/i);
