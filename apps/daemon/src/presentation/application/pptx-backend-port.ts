@@ -5,6 +5,8 @@ import type { CompiledPresentation } from './slide-compilation.js';
 
 /** Internal replaceable renderer boundary; not an external application API. */
 export type PptxBackendId = 'custom' | 'office-kit';
+export const QUALIFICATION_PPTX_BACKEND: PptxBackendId = 'office-kit';
+export const DEFAULT_PPTX_BACKEND: PptxBackendId = QUALIFICATION_PPTX_BACKEND;
 
 export interface PptxRenderInput {
   compiledPresentation: CompiledPresentation;
@@ -78,7 +80,7 @@ export interface PptxRendererPort {
 }
 
 export function parsePptxBackend(value: unknown): PptxBackendId {
-  if (value === undefined || value === null || value === '') return 'custom';
+  if (value === undefined || value === null || value === '') return DEFAULT_PPTX_BACKEND;
   if (value === 'custom' || value === 'office-kit') return value;
   throw new TypeError('LCT_PPTX_BACKEND must be custom or office-kit');
 }

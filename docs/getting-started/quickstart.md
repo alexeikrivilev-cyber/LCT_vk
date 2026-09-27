@@ -15,7 +15,7 @@ Quickstart запускает веб-интерфейс, daemon и fake semantic
 pnpm dlx pnpm@10.33.2 install --frozen-lockfile
 ```
 
-Создайте локальный `.env` копированием `.env.example` при необходимости, затем откройте два терминала.
+Создайте локальный `.env` копированием `.env.example` при необходимости, затем откройте два терминала. В примере зафиксирован release backend `LCT_PPTX_BACKEND=office-kit`; обычный запуск не требует PowerShell override. Backend виден в безопасном диагностическом поле `pptxBackend` ответа `/readiness`.
 
 Терминал 1 — локальные ответы fake endpoint:
 

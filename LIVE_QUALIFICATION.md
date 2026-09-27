@@ -9,6 +9,79 @@ Canonical runner: [`scripts/run-product-e2e.mjs`](./scripts/run-product-e2e.mjs)
 - `--semantic-mode fake`: runner сам поднимает локальный deterministic OpenAI-compatible fake. Сеть внешнего inference не используется.
 - `--semantic-mode external`: используется production `OpenAICompatibleSemanticInferenceAdapter`, настроенный через environment. Runner не поднимает model server.
 
+## Завтрашняя последовательность (Windows PowerShell)
+
+Выполнять только после отдельного разрешения на внешний inference. RunPod resource этим pass не создавался. Для консоли следуйте [startup runbook](./docs/RUNPOD_STARTUP_RUNBOOK.md): self-hosted profile `A100_BF16`, persistent volume смонтирован до старта, `LCT_MODEL_STORAGE_ROOT=/workspace/lct-models`, сначала `LCT_INFERENCE_OFFLINE_PREFLIGHT=1`. Только после exit `0` и полного exact snapshot PASS отключите offline-preflight env в настройках контейнера и перезапустите serving container. Затем container-local:
+
+```bash
+curl --fail --silent http://127.0.0.1:8080/health
+curl --fail --silent http://127.0.0.1:8080/v1/models
+```
+
+В репозитории нет закреплённого registry image tag. В RunPod console выберите уже выпущенный immutable tag и проверьте, что он содержит current runtime/preflight fix; tag не следует выводить из старой команды или подставлять `latest`.
+
+В локальном PowerShell из корня репозитория:
+
+```powershell
+$Repo = (git rev-parse --show-toplevel).Trim()
+Set-Location $Repo
+$WorkspaceTemplate = Join-Path $env:USERPROFILE 'Downloads\VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx'
+$VkTechTemplate = Join-Path $env:USERPROFILE 'Downloads\VK Tech шаблон.pptx'
+if (-not (Test-Path -LiteralPath $VkTechTemplate)) {
+  $VkTechTemplate = Join-Path $Repo '.lct\product-e2e\final-offline-acceptance-vktech-twelve-2026-09-27\runtime-data\projects\e2e-2c00c78c6bb649f8bcd02f53\VK Tech шаблон.pptx'
+}
+$Task = 'Создай презентацию о платформе интеллектуальных ассистентов для корпоративной поддержки. Покажи проблему, решение, принцип работы, преимущества, сценарии использования, безопасность, эффект для бизнеса и следующий шаг.'
+$ExpectedWorkspaceHash = '1b8883114486c69dff706e9c4fd9382727c4506c2cfa3ec34f86987f1e852f2f'
+$ExpectedVkTechHash = 'cbbe3aa6a21d23cebc4d1383b93dd07a9cea460d683de1903567b616c839485d'
+if (-not (Test-Path -LiteralPath $WorkspaceTemplate)) { throw 'WorkSpace PPTX is missing.' }
+if (-not (Test-Path -LiteralPath $VkTechTemplate)) { throw 'VK Tech PPTX is missing; restore the organizer source before the 12-slide run.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $WorkspaceTemplate).Hash.ToLowerInvariant() -ne $ExpectedWorkspaceHash) { throw 'WorkSpace template hash mismatch.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $VkTechTemplate).Hash.ToLowerInvariant() -ne $ExpectedVkTechHash) { throw 'VK Tech template hash mismatch.' }
+$env:LCT_SEMANTIC_BASE_URL = Read-Host 'OpenAI-compatible endpoint base URL ending in /v1'
+$env:LCT_SEMANTIC_MODEL = 'Qwen/Qwen3.8-27B'
+$env:LCT_SEMANTIC_ENABLE_THINKING = 'false'
+$env:LCT_PPTX_BACKEND = 'office-kit'
+# If the endpoint requires a key, load LCT_SEMANTIC_API_KEY from the local secret store for this process only.
+
+# Dry run: validates inputs/config; it starts no daemon and sends no network request.
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
+  --semantic-mode external --provider-label runpod `
+  --template $WorkspaceTemplate --task $Task --slides 3 --dry-run
+if ($LASTEXITCODE -ne 0) { throw 'External dry-run failed; stop here.' }
+
+# Endpoint preflight: one GET /v1/models, zero chat completions. Stop on failure; do not retry.
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
+  --semantic-mode external --provider-label runpod `
+  --template $WorkspaceTemplate --task $Task --slides 3 --preflight-only
+if ($LASTEXITCODE -ne 0) { throw 'Models preflight failed; do not start product qualification.' }
+
+# First live test: exactly one 3-slide WorkSpace workflow, at most four semantic calls.
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
+  --semantic-mode external --provider-label runpod `
+  --template $WorkspaceTemplate --task $Task --slides 3 --max-semantic-requests 4
+if ($LASTEXITCODE -ne 0) { throw '3-slide live qualification failed; stop without retry.' }
+
+# Run only after the first test passes the schema, quality, audit, export, and Office checks below.
+pnpm dlx pnpm@10.33.2 exec node --import tsx scripts/run-product-e2e.mjs `
+  --semantic-mode external --provider-label runpod `
+  --template $VkTechTemplate --task $Task --slides 12 --max-semantic-requests 4
+if ($LASTEXITCODE -ne 0) { throw '12-slide live qualification failed; stop without retry.' }
+```
+
+Не печатайте и не записывайте API key или частный endpoint в отчёт/manifest. Если endpoint требует auth, загрузите `LCT_SEMANTIC_API_KEY` из локального secret store в текущий process environment перед командами. Не сохраняйте ключ в `.env.example`, docs или PowerShell script.
+
+### Live evaluation checklist
+
+- **План:** разные цели слайдов; неповторяющиеся выводы; связное развитие истории; запрошенное число слайдов; осмысленные visual types.
+- **Текст:** короткие выводящие заголовки; презентационные формулировки; нет эха промпта; нет выдуманных неподтверждённых фактов.
+- **Композиция:** нет overlap или очевидного overflow; нет бессмысленных пустых зон; плотность читаема.
+- **A/B/C:** композиции действительно различаются, используют одинаковые подтверждённые факты и соответствуют шаблону.
+- **Audit:** contextual findings полезны, evidence references относятся к реальным source/slide; deterministic audit не пропускает блокирующие ошибки.
+- **Время:** записать semantic, deterministic и total elapsed отдельно; 10–12-slide live target — менее 300 s, измерение fake сюда не засчитывается.
+- **PowerPoint:** открыть без Repair/Recover; проверить редактируемый текст/фигуры и branding; сохранить, закрыть, открыть повторно.
+
+**Abort:** нет matching model в `/v1/models`, timeout/5xx/524, `finish_reason=length`, пустой или schema-invalid ответ, withheld A/B/C, deterministic audit error или export/reopen failure. Не повторять автоматически; сохранить manifest с failure. Второй 12-slide run запускать только после полного PASS первого теста, включая ручную Office проверку.
+
 External environment: `LCT_SEMANTIC_BASE_URL` и `LCT_SEMANTIC_MODEL` обязательны; `LCT_SEMANTIC_API_KEY` optional, если endpoint не требует bearer auth; `LCT_SEMANTIC_ENABLE_THINKING=false` рекомендуется для qualification. База URL должна быть OpenAI-compatible `/v1` без credentials, query и fragment. Значения передаются только через environment, не через CLI. Runner не помещает base URL, API key или Authorization в manifest.
 
 PowerShell setup для отдельного разрешённого external run:

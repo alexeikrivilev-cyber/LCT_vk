@@ -5,7 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
-import { createRequestBudgetAdapter, parseArgs, runCli, runProductE2E } from './run-product-e2e.mjs';
+import { assertQualificationPptxBackend, createRequestBudgetAdapter, parseArgs, runCli, runProductE2E } from './run-product-e2e.mjs';
+import { DEFAULT_PPTX_BACKEND, QUALIFICATION_PPTX_BACKEND, parsePptxBackend } from '../apps/daemon/src/presentation/application/pptx-backend-port.ts';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(path.join(repoRoot, 'apps/daemon/package.json'));
@@ -106,6 +107,33 @@ test('canonical runner enters through the same public one-click workflow endpoin
   const source = await readFile(path.join(repoRoot, 'scripts/run-product-e2e.mjs'), 'utf8');
   assert.match(source, /\/workflow\/generate/u);
   assert.doesNotMatch(source, /\/planning\/generate|TemplateSemanticProfiler|PlanningService|GenerationService/u);
+  assert.doesNotMatch(source, /env\.LCT_PPTX_BACKEND\s*=/u, 'runner must use the same configured backend as the UI');
+  assert.match(source, /readiness\.checks\?\.pptxBackend/u);
+  assert.match(source, /generation\.backend/u);
+});
+
+test('release PPTX backend is office-kit across defaults, env example, runner and docs', async () => {
+  assert.equal(QUALIFICATION_PPTX_BACKEND, 'office-kit');
+  assert.equal(DEFAULT_PPTX_BACKEND, 'office-kit');
+  assert.equal(parsePptxBackend(undefined), 'office-kit');
+  assert.equal(parsePptxBackend(null), 'office-kit');
+  assert.equal(parsePptxBackend(''), 'office-kit');
+  assert.equal(parsePptxBackend('office-kit'), 'office-kit');
+  assert.equal(parsePptxBackend('custom'), 'custom');
+  assert.throws(() => parsePptxBackend('unknown'), /LCT_PPTX_BACKEND must be custom or office-kit/u);
+  assert.equal(assertQualificationPptxBackend('office-kit'), 'office-kit');
+  assert.throws(() => assertQualificationPptxBackend('custom'), (error) => error.code === 'PPTX_BACKEND_MISMATCH');
+
+  const env = await readFile(path.join(repoRoot, '.env.example'), 'utf8');
+  assert.match(env, /^LCT_PPTX_BACKEND=office-kit$/mu);
+  const [readme, config, testing] = await Promise.all([
+    readFile(path.join(repoRoot, 'README.md'), 'utf8'),
+    readFile(path.join(repoRoot, 'docs/getting-started/configuration.md'), 'utf8'),
+    readFile(path.join(repoRoot, 'TESTING.md'), 'utf8'),
+  ]);
+  assert.match(readme, /Office Kit.*default|default.*Office Kit/iu);
+  assert.match(config, /office-kit.*default/u);
+  assert.match(testing, /qualification backend.*Office Kit|Office Kit.*qualification backend/iu);
 });
 
 test('request budget rejects the fifth inference before calling the production adapter', async () => {
@@ -145,6 +173,8 @@ test('same one-click ProductWorkflow API uses four fake semantic requests for 3 
       : `Синтетический этап ${index + 1}: подготовить проверяемый шаг процесса.`).join('\n');
     const manifest = await runProductE2E(workflowOptions(templatePath, outputDir, slides, task), { startFakeSemanticEndpoint: endpointFactory });
     assert.equal(manifest.result, 'PASS', `failed at ${manifest.failure?.stage}: ${manifest.failure?.code}; semantic=${JSON.stringify(manifest.semantic.rawOperationCounts)}`);
+    assert.equal(manifest.expectedPptxBackend, 'office-kit');
+    assert.equal(manifest.pptxBackend, 'office-kit');
     assert.equal(manifest.requestedSlides, slides);
     assert.equal(manifest.actualSlides, slides);
     assert.deepEqual(manifest.semantic.operationCounts, {

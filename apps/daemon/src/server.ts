@@ -310,6 +310,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
         store: storeAvailable ? 'available' : 'unavailable',
         writableDirectories: requiredDirsWritable ? 'writable' : 'unavailable',
         renderer: renderer ? 'initialized' : 'unavailable',
+        pptxBackend: backend,
         semantic: { required: semanticRequired, status: semanticStatus },
       },
     });

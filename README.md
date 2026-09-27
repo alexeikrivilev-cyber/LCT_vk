@@ -2,7 +2,9 @@
 
 LCT принимает PPTX-шаблон и задачу, использует необязательные контекст и исходные материалы, строит план презентации, подбирает безопасные композиции и собирает презентацию с редактируемыми объектами. Это компилятор презентаций, а не редактор слайдов.
 
-Основной путь в приложении — кнопка «Сгенерировать презентацию»: анализ шаблона, планирование, варианты A/B/C и обе проверки выполняются одним сохраняемым действием. Контекст и файлы можно не добавлять; результат и стадия восстанавливаются после обновления страницы.
+Основной путь в приложении — кнопка «Сгенерировать презентацию»: анализ шаблона, планирование, варианты A/B/C и обе проверки выполняются одним сохраняемым действием. Контекст и материалы можно не добавлять; загруженные исходные файлы выбираются автоматически и при необходимости меняются в расширенном режиме. Результат и стадия восстанавливаются после обновления страницы.
+
+Для release и qualification используется Office Kit: он задан в `.env.example` и является default. `custom` сохранён только для явно выбранного legacy/diagnostic режима. Быстрый старт не требует ручного переопределения backend.
 
 ## Возможности
 
@@ -12,7 +14,7 @@ LCT принимает PPTX-шаблон и задачу, использует �
 - Три варианта A/B/C для каждого слайда из одного плана.
 - Детерминированная проверка, ограниченная локальная починка и экспорт в PPTX, PDF или HTML.
 
-Полная совместимость с произвольными PPTX и визуальная точность PowerPoint не заявлены. PDF использует растровое приблизительное превью; HTML — отдельный формат просмотра. Fake-only qualification подтвердила шаблоны VK Tech (12 слайдов), WorkSpace, Education и held-out AIOS (по 3 слайда): selected/A/B/C PPTX прошли структурное reopen; у VK Tech дополнительно проверены PDF и HTML. Canonical one-click runner на 54-слайдовом VK Tech шаблоне создал 12-слайдовую колоду, выполнил 4 fake semantic calls, проверил A/B/C, оба audit и экспорты за 87.597 s. Это локальная проверка pipeline, не оценка качества или latency Qwen/VK. Один canonical runner для fake/external режимов и его лимит в 4 semantic request описаны в [TESTING.md](./TESTING.md) и [LIVE_QUALIFICATION.md](./LIVE_QUALIFICATION.md).
+Полная совместимость с произвольными PPTX и визуальная точность PowerPoint не заявлены. PDF использует растровое приблизительное превью; HTML — отдельный формат просмотра. Fake-only qualification подтвердила шаблоны VK Tech (12 слайдов), WorkSpace, Education и held-out AIOS (по 3 слайда): selected/A/B/C PPTX прошли структурное reopen; у VK Tech дополнительно проверены PDF и HTML. Свежий canonical one-click runner на 54-слайдовом VK Tech шаблоне создал 12-слайдовую колоду, выполнил 4 fake semantic calls, проверил A/B/C, оба audit и экспорты за 95.753 s. Пользователь также вручную проверил в Microsoft PowerPoint конкретную пятислайдовую WorkSpace fake-презентацию: открытие без Repair/Recover, редактирование текста и фигур, сохранение и повторное открытие, сохранение branding и различимость A/B/C. Это scoped manual acceptance, не утверждение pixel-perfect fidelity. Protected View не означает повреждение файла. Это локальная проверка pipeline, не оценка качества или latency Qwen/VK. Один canonical runner для fake/external режимов и его лимит в 4 semantic request описаны в [TESTING.md](./TESTING.md) и [LIVE_QUALIFICATION.md](./LIVE_QUALIFICATION.md).
 
 ## Архитектура в двух словах
 
@@ -86,7 +88,7 @@ Runner сам поднимает fake endpoint и проходит тот же p
 
 ## Ограничения
 
-Статус этого этапа — `PRODUCT_READY_FOR_LIVE`: локальный one-click fake flow, held-out шаблон, track exports, deterministic/contextual audit и автоматические gates прошли. Настоящие Qwen/VK качество, latency и endpoint integration ещё не проверены; визуальный просмотр в PowerPoint/LibreOffice также не выполнялся. Сводный отчёт: [RELEASE_READINESS.md](./RELEASE_READINESS.md).
+Offline freeze status и его точные evidence приведены в [RELEASE_READINESS.md](./RELEASE_READINESS.md). Качество и latency настоящих Qwen/VK inference, а также итоговая визуальная оценка реального model output остаются отдельными live gates.
 
 ## Материалы release acceptance
 

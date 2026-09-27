@@ -86,6 +86,52 @@ test('deterministic and contextual audit sources are visibly distinct and repair
   for (const message of Object.values(ru.workflow.actionMessages)) assert.match(message, /[А-Яа-яЁё]/u);
 });
 
+test('normal user flow requires only a template and task; optional fields stay collapsed', () => {
+  const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  assert.match(appSource, /fetch\(`\/api\/projects\/\$\{encodeURIComponent\(projectId\)\}\/workflow\/generate`/u);
+  assert.match(appSource, /<button className="primary" onClick=\{\(\) => void generatePresentation\(\)\} disabled=\{!templateFile \|\| !briefPurpose\.trim\(\) \|\| busy \|\| productWorkflowRunning\}>/u, 'one-click generation waits for current uploads to settle');
+  assert.match(appSource, /<button className=\{templateFile \? 'quiet' : 'primary'\} onClick=\{\(\) => uploadRef\.current\?\.click\(\)\}/u);
+  assert.match(appSource, /<label className="planning-required-field">[\s\S]*<textarea id="presentation-purpose" required/u);
+  const optionalStart = appSource.indexOf('<details className="advanced-tools optional-settings">');
+  const optionalEnd = appSource.indexOf('</details>', optionalStart);
+  const optionalMarkup = appSource.slice(optionalStart, optionalEnd);
+  assert.ok(optionalStart >= 0 && optionalEnd > optionalStart, 'optional inputs have a native collapsed disclosure');
+  for (const optionalMessage of ['ru.planning.audience', 'ru.planning.outcome', 'ru.planning.context', 'ru.planning.preferences', 'ru.planning.slideCount', 'ru.planning.addSources']) {
+    assert.ok(optionalMarkup.includes(optionalMessage), `${optionalMessage} must be optional`);
+  }
+  assert.match(appSource, /<details className="advanced-tools planning-advanced">[\s\S]*?onClick=\{\(\) => void analyzeTemplate\(\)\}[\s\S]*?onClick=\{\(\) => void generatePlan\(\)\}/u);
+  assert.match(appSource, /<details className="advanced-tools generation-advanced">[\s\S]*?onClick=\{\(\) => void start\(\)\}/u);
+  assert.match(appSource, /<details className="advanced-tools developer-tools">[\s\S]*?<div className="workspace-grid">/u);
+  assert.match(appSource, /<details className="advanced-tools template-report-disclosure">/u);
+  assert.equal(ru.template.upload, 'Загрузить PPTX');
+  assert.equal(ru.planning.optionalSettings, 'Дополнительные настройки');
+  assert.equal(ru.workspace.advancedMode, 'Расширенный режим');
+});
+
+test('ready results, clean audit, and export controls have a clear customer hierarchy', () => {
+  const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  assert.equal(ru.generation.auditSummary(0, 0), 'Проверка пройдена');
+  assert.match(ru.generation.auditSummary(1, 2), /Найдено проблем: 3/u);
+  assert.match(appSource, /canExport \? ru\.generation\.resultReady/u);
+  assert.match(appSource, /canExport \? ru\.generation\.resultSummary/u);
+  assert.match(appSource, /className="primary" disabled=\{!canExport \|\| Boolean\(busy\)\} onClick=\{\(\) => exportDeck\('selected', 'pptx'\)\}/u);
+  assert.match(appSource, /<details className="advanced-tools variant-exports">[\s\S]*?\['A', 'B', 'C'\][\s\S]*?exportDeck\(mode, format\)/u);
+  assert.match(appSource, /ru\.generation\.editablePowerPoint/u);
+  assert.match(appSource, /ru\.generation\.downloadPdf/u);
+  assert.match(appSource, /ru\.generation\.downloadHtml/u);
+  assert.equal(ru.generation.resultSummary(5), '5 слайдов · три варианта для проверки');
+  assert.match(appSource, /className="generation-empty-hint"/u);
+  assert.doesNotMatch(appSource, /ru\.generation\.incompletePlan/u, 'the default empty state must not show a warning before the user starts');
+});
+
+test('workflow failures offer a safe retry and technical codes stay in details', () => {
+  const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  assert.match(appSource, /product-workflow-error" onRetry=\{\(\) => void generatePresentation\(\)\}/u);
+  assert.match(appSource, /<button className="quiet compact ui-error-retry" onClick=\{onRetry\}>\{ru\.errors\.retry\}/u);
+  assert.match(appSource, /<details className="ui-error-details">[\s\S]*?ru\.errors\.code\(value\.code\)/u);
+  assert.doesNotMatch(appSource, /failure\.code\s*\|\|\s*failure\.message/u);
+});
+
 test('visible dates use Russian locale formatting', () => {
   assert.match(formatUiDateTime(new Date('2026-09-26T09:05:00.000Z')), /\d{2}\.\d{2}\.\d{4}/u);
 });

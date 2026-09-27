@@ -1,7 +1,7 @@
 # Готовность продукта к live qualification
 
-**STATUS: PRODUCT_READY_FOR_LIVE**
-Базовая release acceptance: 2026-09-26. Дополнительный final pre-live hardening: 2026-09-27, Windows, local fake OpenAI-compatible endpoint, Office Kit. RunPod, GPU, Qwen, VK inference и любые внешние inference-запросы не запускались. Commit/push не выполнялись.
+**STATUS: READY_FOR_REAL_QWEN_TOMORROW**
+**OFFLINE ENGINEERING: PASS. LIVE MODEL: PENDING.** Статус означает готовность только к одному ограниченному live qualification; это не полная organizer acceptance. `CASE_COMPLIANCE_STATUS: BLOCKED` остаётся по незакрытым требованиям, включая image-generation path и live VK/300-second qualification — см. [CASE_REQUIREMENTS.md](./docs/compliance/CASE_REQUIREMENTS.md). Финальная offline проверка: 2026-09-27, Windows, Office Kit и local fake endpoint. RunPod, GPU, Qwen, VK inference и любые внешние inference-запросы не запускались. Commit/push не выполнялись.
 
 ## CASE COMPLIANCE
 
@@ -45,7 +45,7 @@
 
 ## PERFORMANCE
 
-Предыдущий canonical fake one-click run на 54-слайдовом VK Tech template завершился за 87.597 s; он superseded более свежим pre-live run ниже. Это offline pipeline measurement, не latency настоящего inference.
+Предыдущий canonical fake one-click run на 54-слайдовом VK Tech template завершился за 87.597 s; затем результат был superseded более полными прогонами ниже. Самое свежее повторное измерение этого acceptance pass — 95.753 s. Это offline pipeline measurement, не latency настоящего inference.
 
 ## DUAL-MODE RUNNER
 
@@ -83,6 +83,59 @@ Repository gates в этом pass:
 - `git diff --check` — PASS.
 
 Вызов root `typecheck` wrapper через `corepack pnpm@10.33.2 typecheck` сначала упёрся в PATH, где вложенный `pnpm` разрешился в 11.19.0; та же workspace-команда `-r --filter @lct/web --filter @lct/daemon run typecheck` выполнена напрямую через pnpm 10.33.2 и прошла. Build package scripts также выполнены напрямую через pnpm 10.33.2, последовательно. Ни один из этих gates не запускал внешний inference. Commit/push не выполнялись; pre-existing untracked `test-content.md` сохранён без чтения или изменения.
+
+## FINAL OFFLINE PRODUCT FREEZE (2026-09-27)
+
+**STATUS: OFFLINE_PRODUCT_FROZEN_FOR_LIVE.** Этот итоговый pass supersedes предыдущие локальные readiness labels. RunPod, GPU, настоящий Qwen, VK inference и любые внешние inference-запросы не запускались.
+
+### Backend и конфигурация
+
+- `parsePptxBackend(undefined|null|'')` → `office-kit`; явные `office-kit` и `custom` сохраняют значение; неизвестная настройка завершается ошибкой.
+- `.env.example`, documented quickstart и configuration reference выбирают Office Kit. `custom` остаётся только явно выбранным legacy/diagnostic/experimental backend.
+- Readiness сообщает `checks.pptxBackend`; canonical runner проверяет readiness и persisted generation, сохраняет `expectedPptxBackend`/`pptxBackend` в manifest и останавливается при несоответствии. Runner не подменяет backend в environment.
+- Regression `release PPTX backend is office-kit across defaults, env example, runner and docs` — PASS.
+
+### Exact WorkSpace 5-slide regression
+
+Команда запускалась с `node --env-file=.env.example`, без backend override. Шаблон `VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx`, SHA-256 `1b8883114486c69dff706e9c4fd9382727c4506c2cfa3ec34f86987f1e852f2f`; task — «Создай презентацию о платформе интеллектуальных ассистентов для корпоративной поддержки. Покажи проблему, решение, принцип работы, преимущества, сценарии использования, безопасность, эффект для бизнеса и следующий шаг.»; context пустой, sources 0, 5 слайдов.
+
+- Backend: Office Kit; workflow: `ready`; 5/5 slides; A/B/C: 15/15; `VARIANTS_NOT_DISTINCT`: отсутствует.
+- Deterministic audit: passed, 0 errors, 0 warnings, 15 variants. Contextual audit: `contextual-deck-audit.v2`, 11/11 rules. Fake calls: ровно 4 — template profile, deck plan, plan review, contextual audit; generation model calls: 0.
+- Selected/A/B/C PPTX structural reopen: passed, 5 слайдов в каждом, native editable text, 0 raster-only slides, notes, package errors; также прошли selected PDF (5 страниц) и HTML (5 секций). A/B/C raw hashes distinct. Исходный шаблон не изменён.
+- Свежий повтор 2026-09-27: **36.954 s**; workflow `ready`, 5/5 слайдов, 15/15 вариантов, deterministic audit 0 errors/0 warnings, contextual v2 11/11, ровно 4 fake calls, generation inference 0. Selected/A/B/C PPTX structural reopen, PDF 5 страниц и HTML 5 секций прошли; hash исходного шаблона не изменился. Manifest: `.lct/product-e2e/final-offline-acceptance-workspace-2026-09-27/manifest.json`.
+
+Request budget для этого run: profiler 1, Worker 1, planning Supervisor 1, contextual audit 1, generation 0; total **4**. VK Tech run использовал тот же budget.
+
+### UI и ручная PowerPoint приёмка
+
+- Normal mode оставляет видимыми выбор PPTX-шаблона, задачу, необязательные поля брифа, число слайдов и одну кнопку «Сгенерировать презентацию». Кнопка блокируется на время текущей загрузки, чтобы workflow не стартовал раньше добавления загруженного материала. Загрузка исходных файлов выбирает их по умолчанию в пределах существующего лимита; список, ручные Analyze/Plan/Variants и raw editor/preview/design-system controls скрыты в расширенном/техническом режиме.
+- При переходе workflow в `ready` или `failed` перечитываются persisted template/planning snapshots. Helper regression проверяет оба terminal state и отсутствие reload для `running`; reload не вызывает generation/inference. UI one-click wiring покрыт локальным regression, backend путь — canonical fake E2E.
+- Ручное Microsoft PowerPoint evidence **передано пользователем** для конкретного WorkSpace 5-slide fake deck: открытие без Repair/Recover; текст и native shapes редактируются; сохранение, закрытие и повторное открытие прошли; branding сохранён; A/B/C визуально различались. Это scoped acceptance, не pixel-perfect claim. Protected View не считается повреждением.
+- Visual status: STRUCTURAL — PASS; MANUAL OFFICE — PASS только для указанного output; SEMANTIC CONTENT — N/A под fake; VISUAL POLISH — PARTIAL. У длинных заголовков остаётся title-density риск; некоторые донорские композиции оставляют пустые области карточек. Существующий projected-fit уже участвует в отборе, но Office Kit text-layout evidence approximate/low-confidence; безопасный порог для текущего наблюдения не обоснован. Generic empty shape нельзя уверенно классифицировать как replaceable без новых shape semantics. Backlog: `title-fit`, `empty-content-region quality`. Алгоритмы генерации и fake Worker не тюнились.
+
+### Canonical VK Tech 12-slide fake regression
+
+Шаблон `VK Tech шаблон.pptx`, SHA-256 `cbbe3aa6a21d23cebc4d1383b93dd07a9cea460d683de1903567b616c839485d`, исходно 54 слайда. Источник взят из сохранённой ignored копии после сверки SHA; исходник не изменён. Свежий Office Kit run: `ready`, 12/12; A/B/C: 36/36; ровно 4 fake semantic calls; deterministic audit 0 errors/0 warnings; contextual v2 audit 11/11. Selected/A/B/C PPTX, 12-страничный PDF и 12-секционный HTML прошли structural validation. Время **95.753 s**, ниже локального regression limit 150 s; это не подтверждение live budget 300 s. Manifest: `.lct/product-e2e/final-offline-acceptance-vktech-twelve-2026-09-27/manifest.json`.
+
+### Репозиторные gates
+
+- `pnpm dlx pnpm@10.33.2 install --frozen-lockfile --offline` — PASS; lockfile актуален, 0 downloaded.
+- `pnpm dlx pnpm@10.33.2 test` — **219/219 PASS**.
+- `pnpm dlx pnpm@10.33.2 typecheck` — PASS для web и daemon.
+- `pnpm dlx pnpm@10.33.2 build` — PASS для Next.js web и daemon.
+- `pnpm dlx pnpm@10.33.2 check:boundary`, `lint:craft`, `docs:check` — PASS; docs check: 55 required files, local links resolved.
+- `git diff --check` — PASS.
+
+Эти локальные fake checks не подтверждают реальное качество Qwen, strict-schema behavior целевого serving runtime, latency <300 s или VK endpoint integration.
+
+### Handoff — следующая работа только на live evidence
+
+1. Выполнить сохранённую в [LIVE_QUALIFICATION.md](./LIVE_QUALIFICATION.md) PowerShell-последовательность: RunPod console/startup по текущему runbook, `--dry-run`, один models-only preflight.
+2. Только после PASS preflight — один WorkSpace 3-slide Qwen product run (предел 4 semantic calls, без retry); применить опубликованный live rubric.
+3. Только если первый run PASS — VK Tech 12-slide run и ручной PowerPoint open/edit/save/reopen.
+4. До появления реальных Qwen/VK evidence не делать новых offline feature, selector, UI, audit, T2I, CI или renderer изменений.
+
+Текущий RunPod runbook намеренно не закрепляет registry image tag: перед стартом оператор должен выбрать уже опубликованный immutable tag в console. Этот репозиторий не содержит значения, поэтому tag не выдуман и не записывается в документацию.
 
 ## REMAINING LIVE-ONLY RISKS
 

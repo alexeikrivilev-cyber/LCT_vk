@@ -15,6 +15,8 @@ import {
   variantStatusLabel,
 } from './i18n/ru';
 import { clearWorkspaceDraft, readWorkspaceDraft, writeWorkspaceDraft } from './workspace-draft';
+import { refreshPersistedWorkflowSnapshots } from './workflow-terminal-refresh';
+import { includeUploadedContentFiles } from './uploaded-content-selection';
 
 type Project = {
   id: string;
@@ -214,12 +216,13 @@ function uiFailure(error: unknown, fallback: string = ru.errors.generic): UiFail
   return { message: fallback };
 }
 
-function ErrorNotice({ failure, className, role = 'alert' }: { failure: UiFailure | string | null; className?: string; role?: 'alert' | 'status' }) {
+function ErrorNotice({ failure, className, role = 'alert', onRetry }: { failure: UiFailure | string | null; className?: string; role?: 'alert' | 'status'; onRetry?: () => void }) {
   if (!failure) return null;
   const value = typeof failure === 'string' ? { message: failure } : failure;
   const showDiagnostics = process.env.NODE_ENV !== 'production' && (value.code || value.status);
   return <div className={className} role={role}>
     <span>{value.message}</span>
+    {onRetry ? <button className="quiet compact ui-error-retry" onClick={onRetry}>{ru.errors.retry}</button> : null}
     {showDiagnostics ? <details className="ui-error-details">
       <summary>{ru.errors.diagnostics}</summary>
       {value.code ? <code>{ru.errors.code(value.code)}</code> : null}
@@ -459,6 +462,7 @@ function PresentationHome({ onOpen }: { onOpen: (projectId: string) => void }) {
 
 function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBack: () => void }) {
   const uploadRef = useRef<HTMLInputElement>(null);
+  const sourceUploadRef = useRef<HTMLInputElement>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [files, setFiles] = useState<ProjectFile[]>([]);
   const [designSystems, setDesignSystems] = useState<DesignSystem[]>([]);
@@ -638,7 +642,9 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const templateBadgeStatus = visibleTemplateStatus ?? (templateAnalyzing ? 'analyzing' : templateFetching ? 'loading' : templateError ? 'unavailable' : 'uncompiled');
   const templateBadgeLabel = templateAnalyzing ? ru.template.analyzing
     : templateFetching ? ru.template.fetching
-      : templateStatusLabel(visibleTemplateStatus ?? (templateError ? 'unavailable' : 'uncompiled'));
+      : templateFile && (visibleTemplateStatus === 'uncompiled' || !visibleTemplateStatus) && !templateError ? ru.template.selected
+        : !templateFile && (visibleTemplateStatus === 'uncompiled' || !visibleTemplateStatus) && !templateError ? ru.template.selectTemplate
+          : templateStatusLabel(visibleTemplateStatus ?? (templateError ? 'unavailable' : 'uncompiled'));
   const productWorkflowRunning = productWorkflowBusy || productOperation?.status === 'running';
   const templateIR = record(templateScan?.templateIR);
   const presentationDesignSystem = record(templateScan?.presentationDesignSystem);
@@ -907,9 +913,14 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       let next: ProductWorkflowOperation | null = null;
       try {
         next = await loadProductOperation();
-        if (!cancelled && next?.status === 'ready') {
-          await Promise.all([loadTemplateScan(), loadPlanning()]);
-          document.getElementById('generation-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        if (!cancelled && next) {
+          const refreshed = await refreshPersistedWorkflowSnapshots(next.status, {
+            template: loadTemplateScan,
+            planning: loadPlanning,
+          });
+          if (refreshed && next.status === 'ready') {
+            document.getElementById('generation-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
         }
       } catch (err) {
         if (!cancelled) setProductWorkflowError(uiFailure(err, ru.workflow.error));
@@ -1045,11 +1056,19 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       if (uploadedPath) setTemplateFile(uploadedPath);
       await loadTemplateScan();
       await loadPlanning();
+      const uploadedSourcePaths = uploadedFiles
+        .filter((file) => !/\.pptx$/i.test(filePath(file) || file.originalName || ''))
+        .map(filePath)
+        .filter((path): path is string => Boolean(path));
+      if (uploadedSourcePaths.length) {
+        setSelectedContentFiles((current) => includeUploadedContentFiles(current, uploadedSourcePaths));
+      }
     } catch (err) {
       if (uploadedFiles.length) await loadFiles();
       setError(uiFailure(err));
     } finally {
       if (uploadRef.current) uploadRef.current.value = '';
+      if (sourceUploadRef.current) sourceUploadRef.current.value = '';
       setBusy(false);
       setUploading(false);
     }
@@ -1091,8 +1110,6 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         </div>
         <div className="topbar-actions">
           <button className="quiet" onClick={() => void reload()}>{ru.workspace.reload}</button>
-          <button className="primary" onClick={() => uploadRef.current?.click()} disabled={busy}>{ru.workspace.addSources}</button>
-          <input ref={uploadRef} className="visually-hidden" type="file" multiple aria-label={ru.workspace.addSources} onChange={(event) => void upload(event.target.files)} />
         </div>
       </header>
 
@@ -1120,7 +1137,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         </div>
 
         <div className="template-toolbar">
-          <label htmlFor="template-source">{ru.template.sourceLabel}</label>
+          <label htmlFor="template-source">{ru.template.sourceLabel} <span aria-hidden="true">*</span></label>
           <select
             id="template-source"
             value={templateFile ?? ''}
@@ -1133,16 +1150,17 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
               return <option key={path} value={path}>{path}</option>;
             })}
           </select>
-          <button className="primary" onClick={() => void analyzeTemplate()} disabled={!templateFile || busy || templateFetching || templateAnalyzing || productWorkflowRunning}>
-            {templateAnalyzing ? ru.template.analyzing : ru.template.analyze}
+          <button className={templateFile ? 'quiet' : 'primary'} onClick={() => uploadRef.current?.click()} disabled={busy}>
+            {templateFile ? ru.template.replace : ru.template.upload}
           </button>
+          <input ref={uploadRef} className="visually-hidden" type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" aria-hidden="true" tabIndex={-1} onChange={(event) => void upload(event.target.files)} />
           {templateScan?.compiledAt ? <span className="template-compiled-at">{ru.template.lastScan(formatUiDateTime(new Date(templateScan.compiledAt)))}</span> : null}
         </div>
 
         <p className="template-scope-note">{ru.template.scope}</p>
         <ErrorNotice failure={templateError} className="error-banner template-error" />
 
-        {visibleTemplateStatus === 'uncompiled' ? (
+        {visibleTemplateStatus === 'uncompiled' && templateFiles.length > 0 ? (
           <div className="template-message">{ru.template.chooseAndAnalyze}</div>
         ) : null}
         {visibleTemplateStatus === 'stale' ? (
@@ -1160,6 +1178,8 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         ) : null}
 
         {matchingScan && templateIR ? (
+          <details className="advanced-tools template-report-disclosure">
+            <summary>{ru.template.reportSummary}</summary>
           <div className="template-report">
             <div className="template-source-line">
               <span>{ru.template.scannedFile}</span>
@@ -1278,6 +1298,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
               ) : <p className="template-muted">{ru.template.noUnsupported}</p>}
             </section>
           </div>
+          </details>
         ) : null}
       </section>
 
@@ -1292,37 +1313,29 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             <span className={`planning-status planning-status-${planningGenerating ? 'generating' : planningDraftDirty ? 'stale' : planning?.status ?? 'loading'}`} role="status">
               {planningLoading ? ru.planning.loading : planningGenerating ? ru.planning.understanding : planningStatusLabel(planningDraftDirty ? 'stale' : planning?.status)}
             </span>
-            <button className="quiet" onClick={() => void loadPlanning()} disabled={planningLoading || planningGenerating}>{ru.planning.reload}</button>
           </div>
         </div>
 
         {planning?.templateStatus !== 'ready' || !matchingScan ? (
           <div className="planning-notice" role="status">
-            {ru.planning.analyzeTemplateFirst}
+            {templateFile ? ru.planning.oneClickWillAnalyze : ru.planning.uploadTemplateFirst}
           </div>
         ) : null}
         {planningLoading && !planning ? <div className="planning-notice" role="status">{ru.planning.loading}</div> : null}
         <ErrorNotice failure={planningError} className="error-banner planning-error" />
-        <section className="product-workflow-card" aria-label={ru.workflow.action}>
-          <div className="product-workflow-copy">
-            <strong>{ru.workflow.action}</strong>
-            <p>{ru.workflow.requireTemplateAndTask}</p>
-          </div>
+        {productOperation || productWorkflowError ? <section className="product-workflow-card" aria-label={ru.workflow.action}>
           <div className="product-workflow-controls">
-            <button className="primary" onClick={() => void generatePresentation()} disabled={!templateFile || !briefPurpose.trim() || productWorkflowRunning}>
-              {productWorkflowRunning ? ru.workflow.working : ru.workflow.action}
-            </button>
             {productOperation ? <span className={`product-workflow-status status-${productOperation.status}`} role="status" aria-live="polite">
               {productOperation.status === 'running' ? productWorkflowStageLabel(productOperation.stage, productOperation.readySlides, productOperation.totalSlides)
                 : productWorkflowBusy ? ru.workflow.working
                   : productOperation.status === 'ready' ? ru.workflow.stages.ready : ru.workflow.stages.failed}
             </span> : null}
           </div>
-          <ErrorNotice failure={productWorkflowError} className="error-banner product-workflow-error" />
+          <ErrorNotice failure={productWorkflowError} className="error-banner product-workflow-error" onRetry={() => void generatePresentation()} />
           {productOperation?.failure ? <ErrorNotice role="status" className="product-workflow-failure" failure={{
             message: friendlyErrorMessage(productOperation.failure.code, 500, 'generation'),
             code: productOperation.failure.code,
-          }} /> : null}
+          }} onRetry={() => void generatePresentation()} /> : null}
           {productOperation?.contextualAudit ? <div className="product-contextual-audit" data-audit-source="contextual" role="status">
             <strong>{ru.workflow.contextualAudit}: {ru.workflow.auditFindings(productOperation.contextualAudit.findings?.filter((finding) => finding.severity !== 'info').length ?? 0)}</strong>
             {productOperation.contextualAudit.stale ? <p>{ru.workflow.auditStale}</p> : null}
@@ -1338,7 +1351,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             </details> : <p>{ru.workflow.auditClean}</p>}
             {productOperation.contextualAudit.stale ? <button className="quiet" onClick={() => void repeatContextualAudit()} disabled={productWorkflowRunning}>{ru.workflow.auditRerun}</button> : null}
           </div> : null}
-        </section>
+        </section> : null}
         {planning?.status === 'stale' ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.stale}</div> : null}
         {planningDraftDirty ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.draftChanged}</div> : null}
         {planningFailure?.message ? <ErrorNotice role="status" className="planning-notice planning-notice-warning" failure={{
@@ -1346,62 +1359,83 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
           ...(planningFailure.code ? { code: stringValue(planningFailure.code) } : {}),
         }} /> : null}
 
-        <div className="planning-form-grid">
-          <fieldset className="planning-file-picker">
-            <legend>{ru.planning.sourceFiles} <span>{ru.planning.selected(planningSelectedPaths.length)}</span></legend>
-            {planningSourceFiles.length ? (
-              <div className="planning-file-list">
-                {planningSourceFiles.map((file) => {
-                  const path = filePath(file);
-                  const sourceStatus = contentSourceStatusByPath.get(path) as ContentSourceStatus | undefined ?? 'not-parsed';
-                  return (
-                    <label className="planning-file-option" key={path} title={path}>
-                      <input
-                        type="checkbox"
-                        checked={planningSelectedPaths.includes(path)}
-                        onChange={(event) => togglePlanningFile(path, event.target.checked)}
-                        disabled={planningGenerating || productWorkflowRunning || (!planningSelectedPaths.includes(path) && planningSelectedPaths.length >= 12)}
-                      />
-                      <span>{path}</span>
-                      <small className="content-source-status" data-status={sourceStatus} aria-label={`${contentSourceStatusLabel(sourceStatus)}: ${path}`}>
-                        {contentSourceStatusLabel(sourceStatus)}
-                      </small>
-                      <small>{formatBytes(file.size)}</small>
-                    </label>
-                  );
-                })}
-              </div>
-            ) : <p className="planning-muted">{ru.planning.uploadSources}</p>}
-          </fieldset>
+        <details className="advanced-tools planning-advanced">
+          <summary>{ru.workspace.advancedMode}</summary>
+          <div className="advanced-tools-content">
+            <div className="advanced-actions">
+              <button className="quiet" onClick={() => void loadPlanning()} disabled={planningLoading || planningGenerating}>{ru.planning.reload}</button>
+              <button className="quiet" onClick={() => void analyzeTemplate()} disabled={!templateFile || busy || templateFetching || templateAnalyzing || productWorkflowRunning}>
+                {templateAnalyzing ? ru.template.analyzing : ru.template.analyze}
+              </button>
+              <button className="quiet" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateFetching || templateAnalyzing || planning?.templateStatus !== 'ready' || !matchingScan || !briefPurpose.trim()}>
+                {planningGenerating ? ru.planning.generating : ru.planning.generate}
+              </button>
+            </div>
+          </div>
+        </details>
 
+        <div className="planning-form-grid">
           <div className="planning-brief">
+            <label className="planning-required-field">{ru.planning.purpose} <span aria-hidden="true">*</span>
+              <textarea id="presentation-purpose" required maxLength={1000} value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={3} placeholder={ru.planning.purposePlaceholder} />
+            </label>
+            <details className="advanced-tools optional-settings">
+              <summary>{ru.planning.optionalSettings}</summary>
+              <div className="advanced-tools-content">
             <label>{ru.planning.audience}
               <input maxLength={500} value={briefAudience} onChange={(event) => setBriefAudience(event.target.value)} disabled={planningGenerating || productWorkflowRunning} placeholder={ru.planning.audiencePlaceholder} />
-            </label>
-            <label>{ru.planning.purpose}
-              <textarea maxLength={1000} value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={2} placeholder={ru.planning.purposePlaceholder} />
             </label>
             <label>{ru.planning.outcome}
               <textarea maxLength={1000} value={briefExpectedOutcome} onChange={(event) => setBriefExpectedOutcome(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={2} placeholder={ru.planning.outcomePlaceholder} />
             </label>
-            <label>{ru.planning.context}
+            <label className="planning-optional-context">{ru.planning.context}
               <textarea maxLength={16_000} value={briefContext} onChange={(event) => setBriefContext(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={3} placeholder={ru.planning.contextPlaceholder} />
             </label>
-            <label>{ru.planning.preferences} <span className="planning-label-note">{ru.planning.perLine}</span>
+            <label>{ru.planning.preferences} · {ru.planning.optionalLabel} <span className="planning-label-note">{ru.planning.perLine}</span>
               <textarea value={briefPreferences} onChange={(event) => setBriefPreferences(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={2} placeholder={ru.planning.preferencesPlaceholder} />
             </label>
             <label className="planning-slide-count">{ru.planning.slideCount} <span className="planning-label-note">{ru.planning.optionalRange}</span>
               <input type="number" min="1" max="30" step="1" value={requestedSlideCount} onChange={(event) => setRequestedSlideCount(event.target.value)} disabled={planningGenerating || productWorkflowRunning} placeholder={ru.planning.automatic} />
             </label>
+                <fieldset className="planning-file-picker">
+                  <legend>{ru.planning.sourceFiles} <span>{ru.planning.selected(planningSelectedPaths.length)}</span></legend>
+                  <div className="source-upload-row">
+                    <button className="quiet" onClick={() => sourceUploadRef.current?.click()} disabled={busy || planningGenerating || productWorkflowRunning}>{ru.planning.addSources}</button>
+                    <input ref={sourceUploadRef} className="visually-hidden" type="file" multiple aria-hidden="true" tabIndex={-1} onChange={(event) => void upload(event.target.files)} />
+                  </div>
+                  {planningSourceFiles.length ? (
+                    <div className="planning-file-list">
+                      {planningSourceFiles.map((file) => {
+                        const path = filePath(file);
+                        const sourceStatus = contentSourceStatusByPath.get(path) as ContentSourceStatus | undefined ?? 'not-parsed';
+                        return (
+                          <label className="planning-file-option" key={path} title={path}>
+                            <input type="checkbox" checked={planningSelectedPaths.includes(path)}
+                              onChange={(event) => togglePlanningFile(path, event.target.checked)}
+                              disabled={planningGenerating || productWorkflowRunning || (!planningSelectedPaths.includes(path) && planningSelectedPaths.length >= 12)} />
+                            <span>{path}</span>
+                            <small className="content-source-status" data-status={sourceStatus} aria-label={`${contentSourceStatusLabel(sourceStatus)}: ${path}`}>{contentSourceStatusLabel(sourceStatus)}</small>
+                            <small>{formatBytes(file.size)}</small>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  ) : <p className="planning-muted">{ru.planning.uploadSources}</p>}
+                </fieldset>
+              </div>
+            </details>
             <div className="planning-submit-row">
-              <span className="planning-muted">{ru.planning.requires}</span>
-              <button className="primary" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateFetching || templateAnalyzing || planning?.templateStatus !== 'ready' || !matchingScan || !briefPurpose.trim()}>
-                {planningGenerating ? ru.planning.generating : ru.planning.generate}
+              <span className="planning-muted">{ru.planning.requiredTaskNote}</span>
+              <button className="primary" onClick={() => void generatePresentation()} disabled={!templateFile || !briefPurpose.trim() || busy || productWorkflowRunning}>
+                {productWorkflowRunning ? ru.workflow.working : ru.workflow.action}
               </button>
             </div>
           </div>
         </div>
 
+        {planningWarnings.length || planningDeckPlan || planningReview ? <details className="advanced-tools planning-review-advanced">
+          <summary>{ru.planning.planDetails}</summary>
+          <div className="advanced-tools-content">
         {planningWarnings.length ? (
           <details className="planning-warnings"><summary>{ru.planning.sourceWarningCount(planningWarnings.length)}</summary><p>{ru.planning.sourceWarningSummary}</p></details>
         ) : null}
@@ -1465,6 +1499,8 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             ) : <p className="planning-muted">{ru.planning.noPlanFindings}</p>}
           </section>
         ) : null}
+          </div>
+        </details> : null}
       </section>
 
       <PresentationGenerationPanel
@@ -1478,6 +1514,8 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         onStateChange={reportGenerationState}
       />
 
+      <details className="advanced-tools developer-tools">
+        <summary>{ru.workspace.technicalTools}</summary>
       <div className="workspace-grid">
         <aside className="workspace-sidebar">
           <section className="sidebar-section">
@@ -1554,6 +1592,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
           )}
         </section>
       </div>
+      </details>
     </main>
   );
 }
@@ -1721,26 +1760,28 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
     <section className="generation-panel" id="generation-panel" aria-labelledby="generation-panel-title">
       <div className="generation-panel-head">
         <div>
-          <span className="eyebrow">{ru.generation.eyebrow}</span>
-          <h2 id="generation-panel-title">{ru.generation.title}</h2>
-          <p>{ru.generation.description}</p>
+      <span className="eyebrow">{ru.generation.eyebrow}</span>
+          <h2 id="generation-panel-title">{canExport ? ru.generation.resultReady : ru.generation.title}</h2>
+          <p>{canExport ? ru.generation.resultSummary(generation?.totalSlides ?? 0) : ru.generation.description}</p>
         </div>
         <div className="generation-actions">
           {isActive ? <button className="quiet" onClick={() => void cancel()} disabled={Boolean(busy)}>{ru.generation.cancel}</button>
-            : <button className="primary" onClick={() => void start()} disabled={!planningReady || loading || Boolean(busy) || currentGeneration && (generation?.status === 'completed' || generation?.status === 'cancelled')}>
-              {currentGeneration && generation?.status === 'failed' ? ru.generation.resume : currentGeneration && generation?.status === 'completed' ? ru.generation.generated : ru.generation.generate}
-            </button>}
+            : <details className="advanced-tools generation-advanced">
+              <summary>{ru.workspace.advancedMode}</summary>
+              <button className="primary" onClick={() => void start()} disabled={!planningReady || loading || Boolean(busy) || currentGeneration && (generation?.status === 'completed' || generation?.status === 'cancelled')}>
+                {currentGeneration && generation?.status === 'failed' ? ru.generation.resume : currentGeneration && generation?.status === 'completed' ? ru.generation.generated : ru.generation.generate}
+              </button>
+            </details>}
           <span className={`generation-status generation-status-${generation?.status ?? 'idle'}`} role="status">
             {loading ? ru.generation.loading : generation?.status === 'completed' && !currentGeneration ? ru.planning.planChanged : generation ? generationStatusLabel(generation.status) : planningReady ? ru.planning.readyToGenerate : ru.planning.waiting}
           </span>
         </div>
       </div>
 
-      {!planningReady ? <p className="generation-notice">{ru.generation.incompletePlan}</p> : null}
       <ErrorNotice failure={error} className="generation-error" />
       {generation?.failure ? <ErrorNotice role="status" className="generation-notice" failure={{
         message: friendlyErrorMessage(generation.failure.code, 500, 'generation'), code: generation.failure.code,
-      }} /> : null}
+      }} onRetry={generation.failure.code === 'VARIANTS_NOT_DISTINCT' ? undefined : () => void start()} /> : null}
 
       {generation ? <>
         <div className="generation-progress-row" role="status" aria-live="polite">
@@ -1822,18 +1863,40 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
         <section className="generation-export" aria-labelledby="generation-export-title">
           <div><span className="eyebrow">{ru.generation.exportTitle}</span><h3 id="generation-export-title">{ru.generation.exportHeading}</h3>
             <p>{ru.generation.exportDescription}</p></div>
-          <div className="generation-export-actions">
-            {(['selected', 'A', 'B', 'C'] as const).flatMap((mode) => (['pptx', 'pdf', 'html'] as const).map((format) => <button key={`${mode}-${format}`} className={mode === 'selected' && format === 'pptx' ? 'primary' : 'quiet'}
-              disabled={!canExport || Boolean(busy)} onClick={() => exportDeck(mode, format)}>
-              {busy === `export-${mode}-${format}` ? ru.generation.assembling : ru.generation.exportAction(mode, format)}
-            </button>))}
+          <div className="selected-export">
+            <span className="selected-export-label">{ru.generation.editablePowerPoint}</span>
+            <div className="generation-export-actions">
+              <button className="primary" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'pptx')}>
+                {busy === 'export-selected-pptx' ? ru.generation.assembling : ru.generation.downloadPptx}
+              </button>
+              <button className="quiet" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'pdf')}>{ru.generation.downloadPdf}</button>
+              <button className="quiet" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'html')}>{ru.generation.downloadHtml}</button>
+            </div>
           </div>
-          {generation.exports.length ? <ul className="generation-export-list">{generation.exports.map((artifact) => <li key={artifact.id}>
-            <a href={artifact.downloadUrl} download>{ru.generation.exportAction(artifact.mode, artifact.format ?? 'pptx')}</a>
+          <details className="advanced-tools variant-exports">
+            <summary>{ru.generation.otherVariants}</summary>
+            <div className="advanced-tools-content">
+              {(['A', 'B', 'C'] as const).map((mode) => <div className="variant-export-row" key={mode}>
+                <strong>{ru.generation.variant(mode)}</strong>
+                {(['pptx', 'pdf', 'html'] as const).map((format) => <button key={format} className="quiet" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck(mode, format)}>
+                  {busy === `export-${mode}-${format}` ? ru.generation.assembling : ru.generation.exportAction(mode, format)}
+                </button>)}
+              </div>)}
+              {generation.exports.some((artifact) => artifact.mode !== 'selected') ? <>
+                <strong className="previous-downloads-heading">{ru.generation.previousDownloads}</strong>
+                <ul className="generation-export-list">{generation.exports.filter((artifact) => artifact.mode !== 'selected').map((artifact) => <li key={artifact.id}>
+                  <a href={artifact.downloadUrl} download>{ru.generation.exportAction(artifact.mode, artifact.format ?? 'pptx')}</a>
+                  <span>{ru.generation.validated}</span>
+                </li>)}</ul>
+              </> : null}
+            </div>
+          </details>
+          {generation.exports.some((artifact) => artifact.mode === 'selected') ? <ul className="generation-export-list">{generation.exports.filter((artifact) => artifact.mode === 'selected').map((artifact) => <li key={artifact.id}>
+            <a href={artifact.downloadUrl} download>{artifact.format === 'pdf' ? ru.generation.downloadPdf : artifact.format === 'html' ? ru.generation.downloadHtml : ru.generation.downloadPptx}</a>
             <span>{ru.generation.validated}</span>
           </li>)}</ul> : null}
         </section>
-      </> : <p className="generation-notice">{ru.generation.noGeneration}</p>}
+      </> : <p className="generation-empty-hint">{ru.generation.noGeneration}</p>}
     </section>
   );
 }

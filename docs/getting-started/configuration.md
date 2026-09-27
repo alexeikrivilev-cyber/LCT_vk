@@ -13,7 +13,7 @@
 | `LCT_PORT` | Нет | `7456` | daemon и web proxy; нет | Порт HTTP API daemon. При заданном значении принимается только целое число 1–65535; некорректная настройка завершает запуск с ошибкой |
 | `PORT` | Нет | `3000` в локальном web; `8080` в inference image | scoped process; нет | Web port либо serving container port; эти значения не взаимозаменяемы. Dev launcher проверяет диапазон 1–65535 |
 | `LCT_DATA_DIR` | Нет | `.lct` относительно корня репозитория | daemon; нет | SQLite, проекты, исходники и результаты. Абсолютный путь тоже допустим |
-| `LCT_PPTX_BACKEND` | Нет | `custom`; допустимы `custom`, `office-kit` | daemon; нет | Выбор PPTX backend |
+| `LCT_PPTX_BACKEND` | Нет | `office-kit`; допустимы `office-kit`, `custom` | daemon; нет | Office Kit — release/default и qualification backend. `custom` оставлен только как явно выбранный legacy/diagnostic/experimental backend; он не используется для release/demo qualification. |
 | `LCT_PYTHON` | Нет | auto-discovery Python 3.12 | daemon; абсолютный executable path, не секрет | Явный Python 3.12 для структурного PPTX inspector |
 | `LCT_NEXT_DIST_DIR` | Нет | `.next/dev-<PORT>` в dev script | web dev; нет | Изолированный Next.js build directory |
 | `NODE_ENV` | Нет | задаётся Next/Node runtime | web/diagnostics; нет | Разделяет development/production diagnostics и режим Next.js |

@@ -15,6 +15,7 @@ import {
   semanticInferenceConfigFromEnvironment,
 } from '../apps/daemon/src/presentation/adapters/openai-compatible-semantic-inference.ts';
 import { SemanticInferenceError } from '../apps/daemon/src/presentation/application/semantic-inference-port.ts';
+import { QUALIFICATION_PPTX_BACKEND } from '../apps/daemon/src/presentation/application/pptx-backend-port.ts';
 import { canonicalDeterministicAuditSha256, DETERMINISTIC_AUDIT_RULE_SET_VERSION } from '../apps/daemon/src/presentation/application/deterministic-audit.ts';
 import {
   CONTEXTUAL_AUDIT_RULE_SET_VERSION,
@@ -115,6 +116,13 @@ function errorWithCode(code, message) {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+export function assertQualificationPptxBackend(actual) {
+  if (actual !== QUALIFICATION_PPTX_BACKEND) {
+    throw errorWithCode('PPTX_BACKEND_MISMATCH', `Expected qualification backend ${QUALIFICATION_PPTX_BACKEND}, received ${String(actual)}.`);
+  }
+  return actual;
 }
 
 async function resolveInputs(options) {
@@ -279,6 +287,8 @@ function safeManifestBase(options, input, model) {
     },
     sources: input.sources.map(({ name, sha256: sourceHash }) => ({ filename: name, sha256: sourceHash })),
     requestedSlides: options.slides,
+    expectedPptxBackend: QUALIFICATION_PPTX_BACKEND,
+    pptxBackend: null,
     actualSlides: null,
     semantic: {
       model,
@@ -440,7 +450,6 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
       const reachable = await probe(options.externalConfig, dependencies.fetcher ?? globalThis.fetch);
       if (!reachable) throw errorWithCode('SEMANTIC_MODELS_UNREACHABLE', 'External semantic endpoint or configured model is unavailable; no chat completion was sent.');
     }
-    env.LCT_PPTX_BACKEND = 'office-kit';
     env.LCT_DATA_DIR = path.join(outputDir, 'runtime-data');
     for (const key of ['LCT_IMAGE_BASE_URL', 'LCT_IMAGE_MODEL', 'LCT_IMAGE_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_KEY']) delete env[key];
 
@@ -458,6 +467,8 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
       serveWeb: false, returnServer: true, semanticInferenceAdapter: budget.adapter, enableSemanticProfiling: true });
     manifest.semantic.healthRequests += 1;
     await requestJson(startedServer.url, '/api/health');
+    const readiness = await requestJson(startedServer.url, '/api/readiness');
+    manifest.pptxBackend = assertQualificationPptxBackend(readiness.checks?.pptxBackend);
     const imageModels = await requestJson(startedServer.url, '/api/media/models');
     assert.equal(imageModels.configured, false, 'E2E runner must not configure or call an image service');
     assert.deepEqual(imageModels.image, []);
@@ -508,6 +519,8 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     if (planning.status !== 'ready' || planning.deckPlan?.slides?.length !== options.slides) throw errorWithCode('PLANNING_STATE_INVALID', 'Saved DeckPlan does not match requested slide count.');
     const { generation } = await requestJson(startedServer.url, `/api/projects/${encodeURIComponent(projectId)}/generation`);
     if (generation?.status !== 'completed' || generation.slides?.length !== options.slides) throw errorWithCode('GENERATION_STATE_INVALID', 'Generated slide packs are incomplete.');
+    assertQualificationPptxBackend(generation.backend);
+    if (generation.backend !== manifest.pptxBackend) throw errorWithCode('PPTX_BACKEND_DRIFT', 'The generation backend differs from daemon readiness.');
     const unready = generation.slides.flatMap((slide) => ['A', 'B', 'C'].filter((variant) => slide.variants?.[variant]?.status !== 'ready'));
     if (unready.length) throw errorWithCode('VARIANT_WITHHELD', `${unready.length} A/B/C variants are not ready.`);
     const deterministicReports = generation.slides.flatMap((slide) => ['A', 'B', 'C'].map((variant) => {

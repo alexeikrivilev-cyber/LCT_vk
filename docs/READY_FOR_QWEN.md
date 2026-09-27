@@ -1,7 +1,20 @@
 # Готовность к ограниченной Qwen qualification
 
-**STATUS: READY_FOR_QWEN**
-Базовая product acceptance проверена 2026-09-26; final pre-live hardening — 2026-09-27. Полный отчёт: [RELEASE_READINESS.md](../RELEASE_READINESS.md). Требования и organizer provenance: [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md).
+**STATUS: READY_FOR_REAL_QWEN_TOMORROW**
+**OFFLINE ENGINEERING: PASS. LIVE MODEL: PENDING.** Это готовность только к ограниченной live qualification; `CASE_COMPLIANCE_STATUS: BLOCKED` по отдельным organizer требованиям остаётся и описан в [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md). RunPod, GPU, Qwen, VK и внешний inference в этом offline pass не запускались. Полный отчёт: [RELEASE_READINESS.md](../RELEASE_READINESS.md); точная последовательность live-команд и рубрика: [LIVE_QUALIFICATION.md](../LIVE_QUALIFICATION.md).
+
+## Последний offline freeze
+
+- Release/default/qualification PPTX backend — Office Kit. `parsePptxBackend` default, `.env.example`, quickstart, readiness и canonical runner согласованы; runner завершает проверку ошибкой при backend drift. `custom` оставлен только для явного legacy/diagnostic/experimental выбора.
+- Exact WorkSpace regression: шаблон SHA-256 `1b8883114486c69dff706e9c4fd9382727c4506c2cfa3ec34f86987f1e852f2f`; task «Создай презентацию о платформе интеллектуальных ассистентов для корпоративной поддержки. Покажи проблему, решение, принцип работы, преимущества, сценарии использования, безопасность, эффект для бизнеса и следующий шаг.»; 5 слайдов, без content files и context; `ready`, 15/15 вариантов, deterministic audit без errors/warnings, contextual audit v2 11/11, ровно 4 fake calls; selected/A/B/C PPTX structural reopen, PDF и HTML validation прошли. Свежий повтор — 36.954 s. Manifest: `.lct/product-e2e/final-offline-acceptance-workspace-2026-09-27/manifest.json`.
+- Canonical VK Tech regression: 54-слайдовый шаблон SHA-256 `cbbe3aa6a21d23cebc4d1383b93dd07a9cea460d683de1903567b616c839485d`, выход 12 слайдов; 36/36 вариантов, 4 fake calls, deterministic audit без errors/warnings, contextual audit v2 11/11, selected/A/B/C PPTX, 12-страничный PDF и 12-секционный HTML прошли structural validation; свежий повтор — 95.753 s, ниже offline regression limit 150 s. Manifest: `.lct/product-e2e/final-offline-acceptance-vktech-twelve-2026-09-27/manifest.json`.
+- One-click workflow не требует ручного анализа, создания плана или запуска вариантов. Новые source files включаются при загрузке в пределах действующего лимита 12; основная кнопка ждёт завершения загрузки. Изменить список можно в расширенном режиме. Terminal `ready` и `failed` перечитывает сохранённые template/planning snapshots; generation/inference при этом не запускается.
+
+### Ручная приёмка в Microsoft PowerPoint
+
+Для конкретного пятислайдового WorkSpace fake deck передано пользователем evidence `PASS`: PowerPoint открыл файл без Repair/Recover; в нём 5 слайдов, редактируемый текст и native shapes; `Ctrl+S`, закрытие и повторное открытие прошли без Repair/Recover; branding сохранился; варианты A/B/C визуально различались. Это scoped manual evidence, не автоматическая или pixel-perfect оценка. Protected View не считается повреждением файла.
+
+Статусы качества разделены: **STRUCTURAL — PASS**; **MANUAL OFFICE — PASS** только для проверенного WorkSpace output; **SEMANTIC CONTENT — N/A** для fake; **VISUAL POLISH — PARTIAL**. Долгие заголовки могут выглядеть плотными, а в некоторых донорских композициях остаются пустые области карточек. Безопасное универсальное исправление не подтверждено: projected-fit уже влияет на отбор, а Office Kit text-layout evidence приблизительно; для произвольной пустой фигуры нет достаточной validated replaceable-slot metadata. Backlog для live review: `title-fit`, `empty-content-region quality`.
 
 ## Локальный one-click product flow
 
@@ -27,11 +40,11 @@
 
 Последний canonical runner на 54-слайдовом VK Tech template собрал 12 слайдов: template analysis 1.393 s, planning 0.485 s, generation 52.512 s, exports/reopen 21.509 s, полный fake flow **78.820 s**. Выполнены ровно четыре fake requests (profiler/Worker/planning Supervisor/contextual audit), 36/36 A/B/C готовы; deterministic audit без ошибок, contextual audit 11/11. Selected/A/B/C PPTX structurally reopened: editable native text, notes=0, package errors=0; PDF=12 страниц; HTML=12 секций; исходный шаблон не изменён. Manifest: `.lct/product-e2e/20260926212925-fake-377db269/manifest.json`; deterministic aggregate SHA-256 `a3bd9f74b407728e873b72eba015e72e4408e09337fd21d04a1a949bf78272fa`. Это не прогноз live latency.
 
-PPTX прошли структурный reopen и содержат редактируемый native text на каждом слайде; notes и package validation errors отсутствуют. PDF собран из approximate previews и прошёл reopen/page-count check. HTML прошёл structural/escaping checks. PowerPoint/LibreOffice и browser visual walkthrough здесь не выполнялись.
+PPTX прошли structural reopen и содержат редактируемый native text на каждом слайде; notes и package validation errors отсутствуют. PDF собран из approximate previews и прошёл reopen/page-count check. HTML прошёл structural/escaping checks. Browser visual walkthrough в этой qualification не запускался; ручная PowerPoint acceptance ограничена описанным выше WorkSpace output.
 
 ## Offline checks
 
-Предыдущие repository gates от 2026-09-26 дали 207 тестов; это исторический набор. Final pre-live hardening gates от 2026-09-27: pnpm 10.33.2 offline frozen install — PASS; **212/212 tests**; workspace typecheck — PASS; web/daemon builds — PASS; boundary/craft lint/docs check — PASS (55 docs); `git diff --check` — PASS. Подробности и способ вызова workspace typecheck указаны в [RELEASE_READINESS.md](../RELEASE_READINESS.md). Сам этот документ не запускает inference автоматически.
+Предыдущие repository gates от 2026-09-26 дали 207 тестов; это исторический набор. В текущем final offline acceptance: frozen install без package downloads; **219/219 tests**; workspace typecheck; web/daemon build; boundary; craft lint; docs check (55 required files); `git diff --check`. Точные команды и результаты указаны в [RELEASE_READINESS.md](../RELEASE_READINESS.md). Сам этот документ не запускает inference автоматически.
 
 ## Dual-mode runner
 

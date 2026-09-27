@@ -25,11 +25,14 @@ test('daemon CLI rejects non-loopback binding until an authentication boundary e
 
 test('health is process-only and readiness checks local dependencies without model completion', async (t) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-daemon-ready-'));
+  const previousBackend = process.env.LCT_PPTX_BACKEND;
+  delete process.env.LCT_PPTX_BACKEND;
   const started = await startServer({ host: '127.0.0.1', port: 0, dataDir: temp, projectRoot: repoRoot, serveWeb: false, returnServer: true });
   t.after(async () => {
     await closeHttpServer(started.server);
     await started.shutdown();
     await rm(temp, { recursive: true, force: true });
+    if (previousBackend === undefined) delete process.env.LCT_PPTX_BACKEND; else process.env.LCT_PPTX_BACKEND = previousBackend;
   });
 
   for (const pathName of ['/health', '/api/health']) {
@@ -44,6 +47,7 @@ test('health is process-only and readiness checks local dependencies without mod
     assert.equal(body.checks.store, 'available');
     assert.equal(body.checks.writableDirectories, 'writable');
     assert.equal(body.checks.renderer, 'initialized');
+    assert.equal(body.checks.pptxBackend, 'office-kit');
     assert.deepEqual(body.checks.semantic, { required: false, status: 'not-required' });
   }
 });
@@ -89,6 +93,7 @@ test('configured semantic readiness probes only the local models endpoint and va
   const response = await fetch(`${started.url}/readiness`);
   assert.equal(response.status, 200);
   const body = await response.json();
+  assert.equal(body.checks.pptxBackend, 'office-kit');
   assert.deepEqual(body.checks.semantic, { required: true, status: 'reachable' });
   assert.equal(remoteRequests, 1, 'readiness performs one bounded models probe, never a completion request');
   assert.equal(endpoint.listening, true);
