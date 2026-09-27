@@ -421,6 +421,109 @@ function singleSlidePlan(deckPlan, contentIR, brief, slideIndex = 4) {
   return { brief: singleBrief, deckPlan: singlePlan };
 }
 
+test('brief-task instructions never become slide copy, process steps, or factual support', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-brief-task-not-slide-copy-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const projectDir = path.join(root, 'projects', 'brief-only');
+  await mkdir(projectDir, { recursive: true });
+  const task = '1. Покажи показатель за 2025 год.\n\n2. Сформулируй следующий шаг.';
+  const context = 'Команда поддержки использует единый маршрут обработки обращений.';
+  const contentIR = await compileContentIR(root, 'brief-only', [], { task, context });
+  const taskSource = contentIR.sources.find((source) => source.kind === 'brief-task');
+  const contextSource = contentIR.sources.find((source) => source.kind === 'brief-context');
+  const taskUnits = contentIR.units.filter((unit) => unit.sourceId === taskSource.id);
+  const contextUnits = contentIR.units.filter((unit) => unit.sourceId === contextSource.id);
+  assert.ok(taskUnits.length >= 2, 'fixture task has separately parsed instructions');
+  assert.ok(contextUnits.length > 0, 'fixture includes independently supplied context');
+
+  const brief = { audience: 'Команда', purpose: task, expectedOutcome: 'Краткий обзор', preferences: [], requestedSlideCount: 1 };
+  const makePlan = (refs) => canonicalizeDeckPlan({
+    workingTitle: 'Поддержка обращений',
+    narrativeSummary: 'Проверка разделения задачи и исходного контекста.',
+    slides: [{
+      narrativeRole: 'content', purpose: 'Показать подтверждённый контекст.',
+      takeaway: 'Результат составил 2025 единиц.', contentRefs: refs, mediaRefs: [],
+      semanticVisualType: 'process', targetDensity: 'balanced',
+    }],
+  }, {
+    id: 'brief_task_projection', version: 1, createdAt: '2026-09-27T00:00:00.000Z',
+    inputFingerprint: 'b'.repeat(64), briefHash: briefHash(brief),
+    allowedContentIds: new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => unit.id)),
+    allowedMediaIds: new Set(), requestedSlideCount: 1,
+  });
+
+  const { templates } = await scenario(root);
+  const template = templates[0].templateIR;
+  const taskOnly = compilePresentation(makePlan(taskUnits.map((unit) => unit.id)), contentIR, template, VARIANT_POLICIES[0]).slides[0];
+  assert.deepEqual(taskOnly.body, [], 'imperative brief text is not presentation copy');
+  assert.deepEqual(taskOnly.visualization.processSteps, [], 'task bullets are not transformed into a process diagram');
+  assert.ok(auditCompiledPresentation({ schemaVersion: 1, variantId: 'A', variantPolicyVersion: VARIANT_POLICIES[0].version,
+    deckPlanId: 'brief_task_projection', deckPlanHash: taskOnly.deckPlanHash, contentIRHash: contentIR.hash,
+    templateIRId: template.id, templateIRHash: template.hash, slides: [taskOnly] }, contentIR, template)
+    .findings.some((finding) => finding.ruleId === 'fidelity.unsupported-number'),
+  'a year present only in the task cannot support a visible factual claim');
+
+  const withContext = compilePresentation(makePlan([...taskUnits, ...contextUnits].map((unit) => unit.id)), contentIR, template, VARIANT_POLICIES[0]).slides[0];
+  assert.deepEqual(withContext.body, [context], 'brief-context remains eligible as source-backed presentation copy');
+  assert.ok(!withContext.body.some((line) => line.includes('Покажи показатель')));
+});
+
+test('inherited title sizing is estimated relative to body typography and rejects overflowing headings', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-inherited-title-fit-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { contentIR } = await scenario(root);
+  const { templateIR: template, semanticProfile: profile } = await semanticVisualSlotFixture(root);
+  const reference = contentIR.units.find((unit) => unit.text?.includes('Revenue grew'));
+  assert.ok(reference);
+  const brief = { audience: 'Команда', purpose: 'Проверить текстовую вместимость.', expectedOutcome: 'Короткий заголовок', preferences: [], requestedSlideCount: 1 };
+  const makePlan = (takeaway) => canonicalizeDeckPlan({
+    workingTitle: 'Проверка текста', narrativeSummary: 'Тест оценки унаследованной типографики.',
+    slides: [{ narrativeRole: 'content', purpose: 'Проверить вместимость заголовка.', takeaway,
+      contentRefs: [reference.id], mediaRefs: [], semanticVisualType: 'none', targetDensity: 'compact' }],
+  }, {
+    id: 'inherited_title_fit', version: 1, createdAt: '2026-09-27T00:00:00.000Z',
+    inputFingerprint: 'c'.repeat(64), briefHash: briefHash(brief),
+    allowedContentIds: new Set(contentIR.units.filter((unit) => unit.kind !== 'media-reference').map((unit) => unit.id)),
+    allowedMediaIds: new Set(), requestedSlideCount: 1,
+  });
+  const longTitle = 'Платформа корпоративной поддержки последовательно объединяет интеллектуальные ассистенты, маршрутизацию обращений и контроль качества работы команды';
+  const shortCompiled = compilePresentation(makePlan('Поддержка обращений.'), contentIR, template, VARIANT_POLICIES[0]);
+  for (const slide of template.slides) {
+    const titleId = profile.slides.find((item) => item.sourceSlideIndex === slide.index)?.titleElementId;
+    const title = slide.elements.find((element) => element.id === titleId);
+    assert.ok(title);
+    title.directStyles.fontSizesPt = null;
+    const inheritedTitleBox = title.geometry.resolved ?? title.geometry.direct;
+    assert.ok(inheritedTitleBox);
+    inheritedTitleBox.height = Math.round(inheritedTitleBox.height * 1.2);
+  }
+  template.hash = sha256Json(templateIRHashPayload(template));
+  profile.templateIRHash = template.hash;
+  // Isolate selector text-fit estimation from the earlier layout-ranker gate.
+  const longSlide = structuredClone(shortCompiled.slides[0]);
+  longSlide.title = longTitle;
+  const longAssessment = assessExemplarSelectionRaw(longSlide, template, profile);
+  const titleFitDiagnostics = longAssessment.candidateDiagnostics.filter((item) => item.gate === 'projected-text-fit');
+  assert.ok(titleFitDiagnostics.length > 0, 'long title is rejected by the bounded projection fit gate');
+  assert.ok(titleFitDiagnostics.every((item) => item.projectedFit.title < 0.72), 'unknown direct title size is not treated as an 8 pt font');
+
+  let borderlineAssessment = null;
+  for (let wordCount = 2; wordCount <= 80 && !borderlineAssessment; wordCount += 1) {
+    const borderlineSlide = structuredClone(shortCompiled.slides[0]);
+    borderlineSlide.title = Array(wordCount).fill('Заголовок').join(' ');
+    const assessment = assessExemplarSelectionRaw(borderlineSlide, template, profile);
+    const borderlineCandidates = assessment.candidateDiagnostics.filter((item) => item.projectedFit.title >= 0.72
+      && item.projectedFit.title < 0.9);
+    if (borderlineCandidates.length) borderlineAssessment = { assessment, borderlineCandidates };
+  }
+  assert.ok(borderlineAssessment, 'fixture exposes a title whose estimated fit is between the old and conservative thresholds');
+  assert.ok(borderlineAssessment.borderlineCandidates.every((item) => item.gate === 'projected-text-fit'),
+    'titles with unknown inherited size and less than 0.9 fit are rejected before projection');
+
+  const shortAssessment = assessExemplarSelectionRaw(shortCompiled.slides[0], template, profile);
+  assert.ok(shortAssessment.safeSelections.length > 0, 'short takeaways remain eligible on the same template');
+});
+
 test('one plan compiles deterministically into three layout variants without changing text or provenance', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-slide-compile-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -684,6 +787,45 @@ test('exemplar selection maps exact donor shapes, ranks three supported families
   assert.equal(selectExemplarSlide(uncertain, first.templateIR, null), null, 'low-confidence donor geometry fails closed without semantic mapping');
 });
 
+test('trusted profiles may classify more than four body regions while projection stays bounded and clears unused source copy', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-many-profile-bodies-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'many-profile-bodies.pptx', {
+    includePicture: false,
+    evidenceFragments: 5,
+  });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const profile = semanticProfileFor(template.templateIR);
+  const donor = template.templateIR.slides.find((slide) => slide.index === 1);
+  const profileSlide = profile.slides.find((slide) => slide.sourceSlideIndex === 1);
+  assert.ok(donor && profileSlide);
+  const sourceTextElements = donor.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+    && element.nativeId && element.text?.trim() && (element.geometry.resolved ?? element.geometry.direct));
+  profileSlide.bodyElementIds = sourceTextElements.filter((element) => element.id !== profileSlide.titleElementId).map((element) => element.id);
+  profileSlide.replaceableTextElementIds = profileSlide.replaceableTextElementIds
+    .filter((id) => !profileSlide.bodyElementIds.includes(id));
+  assert.ok(profileSlide.bodyElementIds.length > 4, 'fixture reproduces a valid profile with more source body regions than the projector fills');
+  assert.ok(isValidTemplateSemanticProfile(profile, template.templateIR));
+
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[1];
+  assert.ok(compiled);
+  const assessment = assessExemplarSelection(compiled, template.templateIR, profile);
+  const donorDiagnostic = assessment.candidateDiagnostics.find((item) => item.sourceSlideIndex === 1);
+  assert.equal(donorDiagnostic?.gate, 'passed', JSON.stringify(donorDiagnostic));
+  assert.ok(donorDiagnostic.bodyRegionCount <= 4, 'projected body-region search remains bounded at four');
+  assert.deepEqual(donorDiagnostic.blockedTextElementIds, [], 'every non-projected meaningful source text region is accounted for');
+
+  const selectedElementIds = new Set(donorDiagnostic.replacedTextElementIds);
+  for (const elementId of profileSlide.bodyElementIds) {
+    const element = donor.elements.find((candidate) => candidate.id === elementId);
+    assert.ok(element?.nativeId);
+    if (!selectedElementIds.has(element.id)) {
+      assert.ok(donorDiagnostic.clearedTextElementIds.includes(element.id),
+        'unused profile-mapped body sample text is explicitly cleared');
+    }
+  }
+});
+
 test('Office Kit renderer preserves distinct projected A/B/C composition signatures', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-rendered-variant-signatures-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -801,7 +943,8 @@ test('A/B/C selection deduplicates donor families after source text cleanup', as
   const distinctness = assessVariantCompositionDistinctness(compiledTracks, template.templateIR, 'office-kit');
   assert.equal(distinctness.distinct, false);
   assert.equal(distinctness.availableDistinctFamilies, 1);
-  assert.ok(distinctness.evidence.some((item) => item.includes('could not be assigned three distinct')));
+  assert.ok(distinctness.evidence.some((item) => item.includes('Some tracks reuse a safe projected composition')),
+    'per-slide reuse is diagnostic and does not fail a complete-deck distinctness gate');
   const visibleClearedBox = structuredClone(template.templateIR);
   const styledText = visibleClearedBox.slides.find((slide) => slide.index === 9)?.elements.find((element) => element.text?.startsWith('Unique removable note'));
   assert.ok(styledText);

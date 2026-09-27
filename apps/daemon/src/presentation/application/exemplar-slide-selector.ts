@@ -218,10 +218,10 @@ function geometryBand(value: number, unit: number): number {
   return Math.round(value / unit);
 }
 
-function estimatedLineFit(text: string, element: TemplateElement): number {
+function estimatedLineFit(text: string, element: TemplateElement, minimumFontSizePt = 8): number {
   const box = geometryOf(element);
   if (!box) return 0;
-  const fontSizePt = Math.max(8, maxFont(element));
+  const fontSizePt = Math.max(8, minimumFontSizePt, maxFont(element));
   const widthPt = box.width / 12700;
   const heightPt = box.height / 12700;
   const charactersPerLine = Math.max(6, widthPt / (fontSizePt * 0.52));
@@ -229,6 +229,18 @@ function estimatedLineFit(text: string, element: TemplateElement): number {
   const requiredLines = Math.max(1, text.split(/\r?\n/).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charactersPerLine)), 0));
   const availableLines = Math.max(0.25, heightPt / lineHeightPt);
   return Number(Math.min(1, availableLines / requiredLines).toFixed(4));
+}
+
+function projectedTitleFit(text: string, title: TemplateElement, body: TemplateElement): { fit: number; minimum: number } {
+  const hasDirectTitleSize = maxFont(title) > 0;
+  const inheritedSizeEstimate = Math.max(18, maxFont(body) * 2);
+  return {
+    fit: estimatedLineFit(text, title, hasDirectTitleSize ? 8 : inheritedSizeEstimate),
+    // TemplateIR does not always expose placeholder/master typography. A local
+    // preview showed that .72 can still admit inherited titles that visibly
+    // overflow their boxes, so unknown inherited sizes require extra headroom.
+    minimum: hasDirectTitleSize ? 0.72 : 0.9,
+  };
 }
 
 function normalizedGeometry(box: TemplateGeometry, template: TemplateIR): NormalizedGeometry {
@@ -865,7 +877,10 @@ function candidateFor(
   const titleBox = title ? geometryOf(title) : null;
   if (!title || !title.nativeId || !titleBox) return reject('title-role', 'no usable mapped title text shape with native ID and geometry');
   const bodySamples = (bodyEvidence?.sourceEvidence ?? []).filter((item) => item.sourcePart === slide.sourcePart && item.slideIndex === slide.index);
-  if (trustedProfile && trustedProfile.bodyElementIds.length > 4) return reject('body-role-fit', `semantic profile mapped ${trustedProfile.bodyElementIds.length} body regions; the bounded projector supports at most four`);
+  // Profiles describe every source text region, not just the bounded number of
+  // regions the projector can fill. bodySlotsFor keeps the actual search capped
+  // at four; other explicitly mapped body regions are cleared below so their
+  // source copy cannot leak into the projected slide.
   const semanticBodyCandidates = trustedProfile?.bodyElementIds.map((id) => slide.elements.find((element) => element.id === id))
     .filter((element): element is TemplateElement => Boolean(element));
   const structuralBodyCandidates = bodySamples.map((sample) => slide.elements.find((element) => element.id === sample.elementId));
@@ -906,11 +921,12 @@ function candidateFor(
   const bodySupport = bodyEvidence?.sourceEvidence.filter((item) => item.sourcePart === slide.sourcePart).length ?? 0;
   const styleHierarchy = maxFont(title) > maxFont(body) ? 1 : 0.55;
   const geometryFit = trustedProfile ? 1 : bodyCandidates.find((item) => item.element.id === body.id)?.overlap ?? 0;
-  const titleFit = estimatedLineFit(compiled.title, title);
+  const projectedTitle = projectedTitleFit(compiled.title, title, body);
+  const titleFit = projectedTitle.fit;
   const bodyFit = Math.min(...bodyChoice.fits);
   const contentFit = Math.min(titleFit, bodyFit);
   diagnostic.projectedFit = { title: titleFit, body: bodyFit, combined: contentFit };
-  if (contentFit < 0.55) return reject('projected-text-fit', `projected title/body text fit ${contentFit}<0.55`);
+  if (titleFit < projectedTitle.minimum || bodyFit < 0.55) return reject('projected-text-fit', `projected title/body text fit title=${titleFit} (minimum ${projectedTitle.minimum}), body=${bodyFit} (minimum 0.55)`);
   const confidence = trustedProfile
     ? Number((0.42 * trustedProfile.confidence + 0.22 * geometryFit + 0.18 * styleHierarchy + 0.18 * contentFit).toFixed(4))
     : Number((0.36 * (titleEvidence?.confidence ?? 0) + 0.36 * (bodyEvidence?.confidence ?? 0)
@@ -1117,10 +1133,11 @@ function nativePlaceholderFallbackSupported(
       || !/body|obj|content|subtitle/i.test(`${body.placeholder?.type ?? ''} ${body.placeholder?.role ?? ''}`)) return false;
   const titleBox = geometryOf(title);
   const bodyBox = geometryOf(body);
+  const projectedTitle = projectedTitleFit(compiled.title, title, body);
   if (!titleBox || !bodyBox || !inCanvas(titleBox, template) || !inCanvas(bodyBox, template)
       || (titleBox.x < bodyBox.x + bodyBox.width && titleBox.x + titleBox.width > bodyBox.x
         && titleBox.y < bodyBox.y + bodyBox.height && titleBox.y + titleBox.height > bodyBox.y)
-      || estimatedLineFit(compiled.title, title) < 0.55
+      || projectedTitle.fit < projectedTitle.minimum
       || compiled.body.length > 0 && estimatedLineFit(compiled.body.join('\n'), body) < 0.55) return false;
   const master = sourceLayout.masterId ? template.masters.find((candidate) => candidate.id === sourceLayout.masterId) : null;
   // Static inherited text is not editable through the generated slide. Repetition

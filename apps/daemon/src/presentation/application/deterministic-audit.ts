@@ -85,7 +85,10 @@ export function auditCompiledPresentation(
 ): DeterministicAuditReport {
   const findings: DeterministicAuditFinding[] = [];
   const unitIds = new Set(contentIR.units.map((unit) => unit.id));
-  const sourceTextByUnit = new Map(contentIR.units.map((unit) => [unit.id, unit.text ?? unit.cellValue ?? unit.numericLexeme ?? '']));
+  const sourceById = new Map(contentIR.sources.map((source) => [source.id, source]));
+  const sourceTextByUnit = new Map(contentIR.units
+    .filter((unit) => sourceById.get(unit.sourceId)?.kind !== 'brief-task')
+    .map((unit) => [unit.id, unit.text ?? unit.cellValue ?? unit.numericLexeme ?? '']));
   const seenContent = new Map<string, string>();
 
   for (const slide of presentation.slides) {
