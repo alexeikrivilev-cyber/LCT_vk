@@ -81,9 +81,9 @@ export function isCompleteUnknownTemplateSmoke(report) {
     && requiredGates.every((gate) => report.gates?.[gate] === 'passed')
     && report.audit?.errors === 0
     && report.export?.nativeTextShapes > 0
-    && report.fakeInferenceCallCount === 3
+    && report.fakeInferenceCallCount === 2
     && Array.isArray(report.fakeInferenceRequests)
-    && report.fakeInferenceRequests.map((request) => request.operation).join(',') === 'template-semantic-profile,deck-plan,plan-review'
+    && report.fakeInferenceRequests.map((request) => request.operation).join(',') === 'deck-plan,plan-review'
     && (Number(report?.sourceResidueCheck?.forbiddenTermCount ?? 0) === 0 || report.sourceResidueCheck.status === 'passed')
     && Array.isArray(tracks) && tracks.length === 3
     && new Set(tracks.map((track) => track.mode)).size === 3

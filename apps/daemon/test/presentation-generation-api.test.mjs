@@ -731,10 +731,10 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(generation.slides.length, 3);
     assert.ok(generation.slides.every((pack) => ['A', 'B', 'C'].every((variant) => pack.variants[variant].status === 'ready')));
     assert.deepEqual(endpoint.state.inference.map((entry) => entry.operation).sort(), [
-      'contextual-deck-audit', 'deck-plan', 'plan-review', 'template-semantic-profile',
+      'contextual-deck-audit', 'deck-plan', 'plan-review',
     ].sort());
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 1);
-    assert.equal(endpoint.state.inference.length, 4);
+    assert.equal(endpoint.state.inference.length, 3);
 
     const exportArtifact = async (mode, format) => {
       const response = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
@@ -775,7 +775,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     const afterReload = await getOperation();
     assert.equal(afterReload.operationId, first.operationId);
     assert.equal(afterReload.contextualAudit.stale, true, 'changing the selected deck makes the prior semantic review stale');
-    assert.equal(endpoint.state.inference.length, 4, 'repeat reads and exports must not issue semantic inference');
+    assert.equal(endpoint.state.inference.length, 3, 'repeat reads and exports must not issue semantic inference');
 
     await closeStartedServer(started);
     started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
@@ -786,7 +786,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(restoredGeneration.defaultTrack, 'C');
     assert.equal(restoredGeneration.slides[0].lockedVariant, 'C');
     assert.equal(restoredGeneration.exports.length, 6);
-    assert.equal(endpoint.state.inference.length, 4, 'restart reuses persisted template, plan, generation, and contextual review');
+    assert.equal(endpoint.state.inference.length, 3, 'restart reuses persisted template, plan, generation, and contextual review');
 
     const sourceProjectId = 'one-click-with-optional-source';
     await createProject(started, sourceProjectId);
@@ -809,7 +809,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.deepEqual(sourcePlanning.contentFiles, ['market-context.md']);
     assert.ok(sourcePlanning.contentIR.units.some((unit) => unit.text?.includes('three customer segments')));
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 2);
-    assert.equal(endpoint.state.inference.length, 8);
+    assert.equal(endpoint.state.inference.length, 6);
 
     const recoveryDataDir = path.join(temp, 'recovery-data');
     const recoveryProjectId = 'one-click-recovery-during-generation';
@@ -831,7 +831,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     const interrupted = (await json(await fetch(`${started.url}/api/projects/${recoveryProjectId}/workflow`))).operation;
     assert.equal(interrupted.stage, 'generating');
     const callsBeforeRestart = endpoint.state.inference.length;
-    assert.equal(callsBeforeRestart - beforeRecoveryCalls, 3, 'the persisted stage follows profiler, Worker, and planning Supervisor');
+    assert.equal(callsBeforeRestart - beforeRecoveryCalls, 2, 'the persisted core stage follows Worker and planning Supervisor without template profiling');
     started.server.closeAllConnections?.();
     await new Promise((resolve, reject) => started.server.close((error) => error ? reject(error) : resolve()));
     const shutdown = started.shutdown();

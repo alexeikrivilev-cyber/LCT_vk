@@ -60,7 +60,7 @@ async function makeTemplate(filePath, { slideCount = 3 } = {}) {
 
 function workflowOptions(templatePath, outputDir, slides, task) {
   return { mode: 'fake', templatePath, task, context: '', sources: [], slides, providerLabel: 'local-test', outputDir,
-    maxSemanticRequests: 16, dryRun: false, preflightOnly: false };
+    maxSemanticRequests: 3, enableTemplateProfiler: false, dryRun: false, preflightOnly: false };
 }
 
 test('CLI validates external dry-run config without making any network request or printing secrets', async (t) => {
@@ -98,10 +98,18 @@ test('external preflight sends only one models GET and never sends chat completi
   assert.ok(!serialized.includes(env.LCT_SEMANTIC_BASE_URL));
 });
 
-test('external CLI caps configured request budgets at the versioned hard limit', () => {
-  assert.throws(() => parseArgs(['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x', '--max-semantic-requests', '17']), /between 1 and 16/u);
-  assert.equal(parseArgs(['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x', '--max-semantic-requests', '16']).maxSemanticRequests, 16);
-  assert.equal(parseArgs(['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x', '--preflight-only']).preflightOnly, true);
+test('core CLI defaults to a hard cap of three; bounded profiler mode is an explicit opt-in', () => {
+  const core = ['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x'];
+  const coreOptions = parseArgs(core);
+  assert.equal(coreOptions.enableTemplateProfiler, false);
+  assert.equal(coreOptions.maxSemanticRequests, 3);
+  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '4']), /Core mode is capped at 3/u);
+  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '17']), /between 1 and 16/u);
+  const diagnostic = parseArgs([...core, '--max-semantic-requests', '16', '--enable-template-profiler']);
+  assert.equal(diagnostic.enableTemplateProfiler, true);
+  assert.equal(diagnostic.maxSemanticRequests, 16);
+  assert.equal(parseArgs([...core, '--enable-template-profiler']).maxSemanticRequests, 16);
+  assert.equal(parseArgs([...core, '--preflight-only']).preflightOnly, true);
   assert.throws(() => parseArgs(['--semantic-mode', 'fake', '--template', 'x.pptx', '--task', 'x', '--preflight-only']), /requires --semantic-mode external/u);
 });
 
@@ -110,6 +118,7 @@ test('canonical runner enters through the same public one-click workflow endpoin
   assert.match(source, /\/workflow\/generate/u);
   assert.doesNotMatch(source, /\/planning\/generate|TemplateSemanticProfiler|PlanningService|GenerationService/u);
   assert.doesNotMatch(source, /env\.LCT_PPTX_BACKEND\s*=/u, 'runner must use the same configured backend as the UI');
+  assert.doesNotMatch(source, /enableSemanticProfiling:\s*true/u, 'core qualification must not force optional template enrichment on');
   assert.match(source, /readiness\.checks\?\.pptxBackend/u);
   assert.match(source, /generation\.backend/u);
 });
@@ -138,7 +147,19 @@ test('release PPTX backend is office-kit across defaults, env example, runner an
   assert.match(testing, /qualification backend.*Office Kit|Office Kit.*qualification backend/iu);
 });
 
-test('request budget allows at most thirteen profiler batches plus one request per fixed stage', async () => {
+test('core request budget hard-stops at three semantic completions', async () => {
+  const delegated = [];
+  const delegate = { async infer(request) { delegated.push(request.operation); return { value: {}, telemetry: {} }; } };
+  const budget = createRequestBudgetAdapter(delegate, 3);
+  const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
+  for (const operation of ['deck-plan', 'plan-review', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
+  await assert.rejects(budget.adapter.infer(request('unexpected-fourth-call')), (error) => error.code === 'RATE_LIMITED');
+  assert.deepEqual(delegated, ['deck-plan', 'plan-review', 'contextual-deck-audit']);
+  assert.equal(budget.records.length, 3);
+  assert.equal(budget.rejectedAttempts, 1);
+});
+
+test('explicit profiler diagnostic budget allows at most thirteen batches plus three fixed stages', async () => {
   const delegated = [];
   const delegate = {
     model: 'Qwen/Qwen3.8-27B',
@@ -158,7 +179,7 @@ test('request budget allows at most thirteen profiler batches plus one request p
   assert.equal(budget.rejectedAttempts, 1);
 });
 
-test('canonical one-click fake E2E accounts variable profiler batches for 3 and 12 requested slides', async (t) => {
+test('canonical one-click fake core E2E skips profiler while Worker/Supervisor/audit still run for 3 and 12 slides', async (t) => {
   const scratch = await mkdtemp(path.join(repoRoot, '.lct', 'product-e2e-test-'));
   t.after(() => rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }));
   const templatePath = path.join(scratch, 'синтетический шаблон.pptx');
@@ -180,21 +201,16 @@ test('canonical one-click fake E2E accounts variable profiler batches for 3 and 
     assert.equal(manifest.pptxBackend, 'office-kit');
     assert.equal(manifest.requestedSlides, slides);
     assert.equal(manifest.actualSlides, slides);
+    assert.equal(manifest.templateProfilerEnabled, false);
     assert.deepEqual(manifest.semantic.operationCounts, {
-      profiler: 2, worker: 1, planningSupervisor: 1, contextualAudit: 1,
-      revisionWorker: 0, other: 0, generation: 0, total: 5,
+      profiler: 0, worker: 1, planningSupervisor: 1, contextualAudit: 1,
+      revisionWorker: 0, other: 0, generation: 0, total: 3,
     });
-    assert.equal(manifest.semantic.requestCount, 5);
+    assert.equal(manifest.semantic.requestCount, 3);
     assert.ok(manifest.semantic.requests.every((request) => request.responseFormat === 'json_schema'
       && request.strictJsonSchema === true && request.httpStatus === 200
       && request.runtimeSchemaValidation === 'passed'));
-    assert.deepEqual(manifest.semantic.requests[0].templateProfilerBatch, {
-      batchNumber: 1, totalBatches: 2, sourceSlideIndexes: [1, 2, 3, 4, 5, 6],
-    });
-    assert.equal(manifest.semantic.requests[0].maxOutputTokens, 1024);
-    assert.deepEqual(manifest.semantic.requests[1].templateProfilerBatch, {
-      batchNumber: 2, totalBatches: 2, sourceSlideIndexes: [7, 8, 9],
-    });
+    assert.deepEqual(manifest.semantic.requests.map((request) => request.operation), ['deck-plan', 'plan-review', 'contextual-deck-audit']);
     assert.equal(manifest.semantic.automaticRetries, 0);
     assert.equal(manifest.generation.variantsReady, slides * 3);
     assert.equal(manifest.generation.deterministicAudit.status, 'passed');
@@ -219,7 +235,38 @@ test('canonical one-click fake E2E accounts variable profiler batches for 3 and 
     assert.equal(persisted.result, 'PASS');
   }
   assert.equal(endpoints.length, 2);
-  assert.deepEqual(endpoints.map((endpoint) => endpoint.state.inference.length), [5, 5]);
+  assert.deepEqual(endpoints.map((endpoint) => endpoint.state.inference.map((call) => call.operation)), [
+    ['deck-plan', 'plan-review', 'contextual-deck-audit'],
+    ['deck-plan', 'plan-review', 'contextual-deck-audit'],
+  ]);
+});
+
+test('explicit profiler diagnostic mode retains the bounded batched profiler path', async (t) => {
+  const scratch = await mkdtemp(path.join(repoRoot, '.lct', 'product-e2e-profiler-diagnostic-test-'));
+  t.after(() => rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }));
+  const templatePath = path.join(scratch, 'синтетический шаблон.pptx');
+  await makeTemplate(templatePath, { slideCount: 9 });
+  const endpoints = [];
+  const endpointFactory = async (options) => {
+    const endpoint = await startFakeSemanticEndpoint(options);
+    endpoints.push(endpoint);
+    return endpoint;
+  };
+  const options = workflowOptions(templatePath, path.join(scratch, 'diagnostic'), 3, 'Проверить диагностический профилировщик.');
+  options.enableTemplateProfiler = true;
+  options.maxSemanticRequests = 16;
+  const manifest = await runProductE2E(options, { startFakeSemanticEndpoint: endpointFactory });
+  assert.equal(manifest.result, 'PASS', `failed at ${manifest.failure?.stage}: ${manifest.failure?.code}`);
+  assert.equal(manifest.templateProfilerEnabled, true);
+  assert.equal(manifest.semantic.requestBudget, 16);
+  assert.equal(manifest.semantic.requestCount, 5);
+  assert.deepEqual(manifest.semantic.operationCounts, {
+    profiler: 2, worker: 1, planningSupervisor: 1, contextualAudit: 1,
+    revisionWorker: 0, other: 0, generation: 0, total: 5,
+  });
+  assert.deepEqual(manifest.semantic.requests.slice(0, 2).map((request) => request.templateProfilerBatch?.batchNumber), [1, 2]);
+  assert.equal(manifest.generation.variantsReady, 9);
+  assert.equal(endpoints[0].state.inference.length, 5);
 });
 
 test('a fake semantic request failure stops the product run without retrying', async (t) => {

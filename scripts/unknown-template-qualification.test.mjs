@@ -30,8 +30,8 @@ test('unknown-template acceptance requires every real product-smoke gate and cou
       'generation', 'variantsSelectionAndLock', 'audit', 'exportAndReopen', 'trackExportsAndReopen', 'generationReload', 'sourceImmutable']
       .map((gate) => [gate, 'passed'])),
     audit: { errors: 0 }, export: { nativeTextShapes: 6 },
-    fakeInferenceCallCount: 3,
-    fakeInferenceRequests: ['template-semantic-profile', 'deck-plan', 'plan-review'].map((operation) => ({ operation })),
+    fakeInferenceCallCount: 2,
+    fakeInferenceRequests: ['deck-plan', 'plan-review'].map((operation) => ({ operation })),
     trackExports: ['A', 'B', 'C'].map((mode) => ({ mode, reopened: true })),
   };
   assert.equal(isCompleteUnknownTemplateSmoke(report), true);
@@ -40,7 +40,7 @@ test('unknown-template acceptance requires every real product-smoke gate and cou
   report.sourceResidueCheck.status = 'failed';
   assert.equal(isCompleteUnknownTemplateSmoke(report), false);
   delete report.sourceResidueCheck;
-  assert.equal(fakeInferenceRequestCount({ fakeInferenceRequests: report.fakeInferenceRequests }), 3);
+  assert.equal(fakeInferenceRequestCount({ fakeInferenceRequests: report.fakeInferenceRequests }), 2);
   report.gates.generation = 'failed';
   assert.equal(isCompleteUnknownTemplateSmoke(report), false);
 });

@@ -1,7 +1,9 @@
 # Готовность к ограниченной Qwen qualification
 
-**STATUS: LIVE_MODEL_OUTPUT_BLOCKED**
-**ОФЛАЙН-ПРОВЕРКИ: PASS. LIVE BATCHED WORKSPACE E2E: BLOCKED ON FIRST PROFILER BATCH.** 2026-09-27 canonical WorkSpace E2E на 3 слайда вернул HTTP 200 для batch 1/5 (исходные слайды 1–6), `maxOutputTokens=1024`, `finish_reason=length`, `runtimeSchemaValidation=not-run` и `errorCode=INVALID_STRUCTURED_OUTPUT`. Provider не вернул prompt/completion token usage; latency запроса — 38,017 ms, всего workflow — 41,352 ms, поэтому context headroom неизвестен. Semantic request был один, retries — 0. Worker, planning Supervisor, generation, audit и export не запускались; VK Tech E2E пропущен, так как WorkSpace не прошёл. Manifest: `.lct/product-e2e/20260927141926-external-7ba30e40/manifest.json`. Pod не останавливался и не перезапускался. `CASE_COMPLIANCE_STATUS: BLOCKED`; RunPod не подтверждает обязательный VK inference. Подробности: [RELEASE_READINESS.md](../RELEASE_READINESS.md), [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md), [LIVE_QUALIFICATION.md](../LIVE_QUALIFICATION.md).
+**STATUS: STRUCTURAL_FALLBACK_BLOCKED**
+**ОФЛАЙН CORE E2E: BLOCKED. НОВЫХ LIVE REQUESTS: 0.** На 2026-09-27 целевой fake core WorkSpace (3 слайда, exact template hash `1b8883114486c69dff706e9c4fd9382727c4506c2cfa3ec34f86987f1e852f2f`, exact task hash `6f677ef5e815fedb2272d3ffd98d37e9862d9d34ececb04b911e2db2d4daec2a`) прошёл Worker и planning Supervisor (2/3 completion calls, profiler=0), затем fail-closed завершился `VARIANTS_NOT_DISTINCT` до аудита/экспорта; ready slides=0. С той же WorkSpace задачей explicit profiler fake diagnostic прошёл 3/3 слайда, 9/9 вариантов, deterministic audit, contextual audit 11/11, selected/A/B/C PPTX reopen, PDF/HTML и неизменностью шаблона. VK Tech 12 слайдов прошёл без профиля: 3 completion calls, 36/36 вариантов, audits/export/reopen PASS, template unchanged, 93.531 s. Exact held-out AIOS task+context (0 source files) тоже завершился `VARIANTS_NOT_DISTINCT` с profiler=0 до аудита/экспорта. Core structural fallback поэтому не квалифицирован; live WorkSpace/VK runs запрещены до решения этого блокера. Manifest outputs: `.lct/core-live-e2e-20260927/`. Ранее выполненный live profiler batch остаётся историческим: HTTP 200, batch 1/5, `maxOutputTokens=1024`, `finish_reason=length`, 38,017 ms; runtime validation не запускалась. Pod не останавливался и не перезапускался. `CASE_COMPLIANCE_STATUS: BLOCKED`; обязательная live VK inference не подтверждена. Подробности: [RELEASE_READINESS.md](../RELEASE_READINESS.md), [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md), [LIVE_QUALIFICATION.md](../LIVE_QUALIFICATION.md).
+
+Ниже перечисленные более ранние PASS результаты WorkSpace/AIOS были получены в qualification, где semantic profiler был включён. Они сохраняют историческую ценность, но не подтверждают core-путь с profiler=0.
 
 Предыдущая попытка с монолитным profiler остаётся историческим evidence: HTTP 400 `input_tokens` context overflow при запрошенных 2,784 output tokens. В текущем run наблюдалось усечение ответа; qualification не завершена.
 
@@ -52,7 +54,7 @@ PPTX прошли structural reopen и содержат редактируемы
 
 ## Dual-mode runner
 
-`LIVE_PATH_STATUS: LIVE_PATH_READY` означает готовность runner и его request cap, не успешный model workflow. Текущий внешний run выполнил один profiler batch, получил HTTP 200, но завершился `finish_reason=length`; token usage отсутствует, а runtime schema validation не запускалась. Автоматических retry не было. Локальные fake runs подтверждают wiring/schema, но не live model output.
+`LIVE_PATH_STATUS: BLOCKED`: runner budget/regression tests проходят, но core no-profile generation не проходит offline real-template acceptance на WorkSpace и held-out AIOS. Исторический внешний run выполнил один profiler batch и завершился `finish_reason=length`; token usage отсутствует, а runtime schema validation не запускалась. Live core qualification не начиналась в этом pass. Новые live requests запрещены до снятия структурного блокера.
 
 ## Live-only risks
 

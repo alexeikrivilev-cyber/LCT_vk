@@ -71,7 +71,7 @@ export interface StartServerOptions {
   returnServer?: boolean;
   semanticInferenceAdapter?: SemanticInferenceAdapter;
   semanticInferenceAdapterFactory?: () => SemanticInferenceAdapter;
-  /** Explicitly opt in to template profiling when the inference adapter is injected. */
+  /** Explicit opt-in to the optional semantic template profiler, regardless of adapter source. */
   enableSemanticProfiling?: boolean;
   /** Replaceable renderer seam used by offline application tests. */
   presentationRenderer?: PptxRendererPort;
@@ -210,7 +210,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   if (!hasInjectedSemanticAdapter && semanticConfig) semanticAdapter = new OpenAICompatibleSemanticInferenceAdapter(semanticConfig);
   const getSemanticAdapter = () => semanticAdapter ??= options.semanticInferenceAdapterFactory?.()
     ?? new OpenAICompatibleSemanticInferenceAdapter(semanticConfig ?? semanticInferenceConfigFromEnvironment());
-  const semanticProfilingEnabled = options.enableSemanticProfiling ?? Boolean(semanticConfig);
+  // Template semantic enrichment is optional and must never become a critical-path
+  // dependency merely because Worker/Supervisor inference is configured.
+  const semanticProfilingEnabled = options.enableSemanticProfiling === true;
   const templateProfilers = new Map<string, TemplateSemanticProfiler>();
   const profileTemplate = semanticProfilingEnabled ? async (projectId: string, snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>) => {
     if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {

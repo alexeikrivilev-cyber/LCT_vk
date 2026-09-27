@@ -7,6 +7,7 @@ import test from 'node:test';
 import { register } from 'tsx/esm/api';
 
 import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
+import { startFakeSemanticEndpoint } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
 
 register();
 const { startServer } = await import('../src/server.ts');
@@ -243,5 +244,53 @@ test('semantic profiler failure is not reported or persisted as structural PPTX 
   } finally {
     await new Promise((resolve, reject) => started.server.close((error) => error ? reject(error) : resolve()));
     await started.shutdown();
+  }
+});
+
+test('configured semantic endpoint does not opt structural template compilation into optional profiling', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profiler-default-off-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const endpoint = await startFakeSemanticEndpoint({ model: 'offline-configured-endpoint' });
+  t.after(() => endpoint.close());
+  const envKeys = ['LCT_SEMANTIC_BASE_URL', 'LCT_SEMANTIC_MODEL', 'LCT_SEMANTIC_API_KEY', 'LCT_SEMANTIC_ENABLE_THINKING'];
+  const previous = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  process.env.LCT_SEMANTIC_BASE_URL = endpoint.baseUrl;
+  process.env.LCT_SEMANTIC_MODEL = 'offline-configured-endpoint';
+  process.env.LCT_SEMANTIC_ENABLE_THINKING = 'false';
+  delete process.env.LCT_SEMANTIC_API_KEY;
+  t.after(() => {
+    for (const key of envKeys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+  });
+
+  const started = await startServer({
+    host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
+    serveWeb: false, returnServer: true,
+  });
+  const projectId = 'structural-template-only';
+  try {
+    const created = await fetch(`${started.url}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: projectId, name: 'Structural template understanding' }),
+    });
+    assert.equal(created.status, 201);
+    const template = await makeSyntheticPptx({ slideCount: 2, layoutCount: 2, nestedTemplateGroups: true });
+    const upload = new FormData();
+    upload.append('files', new Blob([template]), 'structural-template.pptx');
+    assert.equal((await fetch(`${started.url}/api/projects/${projectId}/upload`, { method: 'POST', body: upload })).status, 200);
+    const response = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'structural-template.pptx' }),
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const compiled = await response.json();
+    assert.equal(compiled.status, 'ready');
+    assert.ok(compiled.templateIR?.hash);
+    assert.ok(compiled.presentationDesignSystem);
+    assert.equal(endpoint.state.inference.length, 0, 'a configured model endpoint does not trigger optional Template Semantic Profiler calls');
+  } finally {
+    await closeStartedServer(started);
   }
 });

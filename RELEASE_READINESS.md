@@ -1,7 +1,9 @@
 # Готовность продукта к live qualification
 
-**STATUS: LIVE_MODEL_OUTPUT_BLOCKED**
-**ОФЛАЙН-ПРОВЕРКИ: PASS. БАТЧЕВАЯ LIVE WORKSPACE E2E: BLOCKED НА ПЕРВОМ PROFILER BATCH.** 2026-09-27 один canonical external WorkSpace E2E вернул HTTP 200 для batch 1/5 (исходные слайды 1–6), но `finish_reason=length` при `maxOutputTokens=1024`; runtime schema validation не запускалась, запрос завершился `INVALID_STRUCTURED_OUTPUT`. Provider не вернул prompt/completion usage: headroom относительно serving context 16,384 неизвестен. Batch latency — 38.017 s; полный workflow завершился за 41.352 s; retries — 0. Worker/Supervisor/generation/audit/export не запускались; VK Tech E2E пропущен по условию полного WorkSpace PASS. Manifest: `.lct/product-e2e/20260927141926-external-7ba30e40/manifest.json`. Предыдущий monolithic HTTP 400 context overflow сохранён как историческое evidence в `.lct/live-qwen-qualification/workspace-profiler-fix-20260927-164121/manifest.json`. Pod не останавливался и не перезапускался. `CASE_COMPLIANCE_STATUS: BLOCKED`; RunPod не подтверждает обязательный VK inference. Commit/push не выполнялись.
+**STATUS: STRUCTURAL_FALLBACK_BLOCKED**
+**OFFLINE CORE E2E: BLOCKED. НОВЫХ LIVE REQUESTS: 0.** Fake core WorkSpace (3 slides, 0 sources, task hash `6f677ef5e815fedb2272d3ffd98d37e9862d9d34ececb04b911e2db2d4daec2a`) passed Worker and planning Supervisor, then stopped before audit/export with `VARIANTS_NOT_DISTINCT` (readySlides=0; profiler=0; 2/3 semantic calls). The same task/template with explicit fake profiler diagnostic passed 3/3 slides, A/B/C 9/9, deterministic audit, contextual audit 11/11, selected/A/B/C PPTX reopen, PDF/HTML, and source immutability. Core VK Tech (12 slides) passed without profiler in 93.531 s, 3 semantic calls, 36/36 variants, audit/export/reopen and unchanged source. Exact held-out AIOS task+context (0 source files) also stopped with `VARIANTS_NOT_DISTINCT` before audit/export. Do not run external qualification until the structural fallback blocker is resolved without weakening fail-closed composition distinctness. Current run artifacts are under `.lct/core-live-e2e-20260927/`.
+
+The older profiler live attempt remains separate historical evidence: WorkSpace batch 1/5 returned HTTP 200 but `finish_reason=length` at `maxOutputTokens=1024`; validation was not reached (38.017 s, no provider token usage). It did not qualify the core flow. The preceding monolithic request returned HTTP 400 context overflow. Pod was not stopped or restarted. `CASE_COMPLIANCE_STATUS: BLOCKED`; required live VK inference is unverified. No commit/push.
 
 ## CASE COMPLIANCE
 
@@ -34,6 +36,8 @@
 | Education | задача, 0 контекста/файлов | 3 | A/B/C, 9 ready | selected/A/B/C PPTX | PASS |
 | AIOS held-out | задача, 0 контекста/файлов | 3 | A/B/C, 9 ready | selected/A/B/C PPTX; source residue: 80 уникальных фраз × 4 режима, совпадений 0 | PASS |
 
+Все PASS в этой таблице — исторические qualification runs с profiler enabled; они не подтверждают текущий core режим с profiler=0. Текущие real-template no-profile результаты и блокер приведены в шапке и ниже.
+
 В исторической acceptance-матрице было 16 fake semantic calls: по 1 profiler, Worker, planning Supervisor и contextual audit на каждый из четырёх шаблонов. Внешних запросов — 0. Её persisted contextual results содержат 9 правил v1 и теперь считаются stale evidence; это не текущая проверка v2. На всех reopened PPTX проверены число слайдов, native editable text на каждом слайде, отсутствие notes и ошибок package validation. PDF повторно открыт и содержит 12 страниц; HTML содержит 12 slide sections.
 
 ## AUDIT / EXPORT
@@ -49,7 +53,7 @@
 
 ## DUAL-MODE RUNNER
 
-**LIVE_PATH_STATUS: LIVE_PATH_READY** — это готовность canonical runner и его лимита, не успешная live acceptance. Последний внешний WorkSpace workflow прошёл через `/api/projects/:id/workflow/generate`, отправил один Qwen profiler batch и остановился на `finish_reason=length` (`maxOutputTokens=1024`). Runtime validation не запускалась; provider usage отсутствует. Ретраев не было; Worker/Supervisor/contextual-audit/generation calls — 0. Endpoint URL и credentials в manifest отсутствуют. Предшествовавший HTTP 400 `input_tokens` context overflow был на monolithic profiler до batching.
+**LIVE_PATH_STATUS: BLOCKED** — canonical runner budget/regression tests pass, но offline real-template core generation без профиля блокируется на WorkSpace и AIOS. Исторический внешний WorkSpace workflow остановился на profiler batch с `finish_reason=length`; он не достиг Worker. Endpoint URL и credentials в manifest отсутствуют. Предшествовавший HTTP 400 context overflow был на monolithic profiler до batching.
 
 ## UI / DOCUMENTATION
 
@@ -120,7 +124,7 @@ Request budget для этого run: profiler 1, Worker 1, planning Supervisor 
 ### Репозиторные gates
 
 - `pnpm dlx pnpm@10.33.2 install --frozen-lockfile --offline` — PASS; lockfile актуален, 0 downloaded.
-- `pnpm dlx pnpm@10.33.2 test` — **233/233 PASS**; profiler/adapter/runner targeted suite — **34/34 PASS**; целевой profiler suite после final guard — **11/11 PASS**.
+- Текущая targeted regression suite — **25/25 PASS**. Полный suite/typecheck/build/boundary/lint/docs gates не запускались после обнаружения offline real-template blocker; ранее записанные 233 теста/gates относятся к предыдущему состоянию и не квалифицируют новый core путь.
 - `corepack pnpm@10.33.2 --filter @lct/web run typecheck` и аналогичная команда для daemon — PASS.
 - Web и daemon build через pnpm 10.33.2 — PASS; пользовательские изменения `apps/web/next-env.d.ts` и `apps/web/tsconfig.json` сохранены после сборки.
 - `check:boundary`, `lint:craft`, `docs:check` — PASS; docs check: 56 required files, локальные ссылки разрешаются.
@@ -146,4 +150,4 @@ Offline/fake checks не подтверждают Qwen quality или latency. �
 
 ## NEXT ACTION
 
-Остановлена после одного truncated WorkSpace profiler batch. Нового live запроса в рамках этого pass нет. До следующего запуска offline разберите output truncation; serving context и runtime не менялись. Worker, Supervisor и contextual audit в live не проверялись; generation calls — 0.
+Остановлена после двух real-template fake core failures с `VARIANTS_NOT_DISTINCT` (WorkSpace, AIOS). Следующий шаг: исследовать evidence/selector compatibility для structural no-profile path и закрыть WorkSpace + held-out AIOS offline без изменения fail-closed safety gate; затем повторить full offline gates. До этого не запускать live inference. Serving context/runtime не менялись; новых live запросов не было.

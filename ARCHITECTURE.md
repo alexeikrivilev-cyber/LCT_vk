@@ -45,11 +45,11 @@ Worker и Supervisor — разные роли запросов к одному 
 ```mermaid
 flowchart LR
   T[PPTX] --> TI[Детерминированная инспекция: TemplateIR / PDS]
-  T --> SP[Опциональный Template Semantic Profile]
+  T -. optional enrichment .-> SP[Опциональный Template Semantic Profile]
   C[Исходные материалы] --> CI[ContentIR]
   B[Бриф] --> W[Worker: план]
   TI --> W
-  SP --> W
+  SP -. если включён .-> W
   CI --> W
   W --> DP[Валидированный DeckPlan]
   DP --> S[Supervisor: bounded review]
@@ -62,6 +62,8 @@ flowchart LR
 ```
 
 Semantic решение может сформировать план или оценку роли шаблонного слайда. Код проверяет ID, схему, источники и лимиты; владеет геометрией, объектами PowerPoint, очередью, locks, persistence, ремонтом, аудитом и экспортом. Модельный вывод не меняет PPTX или state до runtime validation.
+
+Структурное понимание шаблона (`TemplateIR` / PDS) — часть core workflow. `TemplateSemanticProfiler` отключён по умолчанию даже при настроенном semantic endpoint и остаётся отдельным enrichment path. Однако способность структурного selector безопасно выдать три различные композиции зависит от конкретного шаблона: в текущей fake qualification без профиля WorkSpace (3 слайда) и held-out AIOS (3 слайда) остановились с `VARIANTS_NOT_DISTINCT`, тогда как VK Tech (12 слайдов) прошёл. Поэтому отсутствие profiler не считается доказанной заменой профиля для всех шаблонов; core workflow пока не квалифицирован и не должен запускаться live до решения этого блокера. Generation fail-closed поведение сохраняется.
 
 ## Состояние, хранение и кэш
 

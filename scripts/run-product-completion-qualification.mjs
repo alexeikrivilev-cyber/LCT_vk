@@ -169,7 +169,10 @@ async function main() {
     const { inspectOfficeKitPackage } = await import('../apps/daemon/src/presentation/adapters/office-kit-package-inspector.ts');
     const officePackageJson = daemonRequire.resolve('@office-kit/pptx/package.json');
     const office = await import(pathToFileURL(path.join(path.dirname(officePackageJson), 'dist/node.js')));
-    server = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
+    // This legacy matrix specifically qualifies the optional profiler; the
+    // production core and canonical live runner leave it disabled by default.
+    server = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
+      serveWeb: false, returnServer: true, enableSemanticProfiling: true });
     const imageModels = await requestJson(server.url, '/api/media/models');
     assert.equal(imageModels.configured, false);
     assert.deepEqual(imageModels.image, []);

@@ -1,6 +1,7 @@
 {
-  "schemaVersion": 2,
-  "maxSemanticRequests": 16,
+  "schemaVersion": 3,
+  "coreMaxSemanticRequests": 3,
+  "profilerModeMaxSemanticRequests": 16,
   "maxProfilerRequests": 13,
   "requiredOperations": {
     "deck-plan": 1,
