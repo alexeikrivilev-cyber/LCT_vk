@@ -460,6 +460,13 @@ test('changing the versioned template-profiler prompt invalidates its project pr
   const promptDirectory = path.join(root, 'prompts');
   await mkdir(promptDirectory, { recursive: true });
   const sourcePrompt = await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8');
+  const normalizedPrompt = sourcePrompt.replace(/\s+/g, ' ');
+  assert.match(normalizedPrompt, /AT MOST ONE role/u);
+  for (const role of ['titleElementId', 'bodyElementIds', 'visualElementIds', 'preservedElementIds', 'replaceableTextElementIds']) {
+    assert.ok(normalizedPrompt.includes(role), `the role-exclusivity rule must name ${role}`);
+  }
+  assert.match(normalizedPrompt, /Never use the same ID in two fields/u);
+  assert.match(normalizedPrompt, /single best-supported role/u);
   const promptPath = path.join(promptDirectory, 'template-profiler.v2.md');
   await writeFile(promptPath, sourcePrompt, 'utf8');
   const endpoint = await startFakeSemanticEndpoint({ model });
@@ -467,11 +474,14 @@ test('changing the versioned template-profiler prompt invalidates its project pr
   const cache = projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile');
 
   const first = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache, { promptDirectory });
+  const initialCacheKey = await first.profileCacheKey(templateIR);
   await first.profile(templateIR, presentationDesignSystem);
   assert.equal(endpoint.state.inference.length, 1);
   await writeFile(promptPath, `${sourcePrompt}\nUse no inferred template identity.\n`, 'utf8');
 
   const changedPrompt = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache, { promptDirectory });
+  assert.notEqual(await changedPrompt.profileCacheKey(templateIR), initialCacheKey,
+    'changed prompt content must change the semantic-profile cache fingerprint');
   await changedPrompt.profile(templateIR, presentationDesignSystem);
   assert.equal(endpoint.state.inference.length, 2, 'prompt contents contribute to the persistent cache key');
 });
