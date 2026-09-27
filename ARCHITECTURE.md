@@ -45,16 +45,17 @@ Worker и Supervisor — разные роли запросов к одному 
 ```mermaid
 flowchart LR
   T[PPTX] --> TI[Детерминированная инспекция: TemplateIR / PDS]
-  T -. optional enrichment .-> SP[Опциональный Template Semantic Profile]
+  TI --> PREP[TemplateSemanticProfiler: подготовка и сохранение профиля]
   C[Исходные материалы] --> CI[ContentIR]
-  B[Бриф] --> W[Worker: план]
-  TI --> W
-  SP -. если включён .-> W
+  B[Бриф] --> W
   CI --> W
+  PREP --> SP[Проверенный TemplateSemanticProfile в существующем кэше]
+  SP --> W
   W --> DP[Валидированный DeckPlan]
   DP --> S[Supervisor: bounded review]
   S --> G[A/B/C компиляция из общего плана]
   TI --> G
+  SP --> G
   CI --> G
   G --> R[Native-object renderer]
   R --> A[Детерминированный audit]
@@ -63,7 +64,9 @@ flowchart LR
 
 Semantic решение может сформировать план или оценку роли шаблонного слайда. Код проверяет ID, схему, источники и лимиты; владеет геометрией, объектами PowerPoint, очередью, locks, persistence, ремонтом, аудитом и экспортом. Модельный вывод не меняет PPTX или state до runtime validation.
 
-Структурное понимание шаблона (`TemplateIR` / PDS) — часть core workflow. `TemplateSemanticProfiler` отключён по умолчанию даже при настроенном semantic endpoint и остаётся отдельным enrichment path. Однако способность структурного selector безопасно выдать три различные композиции зависит от конкретного шаблона: в текущей fake qualification без профиля WorkSpace (3 слайда) и held-out AIOS (3 слайда) остановились с `VARIANTS_NOT_DISTINCT`, тогда как VK Tech (12 слайдов) прошёл. Поэтому отсутствие profiler не считается доказанной заменой профиля для всех шаблонов; core workflow пока не квалифицирован и не должен запускаться live до решения этого блокера. Generation fail-closed поведение сохраняется.
+Структурное понимание шаблона (`TemplateIR` / PDS) и валидный `TemplateSemanticProfile` — части обычной подготовки шаблона. Подготовка выполняется через существующий template compile path и сохраняет профиль в существующем кэше. Generate читает подготовленный профиль только из кэша; на cache miss или при невалидном профиле возвращает `TEMPLATE_PROFILE_NOT_READY` и не запускает `TemplateSemanticProfiler`. Профиль не передаётся фронтенду целиком. Ошибка подготовки не считается состоянием «шаблон готов»; selector и generation остаются fail-closed, включая gate различимости вариантов.
+
+Текущая fake acceptance заблокирована на held-out AIOS: профиль был готов, Worker и planning Supervisor завершились, но генерация отказала с `VARIANTS_NOT_DISTINCT`. Это не доказательство live качества. WorkSpace profile-before-Generate прошёл локальную fake-проверку; полный набор реальных шаблонов и live inference не квалифицированы. См. [статус qualification](./docs/READY_FOR_QWEN.md).
 
 ## Состояние, хранение и кэш
 

@@ -103,7 +103,9 @@ test('deterministic and contextual audit sources are visibly distinct and repair
 test('normal user flow requires only a template and task; optional fields stay collapsed', () => {
   const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
   assert.match(appSource, /fetch\(`\/api\/projects\/\$\{encodeURIComponent\(projectId\)\}\/workflow\/generate`/u);
-  assert.match(appSource, /<button className="primary" onClick=\{\(\) => void generatePresentation\(\)\} disabled=\{!templateFile \|\| !briefPurpose\.trim\(\) \|\| busy \|\| productWorkflowRunning\}>/u, 'one-click generation waits for current uploads to settle');
+  assert.match(appSource, /<button className="primary" onClick=\{\(\) => void generatePresentation\(\)\} disabled=\{!templateFile \|\| !templatePreparationReady \|\| !briefPurpose\.trim\(\) \|\| busy \|\| templatePreparationPending \|\| productWorkflowRunning\}>/u, 'one-click generation waits for a complete prepared profile');
+  assert.match(appSource, /templatePreparationReady = matchingScan && templateScan\?\.status === 'ready' && templateProfileStatus === 'ready'/u,
+    'generation remains disabled until the persisted semantic profile validates');
   assert.match(appSource, /<button className=\{templateFile \? 'quiet' : 'primary'\} onClick=\{\(\) => uploadRef\.current\?\.click\(\)\}/u);
   assert.match(appSource, /<label className="planning-required-field">[\s\S]*<textarea id="presentation-purpose" required/u);
   const optionalStart = appSource.indexOf('<details className="advanced-tools optional-settings">');
@@ -158,6 +160,7 @@ test('known design-system names use Russian display labels while preserving thei
 
 test('API failures map to safe user messages without echoing raw server details', () => {
   assert.match(friendlyErrorMessage('TEMPLATE_COMPILE_FAILED', 500, 'template'), /шаблон/i);
+  assert.equal(friendlyErrorMessage('TEMPLATE_PROFILE_NOT_READY', 409, 'generation'), ru.template.prepareBeforeGenerate);
   assert.equal(friendlyErrorMessage('PROVIDER_ERROR', 502, 'template'), ru.errors.semantic,
     'semantic profiling failures during template analysis must not be described as damaged PPTX');
   assert.match(friendlyErrorMessage('LIMIT_FILE_SIZE', 413, 'upload'), /файл превышает/i);

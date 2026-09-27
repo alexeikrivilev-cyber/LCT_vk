@@ -73,6 +73,37 @@ async function removeTempDirectory(directory) {
 
 async function json(response) { return response.json(); }
 
+function templateProfileOnlyAdapter(calls = []) {
+  return {
+    calls,
+    async infer(request) {
+      calls.push(request.operation);
+      assert.equal(request.operation, 'template-semantic-profile', 'generation requests are forbidden in this adapter');
+      const evidence = JSON.parse(request.messages.at(-1).content);
+      return { value: {
+        templateIRHash: evidence.templateIRHash,
+        slides: evidence.slides.map((slide) => {
+          const elements = slide.elements.filter((element) => typeof element.text === 'string' && element.text.trim());
+          const title = elements.find((element) => element.placeholderRole === 'title') ?? elements[0] ?? null;
+          const bodies = elements.filter((element) => element.id !== title?.id && element.placeholderRole === 'body');
+          return {
+            sourceSlideIndex: slide.sourceSlideIndex,
+            archetype: 'content',
+            supportedContentModes: ['text', 'metrics', 'table', 'chart', 'diagram', 'image', 'mixed'],
+            titleElementId: title?.id ?? null,
+            bodyElementIds: bodies.map((element) => element.id),
+            visualElementIds: [],
+            preservedElementIds: [],
+            replaceableTextElementIds: [],
+            confidence: 0.8,
+            reasonCodes: ['offline_test_profile'],
+          };
+        }),
+      }, telemetry: {} };
+    },
+  };
+}
+
 async function waitFor(operation, predicate, label, timeoutMs = 45000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
@@ -256,11 +287,12 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
   const dataDir = path.join(temp, 'data');
   const projectId = 'progressive-generation';
   const inferenceCalls = [];
-  const inferenceAdapter = { async infer(request) { inferenceCalls.push(request); throw new Error('generation must not call inference'); } };
+  const inferenceAdapter = templateProfileOnlyAdapter(inferenceCalls);
   const secondSlideId = 'slide_offline-ready-plan_3';
   const gate = gateRenderer(secondSlideId);
   const options = {
     host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+    enableSemanticProfiling: true,
     semanticInferenceAdapter: inferenceAdapter,
     presentationRenderer: gate.renderer,
   };
@@ -274,7 +306,7 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     const planView = await json(await fetch(`${started.url}/api/projects/${projectId}/planning`));
     assert.equal(planView.status, 'ready');
     assert.equal(planView.deckPlan.hash, seeded.plan.hash);
-    assert.equal(inferenceCalls.length, 0);
+    assert.deepEqual(inferenceCalls, ['template-semantic-profile']);
 
     const startResponse = await fetch(`${started.url}/api/projects/${projectId}/generation`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'Idempotency-Key': 'offline-generation-v1' }, body: '{}',
@@ -355,7 +387,7 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
       'each slide pack validates A/B/C through one renderer pass');
     assert.equal(gate.renderSlideCounts.filter((count) => count === 1).length, 1,
       'a local single-variant repair still uses a one-slide renderer pass');
-    assert.equal(inferenceCalls.length, 0, 'variants, repair, and export must not call semantic inference');
+    assert.equal(inferenceCalls.length, 1, 'variants, repair, and export must not call semantic inference');
     assert.ok(completed.slides.every((pack) => pack.status === 'ready' && variants.every((variant) => pack.variants[variant].previewUrl)));
 
     const previewResponse = await fetch(`${started.url}${completed.slides[0].variants.B.previewUrl}`);
@@ -435,7 +467,7 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
         assert.match(html, /<h1 class="slide-title"/);
       }
     }
-    assert.equal(inferenceCalls.length, 0);
+    assert.equal(inferenceCalls.length, 1);
 
     const stateDb = new Database(path.join(dataDir, 'app.sqlite'), { readonly: true });
     const persisted = stateDb.prepare('SELECT state_json FROM presentation_generations WHERE project_id = ?').get(projectId);
@@ -466,7 +498,7 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
     assert.equal(repeatedExport.status, 201);
     assert.equal((await json(repeatedExport)).artifact.id, exportBody.artifact.id, 'the same export request stays idempotent after daemon restart');
     assert.equal((await fetch(`${started.url}${reloaded.slides[0].variants.B.previewUrl}`)).status, 200);
-    assert.equal(inferenceCalls.length, 0);
+    assert.equal(inferenceCalls.length, 1);
   } finally {
     gate.release();
     await closeStartedServer(started);
@@ -496,7 +528,7 @@ test('a later renderer failure preserves earlier ready packs and explicit cancel
   try {
     started = await startServer({
       host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
-      semanticInferenceAdapter: { async infer() { throw new Error('generation must not call inference'); } },
+      semanticInferenceAdapter: templateProfileOnlyAdapter(),
       presentationRenderer: failingRenderer,
     });
     await createProject(started, projectId);
@@ -528,7 +560,7 @@ test('generation cancellation is explicit, preserves ready work, and survives re
   process.env.LCT_PPTX_BACKEND = 'office-kit';
   let started = await startServer({
     host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
-    semanticInferenceAdapter: { async infer() { throw new Error('generation must not call inference'); } },
+    semanticInferenceAdapter: templateProfileOnlyAdapter(),
     presentationRenderer: gate.renderer,
   });
   try {
@@ -553,7 +585,7 @@ test('generation cancellation is explicit, preserves ready work, and survives re
     await closeStartedServer(started);
     started = await startServer({
       host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
-      semanticInferenceAdapter: { async infer() { throw new Error('generation must not call inference'); } },
+      semanticInferenceAdapter: templateProfileOnlyAdapter(),
     });
     const reloaded = await getGeneration(started, projectId);
     assert.equal(reloaded.status, 'cancelled');
@@ -577,7 +609,7 @@ test('daemon restart recovers pending packs and keeps already published artifact
   process.env.LCT_PPTX_BACKEND = 'office-kit';
   let started = await startServer({
     host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
-    semanticInferenceAdapter: { async infer() { throw new Error('generation must not call inference'); } },
+    semanticInferenceAdapter: templateProfileOnlyAdapter(),
     presentationRenderer: gate.renderer,
   });
   try {
@@ -605,7 +637,7 @@ test('daemon restart recovers pending packs and keeps already published artifact
 
     started = await startServer({
       host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
-      semanticInferenceAdapter: { async infer() { throw new Error('generation must not call inference'); } },
+      semanticInferenceAdapter: templateProfileOnlyAdapter(),
     });
     const completed = await waitFor(() => getGeneration(started, projectId), (state) => state.status === 'completed', 'recovered generation');
     assert.equal(completed.readySlides, 3);
@@ -631,7 +663,7 @@ test('a changed ready plan can replace a completed generation with a fresh idemp
   try {
     started = await startServer({
       host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
-      semanticInferenceAdapter: { async infer() { throw new Error('generation must not call inference'); } },
+      semanticInferenceAdapter: templateProfileOnlyAdapter(),
     });
     await createProject(started, projectId);
     const firstPlan = await seedReadyPlanningState(started, dataDir, projectId);
@@ -684,13 +716,34 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
   for (const key of Object.keys(oldConfig.image)) delete process.env[key];
   let started;
   try {
-    started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
+    started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
+      serveWeb: false, returnServer: true });
     await createProject(started, projectId);
     const imageModels = await json(await fetch(`${started.url}/api/media/models`));
     assert.deepEqual(imageModels.image, []);
     assert.equal(imageModels.configured, false);
     const pptx = await makeValidSyntheticPptx(path.join(temp, 'template'));
     await upload(started, projectId, 'synthetic-template.pptx', pptx);
+    const preparedResponse = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'synthetic-template.pptx' }),
+    });
+    assert.equal(preparedResponse.status, 200, await preparedResponse.clone().text());
+    const prepared = await json(preparedResponse);
+    assert.equal(prepared.status, 'ready');
+    assert.equal(prepared.semanticProfile.status, 'disabled');
+    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, 0);
+    const persistedTemplateState = await json(await fetch(`${started.url}/api/projects/${projectId}/template`));
+    assert.equal(persistedTemplateState.status, 'ready');
+    assert.equal(persistedTemplateState.semanticProfile.status, 'disabled');
+    assert.equal(Object.hasOwn(persistedTemplateState, 'semanticProfileData'), false, 'status API does not return the full profile');
+    const repeatedPreparation = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'synthetic-template.pptx' }),
+    });
+    assert.equal(repeatedPreparation.status, 200);
+    assert.equal((await json(repeatedPreparation)).semanticProfile.status, 'disabled');
+    const profilerCallsBeforeGenerate = endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length;
     const input = {
       templateFilePath: 'synthetic-template.pptx',
       contentFiles: [],
@@ -735,6 +788,8 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     ].sort());
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 1);
     assert.equal(endpoint.state.inference.length, 3);
+    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, profilerCallsBeforeGenerate,
+      'Generate reuses the prepared profile and makes zero profiler requests');
 
     const exportArtifact = async (mode, format) => {
       const response = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
@@ -775,7 +830,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     const afterReload = await getOperation();
     assert.equal(afterReload.operationId, first.operationId);
     assert.equal(afterReload.contextualAudit.stale, true, 'changing the selected deck makes the prior semantic review stale');
-    assert.equal(endpoint.state.inference.length, 3, 'repeat reads and exports must not issue semantic inference');
+    assert.equal(endpoint.state.inference.length, 3, 'structural compile does not profile and read/export do not issue extra inference');
 
     await closeStartedServer(started);
     started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
@@ -786,12 +841,16 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(restoredGeneration.defaultTrack, 'C');
     assert.equal(restoredGeneration.slides[0].lockedVariant, 'C');
     assert.equal(restoredGeneration.exports.length, 6);
-    assert.equal(endpoint.state.inference.length, 3, 'restart reuses persisted template, plan, generation, and contextual review');
+    assert.equal(endpoint.state.inference.length, 3, 'restart reuses plan, generation, and contextual review without template profiling');
 
     const sourceProjectId = 'one-click-with-optional-source';
     await createProject(started, sourceProjectId);
     await upload(started, sourceProjectId, 'source-template.pptx', pptx);
     await upload(started, sourceProjectId, 'market-context.md', Buffer.from('# Current position\nThe product serves three customer segments.\n\n# Next step\nThe team will validate the smallest pilot first.', 'utf8'));
+    const sourceTemplatePrepared = await fetch(`${started.url}/api/projects/${sourceProjectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: 'source-template.pptx' }),
+    });
+    assert.equal(sourceTemplatePrepared.status, 200, await sourceTemplatePrepared.clone().text());
     const withSourceInput = {
       ...input,
       templateFilePath: 'source-template.pptx',
@@ -809,7 +868,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.deepEqual(sourcePlanning.contentFiles, ['market-context.md']);
     assert.ok(sourcePlanning.contentIR.units.some((unit) => unit.text?.includes('three customer segments')));
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 2);
-    assert.equal(endpoint.state.inference.length, 6);
+    assert.equal(endpoint.state.inference.length, 6, 'both product workflows use only Worker, planning Supervisor, and contextual audit');
 
     const recoveryDataDir = path.join(temp, 'recovery-data');
     const recoveryProjectId = 'one-click-recovery-during-generation';
@@ -818,6 +877,10 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     started = await closeAndRestartWithRenderer(started, recoveryDataDir, repoRoot, recoveryRendererGate.renderer);
     await createProject(started, recoveryProjectId);
     await upload(started, recoveryProjectId, 'recovery-template.pptx', recoveryTemplate);
+    const recoveryTemplatePrepared = await fetch(`${started.url}/api/projects/${recoveryProjectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: 'recovery-template.pptx' }),
+    });
+    assert.equal(recoveryTemplatePrepared.status, 200, await recoveryTemplatePrepared.clone().text());
     const beforeRecoveryCalls = endpoint.state.inference.length;
     const recoveryInput = {
       templateFilePath: 'recovery-template.pptx', contentFiles: [],

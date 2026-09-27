@@ -31,34 +31,36 @@ const liveQualificationContract = JSON.parse(readFileSync(path.join(path.dirname
 const requiredOperationTotal = liveQualificationContract.requiredOperations
   && Object.values(liveQualificationContract.requiredOperations).reduce((total, count) => total + count, 0);
 const requiredOperationNames = ['deck-plan', 'plan-review', 'contextual-deck-audit'];
-if (liveQualificationContract.schemaVersion !== 3 || liveQualificationContract.coreMaxSemanticRequests !== 3
-    || !Number.isSafeInteger(liveQualificationContract.profilerModeMaxSemanticRequests)
-    || liveQualificationContract.profilerModeMaxSemanticRequests < 1 || liveQualificationContract.profilerModeMaxSemanticRequests > 16
+if (liveQualificationContract.schemaVersion !== 4 || liveQualificationContract.coreMaxSemanticRequests !== 17
+    || !Number.isSafeInteger(liveQualificationContract.profilerDiagnosticMaxSemanticRequests)
+    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests < liveQualificationContract.coreMaxSemanticRequests
+    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests > 17
     || !Number.isSafeInteger(liveQualificationContract.maxProfilerRequests)
-    || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 13
-    || liveQualificationContract.profilerModeMaxSemanticRequests !== 16 || liveQualificationContract.maxProfilerRequests !== 13
+    || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 14
+    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== 17 || liveQualificationContract.maxProfilerRequests !== 14
     || !liveQualificationContract.requiredOperations
     || Object.keys(liveQualificationContract.requiredOperations).length !== requiredOperationNames.length
     || requiredOperationNames.some((operation) => liveQualificationContract.requiredOperations[operation] !== 1)
     || liveQualificationContract.generationSemanticRequests !== 0
     || !Number.isSafeInteger(requiredOperationTotal)
-    || liveQualificationContract.profilerModeMaxSemanticRequests !== liveQualificationContract.maxProfilerRequests
+    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.maxProfilerRequests
       + requiredOperationTotal + liveQualificationContract.generationSemanticRequests) {
   throw new TypeError('The versioned live qualification request budget contract is invalid.');
 }
 const CORE_MAX_SEMANTIC_REQUESTS = liveQualificationContract.coreMaxSemanticRequests;
-const PROFILER_MODE_MAX_SEMANTIC_REQUESTS = liveQualificationContract.profilerModeMaxSemanticRequests;
+const PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS = liveQualificationContract.profilerDiagnosticMaxSemanticRequests;
 const DEFAULT_MODEL = 'Qwen/Qwen3.8-27B';
 const RUNNER_ENV_KEYS = [
   'LCT_SEMANTIC_BASE_URL', 'LCT_SEMANTIC_MODEL', 'LCT_SEMANTIC_API_KEY', 'LCT_SEMANTIC_ENABLE_THINKING',
   'LCT_PPTX_BACKEND', 'LCT_DATA_DIR', 'LCT_IMAGE_BASE_URL', 'LCT_IMAGE_MODEL', 'LCT_IMAGE_API_KEY',
+  'LCT_TEMPLATE_PROFILE_CONCURRENCY',
   'OPENAI_BASE_URL', 'OPENAI_API_KEY',
 ];
 
 export function parseArgs(argv) {
   const options = { mode: null, templatePath: null, task: null, context: '', sources: [], slides: 3,
-    providerLabel: null, outputDir: null, enableTemplateProfiler: false, maxSemanticRequests: null,
-    maxSemanticRequestsExplicit: false, dryRun: false, preflightOnly: false };
+    providerLabel: null, outputDir: null, maxSemanticRequests: null,
+    maxSemanticRequestsExplicit: false, enableTemplateProfiler: true, dryRun: false, preflightOnly: false };
   const valued = new Set(['--semantic-mode', '--template', '--task', '--context', '--source', '--slides',
     '--provider-label', '--output-dir', '--max-semantic-requests']);
   for (let index = 0; index < argv.length; index += 1) {
@@ -79,8 +81,8 @@ export function parseArgs(argv) {
     }
     if (flag === '--max-semantic-requests') {
       const parsed = Number(value);
-      if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > PROFILER_MODE_MAX_SEMANTIC_REQUESTS) {
-        throw new TypeError(`--max-semantic-requests must be between 1 and ${PROFILER_MODE_MAX_SEMANTIC_REQUESTS}`);
+      if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS) {
+        throw new TypeError(`--max-semantic-requests must be between 1 and ${PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS}`);
       }
       options.maxSemanticRequests = parsed;
       options.maxSemanticRequestsExplicit = true;
@@ -103,11 +105,9 @@ export function parseArgs(argv) {
   }
   if (options.dryRun && options.preflightOnly) throw new TypeError('--dry-run and --preflight-only cannot be combined');
   if (options.preflightOnly && options.mode !== 'external') throw new TypeError('--preflight-only requires --semantic-mode external');
-  const requestCeiling = options.enableTemplateProfiler ? PROFILER_MODE_MAX_SEMANTIC_REQUESTS : CORE_MAX_SEMANTIC_REQUESTS;
+  const requestCeiling = CORE_MAX_SEMANTIC_REQUESTS;
   if (options.maxSemanticRequestsExplicit && options.maxSemanticRequests > requestCeiling) {
-    throw new TypeError(options.enableTemplateProfiler
-      ? `--max-semantic-requests must be between 1 and ${requestCeiling}`
-      : `Core mode is capped at ${requestCeiling}; pass --enable-template-profiler for diagnostic profiling.`);
+    throw new TypeError(`--max-semantic-requests must be between 1 and ${requestCeiling}`);
   }
   options.maxSemanticRequests ??= requestCeiling;
   delete options.maxSemanticRequestsExplicit;
@@ -120,10 +120,10 @@ export function helpText() {
     '  --context <text>                 Optional context text',
     '  --source <file>                  Optional source file; may be repeated (up to 12)',
     '  --slides <number>                Requested slide count, 1..30 (default 3)',
-    '  --provider-label <label>         Manifest label only, e.g. runpod or vk',
+    '  --provider-label <label>         Manifest label only; does not change transport',
     '  --output-dir <directory>         New or empty output directory',
-    '  --enable-template-profiler       Diagnostic only; opt in to bounded semantic template profiling',
-    `  --max-semantic-requests <1..${PROFILER_MODE_MAX_SEMANTIC_REQUESTS}>   Core hard cap ${CORE_MAX_SEMANTIC_REQUESTS}; profiler mode hard cap ${PROFILER_MODE_MAX_SEMANTIC_REQUESTS}`,
+    `  --max-semantic-requests <1..${CORE_MAX_SEMANTIC_REQUESTS}>   Bounded preparation and generation request cap; default ${CORE_MAX_SEMANTIC_REQUESTS}`,
+    `  --enable-template-profiler       Accepted for compatibility; template profile preparation is part of the normal flow (up to ${liveQualificationContract.maxProfilerRequests} batches)`,
     '  --dry-run                        Validate inputs/config only; no daemon or network',
     '  --preflight-only                 External mode: GET /v1/models only; no chat completion',
   ].join('\n');
@@ -223,8 +223,8 @@ function normalizedOperation(operation) {
 }
 
 export function createRequestBudgetAdapter(delegate, limit = CORE_MAX_SEMANTIC_REQUESTS, startedAt = () => nowIso()) {
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > PROFILER_MODE_MAX_SEMANTIC_REQUESTS) {
-    throw new TypeError(`Semantic request budget must be between 1 and ${PROFILER_MODE_MAX_SEMANTIC_REQUESTS}.`);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS) {
+    throw new TypeError(`Semantic request budget must be between 1 and ${PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS}.`);
   }
   const records = [];
   let rejectedAttempts = 0;
@@ -314,7 +314,7 @@ function safeManifestBase(options, input, model) {
     schemaVersion: 1,
     mode: options.mode,
     providerLabel: options.providerLabel ?? (options.mode === 'fake' ? 'local-fake' : 'external'),
-    templateProfilerEnabled: options.enableTemplateProfiler === true,
+    templateProfilerEnabled: options.enableTemplateProfiler,
     gitSha,
     startedAt: nowIso(),
     finishedAt: null,
@@ -342,7 +342,7 @@ function safeManifestBase(options, input, model) {
       healthRequests: 0,
       modelsRequests: 0,
     },
-    workflow: { stages: [], finalStatus: 'not-started' },
+    workflow: { stages: [], finalStatus: 'not-started', templatePreparation: null, timeToThreeVariantsReadyMs: null },
     generation: { variantsReady: 0, deterministicAudit: { status: 'not-run', errorCount: null, warningCount: null }, contextualAudit: { status: 'not-run', findingCount: null, ruleIds: [] } },
     audit: {
       deterministic: { ruleSetVersion: DETERMINISTIC_AUDIT_RULE_SET_VERSION, canonicalSha256: null, auditedVariants: 0 },
@@ -352,7 +352,8 @@ function safeManifestBase(options, input, model) {
     },
     exports: { pptx: {}, pdf: null, html: null },
     timing: {
-      templateAnalysisMs: null, templateSemanticProfileMs: null, planningMs: null,
+      templateAnalysisMs: null, templateStructuralMs: null, templateSemanticProfileMs: null,
+      templatePreparationMs: null, timeToThreeVariantsReadyMs: null, planningMs: null,
       generationMs: null, contextualAuditMs: null, exportsMs: null, totalMs: null,
       semanticTotalMs: 0, deterministicTotalMs: null,
     },
@@ -385,7 +386,7 @@ async function requestJson(baseUrl, route, options = {}, expectedStatus = 200) {
   try { body = text ? JSON.parse(text) : null; }
   catch { throw errorWithCode('PRODUCT_API_INVALID_JSON', 'Product API returned a non-JSON response.'); }
   if (response.status !== expectedStatus) {
-    const apiCode = body?.error?.code;
+    const apiCode = body?.error?.code ?? body?.failure?.code ?? body?.semanticProfile?.failureCode;
     throw errorWithCode(typeof apiCode === 'string' && /^[A-Z0-9_]{1,64}$/.test(apiCode) ? apiCode : 'PRODUCT_API_HTTP_ERROR', `Unexpected HTTP ${response.status} from product API.`);
   }
   return body;
@@ -505,7 +506,8 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     stage = 'daemon-startup';
     startedServer = await startServer({ host: '127.0.0.1', port: 0, dataDir: path.join(outputDir, 'runtime-data'), projectRoot: repoRoot,
       serveWeb: false, returnServer: true, semanticInferenceAdapter: budget.adapter,
-      enableSemanticProfiling: options.enableTemplateProfiler === true });
+      templateProfileConcurrency: Number(env.LCT_TEMPLATE_PROFILE_CONCURRENCY ?? 1),
+      enableSemanticProfiling: options.enableTemplateProfiler });
     manifest.semantic.healthRequests += 1;
     await requestJson(startedServer.url, '/api/health');
     const readiness = await requestJson(startedServer.url, '/api/readiness');
@@ -523,9 +525,47 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     const contentFiles = [];
     for (const source of input.sources) contentFiles.push(await uploadFile(startedServer.url, projectId, source.name, source.bytes));
 
-    stage = 'one-click-product-workflow';
+    stage = 'template-preparation';
     const templateStructure = await inspectOfficeKitPackage(input.templateBytes);
     manifest.template.slideCount = templateStructure.slideCount;
+    const preparationStarted = performance.now();
+    const prepared = await requestJson(startedServer.url, `/api/projects/${encodeURIComponent(projectId)}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: templateFilePath }),
+    });
+    if (prepared.status !== 'ready') {
+      throw errorWithCode('TEMPLATE_STRUCTURAL_ANALYSIS_NOT_READY', 'Structural template analysis did not reach READY.');
+    }
+    if (options.enableTemplateProfiler && prepared.semanticProfile?.status !== 'ready') {
+      const failureCode = prepared.semanticProfile?.failureCode;
+      throw errorWithCode(typeof failureCode === 'string' ? failureCode : 'TEMPLATE_PROFILE_NOT_READY',
+        'Template semantic profile preparation did not reach READY.');
+    }
+    const templatePreparationMs = Math.max(0, Math.round(performance.now() - preparationStarted));
+    const preparedStatus = await requestJson(startedServer.url, `/api/projects/${encodeURIComponent(projectId)}/template`);
+    const expectedProfileStatus = 'ready';
+    if (preparedStatus.status !== 'ready' || prepared.semanticProfile?.status !== 'ready'
+        || preparedStatus.semanticProfile?.status !== expectedProfileStatus
+        || preparedStatus.semanticProfile?.cached !== true
+        || Object.hasOwn(preparedStatus, 'semanticProfileData')) {
+      throw errorWithCode('TEMPLATE_STATUS_INVALID', 'Structural or semantic template preparation status was not safely read back.');
+    }
+    const profilerCountBeforeGenerate = budget.records.filter((record) => record.operation === 'template-semantic-profile').length;
+    if (profilerCountBeforeGenerate < 1 || profilerCountBeforeGenerate > liveQualificationContract.maxProfilerRequests) {
+      throw errorWithCode('TEMPLATE_PROFILE_REQUEST_COUNT_INVALID', 'Template profile preparation exceeded its configured batch limit.');
+    }
+    manifest.workflow.templatePreparation = {
+      structuralStatus: 'ready',
+      semanticProfileStatus: prepared.semanticProfile?.status ?? 'missing',
+      cachedStatusRead: true,
+      profileRequests: profilerCountBeforeGenerate,
+      templateStructuralMs: prepared.templateStructuralMs ?? templatePreparationMs,
+      templateSemanticProfileMs: prepared.semanticProfile?.templateSemanticProfileMs ?? null,
+      templatePreparationMs,
+    };
+    manifest.timing.templateStructuralMs = prepared.templateStructuralMs ?? templatePreparationMs;
+    manifest.timing.templateAnalysisMs = manifest.timing.templateStructuralMs;
+    manifest.timing.templateSemanticProfileMs = prepared.semanticProfile?.templateSemanticProfileMs ?? null;
+    manifest.timing.templatePreparationMs = templatePreparationMs;
     const brief = {
       audience: 'Аудитория из задачи',
       purpose: options.task,
@@ -534,6 +574,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
       preferences: [],
       requestedSlideCount: options.slides,
     };
+    stage = 'generation-click';
     const workflowStarted = performance.now();
     const begin = await requestJson(startedServer.url, `/api/projects/${encodeURIComponent(projectId)}/workflow/generate`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -543,8 +584,18 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     if (typeof operationId !== 'string') throw errorWithCode('PRODUCT_WORKFLOW_ID_MISSING', 'Product workflow did not return an operation id.');
     observe(begin.operation);
     const operation = await waitForWorkflow(startedServer.url, projectId, options.slides >= 10 ? 240_000 : 180_000, observe);
+    const profilerCountAfterGenerate = budget.records.filter((record) => record.operation === 'template-semantic-profile').length;
+    if (profilerCountAfterGenerate !== profilerCountBeforeGenerate) {
+      throw errorWithCode('TEMPLATE_PROFILE_RAN_DURING_GENERATE', 'Generate requested template profiling instead of using the prepared cache.');
+    }
     if (operation.operationId !== operationId) throw errorWithCode('PRODUCT_WORKFLOW_ID_CHANGED', 'A different operation replaced the isolated E2E workflow.');
     if (operation.status !== 'ready') throw errorWithCode(operation.failure?.code ?? 'PRODUCT_WORKFLOW_FAILED', 'Product workflow ended before READY.');
+    if (!Number.isSafeInteger(operation.timeToThreeVariantsReadyMs) || operation.timeToThreeVariantsReadyMs < 0
+        || !operation.generationStartedAt || !operation.threeVariantsReadyAt) {
+      throw errorWithCode('THREE_VARIANTS_TIMING_MISSING', 'Workflow did not persist its three-variant readiness timing.');
+    }
+    manifest.timing.timeToThreeVariantsReadyMs = operation.timeToThreeVariantsReadyMs;
+    manifest.workflow.timeToThreeVariantsReadyMs = operation.timeToThreeVariantsReadyMs;
     if (operation.totalSlides !== options.slides || operation.readySlides !== options.slides) throw errorWithCode('REQUESTED_SLIDE_COUNT_MISMATCH', 'Product workflow did not complete the requested slide count.');
     if (operation.contextualAudit?.status !== 'ready' || operation.contextualAudit?.stale !== false
         || operation.contextualAudit.schemaVersion !== CONTEXTUAL_AUDIT_SCHEMA_VERSION
@@ -596,8 +647,6 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     }));
     manifest.audit.deterministic.auditedVariants = deterministicReports.length;
     manifest.audit.contextual.actualRules = operation.contextualAudit.findings.length;
-    manifest.timing.templateAnalysisMs = stageClock(stageTransitions, 'analyzing_template');
-    manifest.timing.templateSemanticProfileMs = operationTimes(budget.records).templateSemanticProfileMs;
     manifest.timing.planningMs = stageClock(stageTransitions, 'planning');
     manifest.timing.generationMs = stageClock(stageTransitions, 'generating');
     manifest.timing.contextualAuditMs = operationTimes(budget.records).contextualAuditMs;
@@ -676,9 +725,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     const unexpectedOperations = Object.keys(rawOperationCounts).filter((operation) => operation !== 'template-semantic-profile'
       && !Object.hasOwn(requiredOperations, operation));
     const profilerRequestCount = rawOperationCounts['template-semantic-profile'] ?? 0;
-    const profilerCountsValid = options.enableTemplateProfiler
-      ? profilerRequestCount >= 1 && profilerRequestCount <= liveQualificationContract.maxProfilerRequests
-      : profilerRequestCount === 0;
+    const profilerCountsValid = profilerRequestCount >= 1 && profilerRequestCount <= liveQualificationContract.maxProfilerRequests;
     if (unexpectedOperations.length || !profilerCountsValid
         || Object.entries(requiredOperations).some(([operation, count]) => rawOperationCounts[operation] !== count)
         || expectedCounts.generation !== liveQualificationContract.generationSemanticRequests
@@ -722,13 +769,13 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
 }
 
 export async function runProductE2E(options, dependencies = {}) {
-  const enableTemplateProfiler = options.enableTemplateProfiler === true;
-  const requestCeiling = enableTemplateProfiler ? PROFILER_MODE_MAX_SEMANTIC_REQUESTS : CORE_MAX_SEMANTIC_REQUESTS;
+  const enableTemplateProfiler = true;
+  const requestCeiling = CORE_MAX_SEMANTIC_REQUESTS;
   const resolvedOptions = { ...options, enableTemplateProfiler,
     maxSemanticRequests: options.maxSemanticRequests ?? requestCeiling };
   if (!Number.isSafeInteger(resolvedOptions.maxSemanticRequests) || resolvedOptions.maxSemanticRequests < 1
       || resolvedOptions.maxSemanticRequests > requestCeiling) {
-    throw errorWithCode('SEMANTIC_BUDGET_INVALID', `Semantic request budget exceeds the ${enableTemplateProfiler ? 'profiler diagnostic' : 'core'} mode ceiling of ${requestCeiling}.`);
+    throw errorWithCode('SEMANTIC_BUDGET_INVALID', `Semantic request budget exceeds the selected qualification ceiling of ${requestCeiling}.`);
   }
   const input = await resolveInputs(resolvedOptions);
   if (resolvedOptions.mode === 'external' && !resolvedOptions.externalConfig) {
@@ -757,7 +804,7 @@ export async function runCli(argv, dependencies = {}) {
   const common = {
     mode: options.mode,
     providerLabel: options.providerLabel ?? (options.mode === 'fake' ? 'local-fake' : 'external'),
-    templateProfilerEnabled: options.enableTemplateProfiler === true,
+    templateProfilerEnabled: options.enableTemplateProfiler,
     template: { filename: input.templateName, sha256: input.templateHash },
     sourceCount: input.sources.length,
     requestedSlides: options.slides,

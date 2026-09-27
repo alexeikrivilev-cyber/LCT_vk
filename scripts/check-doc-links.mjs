@@ -72,20 +72,20 @@ const failures = [];
 const liveQualificationContract = JSON.parse(await readFile(path.join(root, 'scripts/lib/live-qualification-contract.json'), 'utf8'));
 const requiredSemanticRequests = Object.values(liveQualificationContract.requiredOperations ?? {})
   .reduce((total, count) => total + count, liveQualificationContract.generationSemanticRequests ?? 0);
-if (liveQualificationContract.schemaVersion !== 3
+if (liveQualificationContract.schemaVersion !== 4
     || liveQualificationContract.coreMaxSemanticRequests !== requiredSemanticRequests
-    || liveQualificationContract.profilerModeMaxSemanticRequests !== liveQualificationContract.maxProfilerRequests + requiredSemanticRequests
-    || liveQualificationContract.maxProfilerRequests !== 13) {
+    || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.maxProfilerRequests + requiredSemanticRequests
+    || liveQualificationContract.maxProfilerRequests !== 14) {
   failures.push('live qualification contract: core or diagnostic request budgets do not match the bounded operations');
 }
 const profilerContract = JSON.parse(await readFile(path.join(root, 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
 if (profilerContract.maxBatches !== liveQualificationContract.maxProfilerRequests
-    || profilerContract.maxSlidesPerBatch !== 6 || profilerContract.maxBatchEvidenceBytes !== 24 * 1024) {
+    || profilerContract.maxSlidesPerBatch !== 5 || profilerContract.maxBatchEvidenceBytes !== 24 * 1024) {
   failures.push('template profiler batch limits differ from the hard request budget contract');
 }
 const liveQualificationGuide = await readFile(path.join(root, 'LIVE_QUALIFICATION.md'), 'utf8');
 if (!liveQualificationGuide.includes(`core cap \`${liveQualificationContract.coreMaxSemanticRequests}\``)
-    || !liveQualificationGuide.includes(`profiler diagnostic cap \`${liveQualificationContract.profilerModeMaxSemanticRequests}\``)) {
+    || !liveQualificationGuide.includes(`profiler diagnostic cap \`${liveQualificationContract.profilerDiagnosticMaxSemanticRequests}\``)) {
   failures.push('LIVE_QUALIFICATION.md: documented core/profiler caps differ from the versioned contract');
 }
 const testingGuide = await readFile(path.join(root, 'TESTING.md'), 'utf8');

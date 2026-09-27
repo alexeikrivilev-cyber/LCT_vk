@@ -54,6 +54,20 @@ export interface TemplateSemanticProfileCache {
   invalidate?(cacheKey: string): Promise<void>;
 }
 
+export type TemplateSemanticProfilePreparationStatus = 'processing' | 'ready' | 'failed';
+
+export interface TemplateSemanticProfilePreparationRecord {
+  schemaVersion: 1;
+  templateIRHash: string;
+  profileCacheKey: string;
+  status: TemplateSemanticProfilePreparationStatus;
+  updatedAt: string;
+  failureCode?: string;
+  templatePreparationMs?: number;
+  templateStructuralMs?: number;
+  templateSemanticProfileMs?: number;
+}
+
 /** Stores replaceable semantic evidence inside the owning project, keyed by TemplateIR and prompt/config fingerprints. */
 export function projectTemplateSemanticProfileCache(projectsRoot: string, projectId: string): TemplateSemanticProfileCache {
   const profilePath = async (hash: string, createParent = false) => {
@@ -73,7 +87,8 @@ export function projectTemplateSemanticProfileCache(projectsRoot: string, projec
       try { return JSON.parse(raw) as unknown; }
       catch (error) {
         if (!(error instanceof SyntaxError)) throw error;
-        await rm(target, { force: true });
+        // Reads stay side-effect free. A later preparation may replace this file
+        // atomically after it has produced a fully validated profile.
         return null;
       }
     },
@@ -94,6 +109,52 @@ export function projectTemplateSemanticProfileCache(projectsRoot: string, projec
   };
 }
 
+/** Persist only preparation status metadata, separate from the profile cache itself. */
+export function projectTemplateSemanticProfilePreparationStore(projectsRoot: string, projectId: string) {
+  const recordPath = async (profileCacheKey: string, createParent = false) => {
+    if (!/^[a-f0-9]{64}$/.test(profileCacheKey)) throw new TypeError('Template semantic profile status key is invalid.');
+    return (await resolvePresentationFilePath(projectsRoot, projectId,
+      `.template-compiler/semantic-profile-status/${profileCacheKey}.json`, { createParent })).absolute;
+  };
+  return {
+    async read(profileCacheKey: string): Promise<TemplateSemanticProfilePreparationRecord | null> {
+      let raw: string;
+      try { raw = await readFile(await recordPath(profileCacheKey), 'utf8'); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+      try {
+        const value = JSON.parse(raw) as Partial<TemplateSemanticProfilePreparationRecord>;
+        if (value.schemaVersion !== 1 || value.profileCacheKey !== profileCacheKey
+            || typeof value.templateIRHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.templateIRHash)
+            || !['processing', 'ready', 'failed'].includes(String(value.status))
+            || typeof value.updatedAt !== 'string' || !Number.isFinite(Date.parse(value.updatedAt))
+            || (value.failureCode !== undefined && (typeof value.failureCode !== 'string' || !/^[A-Z0-9_]{1,64}$/.test(value.failureCode)))
+            || ['templatePreparationMs', 'templateStructuralMs', 'templateSemanticProfileMs'].some((key) => {
+              const duration = (value as Record<string, unknown>)[key];
+              return duration !== undefined && (!Number.isSafeInteger(duration) || Number(duration) < 0);
+            })) return null;
+        return value as TemplateSemanticProfilePreparationRecord;
+      } catch (error) {
+        if (error instanceof SyntaxError) return null;
+        throw error;
+      }
+    },
+    async write(record: TemplateSemanticProfilePreparationRecord): Promise<void> {
+      const target = await recordPath(record.profileCacheKey, true);
+      const temporary = `${target}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+      try {
+        await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
+        await rename(temporary, target);
+      } catch (error) {
+        await rm(temporary, { force: true }).catch(() => undefined);
+        throw error;
+      }
+    },
+  };
+}
+
 const TEMPLATE_PROFILE_WORKFLOW = templateProfilerWorkflow;
 const PROFILE_MAX_SLIDES = TEMPLATE_PROFILE_WORKFLOW.maxSlides;
 const PROFILE_MAX_ELEMENTS_PER_SLIDE = TEMPLATE_PROFILE_WORKFLOW.maxElementsPerSlide;
@@ -102,6 +163,7 @@ const DEFAULT_PROMPT_DIRECTORY = path.resolve(path.dirname(fileURLToPath(import.
 const PROFILE_BATCH_SLIDE_LIMIT = TEMPLATE_PROFILE_WORKFLOW.maxSlidesPerBatch;
 const PROFILE_BATCH_EVIDENCE_BYTE_LIMIT = TEMPLATE_PROFILE_WORKFLOW.maxBatchEvidenceBytes;
 const PROFILE_BATCH_COUNT_LIMIT = TEMPLATE_PROFILE_WORKFLOW.maxBatches;
+const PROFILE_BATCH_CONCURRENCY_LIMIT = 2;
 
 export function templateSemanticProfileCacheKey(templateIRHash: string, promptSha256: string): string {
   if (!/^[a-f0-9]{64}$/.test(templateIRHash) || !/^[a-f0-9]{64}$/.test(promptSha256)) {
@@ -443,8 +505,13 @@ export class TemplateSemanticProfiler {
   constructor(
     private readonly inference: SemanticInferenceAdapter,
     private readonly persistentCache?: TemplateSemanticProfileCache,
-    private readonly options: { promptDirectory?: string } = {},
-  ) {}
+    private readonly options: { promptDirectory?: string; concurrency?: number } = {},
+  ) {
+    if (options.concurrency !== undefined && (!Number.isSafeInteger(options.concurrency)
+        || options.concurrency < 1 || options.concurrency > PROFILE_BATCH_CONCURRENCY_LIMIT)) {
+      throw new TypeError(`Template profiler concurrency must be an integer between 1 and ${PROFILE_BATCH_CONCURRENCY_LIMIT}.`);
+    }
+  }
 
   private loadPromptAsset(): Promise<{ content: string; sha256: string }> {
     if (!this.promptAsset) {
@@ -462,11 +529,55 @@ export class TemplateSemanticProfiler {
     return this.promptAsset;
   }
 
-  async profile(templateIRInput: TemplateIR, designSystemInput: PresentationDesignSystem, signal?: AbortSignal): Promise<TemplateSemanticProfile> {
+  private async fingerprint(templateIRInput: TemplateIR, designSystemInput: PresentationDesignSystem) {
     const templateIR = validateTemplateIR(templateIRInput);
     validatePresentationDesignSystem(designSystemInput, templateIR);
     const prompt = await this.loadPromptAsset();
     const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, prompt.sha256);
+    return { templateIR, prompt, cacheKey };
+  }
+
+  async profileCacheKey(templateIRInput: TemplateIR): Promise<string> {
+    const templateIR = validateTemplateIR(templateIRInput);
+    const prompt = await this.loadPromptAsset();
+    return templateSemanticProfileCacheKey(templateIR.hash, prompt.sha256);
+  }
+
+  private async readPrepared(
+    templateIR: TemplateIR,
+    cacheKey: string,
+    invalidateInvalid: boolean,
+  ): Promise<TemplateSemanticProfile | null> {
+    const cached = this.cache.get(cacheKey);
+    if (cached) return structuredClone(cached);
+    const persisted = await this.persistentCache?.read(cacheKey);
+    if (persisted === null || persisted === undefined) return null;
+    try {
+      const profile = validateTemplateSemanticProfile(persisted, templateIR);
+      this.cache.set(cacheKey, profile);
+      return structuredClone(profile);
+    } catch {
+      if (invalidateInvalid) await this.persistentCache?.invalidate?.(cacheKey);
+      return null;
+    }
+  }
+
+  /** Read and validate only. It never calls inference or mutates the persistent profile cache. */
+  async getPreparedTemplateProfile(
+    templateIRInput: TemplateIR,
+    designSystemInput: PresentationDesignSystem,
+  ): Promise<TemplateSemanticProfile | null> {
+    const { templateIR, cacheKey } = await this.fingerprint(templateIRInput, designSystemInput);
+    return this.readPrepared(templateIR, cacheKey, false);
+  }
+
+  /** Prepare once, validating a complete profile before the atomic persistent cache write. */
+  async prepareTemplateProfile(
+    templateIRInput: TemplateIR,
+    designSystemInput: PresentationDesignSystem,
+    signal?: AbortSignal,
+  ): Promise<TemplateSemanticProfile> {
+    const { templateIR, prompt, cacheKey } = await this.fingerprint(templateIRInput, designSystemInput);
     const cached = this.cache.get(cacheKey);
     if (cached) return structuredClone(cached);
     const pending = this.inFlight.get(cacheKey);
@@ -484,14 +595,39 @@ export class TemplateSemanticProfiler {
         }
       }
       const plan = planTemplateSemanticProfileBatches(templateIR);
-      const mergedSlides: TemplateSemanticSlideProfile[] = [];
-      for (const batch of plan.batches) {
-        if (signal?.aborted) throw new InferenceError('CANCELLED', 'Template profiler was cancelled before the next batch.');
-        const batchIndexes = new Set(batch.sourceSlideIndexes);
-        const batchSlides = templateIR.slides.filter((slide) => batchIndexes.has(slide.index));
-        const response = await this.inference.infer({ ...requestFor(templateIR, prompt.content, batch, batchSlides), signal });
-        mergedSlides.push(...response.value.slides);
-      }
+      const batchResults: Array<TemplateSemanticSlideProfile[] | undefined> = new Array(plan.batches.length);
+      const controller = new AbortController();
+      const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+      const concurrency = Math.min(this.options.concurrency ?? 1, plan.batches.length);
+      let nextBatch = 0;
+      let firstFailure: unknown;
+      const workers = Array.from({ length: concurrency }, async () => {
+        while (!firstFailure) {
+          if (signal?.aborted) {
+            firstFailure ??= new InferenceError('CANCELLED', 'Template profiler was cancelled before the next batch.');
+            controller.abort(firstFailure);
+            return;
+          }
+          const batchIndex = nextBatch++;
+          if (batchIndex >= plan.batches.length) return;
+          const batch = plan.batches[batchIndex]!;
+          const batchIndexes = new Set(batch.sourceSlideIndexes);
+          const batchSlides = templateIR.slides.filter((slide) => batchIndexes.has(slide.index));
+          try {
+            const response = await this.inference.infer({
+              ...requestFor(templateIR, prompt.content, batch, batchSlides), signal: requestSignal,
+            });
+            batchResults[batchIndex] = response.value.slides;
+          } catch (error) {
+            if (!firstFailure) firstFailure = error;
+            controller.abort(firstFailure);
+            return;
+          }
+        }
+      });
+      await Promise.all(workers);
+      if (firstFailure) throw firstFailure;
+      const mergedSlides: TemplateSemanticSlideProfile[] = batchResults.flatMap((slides) => slides ?? []);
       const expectedIndexOrder = new Map(templateIR.slides.map((slide, index) => [slide.index, index]));
       mergedSlides.sort((left, right) => (expectedIndexOrder.get(left.sourceSlideIndex) ?? Number.MAX_SAFE_INTEGER)
         - (expectedIndexOrder.get(right.sourceSlideIndex) ?? Number.MAX_SAFE_INTEGER));
@@ -503,6 +639,11 @@ export class TemplateSemanticProfiler {
     this.inFlight.set(cacheKey, task);
     try { return structuredClone(await task); }
     finally { if (this.inFlight.get(cacheKey) === task) this.inFlight.delete(cacheKey); }
+  }
+
+  /** Kept as an internal compatibility alias for existing callers; new callers choose a phase explicitly. */
+  async profile(templateIR: TemplateIR, designSystem: PresentationDesignSystem, signal?: AbortSignal): Promise<TemplateSemanticProfile> {
+    return this.prepareTemplateProfile(templateIR, designSystem, signal);
   }
 
   clear(): void {

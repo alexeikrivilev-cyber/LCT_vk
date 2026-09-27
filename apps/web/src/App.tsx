@@ -54,6 +54,7 @@ class ApplicationUiError extends Error {
 }
 
 type TemplateCompileStatus = 'uncompiled' | 'ready' | 'stale' | 'failed';
+type TemplateSemanticProfileStatus = 'disabled' | 'missing' | 'processing' | 'ready' | 'failed';
 type TemplateCompileResponse = {
   status: TemplateCompileStatus;
   source?: unknown;
@@ -61,6 +62,14 @@ type TemplateCompileResponse = {
   failure?: unknown;
   templateIR?: unknown;
   presentationDesignSystem?: unknown;
+  semanticProfile?: {
+    status: TemplateSemanticProfileStatus;
+    cached: boolean;
+    failureCode?: string;
+    templatePreparationMs?: number | null;
+    templateStructuralMs?: number | null;
+    templateSemanticProfileMs?: number | null;
+  };
 };
 
 type PlanningResponse = {
@@ -538,8 +547,12 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const [generationExported, setGenerationExported] = useState(false);
   const filesRef = useRef(files);
   const templateScanRef = useRef(templateScan);
+  const selectedTemplateRef = useRef(templateFile);
+  const templatePreparationRequestRef = useRef(0);
+  const autoPreparedTemplateRef = useRef<string | null>(null);
   filesRef.current = files;
   templateScanRef.current = templateScan;
+  selectedTemplateRef.current = templateFile;
 
   const loadProject = useCallback(async () => {
     const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, { cache: 'no-store' });
@@ -565,9 +578,11 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     setDesignSystems(body.designSystems ?? []);
   }, []);
 
-  const loadTemplateScan = useCallback(async () => {
-    setTemplateFetching(true);
-    setTemplateError(null);
+  const loadTemplateScan = useCallback(async (options: { quiet?: boolean } = {}) => {
+    if (!options.quiet) {
+      setTemplateFetching(true);
+      setTemplateError(null);
+    }
     try {
       const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/template`, { cache: 'no-store' });
       if (!response.ok) throw await errorMessage(response, 'template');
@@ -575,10 +590,10 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       setTemplateScan(scan);
       return scan;
     } catch (err) {
-      setTemplateError(uiFailure(err, ru.errors.template));
+      if (!options.quiet) setTemplateError(uiFailure(err, ru.errors.template));
       return null;
     } finally {
-      setTemplateFetching(false);
+      if (!options.quiet) setTemplateFetching(false);
     }
   }, [projectId]);
 
@@ -673,19 +688,32 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
 
   const previewFile = useMemo(() => pickPreviewFile(files, selectedFile), [files, selectedFile]);
   const templateFiles = useMemo(() => files.filter((file) => /\.pptx$/i.test(filePath(file))), [files]);
+  const templateIR = record(templateScan?.templateIR);
   const scanSourcePath = sourcePathOf(templateScan);
   const scanSelectionMismatch = Boolean(scanSourcePath && templateFile !== scanSourcePath);
+  const matchingScan = Boolean(templateIR && !scanSelectionMismatch);
+  const rawTemplateProfileStatus = matchingScan ? templateScan?.semanticProfile?.status ?? 'missing' : 'missing';
+  const templateProfileStatus = rawTemplateProfileStatus === 'disabled' ? 'missing' : rawTemplateProfileStatus;
+  const templatePreparationPending = templateAnalyzing || Boolean(matchingScan && templateScan?.status === 'ready'
+    && templateProfileStatus === 'processing');
+  const templatePreparationReady = matchingScan && templateScan?.status === 'ready' && templateProfileStatus === 'ready';
   const visibleTemplateStatus: TemplateCompileStatus | null = scanSelectionMismatch
     ? 'stale'
-    : templateScan?.status ?? null;
-  const templateBadgeStatus = visibleTemplateStatus ?? (templateAnalyzing ? 'analyzing' : templateFetching ? 'loading' : templateError ? 'unavailable' : 'uncompiled');
-  const templateBadgeLabel = templateAnalyzing ? ru.template.analyzing
+    : templateScan?.status === 'ready' && !templatePreparationReady && templateProfileStatus !== 'processing'
+      ? templateProfileStatus === 'failed' ? 'failed' : 'uncompiled'
+      : templateScan?.status ?? null;
+  const templateBadgeStatus = templatePreparationPending ? 'processing' : visibleTemplateStatus ?? (templateFetching ? 'loading' : templateError ? 'unavailable' : 'uncompiled');
+  const templateBadgeLabel = templatePreparationPending
+    ? templateProfileStatus === 'processing' ? ru.template.profileAnalyzing : ru.template.structureAnalyzing
     : templateFetching ? ru.template.fetching
-      : templateFile && (visibleTemplateStatus === 'uncompiled' || !visibleTemplateStatus) && !templateError ? ru.template.selected
+      : templatePreparationReady ? ru.template.ready
+        : templateProfileStatus === 'failed' ? ru.template.profileFailed
+        : templateScan?.status === 'ready' ? ru.template.profileRequired
+        : visibleTemplateStatus === 'ready' ? ru.template.ready
+        : templateFile && (visibleTemplateStatus === 'uncompiled' || !visibleTemplateStatus) && !templateError ? ru.template.selected
         : !templateFile && (visibleTemplateStatus === 'uncompiled' || !visibleTemplateStatus) && !templateError ? ru.template.selectTemplate
           : templateStatusLabel(visibleTemplateStatus ?? (templateError ? 'unavailable' : 'uncompiled'));
   const productWorkflowRunning = productWorkflowBusy || productOperation?.status === 'running';
-  const templateIR = record(templateScan?.templateIR);
   const presentationDesignSystem = record(templateScan?.presentationDesignSystem);
   const canvas = record(firstValue(presentationDesignSystem, ['canvas']))
     ?? record(firstValue(templateIR, ['slideSize', 'canvas']))
@@ -730,7 +758,6 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     ...arrayValue(templateIR, ['warnings']),
     ...arrayValue(presentationDesignSystem, ['warnings']),
   ];
-  const matchingScan = Boolean(templateIR && !scanSelectionMismatch);
   const excludedPlanningPath = templateFile ?? scanSourcePath;
   const planningSourceFiles = files.filter((file) => filePath(file) !== excludedPlanningPath);
   const availablePlanningPaths = new Set(planningSourceFiles.map(filePath));
@@ -848,31 +875,46 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     }
   };
 
-  const analyzeTemplate = async () => {
-    if (!templateFile) return;
+  const selectTemplateFile = (nextFilePath: string | null) => {
+    templatePreparationRequestRef.current += 1;
+    autoPreparedTemplateRef.current = null;
+    selectedTemplateRef.current = nextFilePath;
+    setTemplateAnalyzing(false);
+    setTemplateFile(nextFilePath);
+    setTemplateScan(null);
+    setTemplateError(null);
+  };
+
+  const analyzeTemplate = async (filePath: string | null = templateFile) => {
+    if (!filePath) return;
+    const requestId = ++templatePreparationRequestRef.current;
+    autoPreparedTemplateRef.current = filePath;
     setTemplateAnalyzing(true);
     setTemplateError(null);
     try {
       const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/template/compile`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filePath: templateFile }),
+        body: JSON.stringify({ filePath }),
       });
       const body = await response.json().catch(() => null);
       if (!response.ok) {
         const failed = record(body);
-        if (failed?.status === 'failed') setTemplateScan(parseTemplateCompileResponse(body));
         const failure = record(failed?.failure);
         const code = stringValue(failure?.code) || undefined;
         throw new ApplicationUiError({ message: friendlyErrorMessage(code, response.status, 'template'), ...(code ? { code } : {}), status: response.status });
       }
-      setTemplateScan(parseTemplateCompileResponse(body));
-      await loadPlanning();
+      if (requestId === templatePreparationRequestRef.current && selectedTemplateRef.current === filePath) {
+        setTemplateScan(parseTemplateCompileResponse(body));
+        await loadPlanning();
+      }
     } catch (err) {
-      setTemplateError(uiFailure(err, ru.errors.template));
-      await loadPlanning();
+      if (requestId === templatePreparationRequestRef.current && selectedTemplateRef.current === filePath) {
+        setTemplateError(uiFailure(err, ru.errors.template));
+        await Promise.all([loadTemplateScan({ quiet: true }), loadPlanning()]);
+      }
     } finally {
-      setTemplateAnalyzing(false);
+      if (requestId === templatePreparationRequestRef.current) setTemplateAnalyzing(false);
     }
   };
 
@@ -880,6 +922,10 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     setProductWorkflowError(null);
     if (!templateFile) {
       setProductWorkflowError({ message: ru.template.uploadFirst });
+      return;
+    }
+    if (!templatePreparationReady) {
+      setProductWorkflowError({ message: ru.template.prepareBeforeGenerate, code: 'TEMPLATE_NOT_READY', status: 409 });
       return;
     }
     if (!briefPurpose.trim()) {
@@ -977,8 +1023,35 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     const paths = templateFiles.map(filePath);
     if (templateFile && paths.includes(templateFile)) return;
     const compiledSource = sourcePathOf(templateScan);
-    setTemplateFile(compiledSource && paths.includes(compiledSource) ? compiledSource : paths[0] ?? null);
+    const next = compiledSource && paths.includes(compiledSource) ? compiledSource : paths[0] ?? null;
+    setTemplateFile(next);
+    selectedTemplateRef.current = next;
   }, [templateFile, templateFiles, templateScan]);
+
+  useEffect(() => {
+    if (!templateFile || !templateFiles.some((file) => filePath(file) === templateFile)
+        || templatePreparationReady || templateProfileStatus === 'processing' || templateProfileStatus === 'failed'
+        || templateAnalyzing || templateFetching || busy || productWorkflowRunning
+        || autoPreparedTemplateRef.current === templateFile) return;
+    void analyzeTemplate(templateFile);
+  }, [analyzeTemplate, busy, productWorkflowRunning, templateAnalyzing, templateFetching, templateFile,
+    templateFiles, templatePreparationReady, templateProfileStatus]);
+
+  useEffect(() => {
+    if (!templateAnalyzing && templateProfileStatus !== 'processing') return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      const scan = await loadTemplateScan({ quiet: true });
+      if (cancelled) return;
+      if (templateAnalyzing || scan?.semanticProfile?.status === 'processing') timer = window.setTimeout(() => void poll(), 900);
+    };
+    timer = window.setTimeout(() => void poll(), 900);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [loadTemplateScan, templateAnalyzing, templateProfileStatus]);
 
   const refreshPreview = useCallback(async () => {
     if (!previewFile) {
@@ -1092,8 +1165,8 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       const uploadedPath = uploadedTemplate
         ? filePath(uploadedTemplate)
         : incomingTemplate?.name ?? null;
-      if (uploadedPath) setTemplateFile(uploadedPath);
-      await loadTemplateScan();
+      if (uploadedPath) selectTemplateFile(uploadedPath);
+      else await loadTemplateScan();
       await loadPlanning();
       const uploadedSourcePaths = uploadedFiles
         .filter((file) => !/\.pptx$/i.test(filePath(file) || file.originalName || ''))
@@ -1156,7 +1229,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       {uploading ? <p className="workspace-operation-status" role="status" aria-live="polite">{ru.workspace.uploading}</p> : null}
 
       <nav className="workspace-stages" aria-label={ru.workspace.stagesLabel}>
-        <a href="#template-panel" data-complete={visibleTemplateStatus === 'ready'}>{ru.workspace.templateStage}</a>
+        <a href="#template-panel" data-complete={templatePreparationReady}>{ru.workspace.templateStage}</a>
         <a href="#planning-panel" data-complete={planningSourceFiles.length > 0}>{ru.workspace.contentStage}</a>
         <a href="#planning-panel" data-complete={savedPlanReady}>{ru.workspace.planStage}</a>
         <a href="#generation-panel" data-complete={generationComplete}>{ru.workspace.generateStage}</a>
@@ -1180,7 +1253,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
           <select
             id="template-source"
             value={templateFile ?? ''}
-            onChange={(event) => setTemplateFile(event.target.value || null)}
+            onChange={(event) => selectTemplateFile(event.target.value || null)}
             disabled={templateFiles.length === 0 || templateFetching || templateAnalyzing || productWorkflowRunning}
           >
             {templateFiles.length === 0 ? <option value="">{ru.template.uploadFirst}</option> : null}
@@ -1211,6 +1284,10 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         ) : null}
         {visibleTemplateStatus === 'failed' ? (
           <ErrorNotice failure={templateFailureInfo(templateScan?.failure)} className="template-message template-message-warning" role="status" />
+        ) : null}
+        {templateProfileStatus === 'failed' && templateScan?.status === 'ready' ? (
+          <ErrorNotice failure={{ message: ru.template.profileFailed, ...(templateScan.semanticProfile?.failureCode ? { code: templateScan.semanticProfile.failureCode } : {}) }}
+            className="template-message template-message-warning" role="status" onRetry={() => void analyzeTemplate(templateFile)} />
         ) : null}
         {!templateFetching && !templateAnalyzing && !templateScan && templateError ? (
           <div className="template-message template-message-warning">{ru.template.scanUnavailable}</div>
@@ -1406,7 +1483,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
               <button className="quiet" onClick={() => void analyzeTemplate()} disabled={!templateFile || busy || templateFetching || templateAnalyzing || productWorkflowRunning}>
                 {templateAnalyzing ? ru.template.analyzing : ru.template.analyze}
               </button>
-              <button className="quiet" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateFetching || templateAnalyzing || planning?.templateStatus !== 'ready' || !matchingScan || !briefPurpose.trim()}>
+              <button className="quiet" onClick={() => void generatePlan()} disabled={planningGenerating || planningLoading || templateFetching || templateAnalyzing || !templatePreparationReady || planning?.templateStatus !== 'ready' || !matchingScan || !briefPurpose.trim()}>
                 {planningGenerating ? ru.planning.generating : ru.planning.generate}
               </button>
             </div>
@@ -1465,7 +1542,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             </details>
             <div className="planning-submit-row">
               <span className="planning-muted">{ru.planning.requiredTaskNote}</span>
-              <button className="primary" onClick={() => void generatePresentation()} disabled={!templateFile || !briefPurpose.trim() || busy || productWorkflowRunning}>
+              <button className="primary" onClick={() => void generatePresentation()} disabled={!templateFile || !templatePreparationReady || !briefPurpose.trim() || busy || templatePreparationPending || productWorkflowRunning}>
                 {productWorkflowRunning ? ru.workflow.working : ru.workflow.action}
               </button>
             </div>

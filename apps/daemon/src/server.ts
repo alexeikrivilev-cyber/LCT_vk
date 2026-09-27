@@ -47,7 +47,12 @@ import {
 import { SemanticInferenceError, type SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
 import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
 import { ProductWorkflowError, ProductWorkflowService } from './presentation/application/product-workflow-service.js';
-import { projectTemplateSemanticProfileCache, TemplateSemanticProfiler } from './presentation/application/template-semantic-profiler.js';
+import {
+  projectTemplateSemanticProfileCache,
+  projectTemplateSemanticProfilePreparationStore,
+  TemplateSemanticProfiler,
+  type TemplateSemanticProfilePreparationRecord,
+} from './presentation/application/template-semantic-profiler.js';
 import {
   PresentationGenerationError,
   PresentationGenerationService,
@@ -71,8 +76,10 @@ export interface StartServerOptions {
   returnServer?: boolean;
   semanticInferenceAdapter?: SemanticInferenceAdapter;
   semanticInferenceAdapterFactory?: () => SemanticInferenceAdapter;
-  /** Explicit opt-in to the optional semantic template profiler, regardless of adapter source. */
+  /** Internal structural-only seam. The normal daemon enables prepared semantic profiles. */
   enableSemanticProfiling?: boolean;
+  /** Replaceable bounded concurrency for template preparation; defaults to LCT_TEMPLATE_PROFILE_CONCURRENCY or 1. */
+  templateProfileConcurrency?: number;
   /** Replaceable renderer seam used by offline application tests. */
   presentationRenderer?: PptxRendererPort;
   /** Replaceable preview seam used by offline application tests. */
@@ -111,14 +118,6 @@ function apiError(res: express.Response, status: number, error: unknown): void {
   const code = status === 404 ? 'NOT_FOUND' : 'PRESENTATION_CORE_ERROR';
   res.locals.errorCode = code;
   res.status(status).json({ error: { code, message } });
-}
-
-function semanticFailureStatus(error: SemanticInferenceError): number {
-  if (error.code === 'CONFIGURATION_ERROR' || error.code === 'SERVICE_UNAVAILABLE') return 503;
-  if (error.code === 'TIMEOUT' || error.code === 'DEADLINE_EXCEEDED') return 504;
-  if (error.code === 'RATE_LIMITED') return 429;
-  if (error.code === 'CANCELLED') return 409;
-  return 502;
 }
 
 function safeProjectId(value: unknown): string | null {
@@ -193,8 +192,15 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   const envPort = parseDaemonPort(process.env.LCT_PORT, DEFAULT_DAEMON_PORT);
   const port = options.port === undefined ? envPort : Number(options.port);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new TypeError('LCT_PORT must be an integer between 1 and 65535.');
+  const configuredProfileConcurrency = process.env.LCT_TEMPLATE_PROFILE_CONCURRENCY;
+  const profileConcurrency = options.templateProfileConcurrency
+    ?? (configuredProfileConcurrency === undefined || configuredProfileConcurrency.trim() === '' ? 1 : Number(configuredProfileConcurrency));
+  if (!Number.isSafeInteger(profileConcurrency) || profileConcurrency < 1 || profileConcurrency > 2) {
+    throw new TypeError('LCT_TEMPLATE_PROFILE_CONCURRENCY must be an integer between 1 and 2.');
+  }
   const projectRoot = path.resolve(options.projectRoot ?? repoRootFromModule());
   const hasInjectedSemanticAdapter = Boolean(options.semanticInferenceAdapter || options.semanticInferenceAdapterFactory);
+  const semanticProfilingEnabled = options.enableSemanticProfiling === true;
   const configuredSemanticBaseUrl = process.env.LCT_SEMANTIC_BASE_URL?.trim();
   const semanticConfig = !hasInjectedSemanticAdapter && configuredSemanticBaseUrl
     ? semanticInferenceConfigFromEnvironment()
@@ -210,21 +216,113 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   if (!hasInjectedSemanticAdapter && semanticConfig) semanticAdapter = new OpenAICompatibleSemanticInferenceAdapter(semanticConfig);
   const getSemanticAdapter = () => semanticAdapter ??= options.semanticInferenceAdapterFactory?.()
     ?? new OpenAICompatibleSemanticInferenceAdapter(semanticConfig ?? semanticInferenceConfigFromEnvironment());
-  // Template semantic enrichment is optional and must never become a critical-path
-  // dependency merely because Worker/Supervisor inference is configured.
-  const semanticProfilingEnabled = options.enableSemanticProfiling === true;
   const templateProfilers = new Map<string, TemplateSemanticProfiler>();
-  const profileTemplate = semanticProfilingEnabled ? async (projectId: string, snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>) => {
-    if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
-      throw new TypeError('A ready TemplateIR and presentation design system are required for semantic profiling.');
-    }
+  const templatePreparationStores = new Map<string, ReturnType<typeof projectTemplateSemanticProfilePreparationStore>>();
+  const activeTemplatePreparations = new Map<string, Promise<unknown>>();
+  const lazyTemplateProfileAdapter: SemanticInferenceAdapter = { infer: (request) => getSemanticAdapter().infer(request) };
+  const profilerForProject = (projectId: string) => {
     let profiler = templateProfilers.get(projectId);
     if (!profiler) {
-      profiler = new TemplateSemanticProfiler(getSemanticAdapter(), projectTemplateSemanticProfileCache(projectsRoot, projectId));
+      profiler = new TemplateSemanticProfiler(lazyTemplateProfileAdapter, projectTemplateSemanticProfileCache(projectsRoot, projectId), {
+        concurrency: profileConcurrency,
+      });
       templateProfilers.set(projectId, profiler);
     }
-    return profiler.profile(snapshot.templateIR, snapshot.presentationDesignSystem);
-  } : undefined;
+    return profiler;
+  };
+  const preparationStoreForProject = (projectId: string) => {
+    let store = templatePreparationStores.get(projectId);
+    if (!store) {
+      store = projectTemplateSemanticProfilePreparationStore(projectsRoot, projectId);
+      templatePreparationStores.set(projectId, store);
+    }
+    return store;
+  };
+  const readPreparedTemplateProfile = async (projectId: string, snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>) => {
+    if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
+      return null;
+    }
+    try {
+      return await profilerForProject(projectId).getPreparedTemplateProfile(snapshot.templateIR, snapshot.presentationDesignSystem);
+    } catch {
+      return null;
+    }
+  };
+  const preparationStatus = async (
+    projectId: string,
+    snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>,
+  ): Promise<Record<string, unknown>> => {
+    if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
+      return { status: 'missing', cached: false };
+    }
+    try {
+      const profiler = profilerForProject(projectId);
+      const profileCacheKey = await profiler.profileCacheKey(snapshot.templateIR);
+      const key = `${projectId}:${profileCacheKey}`;
+      const record = await preparationStoreForProject(projectId).read(profileCacheKey);
+      const profile = await profiler.getPreparedTemplateProfile(snapshot.templateIR, snapshot.presentationDesignSystem);
+      if (profile) return { status: 'ready', cached: true, ...(record?.templateIRHash === snapshot.templateIR.hash ? {
+        templatePreparationMs: record.templatePreparationMs ?? null,
+        templateStructuralMs: record.templateStructuralMs ?? null,
+        templateSemanticProfileMs: record.templateSemanticProfileMs ?? null,
+      } : {}) };
+      if (activeTemplatePreparations.has(key)) return { status: 'processing', cached: false,
+        ...(record?.templateIRHash === snapshot.templateIR.hash && record.templateStructuralMs !== undefined
+          ? { templateStructuralMs: record.templateStructuralMs } : {}) };
+      if (record?.templateIRHash === snapshot.templateIR.hash) {
+        if (record.status === 'failed') return { status: 'failed', cached: false, failureCode: record.failureCode ?? 'TEMPLATE_PROFILE_FAILED' };
+        if (record.status === 'processing') return { status: 'failed', cached: false, failureCode: 'TEMPLATE_PROFILE_INTERRUPTED' };
+      }
+      return { status: 'missing', cached: false };
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+        && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : 'TEMPLATE_PROFILE_STATUS_UNAVAILABLE';
+      return { status: 'failed', cached: false, failureCode: code };
+    }
+  };
+  const prepareTemplateProfile = async (
+    projectId: string,
+    snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>,
+    timing: { templateStructuralMs: number },
+  ): Promise<{ cached: boolean; templateSemanticProfileMs: number }> => {
+    if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
+      throw new TypeError('A structurally ready TemplateIR and presentation design system are required for semantic profiling.');
+    }
+    const profiler = profilerForProject(projectId);
+    const profileCacheKey = await profiler.profileCacheKey(snapshot.templateIR);
+    const key = `${projectId}:${profileCacheKey}`;
+    const store = preparationStoreForProject(projectId);
+    const alreadyPrepared = await profiler.getPreparedTemplateProfile(snapshot.templateIR, snapshot.presentationDesignSystem);
+    if (alreadyPrepared) {
+      await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR.hash, profileCacheKey,
+        status: 'ready', updatedAt: new Date().toISOString(), ...timing, templateSemanticProfileMs: 0 });
+      return { cached: true, templateSemanticProfileMs: 0 };
+    }
+    const existing = activeTemplatePreparations.get(key);
+    if (existing) return existing as Promise<{ cached: boolean; templateSemanticProfileMs: number }>;
+    const task = (async () => {
+      await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR!.hash, profileCacheKey,
+        status: 'processing', updatedAt: new Date().toISOString(), templateStructuralMs: timing.templateStructuralMs });
+      const startedAt = performance.now();
+      try {
+        await profilerForProject(projectId).prepareTemplateProfile(snapshot.templateIR!, snapshot.presentationDesignSystem!);
+        const templateSemanticProfileMs = Math.max(0, Math.round(performance.now() - startedAt));
+        await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR!.hash, profileCacheKey,
+          status: 'ready', updatedAt: new Date().toISOString(), ...timing, templateSemanticProfileMs });
+        return { cached: false, templateSemanticProfileMs };
+      } catch (error) {
+        const failureCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+          && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : 'TEMPLATE_PROFILE_FAILED';
+        await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR!.hash, profileCacheKey,
+          status: 'failed', updatedAt: new Date().toISOString(), failureCode, ...timing,
+          templateSemanticProfileMs: Math.max(0, Math.round(performance.now() - startedAt)) });
+        throw error;
+      }
+    })();
+    activeTemplatePreparations.set(key, task);
+    try { return await task; }
+    finally { if (activeTemplatePreparations.get(key) === task) activeTemplatePreparations.delete(key); }
+  };
   const planningService = new PlanningService({
     projectRoot,
     projectsRoot,
@@ -236,7 +334,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     planningService,
     backend,
     renderer,
-    ...(profileTemplate ? { profileTemplate } : {}),
+    ...(semanticProfilingEnabled ? { getPreparedTemplateProfile: readPreparedTemplateProfile } : {}),
     ...(options.performanceDiagnostics ? { performanceDiagnostics: options.performanceDiagnostics } : {}),
     ...(options.presentationRenderer ? { renderer: options.presentationRenderer } : {}),
     ...(options.presentationPreview ? { preview: options.presentationPreview } : {}),
@@ -247,7 +345,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     planningService,
     generationService,
     getInferenceAdapter: getSemanticAdapter,
-    ...(profileTemplate ? { profileTemplate } : {}),
+    ...(semanticProfilingEnabled ? { getPreparedTemplateProfile: readPreparedTemplateProfile } : {}),
   });
   const app = express();
   const deletingProjects = new Set<string>();
@@ -308,12 +406,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     } finally {
       await Promise.all(probes.map((probe) => rm(probe, { force: true }).catch(() => undefined)));
     }
-    const semanticRequired = Boolean(semanticConfig);
+    const semanticRequired = semanticProfilingEnabled || Boolean(semanticConfig);
     const semanticReachable = semanticConfig ? await probeSemanticEndpoint(semanticConfig) : null;
+    const semanticReady = !semanticRequired || (semanticConfig ? semanticReachable === true : hasInjectedSemanticAdapter);
     const ready = storeAvailable && requiredDirsWritable && Boolean(renderer)
-      && (!semanticRequired || semanticReachable === true);
-    const semanticStatus = semanticRequired ? semanticReachable ? 'reachable' : 'unreachable'
-      : hasInjectedSemanticAdapter ? 'injected-unprobed' : 'not-required';
+      && semanticReady;
+    const semanticStatus = semanticConfig ? semanticReachable ? 'reachable' : 'unreachable'
+      : hasInjectedSemanticAdapter ? 'injected-unprobed' : semanticRequired ? 'unconfigured' : 'not-required';
     res.status(ready ? 200 : 503).json({
       ok: ready,
       checks: {
@@ -472,7 +571,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   app.get('/api/projects/:id/template', async (req, res) => {
     try {
       if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
-      res.json(await getTemplateCompilation(projectsRoot, req.params.id));
+      const snapshot = await getTemplateCompilation(projectsRoot, req.params.id);
+      res.json({ ...snapshot, semanticProfile: semanticProfilingEnabled
+        ? await preparationStatus(req.params.id, snapshot)
+        : { status: 'disabled', cached: false } });
     } catch (error) {
       if (error instanceof TemplateCompilerError) {
         return res.status(error.status).json({ status: 'failed', failure: { code: error.code, message: error.message } });
@@ -487,16 +589,43 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   app.post('/api/projects/:id/template/compile', async (req, res) => {
     if (!getPresentationProject(db, req.params.id)) return projectNotFound(res);
     const filePath = typeof req.body?.filePath === 'string' ? req.body.filePath : '';
+    const preparationStartedAt = performance.now();
     try {
+      const structuralStartedAt = performance.now();
       const compiled = await compileTemplate(projectsRoot, req.params.id, filePath);
-      if (profileTemplate) await profileTemplate(req.params.id, compiled);
-      res.json(compiled);
+      const templateStructuralMs = Math.max(0, Math.round(performance.now() - structuralStartedAt));
+      if (!semanticProfilingEnabled) {
+        res.json({ ...compiled, semanticProfile: { status: 'disabled', cached: false } });
+        return;
+      }
+      const profile = await prepareTemplateProfile(req.params.id, compiled, { templateStructuralMs });
+      const templatePreparationMs = Math.max(0, Math.round(performance.now() - preparationStartedAt));
+      const profiler = profilerForProject(req.params.id);
+      const compiledIR = compiled.templateIR;
+      if (!compiledIR) throw new TypeError('Structural template compilation did not return a TemplateIR.');
+      const profileCacheKey = await profiler.profileCacheKey(compiledIR);
+      await preparationStoreForProject(req.params.id).write({
+        schemaVersion: 1,
+        templateIRHash: compiledIR.hash,
+        profileCacheKey,
+        status: 'ready',
+        updatedAt: new Date().toISOString(),
+        templatePreparationMs,
+        templateStructuralMs,
+        templateSemanticProfileMs: profile.templateSemanticProfileMs,
+      });
+      res.json({ ...compiled, semanticProfile: {
+        status: 'ready', cached: profile.cached, templatePreparationMs,
+        templateStructuralMs, templateSemanticProfileMs: profile.templateSemanticProfileMs,
+      } });
     } catch (error) {
       if (error instanceof SemanticInferenceError) {
         res.locals.errorCode = error.code;
-        return res.status(semanticFailureStatus(error)).json({
-          status: 'failed',
-          failure: { code: error.code, message: 'Сервис анализа временно не смог обработать шаблон.' },
+        const snapshot = await getTemplateCompilation(projectsRoot, req.params.id);
+        return res.status(200).json({
+          ...snapshot,
+          semanticProfile: { status: 'failed', cached: false, failureCode: error.code },
+          semanticProfileNotice: { code: error.code, message: 'Не удалось завершить анализ оформления шаблона. Повторите подготовку перед созданием презентации.' },
         });
       }
       if (error instanceof TemplateCompilerError) {
@@ -504,6 +633,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       }
       return res.status(500).json({
         status: 'failed',
+        semanticProfile: { status: 'failed', cached: false, failureCode: 'TEMPLATE_PROFILE_FAILED' },
         failure: { code: 'TEMPLATE_COMPILE_FAILED', message: 'Template compilation failed.' },
       });
     }

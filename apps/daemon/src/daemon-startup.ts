@@ -80,7 +80,13 @@ export async function closeHttpServer(server: Server): Promise<void> {
 export async function startDaemonRuntime(options: DaemonRuntimeOptions = {}): Promise<StartedDaemonRuntime> {
   const { openBrowser = false, logListening = false, ...serverOptions } = options;
   const { startServer } = await import('./server.js');
-  const started = await startServer({ ...serverOptions, returnServer: true });
+  // A normal daemon serves the prepared-profile quality path. Structural-only
+  // behavior remains available to explicitly opted-out test/diagnostic callers.
+  const started = await startServer({
+    ...serverOptions,
+    enableSemanticProfiling: serverOptions.enableSemanticProfiling ?? true,
+    returnServer: true,
+  });
   if (typeof started === 'string') throw new Error('presentation server did not return a server handle');
   const stop = async () => {
     await closeHttpServer(started.server);

@@ -1,15 +1,15 @@
 # Готовность к ограниченной Qwen qualification
 
-**STATUS: STRUCTURAL_FALLBACK_BLOCKED**
-**ОФЛАЙН CORE E2E: BLOCKED. НОВЫХ LIVE REQUESTS: 0.** На 2026-09-27 целевой fake core WorkSpace (3 слайда, exact template hash `1b8883114486c69dff706e9c4fd9382727c4506c2cfa3ec34f86987f1e852f2f`, exact task hash `6f677ef5e815fedb2272d3ffd98d37e9862d9d34ececb04b911e2db2d4daec2a`) прошёл Worker и planning Supervisor (2/3 completion calls, profiler=0), затем fail-closed завершился `VARIANTS_NOT_DISTINCT` до аудита/экспорта; ready slides=0. С той же WorkSpace задачей explicit profiler fake diagnostic прошёл 3/3 слайда, 9/9 вариантов, deterministic audit, contextual audit 11/11, selected/A/B/C PPTX reopen, PDF/HTML и неизменностью шаблона. VK Tech 12 слайдов прошёл без профиля: 3 completion calls, 36/36 вариантов, audits/export/reopen PASS, template unchanged, 93.531 s. Exact held-out AIOS task+context (0 source files) тоже завершился `VARIANTS_NOT_DISTINCT` с profiler=0 до аудита/экспорта. Core structural fallback поэтому не квалифицирован; live WorkSpace/VK runs запрещены до решения этого блокера. Manifest outputs: `.lct/core-live-e2e-20260927/`. Ранее выполненный live profiler batch остаётся историческим: HTTP 200, batch 1/5, `maxOutputTokens=1024`, `finish_reason=length`, 38,017 ms; runtime validation не запускалась. Pod не останавливался и не перезапускался. `CASE_COMPLIANCE_STATUS: BLOCKED`; обязательная live VK inference не подтверждена. Подробности: [RELEASE_READINESS.md](../RELEASE_READINESS.md), [CASE_REQUIREMENTS.md](./compliance/CASE_REQUIREMENTS.md), [LIVE_QUALIFICATION.md](../LIVE_QUALIFICATION.md).
+**STATUS: LIVE_GENERATION_BLOCKED (пред-live fake gate)**
+**Текущая profile-before-Generate acceptance: BLOCKED; новых live requests в этом pass: 0.** WorkSpace (29 source slides, SHA-256 `1b8883114486c69dff706e9c4fd9382727c4506c2cfa3ec34f86987f1e852f2f`) прошёл подготовку профиля в 6 batches; затем Generate без profiler calls прошёл 3/3 slides, A/B/C 9/9, audits, PPTX/PDF/HTML validation и сохранил исходный шаблон неизменённым. Manifest: `.lct/prepared-profile-fake-workspace-20260927/manifest.json`. Exact held-out AIOS (16 source slides, SHA-256 `18198cc08df9fc3ea5aee5f509d89e70a4ade68bb539fed61a957581ee365ad1`) подготовил профиль в 4 batches; Worker и planning Supervisor завершились, но Generate fail-closed остановился с `VARIANTS_NOT_DISTINCT` (0/3 variants; contextual audit/export не запускались). Manifest: `.lct/prepared-profile-fake-aios-20260927/manifest.json`. По stop condition VK Tech fake и любые live requests не запускались; RunPod не останавливался/перезапускался, image не пересобирался, weights не скачивались. Подробности: [активный план](./plans/active/live-readiness-dual-mode.md), [RELEASE_READINESS.md](../RELEASE_READINESS.md), [LIVE_QUALIFICATION.md](../LIVE_QUALIFICATION.md).
 
-Ниже перечисленные более ранние PASS результаты WorkSpace/AIOS были получены в qualification, где semantic profiler был включён. Они сохраняют историческую ценность, но не подтверждают core-путь с profiler=0.
+Ниже приведены исторические результаты прежних стратегий; они не заменяют текущий stop status.
 
 Предыдущая попытка с монолитным profiler остаётся историческим evidence: HTTP 400 `input_tokens` context overflow при запрошенных 2,784 output tokens. В текущем run наблюдалось усечение ответа; qualification не завершена.
 
 Profiler evidence boundary сократила сериализованный WorkSpace evidence с 134,049 до 69,034 байт (−48.5%), но этого недостаточно для текущего context window. Данные provider usage для отклонённого запроса отсутствуют; нижняя граница по заданному output budget — более 13,600 input tokens. Это не точный tokenizer estimate.
 
-## Последний offline freeze
+## Последний offline freeze (исторический baseline до текущего pass)
 
 - Release/default/qualification PPTX backend — Office Kit. `parsePptxBackend` default, `.env.example`, quickstart, readiness и canonical runner согласованы; runner завершает проверку ошибкой при backend drift. `custom` оставлен только для явного legacy/diagnostic/experimental выбора.
 - Exact WorkSpace regression: шаблон SHA-256 `1b8883114486c69dff706e9c4fd9382727c4506c2cfa3ec34f86987f1e852f2f`; task «Создай презентацию о платформе интеллектуальных ассистентов для корпоративной поддержки. Покажи проблему, решение, принцип работы, преимущества, сценарии использования, безопасность, эффект для бизнеса и следующий шаг.»; 5 слайдов, без content files и context; `ready`, 15/15 вариантов, deterministic audit без errors/warnings, contextual audit v2 11/11, ровно 4 fake calls; selected/A/B/C PPTX structural reopen, PDF и HTML validation прошли. Свежий повтор — 36.954 s. Manifest: `.lct/product-e2e/final-offline-acceptance-workspace-2026-09-27/manifest.json`.
@@ -22,14 +22,15 @@ Profiler evidence boundary сократила сериализованный Wor
 
 Статусы качества разделены: **STRUCTURAL — PASS**; **MANUAL OFFICE — PASS** только для проверенного WorkSpace output; **SEMANTIC CONTENT — N/A** для fake; **VISUAL POLISH — PARTIAL**. Долгие заголовки могут выглядеть плотными, а в некоторых донорских композициях остаются пустые области карточек. Безопасное универсальное исправление не подтверждено: projected-fit уже влияет на отбор, а Office Kit text-layout evidence приблизительно; для произвольной пустой фигуры нет достаточной validated replaceable-slot metadata. Backlog для live review: `title-fit`, `empty-content-region quality`.
 
-## Локальный one-click product flow
+## Локальный one-click product flow (текущее правило)
 
-- Кнопка «Сгенерировать презентацию» запускает и сохраняет шаблонный analysis/profile, planning + review, A/B/C generation, deterministic audit и один contextual audit на готовую выбранную deck.
+- Загрузка/выбор шаблона автоматически выполняет структурный анализ и готовит полный `TemplateSemanticProfile`; Generate доступен только при persisted `semanticProfile.status=ready`.
+- Во время Generate профиль читается только из существующего cache; cache miss или invalid profile даёт `409 TEMPLATE_PROFILE_NOT_READY`, без скрытого inference.
 - Task-only input работает с 0 source files; контекст также optional. Запрошенный slide count соблюдён: VK Tech — 12; WorkSpace, Education, AIOS — по 3.
 - Повторный запрос идемпотентен; этап операции восстанавливается через API после refresh/restart. Ошибки замены workflow state при временном Windows file lock имеют ограниченный retry; regression tests подтверждают retry и отказ без retry для permanent error.
 - Image generation по умолчанию не настроена: image models пусты и сетевых image calls нет. Для включения необходимы явные `LCT_IMAGE_BASE_URL`, `LCT_IMAGE_MODEL`, а image request также требует `LCT_IMAGE_API_KEY`. `OPENAI_*` не используются как fallback.
 
-## Template qualification
+## Template qualification (историческая matrix; см. текущий pass в шапке)
 
 Итоговые артефакты: `.lct/product-completion-final-acceptance-2026-09-26/qualification.json`.
 
@@ -42,7 +43,7 @@ Profiler evidence boundary сократила сериализованный Wor
 
 Историческая 4-template matrix имела 16 локальных fake calls и 0 external requests; её persisted contextual v1/9-rule findings теперь stale и не используются как current v2 evidence. Дополнительные текущие hardening runs VK Tech/WorkSpace/AIOS прошли через local fake endpoint с 4 requests на run, 11/11 contextual rules и 0 generation calls. Fake findings подтверждают технический pipeline/schema, не семантическое качество Qwen.
 
-## Performance и экспорт
+## Performance и экспорт (исторические measurements)
 
 Последний canonical runner на 54-слайдовом VK Tech template собрал 12 слайдов: template analysis 1.393 s, planning 0.485 s, generation 52.512 s, exports/reopen 21.509 s, полный fake flow **78.820 s**. Выполнены ровно четыре fake requests (profiler/Worker/planning Supervisor/contextual audit), 36/36 A/B/C готовы; deterministic audit без ошибок, contextual audit 11/11. Selected/A/B/C PPTX structurally reopened: editable native text, notes=0, package errors=0; PDF=12 страниц; HTML=12 секций; исходный шаблон не изменён. Manifest: `.lct/product-e2e/20260926212925-fake-377db269/manifest.json`; deterministic aggregate SHA-256 `a3bd9f74b407728e873b72eba015e72e4408e09337fd21d04a1a949bf78272fa`. Это не прогноз live latency.
 
@@ -50,11 +51,11 @@ PPTX прошли structural reopen и содержат редактируемы
 
 ## Offline checks
 
-Предыдущие repository gates от 2026-09-26 дали 207 и 229 тестов; это исторические наборы. В текущем bounded-profiler pass: **233/233 tests**; profiler targeted suite **11/11**; web и daemon typecheck/build; boundary; craft lint; docs check (56 required files); `git diff --check`. Эти проверки не запускают inference автоматически. Точные команды и результаты указаны в [RELEASE_READINESS.md](../RELEASE_READINESS.md).
+Для текущего change pass после первого fake blocker выполнены только targeted suites: daemon 25/25; runner и web Russian messages 22/22; `git diff --check` PASS. Полный suite/build/boundary/lint/docs gate не запускался после этих изменений. Прежние результаты 239/239 относятся к предыдущему состоянию и не объявляются PASS для текущего diff. Ни один gate не запускает live inference автоматически.
 
-## Dual-mode runner
+## Dual-mode runner (обновлённая стратегия)
 
-`LIVE_PATH_STATUS: BLOCKED`: runner budget/regression tests проходят, но core no-profile generation не проходит offline real-template acceptance на WorkSpace и held-out AIOS. Исторический внешний run выполнил один profiler batch и завершился `finish_reason=length`; token usage отсутствует, а runtime schema validation не запускалась. Live core qualification не начиналась в этом pass. Новые live requests запрещены до снятия структурного блокера.
+`LIVE_PATH_STATUS: BLOCKED`: runner budget/regression tests проходят. Текущий profile-before-Generate fake gate остановился на held-out AIOS после profile preparation, Worker и planning Supervisor с `VARIANTS_NOT_DISTINCT`; VK Tech fake продолжение и external inference не запускались. Исторический live profile batch завершился `finish_reason=length`; это не является результатом текущего lifecycle. Новые live requests запрещены до полного offline acceptance.
 
 ## Live-only risks
 
@@ -64,4 +65,4 @@ PPTX прошли structural reopen и содержат редактируемы
 
 ## Следующее действие
 
-Остановиться после первого усечённого profiler batch. В рамках этой qualification не повторять inference; сначала офлайн исследовать, почему bounded batch из 6 слайдов исчерпал лимит 1,024 output tokens, не меняя serving context. Новый live run требует отдельного запроса; VK Tech 12-slide run допускается только после полного WorkSpace PASS.
+Следующий шаг — диагностировать почему точный fake profile-before-Generate AIOS workflow после успешных Worker и planning Supervisor не может выпустить различимые варианты. Сохранять fail-closed `VARIANTS_NOT_DISTINCT`; не запускать VK Tech fake или любой live inference до устранения blocker и прохождения полного offline matrix + repository gates.

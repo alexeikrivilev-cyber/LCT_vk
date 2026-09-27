@@ -79,6 +79,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .template-status.status-ready { border-color: #b8d4c0; background: #eff8f1; color: #255c35; }
 .template-status.status-stale, .template-status.status-failed, .template-status.status-unavailable { border-color: #e3c49b; background: #fff7e9; color: #80511c; }
 .template-status.status-loading { border-color: #c8c8c0; background: #f1f1ee; }
+.template-status.status-processing { border-color: #c8c8c0; background: #f1f1ee; }
 .template-toolbar { display: grid; grid-template-columns: auto minmax(220px, 1fr) auto; align-items: center; gap: 10px; margin-top: 16px; }
 .template-toolbar label { color: var(--muted); font-size: 12px; font-weight: 650; }
 .template-toolbar select { min-width: 0; background: #fff; font-size: 12px; }

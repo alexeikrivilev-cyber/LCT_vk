@@ -155,8 +155,10 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
   const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 17 });
   const plan = planTemplateSemanticProfileBatches(templateIR);
   assert.ok(plan.batches.length > 1);
-  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 6));
+  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 5));
   assert.ok(plan.batches.every((batch) => batch.evidenceBytes <= 24 * 1024));
+  assert.ok(plan.batches.every((batch) => batch.maxOutputTokens >= 2048 && batch.maxOutputTokens <= 4096));
+  assert.ok(plan.batches.some((batch) => batch.sourceSlideIndexes.length === 5 && batch.maxOutputTokens === 4096));
   assert.deepEqual(plan.batches.flatMap((batch) => batch.sourceSlideIndexes), templateIR.slides.map((slide) => slide.index));
 
   const endpoint = await startFakeSemanticEndpoint({
@@ -204,6 +206,65 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
 
   await profiler.profile(templateIR, presentationDesignSystem);
   assert.equal(endpoint.state.inference.length, plan.batches.length, 'the complete in-memory profile cache avoids later provider requests');
+});
+
+test('profile preparation bounds concurrent batches, merges deterministically, and read-only cache misses make no requests', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-concurrency-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 17 });
+  const plan = planTemplateSemanticProfileBatches(templateIR);
+  let active = 0;
+  let maximumActive = 0;
+  const requestBatchNumbers = [];
+  let writes = 0;
+  const cache = { async read() { return null; }, async write() { writes += 1; } };
+  const fake = {
+    async infer(request) {
+      const batchNumber = request.metadata.templateProfilerBatch.batchNumber;
+      requestBatchNumbers.push(batchNumber);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, (plan.batches.length - batchNumber + 1) * 8));
+        const response = deterministicPlanningResponse({
+          model,
+          messages: request.messages,
+          response_format: { json_schema: { name: request.output.name } },
+        });
+        return { value: JSON.parse(response.choices[0].message.content), telemetry: {} };
+      } finally { active -= 1; }
+    },
+  };
+  const profiler = new TemplateSemanticProfiler(fake, cache, { concurrency: 2 });
+  const profile = await profiler.prepareTemplateProfile(templateIR, presentationDesignSystem);
+  assert.equal(maximumActive, 2);
+  assert.equal(writes, 1, 'only the fully merged, validated profile is persisted');
+  assert.deepEqual(requestBatchNumbers, plan.batches.map((batch) => batch.batchNumber));
+  assert.deepEqual(profile.slides.map((slide) => slide.sourceSlideIndex), templateIR.slides.map((slide) => slide.index));
+
+  const failedRequests = [];
+  let failedWrites = 0;
+  const failingProfiler = new TemplateSemanticProfiler({
+    async infer(request) {
+      const batchNumber = request.metadata.templateProfilerBatch.batchNumber;
+      failedRequests.push(batchNumber);
+      if (batchNumber === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        throw new Error('first batch failed');
+      }
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(new Error('sibling batch aborted')), { once: true });
+      });
+    },
+  }, { async read() { return null; }, async write() { failedWrites += 1; } }, { concurrency: 2 });
+  await assert.rejects(failingProfiler.prepareTemplateProfile(templateIR, presentationDesignSystem));
+  assert.deepEqual(failedRequests.sort(), [1, 2], 'no later batch starts after the first provider failure');
+  assert.equal(failedWrites, 0, 'failed concurrent preparation never stores a partial profile');
+
+  const emptyCacheProfiler = new TemplateSemanticProfiler({ async infer() { throw new Error('read-only lookup must not infer'); } }, {
+    async read() { return null; }, async write() { throw new Error('read-only lookup must not write'); },
+  });
+  assert.equal(await emptyCacheProfiler.getPreparedTemplateProfile(templateIR, presentationDesignSystem), null);
 });
 
 test('batch response index coverage is exact and partial results are never cached', async (t) => {
@@ -335,7 +396,7 @@ test('profiler config version invalidates profiles produced from the previous ev
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root);
   const contract = JSON.parse(await readFile(path.join(process.cwd(), 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
-  assert.equal(contract.configVersion, 'template-profiler-config.v3');
+  assert.equal(contract.configVersion, 'template-profiler-config.v5');
   const prompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8')).replace(/\s+/g, ' ').trim();
   const promptSha256 = createHash('sha256').update(prompt, 'utf8').digest('hex');
   const oldCacheKey = createHash('sha256').update(JSON.stringify({

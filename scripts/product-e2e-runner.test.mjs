@@ -58,9 +58,9 @@ async function makeTemplate(filePath, { slideCount = 3 } = {}) {
   await deck.writeFile({ fileName: filePath });
 }
 
-function workflowOptions(templatePath, outputDir, slides, task) {
+function workflowOptions(templatePath, outputDir, slides, task, enableTemplateProfiler = true) {
   return { mode: 'fake', templatePath, task, context: '', sources: [], slides, providerLabel: 'local-test', outputDir,
-    maxSemanticRequests: 3, enableTemplateProfiler: false, dryRun: false, preflightOnly: false };
+    enableTemplateProfiler, maxSemanticRequests: enableTemplateProfiler ? 17 : 3, dryRun: false, preflightOnly: false };
 }
 
 test('CLI validates external dry-run config without making any network request or printing secrets', async (t) => {
@@ -98,27 +98,25 @@ test('external preflight sends only one models GET and never sends chat completi
   assert.ok(!serialized.includes(env.LCT_SEMANTIC_BASE_URL));
 });
 
-test('core CLI defaults to a hard cap of three; bounded profiler mode is an explicit opt-in', () => {
+test('product CLI uses a bounded profile-preparation and generation budget by default', () => {
   const core = ['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x'];
   const coreOptions = parseArgs(core);
-  assert.equal(coreOptions.enableTemplateProfiler, false);
-  assert.equal(coreOptions.maxSemanticRequests, 3);
-  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '4']), /Core mode is capped at 3/u);
-  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '17']), /between 1 and 16/u);
-  const diagnostic = parseArgs([...core, '--max-semantic-requests', '16', '--enable-template-profiler']);
-  assert.equal(diagnostic.enableTemplateProfiler, true);
-  assert.equal(diagnostic.maxSemanticRequests, 16);
-  assert.equal(parseArgs([...core, '--enable-template-profiler']).maxSemanticRequests, 16);
+  assert.equal(coreOptions.maxSemanticRequests, 17);
+  assert.equal(coreOptions.enableTemplateProfiler, true);
+  assert.equal(parseArgs([...core, '--max-semantic-requests', '17']).maxSemanticRequests, 17);
+  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '18']), /between 1 and 17/u);
   assert.equal(parseArgs([...core, '--preflight-only']).preflightOnly, true);
   assert.throws(() => parseArgs(['--semantic-mode', 'fake', '--template', 'x.pptx', '--task', 'x', '--preflight-only']), /requires --semantic-mode external/u);
 });
 
-test('canonical runner enters through the same public one-click workflow endpoint as the UI', async () => {
+test('canonical runner prepares and caches the semantic profile before the UI workflow', async () => {
   const source = await readFile(path.join(repoRoot, 'scripts/run-product-e2e.mjs'), 'utf8');
+  assert.match(source, /\/template\/compile/u);
   assert.match(source, /\/workflow\/generate/u);
+  assert.ok(source.indexOf('/template/compile') < source.indexOf('/workflow/generate'));
   assert.doesNotMatch(source, /\/planning\/generate|TemplateSemanticProfiler|PlanningService|GenerationService/u);
   assert.doesNotMatch(source, /env\.LCT_PPTX_BACKEND\s*=/u, 'runner must use the same configured backend as the UI');
-  assert.doesNotMatch(source, /enableSemanticProfiling:\s*true/u, 'core qualification must not force optional template enrichment on');
+  assert.match(source, /enableSemanticProfiling:\s*options\.enableTemplateProfiler/u);
   assert.match(source, /readiness\.checks\?\.pptxBackend/u);
   assert.match(source, /generation\.backend/u);
 });
@@ -159,7 +157,7 @@ test('core request budget hard-stops at three semantic completions', async () =>
   assert.equal(budget.rejectedAttempts, 1);
 });
 
-test('explicit profiler diagnostic budget allows at most thirteen batches plus three fixed stages', async () => {
+test('full product request budget allows at most fourteen profile batches plus three fixed stages', async () => {
   const delegated = [];
   const delegate = {
     model: 'Qwen/Qwen3.8-27B',
@@ -169,17 +167,17 @@ test('explicit profiler diagnostic budget allows at most thirteen batches plus t
         finishReason: 'stop', promptTokens: 1, completionTokens: 1 } };
     },
   };
-  const budget = createRequestBudgetAdapter(delegate, 16);
+  const budget = createRequestBudgetAdapter(delegate, 17);
   const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
-  for (let index = 0; index < 13; index += 1) await budget.adapter.infer(request('template-semantic-profile'));
+  for (let index = 0; index < 14; index += 1) await budget.adapter.infer(request('template-semantic-profile'));
   for (const operation of ['deck-plan', 'plan-review', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
-  await assert.rejects(budget.adapter.infer(request('unexpected-seventeenth-call')), (error) => error.code === 'RATE_LIMITED');
-  assert.equal(delegated.length, 16);
-  assert.equal(budget.records.length, 16);
+  await assert.rejects(budget.adapter.infer(request('unexpected-eighteenth-call')), (error) => error.code === 'RATE_LIMITED');
+  assert.equal(delegated.length, 17);
+  assert.equal(budget.records.length, 17);
   assert.equal(budget.rejectedAttempts, 1);
 });
 
-test('canonical one-click fake core E2E skips profiler while Worker/Supervisor/audit still run for 3 and 12 slides', async (t) => {
+test('canonical fake E2E prepares the profile before Generate and runs no profiler requests during Generate', async (t) => {
   const scratch = await mkdtemp(path.join(repoRoot, '.lct', 'product-e2e-test-'));
   t.after(() => rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }));
   const templatePath = path.join(scratch, 'синтетический шаблон.pptx');
@@ -201,16 +199,25 @@ test('canonical one-click fake core E2E skips profiler while Worker/Supervisor/a
     assert.equal(manifest.pptxBackend, 'office-kit');
     assert.equal(manifest.requestedSlides, slides);
     assert.equal(manifest.actualSlides, slides);
-    assert.equal(manifest.templateProfilerEnabled, false);
+    assert.equal(manifest.templateProfilerEnabled, true);
+    assert.ok(manifest.workflow.templatePreparation.profileRequests > 0);
     assert.deepEqual(manifest.semantic.operationCounts, {
-      profiler: 0, worker: 1, planningSupervisor: 1, contextualAudit: 1,
-      revisionWorker: 0, other: 0, generation: 0, total: 3,
+      profiler: manifest.workflow.templatePreparation.profileRequests, worker: 1, planningSupervisor: 1, contextualAudit: 1,
+      revisionWorker: 0, other: 0, generation: 0, total: manifest.workflow.templatePreparation.profileRequests + 3,
     });
-    assert.equal(manifest.semantic.requestCount, 3);
+    assert.equal(manifest.semantic.requestCount, manifest.workflow.templatePreparation.profileRequests + 3);
+    assert.equal(manifest.semantic.requestBudget, 17);
+    assert.equal(manifest.workflow.templatePreparation.structuralStatus, 'ready');
+    assert.equal(manifest.workflow.templatePreparation.semanticProfileStatus, 'ready');
+    assert.equal(manifest.workflow.templatePreparation.cachedStatusRead, true);
+    assert.ok(manifest.timing.templatePreparationMs > 0);
+    assert.ok(Number.isSafeInteger(manifest.timing.timeToThreeVariantsReadyMs));
     assert.ok(manifest.semantic.requests.every((request) => request.responseFormat === 'json_schema'
       && request.strictJsonSchema === true && request.httpStatus === 200
       && request.runtimeSchemaValidation === 'passed'));
-    assert.deepEqual(manifest.semantic.requests.map((request) => request.operation), ['deck-plan', 'plan-review', 'contextual-deck-audit']);
+    assert.deepEqual(manifest.semantic.requests.slice(-3).map((request) => request.operation), [
+      'deck-plan', 'plan-review', 'contextual-deck-audit',
+    ]);
     assert.equal(manifest.semantic.automaticRetries, 0);
     assert.equal(manifest.generation.variantsReady, slides * 3);
     assert.equal(manifest.generation.deterministicAudit.status, 'passed');
@@ -235,14 +242,13 @@ test('canonical one-click fake core E2E skips profiler while Worker/Supervisor/a
     assert.equal(persisted.result, 'PASS');
   }
   assert.equal(endpoints.length, 2);
-  assert.deepEqual(endpoints.map((endpoint) => endpoint.state.inference.map((call) => call.operation)), [
-    ['deck-plan', 'plan-review', 'contextual-deck-audit'],
-    ['deck-plan', 'plan-review', 'contextual-deck-audit'],
-  ]);
+  assert.ok(endpoints.every((endpoint) => endpoint.state.inference.filter((call) => call.operation === 'template-semantic-profile').length > 0));
+  assert.ok(endpoints.every((endpoint) => endpoint.state.inference.slice(-3).map((call) => call.operation).join(',')
+    === 'deck-plan,plan-review,contextual-deck-audit'));
 });
 
-test('explicit profiler diagnostic mode retains the bounded batched profiler path', async (t) => {
-  const scratch = await mkdtemp(path.join(repoRoot, '.lct', 'product-e2e-profiler-diagnostic-test-'));
+test('profile batches remain bounded and run before all three downstream semantic operations', async (t) => {
+  const scratch = await mkdtemp(path.join(repoRoot, '.lct', 'product-e2e-profile-required-test-'));
   t.after(() => rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }));
   const templatePath = path.join(scratch, 'синтетический шаблон.pptx');
   await makeTemplate(templatePath, { slideCount: 9 });
@@ -252,13 +258,11 @@ test('explicit profiler diagnostic mode retains the bounded batched profiler pat
     endpoints.push(endpoint);
     return endpoint;
   };
-  const options = workflowOptions(templatePath, path.join(scratch, 'diagnostic'), 3, 'Проверить диагностический профилировщик.');
-  options.enableTemplateProfiler = true;
-  options.maxSemanticRequests = 16;
+  const options = workflowOptions(templatePath, path.join(scratch, 'full'), 3, 'Проверить подготовку шаблона.');
   const manifest = await runProductE2E(options, { startFakeSemanticEndpoint: endpointFactory });
   assert.equal(manifest.result, 'PASS', `failed at ${manifest.failure?.stage}: ${manifest.failure?.code}`);
   assert.equal(manifest.templateProfilerEnabled, true);
-  assert.equal(manifest.semantic.requestBudget, 16);
+  assert.equal(manifest.semantic.requestBudget, 17);
   assert.equal(manifest.semantic.requestCount, 5);
   assert.deepEqual(manifest.semantic.operationCounts, {
     profiler: 2, worker: 1, planningSupervisor: 1, contextualAudit: 1,
@@ -269,7 +273,7 @@ test('explicit profiler diagnostic mode retains the bounded batched profiler pat
   assert.equal(endpoints[0].state.inference.length, 5);
 });
 
-test('a fake semantic request failure stops the product run without retrying', async (t) => {
+test('fake profile preparation stops after one failure and does not retry', async (t) => {
   const scratch = await mkdtemp(path.join(repoRoot, '.lct', 'product-e2e-failure-test-'));
   t.after(() => rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }));
   const templatePath = path.join(scratch, 'template.pptx');
@@ -280,7 +284,7 @@ test('a fake semantic request failure stops the product run without retrying', a
     endpoints.push(endpoint);
     return endpoint;
   };
-  const manifest = await runProductE2E(workflowOptions(templatePath, path.join(scratch, 'failure'), 3, 'Проверить контролируемый отказ.'), {
+  const manifest = await runProductE2E(workflowOptions(templatePath, path.join(scratch, 'failure'), 3, 'Проверить контролируемый отказ.', true), {
     startFakeSemanticEndpoint: endpointFactory,
   });
   assert.equal(manifest.result, 'FAIL');
@@ -289,5 +293,8 @@ test('a fake semantic request failure stops the product run without retrying', a
   assert.equal(manifest.semantic.automaticRetries, 0);
   assert.equal(manifest.semantic.requests[0].httpStatus, 524);
   assert.equal(manifest.semantic.requests[0].runtimeSchemaValidation, 'not-run');
+  assert.equal(manifest.semantic.requests[0].operation, 'template-semantic-profile');
+  assert.equal(manifest.semantic.rawOperationCounts['deck-plan'], undefined);
   assert.equal(endpoints[0].state.inference.length, 1);
+  assert.deepEqual(endpoints[0].state.inference.map((call) => call.operation), ['template-semantic-profile']);
 });

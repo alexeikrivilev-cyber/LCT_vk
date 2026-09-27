@@ -62,6 +62,9 @@ export const ru = {
     description: 'Загрузите PowerPoint-шаблон. Мы используем его макеты, тему и оформление.',
     fetching: 'Загружаем сохранённый результат…',
     analyzing: 'Анализируем шаблон…',
+    preparing: 'Подготавливаем шаблон…',
+    structureAnalyzing: 'Разбираем структуру шаблона…',
+    profileAnalyzing: 'Анализируем композиции…',
     ready: 'Шаблон изучен',
     selected: 'Шаблон выбран',
     selectTemplate: 'Загрузите шаблон',
@@ -80,6 +83,9 @@ export const ru = {
     chooseAndAnalyze: 'Выберите загруженный файл .pptx. Основная кнопка запустит анализ автоматически.',
     scanUnavailable: 'Не удалось загрузить сохранённое состояние анализа шаблона.',
     technicalFailure: 'Не удалось завершить анализ шаблона.',
+    profileFailed: 'Не удалось завершить анализ оформления шаблона. Повторите подготовку перед созданием презентации.',
+    profileRequired: 'Завершите анализ оформления шаблона, чтобы продолжить.',
+    prepareBeforeGenerate: 'Сначала завершите анализ оформления шаблона.',
     diagnosticLabel: 'Подробности анализа',
     scannedFile: 'Проанализированный файл',
     notReported: 'Нет данных',
@@ -147,7 +153,7 @@ export const ru = {
     unavailable: 'Состояние плана недоступно',
     reload: 'Обновить план',
     analyzeTemplateFirst: 'Сначала проанализируйте выбранный шаблон PowerPoint.',
-    oneClickWillAnalyze: 'Шаблон будет проанализирован автоматически при создании презентации.',
+    oneClickWillAnalyze: 'Сначала завершите подготовку шаблона. После этого можно будет создать презентацию.',
     uploadTemplateFirst: 'Сначала выберите PPTX-шаблон.',
     optionalLabel: 'необязательно',
     stale: 'Сохранённый план построен по прежней задаче, контексту, материалам или шаблону. Создайте новый план.',
@@ -463,6 +469,7 @@ export function friendlyErrorMessage(code: string | undefined, status: number, o
   if (/TOO_LARGE/.test(normalized)) return operation === 'planning' ? ru.errors.plan : ru.errors.requestTooLarge;
   if (/UNSUPPORTED_FORMAT|UNSUPPORTED_FILE|INVALID_UTF8|NOT_PARSED/.test(normalized)) return ru.errors.unsupportedFile;
   if (/VARIANTS_NOT_DISTINCT|VARIANT_NOT_READY/.test(normalized)) return ru.errors.variant;
+  if (/TEMPLATE_PROFILE_NOT_READY/.test(normalized)) return ru.template.prepareBeforeGenerate;
   if (/EXPORT|POWERPOINT_ASSEMBLY/.test(normalized) || operation === 'export') return ru.errors.export;
   if (/SEMANTIC|INFERENCE|PROVIDER|TIMEOUT|DEADLINE|CONFIGURATION|STRUCTURED_OUTPUT|INVALID_JSON|EMPTY_RESPONSE|SERVICE_UNAVAILABLE|AUTH_ERROR|RATE_LIMIT/.test(normalized)
       || status === 502 || status === 503 || status === 504) return ru.errors.semantic;

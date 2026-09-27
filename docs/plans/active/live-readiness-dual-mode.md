@@ -1,37 +1,43 @@
-# Plan: P0 core live E2E без обязательного Template Profiler
+# Plan: prepared semantic profile and bounded live qualification
 
-> **Current scope (2026-09-27):** перевести production/core one-click workflow на структурный путь без обязательного TemplateSemanticProfiler. Профилировщик и его batching сохраняются как explicit opt-in diagnostic/enrichment path; его live результат при 1024 tokens остаётся `finish_reason=length` и `PENDING`.
+> **Current scope (2026-09-27):** final product decision is to prepare and persist a complete `TemplateSemanticProfile` before Generate, then use cache-only reads during generation. The profile-before-Generate WorkSpace fake E2E passed; exact held-out AIOS profile preparation passed but Generate failed closed with `VARIANTS_NOT_DISTINCT`. Stop condition triggered. VK Tech matrix and live inference were not run. Do not weaken distinctness or launch live before resolving this offline blocker.
 
 ## Goal
 
-Make the one-click product workflow independent of full-template semantic profiling, preserve structural selection/generation safety, and run offline real-template acceptance before the specifically authorized bounded live qualification.
+Подготовка шаблона выполняет structural TemplateIR/PDS inspection, затем `TemplateSemanticProfiler`, validation и запись профиля в существующий cache. Generate использует только read-only profile lookup и возвращает `409 TEMPLATE_PROFILE_NOT_READY` при missing/invalid cache entry. Подтвердить этот lifecycle real-template fake E2E, затем полными локальными gates; live WorkSpace разрешён только после полного fake и local PASS.
 
 ## Constraints
 
-- Preserve the running Pod: no stop, restart, recreation, Docker rebuild, model download, or serving-context/runtime/precision change. This task explicitly authorizes one WorkSpace live core E2E only after all offline gates, then one VK Tech 12-slide live core E2E only if WorkSpace fully passes.
-- Do not commit or push.
+- Preserve the running Pod: no stop, restart, recreation, Docker rebuild, model download, or serving-context/runtime/precision change. Only the bounded WorkSpace qualification is authorized after local gates; VK Tech 12 slides is conditional on the complete WorkSpace PASS.
+- Do not commit or push for this task.
 - Preserve all pre-existing user changes, especially `test-content.md`; do not reset, clean, checkout, or overwrite them.
 - Keep provider-specific deployment details out of application logic; provider label is report metadata only.
-- Runner enters through the public one-click workflow API and does not call planning or generation services directly.
+- Runner enters through public template preparation and one-click workflow APIs; it does not call planning or generation services directly.
 
 ## Acceptance
 
-- Semantic endpoint configuration leaves profiler disabled unless `enableSemanticProfiling=true` is explicitly supplied.
-- Core qualification has a hard maximum of 3 semantic completions: one Worker, one planning Supervisor, one contextual audit; profiler and generation calls are 0, retries are 0.
-- Explicit profiler diagnostic mode retains up to 13 bounded batches and a 16-call total cap, with all existing profiler validation/cache/batching tests preserved.
-- Exact WorkSpace, VK Tech, and held-out AIOS task-only fake product flows prove structural no-profile generation, A/B/C PPTX reopen/native objects, deterministic audit, required exports and unchanged sources.
+- Template preparation may infer on cache miss, validates the complete profile, and persists it with the existing TemplateIR hash/prompt/config fingerprint.
+- Generate never calls the profiler; cache miss or invalid profile fails with `TEMPLATE_PROFILE_NOT_READY`. Structural fallback does not substitute for the normal quality path.
+- Profile preparation is bounded to at most 14 batches; full fake/live flow budget is at most 17 calls (14 profiler + Worker + planning Supervisor + contextual audit), retries zero.
+- Exact WorkSpace, AIOS and VK Tech fake flows must prove ready workflow, A/B/C, audits, reopenable exports and unchanged sources before any live run.
 - Offline repository gates pass before any live request; WorkSpace live PASS gates the conditional VK Tech live run.
 
 ## Current execution checklist
 
-- [x] Default server wiring and canonical runner disable semantic template profiling; explicit diagnostic opt-in remains bounded.
-- [x] Regression tests prove configured inference still runs Worker/Supervisor/audit, while profiler request count stays 0 in core.
-- [ ] Fake product E2E: blocked. VK Tech 12 slides passes core; WorkSpace 3 slides and exact held-out AIOS task/context both fail closed at generation with `VARIANTS_NOT_DISTINCT` (0 ready slides). Same WorkSpace/task with explicit fake profiler diagnostic passes all export/audit gates.
-- [x] Targeted test suite — 25/25 pass. Full tests/typecheck/build/boundary/lint gates stopped after blocker discovery; docs check passes (56 files); `git diff --check` passes.
-- [ ] External WorkSpace/VK Tech live E2E — NOT RUN; offline gate failed. No further live request permitted in this run.
-- [x] Readiness reports updated with current blocked state; no commit/push.
+- [x] Reconnect existing template compile, profiler and cache so normal preparation stores a validated semantic profile; Generate uses read-only cache lookup.
+- [x] Add UI readiness/polling and failure state so Generate is unavailable until persisted semantic profile is ready.
+- [x] Measure deterministic fake response JSON sizes for WorkSpace, VK Tech and Education; select output cap up to 4,096 tokens and preserve batch bounds.
+- [x] WorkSpace fake: 29 source slides / 6 profiler batches; preparation READY; Generate profiler calls 0; Worker 1, planning Supervisor 1, contextual audit 1; 3/3 slides, A/B/C 9/9, audits, PPTX/PDF/HTML, source unchanged.
+- [x] Exact AIOS preparation: 16 source slides / 4 batches; profile READY; Generate failed at `VARIANTS_NOT_DISTINCT` after Worker + planning Supervisor. No contextual audit/export. Manifest: `.lct/prepared-profile-fake-aios-20260927/manifest.json`.
+- [ ] VK Tech 12-slide profile-before-Generate fake E2E — not run after AIOS stop condition.
+- [ ] Full repository gates — not run after AIOS stop condition. Focused tests pass: daemon 25/25; adapter 16/16; runner + UI messages 22/22; `git diff --check` pass.
+- [x] Stop before live WorkSpace/VK because all-template fake acceptance did not pass. No live requests, Pod lifecycle actions, rebuild or downloads.
 
-## Historical bounded-profiler qualification (superseded for core)
+## Fake serialized response sizing (current profile contract)
+
+Sizing was measured with the deterministic local fake, not an inference call. Serialized fake completion maxima: WorkSpace 4,519 bytes (29 source slides / 6 batches), VK Tech 5,739 bytes (54 / 14), Education 3,829 bytes (55 / 11). Every batch stayed within 5 slides and 24 KiB evidence; fake responses ended with `finish_reason=stop`. The versioned profiler config uses a maximum output cap of 4,096 tokens and a bounded per-batch estimate (minimum 2,048, up to 1,024 tokens/source slide), with no automatic retries. This is a fake sizing choice, not proof that live Qwen will fit or meet latency.
+
+## Historical live profile qualification (earlier protocol)
 
 - [x] Offline sizing on the canonical WorkSpace and VK Tech source PPTX files; bounded batch plans fit the 6-slide/24-KiB limits and the 13-batch cap.
 - [x] Targeted profiler/adapter/runner regressions and full repository checks pass before external inference.
@@ -64,13 +70,13 @@ Offline measurements use SHA-256 `1b8883114486c69dff706e9c4fd9382727c4506c2cfa3e
 
 ## Progress
 
-- [x] 2026-09-27 core qualification attempt: WorkSpace no-profiler 3-slide run failed `VARIANTS_NOT_DISTINCT` after Worker + planning Supervisor (2 calls); same WorkSpace/task with 5 fake profiler batches passed 3/3, 9/9, audits and all exports. VK Tech no-profiler 12-slide passed 12/12, 36/36, 3 calls, audits and PPTX/PDF/HTML in 93.531 s. Exact AIOS task+context with no profiler failed `VARIANTS_NOT_DISTINCT` before audit/export. Evidence: `.lct/core-live-e2e-20260927/`.
-- [x] Stop condition triggered: no live WorkSpace/VK Tech requests; no selector rewrite or token tuning attempted.
+- [x] Historical structural-core qualification (superseded strategy): no-profiler WorkSpace and AIOS failed `VARIANTS_NOT_DISTINCT`; VK Tech 12-slide passed. These results do not qualify the current prepared-profile lifecycle. Manifests: `.lct/core-no-profiler-workspace-confirmed-20260927/`, `.lct/core-no-profiler-vktech12-20260927/`, `.lct/core-no-profiler-aios-capture-20260927/`.
+- [x] Current stop condition: profile-before-Generate AIOS fake failed closed; no VK fake continuation and no live WorkSpace/VK requests. Distinctness gate remains unchanged.
 
-- [x] Confirmed baseline `eabaad52496c230992bcde882f41e1d3a4001abe`, clean tracked diff; preserved pre-existing `test-content.md`.
+- [x] Historical prior-run note: baseline was `eabaad52496c230992bcde882f41e1d3a4001abe`. This pass started at `94a355240bc2e144b88f5df539e4802a58db7107` with existing worktree changes; preserved them, including untracked `test-content.md`.
 - [x] Added canonical runner, versioned bounded-request contract, and tests for fake/external safety and workflow request accounting.
 - [x] Updated targeted active docs; corrected model/image configuration claims and request budget.
-- [x] Added explicit `enableSemanticProfiling` opt-in for the canonical runner because an injected adapter otherwise leaves template profiling off; the default behavior for existing injected-adapter callers remains unchanged.
+- [x] Canonical runner performs profile preparation by default before the persisted one-click workflow; profiler calls are measured separately from calls during Generate.
 - [x] Earlier regression suite passed 7/7 for the single-request profiler; this historical result is superseded by the batching regression suite below.
 - [x] Run the canonical runner on the available real VK Tech template for 12 slides.
 - [x] Run the full suite and repository install/typecheck/build/boundary/lint gates; synchronize verified current performance and test counts.

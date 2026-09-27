@@ -158,6 +158,23 @@ test('validates structured output and keeps Worker and Supervisor evidence in se
   assert.doesNotMatch(JSON.stringify(supervisor.telemetry), /WORKER_SENTINEL|SUPERVISOR_SENTINEL/);
 });
 
+test('accepts the fourteenth bounded template-profile batch in the full-product request budget', async (t) => {
+  let calls = 0;
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    calls += 1;
+    reply.writeHead(200, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify(openAIResponse(JSON.stringify({
+      status: 'ok', summary: WORKER_SENTINEL, nextAction: 'continue',
+    }))));
+  });
+  const request = workerSmokeRequest();
+  request.operation = 'template-semantic-profile';
+  request.metadata = { templateProfilerBatch: { batchNumber: 14, totalBatches: 14, sourceSlideIndexes: [500] } };
+  const response = await adapter(baseUrl).infer(request);
+  assert.equal(response.value.summary, WORKER_SENTINEL);
+  assert.equal(calls, 1);
+});
+
 test('maps the optional adapter thinking setting to request-level chat template kwargs', async (t) => {
   let receivedBody;
   const { baseUrl } = await startServer(t, async (request, reply) => {

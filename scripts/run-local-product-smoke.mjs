@@ -144,7 +144,8 @@ async function main() {
     gates: {},
     timingsMs: {},
   };
-  const start = () => startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true, performanceDiagnostics });
+  const start = () => startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+    enableSemanticProfiling: true, performanceDiagnostics });
   const ensure = async (body) => writeFile(path.join(runDir, 'smoke-report.json'), JSON.stringify(body, null, 2));
 
   try {
@@ -173,6 +174,9 @@ async function main() {
       body: JSON.stringify({ filePath: templateName }),
     });
     assert.equal(templateResponse.status, 'ready', JSON.stringify(templateResponse.failure));
+    assert.equal(templateResponse.semanticProfile?.status, 'ready', 'normal local product flow prepares the semantic profile before planning');
+    const preparedProfileRequestCount = fake.state.inference.filter((item) => item.operation === 'template-semantic-profile').length;
+    assert.ok(preparedProfileRequestCount > 0);
     assert.ok(templateResponse.templateIR?.hash);
     assert.ok(templateResponse.templateIR.slides.length > 0);
     report.gates.template = 'passed';
@@ -251,7 +255,7 @@ async function main() {
       latencyMs: Math.round(item.durationMs ?? 0),
       strictJsonSchema: item.request.response_format?.type === 'json_schema' && item.request.response_format.json_schema?.strict === true,
     }));
-    assert.deepEqual(report.fakeInferenceRequests.map((item) => item.operation), ['deck-plan', 'plan-review']);
+    assert.deepEqual(report.fakeInferenceRequests.slice(-2).map((item) => item.operation), ['deck-plan', 'plan-review']);
     assert.ok(report.fakeInferenceRequests.every((item) => item.strictJsonSchema));
     report.timingsMs.planningIncludingFakeInference = Math.round(performance.now() - stageStartedAt);
     report.timingsMs.workerAndSupervisorReportedMs = planning.telemetry?.totalWallTimeMs ?? null;
@@ -429,9 +433,10 @@ async function main() {
     assert.equal(sha256(await readFile(templatePath)), templateHashBefore, 'source template must remain byte-identical');
     if (sourcePath && report.source) assert.equal(sha256(await readFile(sourcePath)), report.source.sha256, 'optional source file must remain byte-identical');
     report.gates.sourceImmutable = 'passed';
-    assert.equal(fake.state.inference.filter((item) => item.operation === 'template-semantic-profile').length, 0,
-      'structural template understanding does not invoke the optional semantic profiler');
-    assert.equal(fake.state.inference.length, 2, 'only Worker and planning Supervisor run; generation, selection, repair, and export do not call semantic inference');
+    assert.equal(fake.state.inference.filter((item) => item.operation === 'template-semantic-profile').length, preparedProfileRequestCount,
+      'Generate, selection, repair, and export reuse the prepared profile without further profile inference');
+    assert.equal(fake.state.inference.length, preparedProfileRequestCount + 2,
+      'the normal flow performs bounded profile preparation before the Worker and planning Supervisor only');
     report.fakeInferenceCallCount = fake.state.inference.length;
     const performanceSnapshot = performanceDiagnostics.snapshot();
     const performanceCounts = performanceSnapshot.counts;

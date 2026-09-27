@@ -12,6 +12,8 @@ import { startFakeSemanticEndpoint } from '../../../scripts/lib/fake-openai-comp
 register();
 const { startServer } = await import('../src/server.ts');
 const { SemanticInferenceError } = await import('../src/presentation/application/semantic-inference-port.ts');
+const { OpenAICompatibleSemanticInferenceAdapter } = await import('../src/presentation/adapters/openai-compatible-semantic-inference.ts');
+const { compileTemplate } = await import('../src/presentation/application/template-compiler.ts');
 
 const repoRoot = path.resolve(import.meta.dirname, '../../..');
 
@@ -39,7 +41,11 @@ test('Template Compiler API persists understanding, detects source changes, and 
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-compiler-api-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const dataDir = path.join(temp, 'data');
-  const options = { host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true };
+  const endpoint = await startFakeSemanticEndpoint({ model: 'offline-template-profile' });
+  t.after(() => endpoint.close());
+  const options = { host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+    enableSemanticProfiling: true,
+    semanticInferenceAdapter: new OpenAICompatibleSemanticInferenceAdapter({ baseUrl: endpoint.baseUrl, model: 'offline-template-profile', enableThinking: false }) };
   let started = await startServer(options);
   assert.equal(typeof started, 'object');
   const projectId = 'template-understanding';
@@ -81,6 +87,8 @@ test('Template Compiler API persists understanding, detects source changes, and 
     assert.equal(compiledBody.source.sha256, originalHash);
     assert.equal(compiledBody.templateIR.slides.length, 2);
     assert.equal(compiledBody.presentationDesignSystem.templateIRId, compiledBody.templateIR.id);
+    assert.equal(compiledBody.semanticProfile.status, 'ready');
+    assert.equal(compiledBody.semanticProfile.cached, false);
     assert.ok(!Object.hasOwn(compiledBody, 'inspection'), 'the private inspection DTO must not be exposed');
     const irKeys = objectKeys(compiledBody.templateIR);
     assert.equal(irKeys.has('protocolVersion'), false);
@@ -139,6 +147,9 @@ test('Template Compiler API persists understanding, detects source changes, and 
     const reloadedBody = await json(reloaded);
     assert.equal(reloadedBody.status, 'ready', 'compiled state survives daemon restart');
     assert.equal(reloadedBody.templateIR.hash, compiledBody.templateIR.hash);
+    assert.equal(reloadedBody.semanticProfile.status, 'ready', 'profile readiness survives daemon restart');
+    assert.equal(reloadedBody.semanticProfile.cached, true);
+    assert.equal(Object.hasOwn(reloadedBody, 'semanticProfileData'), false, 'GET exposes status, not profile contents');
 
     const missingProject = await fetch(`${started.url}/api/projects/does-not-exist/template`);
     assert.equal(missingProject.status, 404);
@@ -205,14 +216,16 @@ test('Template Compiler API persists understanding, detects source changes, and 
   }
 });
 
-test('semantic profiler failure is not reported or persisted as structural PPTX corruption', async (t) => {
+test('failed semantic preparation blocks Generate with 409 without a profile retry', async (t) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profiler-error-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
+  let inferenceCalls = 0;
   const started = await startServer({
     host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
-    serveWeb: false, returnServer: true, enableSemanticProfiling: true,
+    serveWeb: false, returnServer: true,
+    enableSemanticProfiling: true,
     semanticInferenceAdapter: {
-      async infer() { throw new SemanticInferenceError('PROVIDER_ERROR', 'unsafe raw provider message'); },
+      async infer() { inferenceCalls += 1; throw new SemanticInferenceError('PROVIDER_ERROR', 'unsafe raw provider message'); },
     },
   });
   const projectId = 'semantic-profile-boundary';
@@ -231,24 +244,70 @@ test('semantic profiler failure is not reported or persisted as structural PPTX 
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ filePath: 'Шаблон.pptx' }),
     });
-    assert.equal(response.status, 502);
+    assert.equal(response.status, 200);
     const failure = await response.json();
-    assert.equal(failure.status, 'failed');
-    assert.equal(failure.failure.code, 'PROVIDER_ERROR');
-    assert.match(failure.failure.message, /Сервис анализа/u);
+    assert.equal(failure.status, 'ready');
+    assert.equal(failure.semanticProfile.status, 'failed');
+    assert.equal(failure.semanticProfile.failureCode, 'PROVIDER_ERROR');
+    assert.doesNotMatch(failure.semanticProfileNotice.message, /можно продолжить/u);
     assert.doesNotMatch(JSON.stringify(failure), /unsafe raw provider message|C:\\\\|node_modules/u);
 
     const saved = await fetch(`${started.url}/api/projects/${projectId}/template`);
     assert.equal(saved.status, 200);
-    assert.equal((await saved.json()).status, 'ready', 'successful structural compilation stays available for retrying semantic profiling');
+    const savedBody = await saved.json();
+    assert.equal(savedBody.status, 'ready', 'structural readiness remains separately observable after profile failure');
+    assert.equal(savedBody.semanticProfile.status, 'failed');
+
+    const callsBeforeGenerate = inferenceCalls;
+    assert.ok(callsBeforeGenerate > 0, 'template preparation attempted semantic profiling');
+    const blocked = await fetch(`${started.url}/api/projects/${projectId}/workflow/generate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ templateFilePath: 'Шаблон.pptx', contentFiles: [], brief: {
+        audience: 'Продуктовая команда', purpose: 'Подготовить краткий обзор.',
+        expectedOutcome: 'Согласовать следующий шаг.', preferences: [], requestedSlideCount: 1,
+      } }),
+    });
+    assert.equal(blocked.status, 409);
+    assert.equal((await blocked.json()).error.code, 'TEMPLATE_PROFILE_NOT_READY');
+    assert.equal(inferenceCalls, callsBeforeGenerate, 'Generate must not retry profile inference on a cache miss');
   } finally {
     await new Promise((resolve, reject) => started.server.close((error) => error ? reject(error) : resolve()));
     await started.shutdown();
   }
 });
 
-test('configured semantic endpoint does not opt structural template compilation into optional profiling', async (t) => {
-  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profiler-default-off-'));
+test('explicit structural-only diagnostic mode does not profile during template compilation', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-required-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const dataDir = path.join(temp, 'data');
+  let inferenceCalls = 0;
+  const started = await startServer({
+    host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
+    serveWeb: false, returnServer: true,
+    enableSemanticProfiling: false,
+    semanticInferenceAdapter: { async infer() { inferenceCalls += 1; throw new Error('unexpected semantic inference'); } },
+  });
+  const projectId = 'missing-semantic-profile';
+  try {
+    assert.equal((await fetch(`${started.url}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: projectId, name: 'Profile gate test' }),
+    })).status, 201);
+    const upload = new FormData();
+    upload.append('files', new Blob([await makeSyntheticPptx({ slideCount: 2, layoutCount: 2 })]), 'template.pptx');
+    assert.equal((await fetch(`${started.url}/api/projects/${projectId}/upload`, { method: 'POST', body: upload })).status, 200);
+    const structural = await compileTemplate(path.join(dataDir, 'projects'), projectId, 'template.pptx');
+    assert.equal(structural.status, 'ready');
+    const state = await json(await fetch(`${started.url}/api/projects/${projectId}/template`));
+    assert.equal(state.status, 'ready');
+    assert.equal(state.semanticProfile.status, 'disabled');
+    assert.equal(inferenceCalls, 0, 'endpoint configuration does not cause a template-profiler call');
+  } finally {
+    await closeStartedServer(started);
+  }
+});
+
+test('template preparation profiles before Generate and exposes read-only cache status', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profiler-preparation-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const endpoint = await startFakeSemanticEndpoint({ model: 'offline-configured-endpoint' });
   t.after(() => endpoint.close());
@@ -268,6 +327,7 @@ test('configured semantic endpoint does not opt structural template compilation 
   const started = await startServer({
     host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
     serveWeb: false, returnServer: true,
+    enableSemanticProfiling: true,
   });
   const projectId = 'structural-template-only';
   try {
@@ -287,9 +347,16 @@ test('configured semantic endpoint does not opt structural template compilation 
     assert.equal(response.status, 200, await response.clone().text());
     const compiled = await response.json();
     assert.equal(compiled.status, 'ready');
+    assert.equal(compiled.semanticProfile.status, 'ready');
+    assert.equal(compiled.semanticProfile.cached, false);
     assert.ok(compiled.templateIR?.hash);
     assert.ok(compiled.presentationDesignSystem);
-    assert.equal(endpoint.state.inference.length, 0, 'a configured model endpoint does not trigger optional Template Semantic Profiler calls');
+    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, 1);
+    const callsAfterPrepare = endpoint.state.inference.length;
+    const persistedState = await json(await fetch(`${started.url}/api/projects/${projectId}/template`));
+    assert.equal(persistedState.semanticProfile.status, 'ready');
+    assert.equal(persistedState.semanticProfile.cached, true);
+    assert.equal(endpoint.state.inference.length, callsAfterPrepare, 'GET validates the profile cache without inference');
   } finally {
     await closeStartedServer(started);
   }

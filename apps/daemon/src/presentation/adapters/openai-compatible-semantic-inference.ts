@@ -24,6 +24,7 @@ const MAX_SCHEMA_BYTES = 64 * 1024;
 const MAX_SCHEMA_NODES = 8192;
 const MAX_SCHEMA_DEPTH = 64;
 const MAX_OUTPUT_TOKENS = 8192;
+const MAX_TEMPLATE_PROFILE_BATCHES = 14;
 const MAX_TEXT_CHARS = 4 * 1024 * 1024;
 const OPERATION_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -135,8 +136,8 @@ function validateMetadata(metadata: SemanticRequestMetadata | undefined): void {
   for (const [name, value] of Object.entries(metadata)) {
     if (name === 'templateProfilerBatch') {
       if (!isRecord(value)
-          || !isFiniteInteger(value.batchNumber, 1, 13)
-          || !isFiniteInteger(value.totalBatches, 1, 13)
+          || !isFiniteInteger(value.batchNumber, 1, MAX_TEMPLATE_PROFILE_BATCHES)
+          || !isFiniteInteger(value.totalBatches, 1, MAX_TEMPLATE_PROFILE_BATCHES)
           || value.batchNumber > value.totalBatches
           || !Array.isArray(value.sourceSlideIndexes)
           || value.sourceSlideIndexes.length === 0 || value.sourceSlideIndexes.length > 6

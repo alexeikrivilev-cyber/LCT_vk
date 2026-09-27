@@ -8,7 +8,7 @@ import type { PlanningResponse, PlanningService } from './planning-service.js';
 import { PlanningServiceError } from './planning-service.js';
 import type { PresentationGenerationService, PublicPresentationGeneration } from './generation-service.js';
 import { PresentationGenerationError } from './generation-service.js';
-import { compileTemplate, getTemplateCompilation, TemplateCompilerError, type TemplateCompilationResponse } from './template-compiler.js';
+import { getTemplateCompilation, TemplateCompilerError, type TemplateCompilationResponse } from './template-compiler.js';
 import { validateBrief, type Brief } from '../domain/brief.js';
 import type { ContentIR } from '../domain/content-ir.js';
 import type { DeckPlan } from '../domain/deck-plan.js';
@@ -91,6 +91,9 @@ interface StoredProductWorkflow {
   generationId: string | null;
   contextualAudit: ProductContextualAuditState | null;
   failure: ProductWorkflowFailure | null;
+  generationStartedAt?: string | null;
+  threeVariantsReadyAt?: string | null;
+  timeToThreeVariantsReadyMs?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -106,6 +109,9 @@ export interface ProductWorkflowSnapshot {
   generationId: string | null;
   contextualAudit: (ProductContextualAuditState & { stale: boolean }) | null;
   failure: ProductWorkflowFailure | null;
+  generationStartedAt: string | null;
+  threeVariantsReadyAt: string | null;
+  timeToThreeVariantsReadyMs: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -128,7 +134,7 @@ export interface ProductWorkflowServiceOptions {
   planningService: PlanningService;
   generationService: PresentationGenerationService;
   getInferenceAdapter: () => SemanticInferenceAdapter;
-  profileTemplate?: (projectId: string, template: TemplateCompilationResponse) => Promise<unknown>;
+  getPreparedTemplateProfile?: (projectId: string, template: TemplateCompilationResponse) => Promise<unknown | null>;
   now?: () => Date;
 }
 
@@ -260,6 +266,12 @@ function validateStored(value: unknown): StoredProductWorkflow {
       || !(value.planningFingerprint === null || safeFingerprint(value.planningFingerprint))
       || !(value.generationId === null || typeof value.generationId === 'string' && value.generationId.length <= 80)
       || !(value.contextualAudit === null || isSafeAuditState(value.contextualAudit))
+      || !(value.generationStartedAt === undefined || value.generationStartedAt === null
+        || typeof value.generationStartedAt === 'string' && Number.isFinite(Date.parse(value.generationStartedAt)))
+      || !(value.threeVariantsReadyAt === undefined || value.threeVariantsReadyAt === null
+        || typeof value.threeVariantsReadyAt === 'string' && Number.isFinite(Date.parse(value.threeVariantsReadyAt)))
+      || !(value.timeToThreeVariantsReadyMs === undefined || value.timeToThreeVariantsReadyMs === null
+        || Number.isSafeInteger(value.timeToThreeVariantsReadyMs) && Number(value.timeToThreeVariantsReadyMs) >= 0)
       || !(value.failure === null || isRecord(value.failure) && typeof value.failure.code === 'string' && value.failure.code.length <= 80
         && isStage(value.failure.stage) && typeof value.failure.retryable === 'boolean')
       || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt))
@@ -289,6 +301,9 @@ function publicSnapshot(state: StoredProductWorkflow, stale = false): ProductWor
     generationId: state.generationId,
     contextualAudit: state.contextualAudit ? { ...state.contextualAudit, stale } : null,
     failure: state.failure,
+    generationStartedAt: state.generationStartedAt ?? null,
+    threeVariantsReadyAt: state.threeVariantsReadyAt ?? null,
+    timeToThreeVariantsReadyMs: state.timeToThreeVariantsReadyMs ?? null,
     createdAt: state.createdAt,
     updatedAt: state.updatedAt,
   };
@@ -420,6 +435,23 @@ export class ProductWorkflowService {
       if (saved?.status === 'running' && saved.inputFingerprint !== fingerprint) {
         throw new ProductWorkflowError('PRODUCT_WORKFLOW_ALREADY_RUNNING', 'A different presentation operation is already running for this project.', 409);
       }
+      const template = await getTemplateCompilation(this.options.projectsRoot, projectId);
+      if (template.status !== 'ready' || template.source?.filePath !== inputs.templateFilePath
+          || !template.templateIR || !template.presentationDesignSystem) {
+        throw new ProductWorkflowError('TEMPLATE_NOT_READY', 'Сначала подготовьте выбранный шаблон.', 409);
+      }
+      if (this.options.getPreparedTemplateProfile) {
+        let profile: unknown | null = null;
+        try { profile = await this.options.getPreparedTemplateProfile(projectId, template); }
+        catch { /* Invalid or unreadable cache is a not-ready state; never profile from Generate. */ }
+        if (!profile) {
+          throw new ProductWorkflowError(
+            'TEMPLATE_PROFILE_NOT_READY',
+            'Сначала завершите анализ оформления шаблона.',
+            409,
+          );
+        }
+      }
       if (saved?.inputFingerprint === fingerprint && saved.status === 'ready') {
         const current = await this.snapshotWithFreshness(projectId, saved);
         if (current.contextualAudit && !current.contextualAudit.stale) return current;
@@ -435,13 +467,16 @@ export class ProductWorkflowService {
         inputFingerprint: fingerprint,
         inputs,
         status: 'running',
-        stage: 'analyzing_template',
+        stage: 'planning',
         readySlides: 0,
         totalSlides: null,
         planningFingerprint: null,
         generationId: null,
         contextualAudit: null,
         failure: null,
+        generationStartedAt: timestamp,
+        threeVariantsReadyAt: null,
+        timeToThreeVariantsReadyMs: null,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -524,18 +559,20 @@ export class ProductWorkflowService {
     try {
       this.throwIfShuttingDown();
       let template = await getTemplateCompilation(this.options.projectsRoot, projectId);
-      if (template.status !== 'ready' || template.source?.filePath !== inputs.templateFilePath) {
-        await this.update(projectId, saved, { stage: 'analyzing_template', failure: null, status: 'running' });
-        template = await compileTemplate(this.options.projectsRoot, projectId, inputs.templateFilePath);
-      }
-      this.throwIfShuttingDown();
       if (template.status !== 'ready' || !template.templateIR || !template.presentationDesignSystem) {
         throw new ProductWorkflowError('TEMPLATE_NOT_READY', 'Не удалось подготовить выбранный шаблон.', 409);
       }
-      saved = (await this.read(projectId))!;
-      await this.update(projectId, saved, { stage: 'understanding_template' });
-      if (this.options.profileTemplate) await this.options.profileTemplate(projectId, template);
-
+      if (template.source?.filePath !== inputs.templateFilePath) {
+        throw new ProductWorkflowError('TEMPLATE_NOT_READY', 'Подготовьте выбранный шаблон перед созданием презентации.', 409);
+      }
+      if (this.options.getPreparedTemplateProfile) {
+        let profile: unknown | null = null;
+        try { profile = await this.options.getPreparedTemplateProfile(projectId, template); }
+        catch { /* Generate reads only; cache miss never starts inference. */ }
+        if (!profile) {
+          throw new ProductWorkflowError('TEMPLATE_PROFILE_NOT_READY', 'Сначала завершите анализ оформления шаблона.', 409);
+        }
+      }
       this.throwIfShuttingDown();
       saved = (await this.read(projectId))!;
       await this.update(projectId, saved, { stage: 'planning' });
@@ -571,6 +608,18 @@ export class ProductWorkflowService {
           totalSlides: next.totalSlides,
           generationId: next.generationId,
         });
+      });
+      saved = (await this.read(projectId))!;
+      const variantsComplete = generation.slides.length > 0 && generation.slides.every((pack) =>
+        ['A', 'B', 'C'].every((variant) => pack.variants[variant as keyof typeof pack.variants]?.status === 'ready'));
+      if (!variantsComplete) {
+        throw new ProductWorkflowError('THREE_VARIANTS_NOT_READY', 'Три полных варианта презентации ещё не готовы.', 409);
+      }
+      const threeVariantsReadyAt = this.now().toISOString();
+      const generationStartedAt = saved.generationStartedAt ?? saved.createdAt;
+      await this.update(projectId, saved, {
+        threeVariantsReadyAt,
+        timeToThreeVariantsReadyMs: Math.max(0, Date.parse(threeVariantsReadyAt) - Date.parse(generationStartedAt)),
       });
       saved = (await this.read(projectId))!;
       await this.update(projectId, saved, { stage: 'contextual_audit', generationId: generation.generationId, readySlides: generation.readySlides, totalSlides: generation.totalSlides });

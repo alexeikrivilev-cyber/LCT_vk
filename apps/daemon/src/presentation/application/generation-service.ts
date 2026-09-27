@@ -153,7 +153,7 @@ export interface PresentationGenerationServiceOptions {
   htmlExporter?: Pick<SemanticHtmlExportAdapter, 'export'>;
   /** Replaceable dependency seams for offline API tests. */
   inspectPackage?: typeof inspectOfficeKitPackage;
-  profileTemplate?: (projectId: string, template: TemplateCompilationResponse) => Promise<TemplateSemanticProfile>;
+  getPreparedTemplateProfile?: (projectId: string, template: TemplateCompilationResponse) => Promise<TemplateSemanticProfile | null>;
   performanceDiagnostics?: PerformanceDiagnosticsPort;
   now?: () => Date;
 }
@@ -424,9 +424,21 @@ export class PresentationGenerationService {
       contentIRHash: planning.contentIR.hash,
       templateIRHash: template.templateIR.hash,
     });
-    const semanticProfile = this.options.profileTemplate
-      ? await this.options.profileTemplate(projectId, template)
-      : undefined;
+    let semanticProfile: TemplateSemanticProfile | undefined;
+    if (this.options.getPreparedTemplateProfile) {
+      try {
+        semanticProfile = (await this.options.getPreparedTemplateProfile(projectId, template)) ?? undefined;
+      } catch {
+        semanticProfile = undefined;
+      }
+      if (!semanticProfile) {
+        throw new PresentationGenerationError(
+          'TEMPLATE_PROFILE_NOT_READY',
+          'Подготовьте и проверьте профиль шаблона перед созданием вариантов.',
+          409,
+        );
+      }
+    }
     return {
       planning,
       deckPlan: planning.deckPlan,

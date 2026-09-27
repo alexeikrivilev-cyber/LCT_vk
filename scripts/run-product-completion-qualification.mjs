@@ -169,8 +169,6 @@ async function main() {
     const { inspectOfficeKitPackage } = await import('../apps/daemon/src/presentation/adapters/office-kit-package-inspector.ts');
     const officePackageJson = daemonRequire.resolve('@office-kit/pptx/package.json');
     const office = await import(pathToFileURL(path.join(path.dirname(officePackageJson), 'dist/node.js')));
-    // This legacy matrix specifically qualifies the optional profiler; the
-    // production core and canonical live runner leave it disabled by default.
     server = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
       serveWeb: false, returnServer: true, enableSemanticProfiling: true });
     const imageModels = await requestJson(server.url, '/api/media/models');
@@ -200,6 +198,19 @@ async function main() {
         ...(context ? { context } : {}),
       };
       const inferenceOffset = fake.state.inference.length;
+      const templatePreparationStartedAt = performance.now();
+      const preparedTemplate = await requestJson(server.url, `/api/projects/${encodeURIComponent(projectId)}/template/compile`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: templateFilePath }),
+      });
+      assert.equal(preparedTemplate.status, 'ready', `${template.label}: structural template preparation must pass`);
+      assert.equal(preparedTemplate.semanticProfile?.status, 'ready', `${template.label}: semantic template preparation must pass`);
+      const preparedStatus = await requestJson(server.url, `/api/projects/${encodeURIComponent(projectId)}/template`);
+      assert.equal(preparedStatus.semanticProfile?.status, 'ready');
+      assert.equal(preparedStatus.semanticProfile?.cached, true);
+      const templatePreparationMs = Math.round(performance.now() - templatePreparationStartedAt);
+      const profileRequestCount = fake.state.inference.slice(inferenceOffset)
+        .filter((call) => call.operation === 'template-semantic-profile').length;
+      assert.ok(profileRequestCount >= 1 && profileRequestCount <= 14, `${template.label}: profile request count must be bounded`);
       const flowStartedAt = performance.now();
       const begin = await requestJson(server.url, `/api/projects/${encodeURIComponent(projectId)}/workflow/generate`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -230,8 +241,11 @@ async function main() {
       const caseCalls = fake.state.inference.slice(inferenceOffset);
       const callsByOperation = Object.fromEntries([...new Set(caseCalls.map((call) => call.operation))]
         .map((name) => [name, caseCalls.filter((call) => call.operation === name).length]));
+      assert.equal(callsByOperation['template-semantic-profile'], profileRequestCount,
+        `${template.label}: Generate must reuse the prepared profile without more semantic calls`);
       assert.equal(callsByOperation['contextual-deck-audit'], 1, `${template.label} must receive exactly one contextual deck review`);
-      assert.equal(caseCalls.length, 4, `${template.label} should use profiler, worker, planning review and one contextual review`);
+      assert.equal(caseCalls.length, profileRequestCount + 3, `${template.label} should use bounded preparation plus Worker, planning review and one contextual review`);
+      assert.equal(caseCalls[profileRequestCount]?.operation, 'deck-plan', `${template.label}: Worker inference starts only after every profile batch completed`);
 
       const variantExports = [];
       const pptxByMode = new Map();
@@ -305,6 +319,8 @@ async function main() {
         deterministicAudit: 'passed',
         contextualAudit: { status: 'passed', findings: 9, requests: callsByOperation['contextual-deck-audit'] },
         semanticCalls: { count: caseCalls.length, byOperation: callsByOperation },
+        templatePreparationMs,
+        timeToThreeVariantsReadyMs: operation.timeToThreeVariantsReadyMs,
         generationMs,
         exports: [...variantExports, ...otherExports],
         sourceResidue,
