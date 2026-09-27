@@ -466,10 +466,20 @@ export class PresentationGenerationService {
     if (typeof keyValue !== 'string' || !IDEMPOTENCY_KEY.test(keyValue)) {
       throw new PresentationGenerationError('INVALID_IDEMPOTENCY_KEY', 'Send an Idempotency-Key containing 8 to 128 safe characters.', 400);
     }
+    let context = await this.context(projectId);
+    while (true) {
+      const current = getPresentationGeneration<PresentationGenerationState>(this.options.db, projectId);
+      const task = this.tasks.get(projectId);
+      const terminal = current && ['completed', 'failed', 'cancelled', 'stale'].includes(current.state.status);
+      if (!terminal || !task) break;
+      // A terminal snapshot can become visible just before run().finally removes
+      // its task. Wait, then refresh context before replacing or resuming that row.
+      await task.promise;
+      context = await this.context(projectId);
+    }
     if (!this.tasks.has(projectId) && this.tasks.size >= 2) {
       throw new PresentationGenerationError('GENERATION_CAPACITY', 'Generation capacity is full. Wait for another presentation to finish and retry.', 429);
     }
-    const context = await this.context(projectId);
     const now = this.now().toISOString();
     const state: PresentationGenerationState = {
       schemaVersion: 1,

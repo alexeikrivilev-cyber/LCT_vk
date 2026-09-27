@@ -76,7 +76,9 @@ export function startPresentationGeneration<T extends { generationId: string; re
       }
       const active = current.state.status === 'preparing' || current.state.status === 'generating';
       if (active) return { kind: 'active-conflict', generation: current };
-      if (current.inputFingerprint === input.inputFingerprint) return { kind: 'existing', generation: current };
+      if (current.state.status === 'completed' && current.inputFingerprint === input.inputFingerprint) {
+        return { kind: 'existing', generation: current };
+      }
     }
     db.prepare(`
       INSERT INTO presentation_generations

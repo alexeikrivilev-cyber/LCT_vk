@@ -591,7 +591,9 @@ export class ProductWorkflowService {
         planningFingerprint: planning.inputFingerprint,
         totalSlides: planning.deckPlan.slides.length,
       });
-      const generationKey = `workflow-${sha256(`${planning.inputFingerprint}:${planning.deckPlan.hash}`).slice(0, 48)}`;
+      // Keep recovery idempotent within one persisted workflow operation, while a
+      // later user-started workflow gets a fresh generation key for the same inputs.
+      const generationKey = `workflow-${sha256(`${saved.operationId}:${planning.inputFingerprint}:${planning.deckPlan.hash}`).slice(0, 48)}`;
       const existingGeneration = await this.options.generationService.getSnapshot(projectId);
       const isSameGeneration = Boolean(existingGeneration
         && existingGeneration.planHash === planning.deckPlan.hash

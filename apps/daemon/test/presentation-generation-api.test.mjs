@@ -543,6 +543,26 @@ test('a later renderer failure preserves earlier ready packs and explicit cancel
     assert.deepEqual(failed.slides.map((pack) => pack.status), ['ready', 'ready', 'failed']);
     assert.match(failed.failure.message, /Earlier ready slide packs remain available/);
 
+    const sameKeyRetryResponse = await fetch(`${started.url}/api/projects/${projectId}/generation`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'Idempotency-Key': 'offline-failure-v1' }, body: '{}',
+    });
+    assert.equal(sameKeyRetryResponse.status, 200);
+    const sameKeyRetry = (await json(sameKeyRetryResponse)).generation;
+    assert.equal(sameKeyRetry.generationId, failed.generationId);
+    assert.equal(sameKeyRetry.status, 'generating', 'retrying the same failed request resumes its existing generation');
+    const failedAgain = await waitFor(() => getGeneration(started, projectId), (state) => state.status === 'failed', 'same-key generation retry');
+    assert.equal(failedAgain.generationId, failed.generationId);
+
+    const newKeyRetryResponse = await fetch(`${started.url}/api/projects/${projectId}/generation`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'Idempotency-Key': 'offline-failure-v2' }, body: '{}',
+    });
+    assert.equal(newKeyRetryResponse.status, 202);
+    const newKeyRetry = (await json(newKeyRetryResponse)).generation;
+    assert.notEqual(newKeyRetry.generationId, failed.generationId);
+    assert.equal(newKeyRetry.status, 'generating');
+    assert.equal(newKeyRetry.readySlides, 0);
+    assert.deepEqual(newKeyRetry.slides.map((pack) => pack.status), ['pending', 'pending', 'pending']);
+
   } finally {
     if (started) await closeStartedServer(started);
     if (priorBackend === undefined) delete process.env.LCT_PPTX_BACKEND;
@@ -778,6 +798,12 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     const plan = await json(await fetch(`${started.url}/api/projects/${projectId}/planning`));
     assert.equal(plan.status, 'ready');
     assert.equal(plan.deckPlan.slides.length, 3);
+    const identityDb = new Database(path.join(dataDir, 'app.sqlite'), { readonly: true });
+    const persistedIdentity = identityDb.prepare('SELECT idempotency_key FROM presentation_generations WHERE project_id = ?').get(projectId);
+    identityDb.close();
+    const expectedGenerationKey = `workflow-${createHash('sha256').update(`${first.operationId}:${plan.inputFingerprint}:${plan.deckPlan.hash}`).digest('hex').slice(0, 48)}`;
+    assert.equal(persistedIdentity.idempotency_key, expectedGenerationKey,
+      'generation idempotency is stable for workflow recovery and unique across a new workflow attempt');
     const generationResponse = await fetch(`${started.url}/api/projects/${projectId}/generation`);
     const generation = (await json(generationResponse)).generation;
     assert.equal(generation.status, 'completed');

@@ -72,6 +72,8 @@ Semantic решение может сформировать план или оц
 
 LCT_DATA_DIR задаёт data root и по умолчанию указывает на .lct. SQLite хранит project/generation metadata; проектные файлы — исходные и созданные артефакты. В проекте используются .template-compiler/state.json, .template-compiler/semantic-profiles/, .planning/state.json и .generation/. Исходный PPTX не изменяется.
 
+Для Generate повтор того же `Idempotency-Key` с тем же fingerprint возвращает или возобновляет существующую generation; активная generation блокирует параллельный запуск с другим ключом. Завершённая generation с теми же входами может быть возвращена и для нового ключа. После terminal `failed`, `cancelled` или `stale` новый ключ создаёт новое состояние generation с pending packs; template/profile cache и готовый planning state сохраняются. Каждый новый persisted workflow получает новый ключ generation, а восстановление после перезапуска сохраняет ключ текущего workflow.
+
 Кэш TemplateIR привязан к hash источника. Semantic profile cache теперь привязан к hash TemplateIR и fingerprints версии/содержимого prompt/config; смена prompt создаёт новый cache entry. Worker/Supervisor planning fingerprint включает prompt hashes и workflow contract. Клиент восстанавливает состояние из daemon snapshots и опрашивает API во время generation; SSE/WebSocket нет. Restart recovery покрыт offline tests.
 
 ## Отказы и безопасность границ
