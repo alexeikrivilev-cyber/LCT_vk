@@ -2,6 +2,7 @@ import type { ContentIR } from '../domain/content-ir.js';
 import type { TemplateIR } from '../domain/template-ir.js';
 import type { TemplateSemanticProfile } from './template-semantic-profiler.js';
 import type { CompiledPresentation } from './slide-compilation.js';
+import type { SemanticVisualType } from '../domain/deck-plan.js';
 
 /** Internal replaceable renderer boundary; not an external application API. */
 export type PptxBackendId = 'custom' | 'office-kit';
@@ -39,6 +40,13 @@ export interface PptxRenderResult {
   templatePreservationStatus: 'passed' | 'failed' | 'unknown';
   validationIssues: readonly { severity: 'error' | 'warning'; message: string; partName: string | null }[];
   unresolvedVisualTypes: readonly string[];
+  /** Replaceable internal evidence of the visual intent actually materialized by this renderer. */
+  visualIntents: readonly {
+    slideId: string;
+    requestedType: SemanticVisualType;
+    realizedType: SemanticVisualType | 'text-only' | 'unresolved';
+    fallbackReason: string | null;
+  }[];
   /** Replaceable internal evidence describing the post-cleanup native composition selected for each slide. */
   projectedCompositions: readonly {
     slideId: string;

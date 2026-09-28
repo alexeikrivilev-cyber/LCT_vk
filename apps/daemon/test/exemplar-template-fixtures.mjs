@@ -89,6 +89,31 @@ export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unl
   await deck.writeFile({ fileName: filePath });
 }
 
+/** Repeated 2x3 body grid used to verify that sparse copy occupies a coherent subset. */
+export async function createSixRegionGridExemplarTemplate(filePath, { masterName = 'Six-region grid' } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({ title: masterName, objects: [] });
+  for (let slideIndex = 0; slideIndex < 4; slideIndex += 1) {
+    const slide = deck.addSlide({ masterName });
+    slide.addText(`Source headline ${slideIndex + 1}`, {
+      x: 0.58, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
+    });
+    for (let row = 0; row < 2; row += 1) for (let column = 0; column < 3; column += 1) {
+      const region = row * 3 + column + 1;
+      slide.addText(`Source panel ${slideIndex + 1}-${region}`, {
+        x: 0.58 + column * 4.12, y: 1.55 + row * 1.95, w: 3.78, h: 1.55,
+        fontFace: 'Aptos', fontSize: 16, margin: 0.16, valign: 'top',
+        fill: { color: 'E9EEF3' }, line: { color: 'D1D9E0', width: 0.8 },
+      });
+    }
+    slide.addText('REPEATED GRID BRAND', {
+      x: 0.58, y: 7.08, w: 2.9, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+    });
+  }
+  await deck.writeFile({ fileName: filePath });
+}
+
 /** Structural role fixtures; titles and bodies share geometry so only measured typography/topology distinguishes them. */
 export async function createRoleExemplarTemplate(filePath, { masterName = 'Structural role fixtures' } = {}) {
   const deck = new pptxgen();

@@ -24,8 +24,11 @@ import { classifySourceTemplateBleed } from './preview-layout-evidence.js';
 
 type MatrixPreviewStatus = 'passed' | 'passed-with-warnings' | 'failed' | 'unknown';
 
-function classifyMatrixSourceTemplateBleed(issue: unknown, compiledSlide: ReturnType<typeof compilePresentation>['slides'][number], template: TemplateIR, profile?: TemplateSemanticProfile): unknown {
-  return classifySourceTemplateBleed(issue, template, assessExemplarSelection(compiledSlide, template, profile).selection);
+function classifyMatrixSourceTemplateBleed(issue: unknown, compiledSlide: ReturnType<typeof compilePresentation>['slides'][number], template: TemplateIR): unknown {
+  // The renderer uses this exact qualified donor. Re-running candidate ranking
+  // here can select a different donor and misclassify inherited source geometry
+  // as a newly generated overflow (or vice versa).
+  return classifySourceTemplateBleed(issue, template, compiledSlide.exemplarSelection);
 }
 
 function matrixPreviewStatus(preview: Awaited<ReturnType<NonNullable<PptxPreviewPort>['preview']>>, geometryIssues: readonly unknown[]): MatrixPreviewStatus {
@@ -114,6 +117,7 @@ export interface OfflineMatrixResult {
     templatePreservationStatus: PptxRenderResult['templatePreservationStatus'];
     factualEquivalenceStatus: 'passed' | 'failed';
     unresolvedVisualTypes: readonly string[];
+    visualIntents: PptxRenderResult['visualIntents'];
   }>;
 }
 
@@ -337,7 +341,7 @@ export async function runOfflinePresentationMatrix(input: {
             const preview = await input.previewAdapter.preview(previewBytes, slideIndex);
             timings.preview = (timings.preview ?? 0) + performance.now() - previewStarted;
             const compiledSlide = compiled.slides[slideIndex]!;
-            const geometryIssues = (preview.geometryIssues ?? []).map((issue) => classifyMatrixSourceTemplateBleed(issue, compiledSlide, template.templateIR, semanticProfile));
+            const geometryIssues = (preview.geometryIssues ?? []).map((issue) => classifyMatrixSourceTemplateBleed(issue, compiledSlide, template.templateIR));
             const fileStem = `slide-${String(slideIndex + 1).padStart(2, '0')}`;
             await Promise.all([
               writeFile(path.join(previewDirectory, `${fileStem}.svg`), preview.svg, 'utf8'),
@@ -422,6 +426,7 @@ export async function runOfflinePresentationMatrix(input: {
           templatePreservationStatus: rendered.templatePreservationStatus,
           factualEquivalenceStatus,
           unresolvedVisualTypes: rendered.unresolvedVisualTypes,
+          visualIntents: rendered.visualIntents,
         });
       }
       const compositionsByVariant = Object.fromEntries(policies.map((policy) => [policy.id,

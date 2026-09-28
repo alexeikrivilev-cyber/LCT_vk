@@ -171,6 +171,7 @@ export function projectTemplateSemanticProfilePreparationStore(projectsRoot: str
 const TEMPLATE_PROFILE_WORKFLOW = templateProfilerWorkflow;
 const PROFILE_MAX_SLIDES = TEMPLATE_PROFILE_WORKFLOW.maxSlides;
 const PROFILE_MAX_ELEMENTS_PER_SLIDE = TEMPLATE_PROFILE_WORKFLOW.maxElementsPerSlide;
+const PROFILE_MAX_NON_TEXT_EVIDENCE_ELEMENTS_PER_SLIDE = TEMPLATE_PROFILE_WORKFLOW.maxNonTextEvidenceElementsPerSlide;
 const TEMPLATE_PROFILE_VERSION = TEMPLATE_PROFILE_WORKFLOW.promptVersion;
 const DEFAULT_PROMPT_DIRECTORY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../prompts');
 const PROFILE_BATCH_SLIDE_LIMIT = TEMPLATE_PROFILE_WORKFLOW.maxSlidesPerBatch;
@@ -231,16 +232,28 @@ export function templateSemanticProfileJsonSchema(
   if (expectedSlides.length === 0 || expectedSlides.length > PROFILE_BATCH_SLIDE_LIMIT) {
     throw new TypeError(`Template profile schema requires between 1 and ${PROFILE_BATCH_SLIDE_LIMIT} expected slides.`);
   }
-  const idArray = (ids: readonly string[]) => ({
+  const definitions: Record<string, unknown> = {};
+  const idArray = (ids: readonly string[], definitionName: string) => ({
     type: 'array',
     maxItems: Math.min(PROFILE_MAX_ELEMENTS_PER_SLIDE, ids.length),
-    ...(ids.length > 0 ? { items: { type: 'string', enum: [...ids] } } : {}),
+    ...(ids.length > 0 ? { items: { $ref: `#/$defs/${definitionName}` } } : {}),
   });
   const slideSchemas = expectedSlides.map((slide) => {
-    const allIds = slide.elements.map((element) => element.id);
-    const textIds = slide.elements.filter((element) => Boolean(element.text?.trim())).map((element) => element.id);
-    const replaceableTextIds = slide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+    // Keep the strict output enum limited to the same prioritized set that
+    // profileEvidenceSlide supplies; omitted IDs cannot be classified safely.
+    const visibleElements = profileElementsForSlide(slide);
+    const allIds = visibleElements.map((element) => element.id);
+    const textIds = visibleElements.filter((element) => Boolean(element.text?.trim())).map((element) => element.id);
+    const replaceableTextIds = visibleElements.filter((element) => element.kind.toLowerCase() === 'shape'
       && Boolean(element.nativeId) && Boolean(element.text?.trim())).map((element) => element.id);
+    const definitionsForSlide = {
+      all: `slide_${slide.index}_element_id`,
+      text: `slide_${slide.index}_text_element_id`,
+      replaceable: `slide_${slide.index}_replaceable_text_element_id`,
+    };
+    if (allIds.length) definitions[definitionsForSlide.all] = { type: 'string', enum: allIds };
+    if (textIds.length) definitions[definitionsForSlide.text] = { type: 'string', enum: textIds };
+    if (replaceableTextIds.length) definitions[definitionsForSlide.replaceable] = { type: 'string', enum: replaceableTextIds };
     return {
       type: 'object',
       additionalProperties: false,
@@ -248,11 +261,13 @@ export function templateSemanticProfileJsonSchema(
         sourceSlideIndex: { type: 'integer', enum: [slide.index] },
         archetype: { type: 'string', enum: [...TEMPLATE_SLIDE_ARCHETYPES] },
         supportedContentModes: { type: 'array', maxItems: TEMPLATE_CONTENT_MODES.length, items: { type: 'string', enum: [...TEMPLATE_CONTENT_MODES] } },
-        titleElementId: { type: ['string', 'null'], enum: [null, ...textIds] },
-        bodyElementIds: idArray(textIds),
-        visualElementIds: idArray(allIds),
-        preservedElementIds: idArray(allIds),
-        replaceableTextElementIds: idArray(replaceableTextIds),
+        titleElementId: textIds.length
+          ? { anyOf: [{ type: 'null' }, { $ref: `#/$defs/${definitionsForSlide.text}` }] }
+          : { type: 'null' },
+        bodyElementIds: idArray(textIds, definitionsForSlide.text),
+        visualElementIds: idArray(allIds, definitionsForSlide.all),
+        preservedElementIds: idArray(allIds, definitionsForSlide.all),
+        replaceableTextElementIds: idArray(replaceableTextIds, definitionsForSlide.replaceable),
         confidence: { type: 'number', minimum: 0, maximum: 1 },
         reasonCodes: { type: 'array', maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9._-]*$' } },
       },
@@ -262,6 +277,7 @@ export function templateSemanticProfileJsonSchema(
   return {
     type: 'object',
     additionalProperties: false,
+    ...(Object.keys(definitions).length ? { $defs: definitions } : {}),
     properties: {
       templateIRHash: { type: 'string', enum: [templateIR.hash] },
       slides: {
@@ -318,21 +334,40 @@ export function validateTemplateSemanticProfile(value: unknown, templateIR: Temp
   };
 }
 
+/** Prioritize readable text, then the largest/media-like non-text objects inside the bounded profile evidence. */
+function profileElementsForSlide(slide: TemplateIR['slides'][number]): TemplateIR['slides'][number]['elements'] {
+  const area = (element: TemplateIR['slides'][number]['elements'][number]) => {
+    const geometry = element.geometry.resolved ?? element.geometry.direct;
+    return geometry ? Math.max(0, geometry.width) * Math.max(0, geometry.height) : 0;
+  };
+  const textBearing = slide.elements.filter((element) => Boolean(element.text?.trim()) || element.placeholder !== null)
+    .sort((left, right) => area(right) - area(left) || left.order - right.order);
+  const nonText = slide.elements.filter((element) => !element.text?.trim() && element.placeholder === null)
+    .sort((left, right) => {
+      const mediaRank = (element: TemplateIR['slides'][number]['elements'][number]) =>
+        /picture|image|chart|table|graphicframe|group/i.test(element.kind) ? 1 : 0;
+      return mediaRank(right) - mediaRank(left) || area(right) - area(left) || left.order - right.order;
+    }).slice(0, PROFILE_MAX_NON_TEXT_EVIDENCE_ELEMENTS_PER_SLIDE);
+  return [...textBearing, ...nonText].slice(0, PROFILE_MAX_ELEMENTS_PER_SLIDE)
+    .sort((left, right) => left.order - right.order);
+}
+
 function profileEvidenceSlide(
   slide: TemplateIR['slides'][number],
   textLimit = 320,
   compactFallback = false,
 ): Record<string, unknown> {
+  const visibleElements = profileElementsForSlide(slide);
   return {
     sourceSlideIndex: slide.index,
-    elements: slide.elements.slice(0, PROFILE_MAX_ELEMENTS_PER_SLIDE).map((element) => {
+    elements: visibleElements.map((element) => {
       const rawText = typeof element.text === 'string' ? element.text.trim() : '';
       const text = rawText && textLimit > 0 ? rawText.slice(0, textLimit) : null;
       const textBearing = text !== null || element.placeholder !== null;
       const geometry = element.geometry.resolved ?? element.geometry.direct;
       const evidence: Record<string, unknown> = {
         id: element.id,
-        order: element.order,
+        ...(!compactFallback ? { order: element.order } : {}),
         kind: element.kind,
         ...(text === null ? {} : { text }),
         ...(element.placeholder?.role ? { placeholderRole: element.placeholder.role } : {}),
@@ -353,8 +388,9 @@ function profileEvidenceSlide(
       }
       return evidence;
     }),
-    ...(slide.elements.length > PROFILE_MAX_ELEMENTS_PER_SLIDE ? { evidenceTruncated: true } : {}),
+    ...(slide.elements.length > visibleElements.length ? { evidenceTruncated: true } : {}),
     ...(slide.elements.some((element) => typeof element.text === 'string' && element.text.trim().length > textLimit)
+      || slide.elements.some((element) => (Boolean(element.text?.trim()) || element.placeholder !== null) && !visibleElements.includes(element))
       ? { textEvidenceTruncated: true } : {}),
   };
 }
@@ -457,7 +493,7 @@ export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR, 
   }
   const systemPromptBytes = Buffer.byteLength(systemPrompt, 'utf8');
   const totalEvidenceBytes = Buffer.byteLength(JSON.stringify(profileEvidence(templateIR, templateIR.slides)), 'utf8');
-  const batches: Array<{
+  type PlannedBatch = {
     slides: TemplateIR['slides'][number][];
     evidence: Record<string, unknown>;
     evidenceJson: string;
@@ -469,31 +505,53 @@ export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR, 
     outputTokenReserveBytes: number;
     estimatedTotalRequestBytes: number;
     maxOutputTokens: number;
-  }> = [];
-  let currentSlides: TemplateIR['slides'][number][] = [];
-  let current: ReturnType<typeof boundedBatchEvidence> = null;
-  for (const slide of templateIR.slides) {
-    const candidateSlides = [...currentSlides, slide];
-    const candidate = candidateSlides.length <= PROFILE_BATCH_SLIDE_LIMIT
-      ? boundedBatchEvidence(templateIR, candidateSlides, systemPrompt)
+  };
+  type Partition = { batches: PlannedBatch[]; totalEstimatedBytes: number };
+  const candidateCache = new Map<string, PlannedBatch | null>();
+  const candidateForRange = (start: number, end: number): PlannedBatch | null => {
+    const key = `${start}:${end}`;
+    if (candidateCache.has(key)) return candidateCache.get(key)!;
+    const slides = templateIR.slides.slice(start, end + 1);
+    const measured = slides.length <= PROFILE_BATCH_SLIDE_LIMIT
+      ? boundedBatchEvidence(templateIR, slides, systemPrompt)
       : null;
-    if (candidate) {
-      currentSlides = candidateSlides;
-      current = candidate;
-      continue;
+    const candidate = measured ? { slides, ...measured } : null;
+    candidateCache.set(key, candidate);
+    return candidate;
+  };
+  const betterPartition = (candidate: Partition, current: Partition | null): boolean => {
+    if (!current || candidate.batches.length !== current.batches.length) return !current || candidate.batches.length < current.batches.length;
+    if (candidate.totalEstimatedBytes !== current.totalEstimatedBytes) return candidate.totalEstimatedBytes < current.totalEstimatedBytes;
+    // Stable tie-break: consume the longest valid source-order batch first.
+    for (let index = 0; index < candidate.batches.length; index += 1) {
+      const candidateLength = candidate.batches[index]!.slides.length;
+      const currentLength = current.batches[index]!.slides.length;
+      if (candidateLength !== currentLength) return candidateLength > currentLength;
     }
-    if (currentSlides.length > 0 && current) {
-      batches.push({ slides: currentSlides, ...current });
+    return false;
+  };
+  const bestFrom = new Array<Partition | null>(templateIR.slides.length + 1).fill(null);
+  bestFrom[templateIR.slides.length] = { batches: [], totalEstimatedBytes: 0 };
+  for (let start = templateIR.slides.length - 1; start >= 0; start -= 1) {
+    let best: Partition | null = null;
+    const maximumEnd = Math.min(templateIR.slides.length - 1, start + PROFILE_BATCH_SLIDE_LIMIT - 1);
+    for (let end = start; end <= maximumEnd; end += 1) {
+      const candidate = candidateForRange(start, end);
+      const suffix = bestFrom[end + 1];
+      if (!candidate || !suffix) continue;
+      const option: Partition = {
+        batches: [candidate, ...suffix.batches],
+        totalEstimatedBytes: candidate.estimatedTotalRequestBytes + suffix.totalEstimatedBytes,
+      };
+      if (betterPartition(option, best)) best = option;
     }
-    const single = boundedBatchEvidence(templateIR, [slide], systemPrompt);
-    if (!single) {
-      throw new InferenceError('REQUEST_TOO_LARGE', `Template profiler request for source slide ${slide.index} exceeds the safe evidence or estimated request byte limit.`);
-    }
-    currentSlides = [slide];
-    current = single;
+    bestFrom[start] = best;
   }
-  if (currentSlides.length > 0 && current) {
-    batches.push({ slides: currentSlides, ...current });
+  const batches = bestFrom[0]?.batches ?? [];
+  if (!batches.length && templateIR.slides.length > 0) {
+    const oversized = templateIR.slides.find((slide) => !boundedBatchEvidence(templateIR, [slide], systemPrompt));
+    if (oversized) throw new InferenceError('REQUEST_TOO_LARGE', `Template profiler request for source slide ${oversized.index} exceeds the safe evidence or estimated request byte limit.`);
+    throw new InferenceError('REQUEST_TOO_LARGE', 'Template profiler batches could not be partitioned within the safe request limits.');
   }
   if (batches.length > PROFILE_BATCH_COUNT_LIMIT) {
     throw new InferenceError('REQUEST_TOO_LARGE', `Template requires ${batches.length} profiler batches; the configured safe maximum is ${PROFILE_BATCH_COUNT_LIMIT}.`);

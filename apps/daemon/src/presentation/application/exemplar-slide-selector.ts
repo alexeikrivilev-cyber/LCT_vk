@@ -6,7 +6,22 @@ import type { TemplateElement, TemplateGeometry, TemplateIR, TemplateSlide } fro
 import { validateTemplateSemanticProfile, type TemplateSemanticProfile, type TemplateSemanticSlideProfile } from './template-semantic-profiler.js';
 
 const MIN_EXEMPLAR_CONFIDENCE = 0.72;
+const MIN_PROJECTED_BODY_FIT = 0.68;
+const MAX_BODY_SLOT_CANDIDATES = 6;
 const VARIANT_FAMILY_INDEX = { A: 0, B: 1, C: 2 } as const;
+
+const VARIANT_ARCHETYPE_PREFERENCE: Record<CompiledSlide['variantId'], Partial<Record<ExemplarArchetype, number>>> = {
+  A: { content: 0.24, 'content-split': 0.2, cover: 0.18, hero: 0.14, closing: 0.12, 'section-divider': 0.08, 'content-dense': 0.02, 'metric-evidence': 0, 'table-data': -0.02, 'visual-led': 0.04 },
+  B: { 'visual-led': 0.3, hero: 0.26, cover: 0.2, closing: 0.18, 'content-split': 0.18, 'section-divider': 0.14, 'metric-evidence': 0.08, content: 0.02, 'content-dense': -0.08, 'table-data': -0.02 },
+  C: { 'content-dense': 0.3, 'table-data': 0.28, 'metric-evidence': 0.24, content: 0.16, 'content-split': 0.08, 'visual-led': -0.02, hero: -0.02, cover: 0.02, closing: 0.08, 'section-divider': -0.02 },
+};
+
+function rolePreference(intent: CompiledSlide['intent'], archetype: ExemplarArchetype): number {
+  if (intent === 'title') return ['cover', 'hero'].includes(archetype) ? 0.35 : -0.1;
+  if (intent === 'section') return ['section-divider', 'hero'].includes(archetype) ? 0.3 : -0.08;
+  if (intent === 'summary') return ['closing', 'content-dense'].includes(archetype) ? 0.25 : -0.04;
+  return ['content', 'content-split', 'content-dense', 'table-data'].includes(archetype) ? 0.14 : -0.04;
+}
 
 export type ExemplarArchetype =
   | 'cover'
@@ -48,9 +63,12 @@ export interface ExemplarSlideSelection {
     preserved: string[];
     replaced: string[];
     cleared: string[];
+    removed: string[];
     blocked: string[];
   };
   clearElementNativeIds: string[];
+  /** Whole source shapes removed only when a trusted profile marks them as unused body copy. */
+  removeElementNativeIds: string[];
   preserveChromeNativeIds: string[];
   /** Legacy source morphology key, retained as evidence only. It is not used for A/B/C deduplication. */
   familyKey: string;
@@ -59,6 +77,17 @@ export interface ExemplarSlideSelection {
   titleGeometryNormalized: NormalizedGeometry;
   bodyGeometryNormalized: NormalizedGeometry;
   titleBodyFontHierarchy: { titlePt: number; bodyPt: number; ratio: number };
+  designFeatures: {
+    structuralArchetype: ExemplarArchetype;
+    mappedBodyRegionCount: number;
+    projectedBodyRegionCount: number;
+    unusedMappedBodyRegionCount: number;
+    visualAreaShare: number;
+    bodyAreaShare: number;
+    bodyArrangementScore: number;
+    textDensity: number;
+    connectorCount: number;
+  };
   selectionReason: string;
   evidence: string[];
   limitations: string[];
@@ -88,6 +117,7 @@ export interface ExemplarSelectionAssessment {
     preservedTextElementIds: string[];
     replacedTextElementIds: string[];
     clearedTextElementIds: string[];
+    removedTextElementIds: string[];
     blockedTextElementIds: string[];
     gate: string;
     rejectReason: string | null;
@@ -99,6 +129,17 @@ export interface ExemplarSelectionAssessment {
     titleGeometryNormalized: NormalizedGeometry | null;
     bodyGeometryNormalized: NormalizedGeometry | null;
     titleBodyFontHierarchy: { titlePt: number; bodyPt: number; ratio: number } | null;
+    designFeatures: {
+      structuralArchetype: ExemplarArchetype;
+      mappedBodyRegionCount: number;
+      projectedBodyRegionCount: number;
+      unusedMappedBodyRegionCount: number;
+      visualAreaShare: number;
+      bodyAreaShare: number;
+      bodyArrangementScore: number;
+      textDensity: number;
+      connectorCount: number;
+    } | null;
     evidence: string[];
   }>;
   supportedCandidateCount: number;
@@ -131,9 +172,19 @@ export interface VariantCompositionAssignment {
   compositionKind: 'exemplar-backed' | 'layout-placeholder-backed' | 'safe-generated-fallback';
   layoutCandidateIndex: number;
   projectedCompositionSignature: string;
+  /** Generic native family identity used only to prefer deck-level visual variety. */
+  compositionFamilyKey?: string;
   /** Present for exemplar-backed choices so the renderer can honor the joint assignment exactly. */
   exemplarSelection?: ExemplarSlideSelection;
 }
+
+export interface ExemplarSelectionHistoryEntry {
+  sourcePart: string;
+  sourceSlideIndex: number;
+  familyKey?: string;
+  semanticArchetype?: ExemplarArchetype;
+}
+export type ExemplarSelectionHistory = Partial<Record<CompiledSlide['variantId'], readonly ExemplarSelectionHistoryEntry[]>>;
 
 /** Minimal persisted identity for an exact exemplar choice; content is recomputed from the current plan. */
 export interface ExemplarSelectionReference {
@@ -591,6 +642,7 @@ function projectedCompositionSignature(
   slide: TemplateSlide,
   title: TemplateElement,
   bodies: readonly TemplateElement[],
+  removedBodyIds: ReadonlySet<string>,
   bodyHasContent: boolean,
   preservedChromeIds: ReadonlySet<string>,
   template: TemplateIR,
@@ -604,6 +656,7 @@ function projectedCompositionSignature(
   const mappedVisualId = visualSlot?.id ?? null;
   const keptTextIds = new Set([title.id, ...bodyIds, ...preservedChromeIds]);
   const projectedElements = slide.elements.filter((element) => {
+    if (removedBodyIds.has(element.id)) return false;
     if (element.id === title.id || bodyIds.has(element.id) || element.id === mappedVisualId) return false;
     if (keptTextIds.has(element.id)) return true;
     if (normalizedText(element)) {
@@ -626,8 +679,13 @@ function projectedCompositionSignature(
 }
 
 function hasRenderableVisual(compiled: CompiledSlide): boolean {
+  const normalizeCopy = (value: string) => value.replace(/^\s*(?:\d+[.)]|[-*•])\s+/u, '').trim().replace(/\s+/gu, ' ').toLowerCase();
+  const bodyHostsSequence = compiled.visualization.processSteps.length >= 2 && compiled.body.length > 0
+    && compiled.body.length <= compiled.visualization.processSteps.length
+    && compiled.body.every((text) => compiled.visualization.processSteps.some((step) =>
+      normalizeCopy(text) === normalizeCopy(step.text)));
   return Boolean(compiled.visualization.tableData || compiled.visualization.chartData || compiled.visualization.kpi
-    || compiled.visualization.processSteps.length >= 2 || compiled.imageRefs.length > 0);
+    || compiled.visualization.processSteps.length >= 2 && !bodyHostsSequence || compiled.imageRefs.length > 0);
 }
 
 function fallbackCompositionSignature(compiled: CompiledSlide, template: TemplateIR): string {
@@ -684,6 +742,56 @@ interface BodySlotsChoice {
   segmentation: ExemplarSlideSelection['bodySegmentation'];
 }
 
+/** Prefer a compact, aligned group of body regions over arbitrary holes in a larger grid. */
+function bodyArrangementScore(elements: readonly TemplateElement[]): number {
+  if (elements.length < 2) return 0.5;
+  const boxes = elements.map((element) => geometryOf(element)!).filter(Boolean);
+  if (boxes.length !== elements.length) return 0;
+  const median = (values: number[]) => {
+    const sorted = [...values].sort((left, right) => left - right);
+    return sorted[Math.floor(sorted.length / 2)] ?? 0;
+  };
+  const rowTolerance = Math.max(1, median(boxes.map((box) => box.height)) * 0.32);
+  const columnTolerance = Math.max(1, median(boxes.map((box) => box.width)) * 0.32);
+  const clusterCount = (values: number[], tolerance: number) => {
+    let clusters = 0;
+    let clusterCenter = Number.NEGATIVE_INFINITY;
+    for (const value of [...values].sort((left, right) => left - right)) {
+      if (!clusters || Math.abs(value - clusterCenter) > tolerance) {
+        clusters += 1;
+        clusterCenter = value;
+      } else {
+        clusterCenter = (clusterCenter * 0.5) + (value * 0.5);
+      }
+    }
+    return clusters;
+  };
+  const rowCount = clusterCount(boxes.map((box) => box.y + box.height / 2), rowTolerance);
+  const columnCount = clusterCount(boxes.map((box) => box.x + box.width / 2), columnTolerance);
+  const bestAlignment = Math.max(1 / rowCount, 1 / columnCount);
+  const minX = Math.min(...boxes.map((box) => box.x));
+  const minY = Math.min(...boxes.map((box) => box.y));
+  const maxX = Math.max(...boxes.map((box) => box.x + box.width));
+  const maxY = Math.max(...boxes.map((box) => box.y + box.height));
+  const occupiedArea = boxes.reduce((sum, box) => sum + box.width * box.height, 0);
+  const compactness = Math.min(1, occupiedArea / Math.max(1, (maxX - minX) * (maxY - minY)));
+  const spacingRegularity = (axis: 'x' | 'y'): number => {
+    const dimension = axis === 'x' ? 'width' : 'height';
+    const ordered = [...boxes].sort((left, right) => left[axis] - right[axis]);
+    const gaps = ordered.slice(1).map((box, index) => {
+      const previous = ordered[index]!;
+      return Math.max(0, box[axis] - (previous[axis] + previous[dimension]));
+    });
+    if (gaps.length < 2) return 0.5;
+    const average = gaps.reduce((sum, gap) => sum + gap, 0) / gaps.length;
+    if (average <= 0) return 1;
+    const deviation = gaps.reduce((sum, gap) => sum + Math.abs(gap - average), 0) / gaps.length;
+    return Math.max(0, 1 - deviation / average);
+  };
+  const bestSpacing = Math.max(spacingRegularity('x'), spacingRegularity('y'));
+  return Number((0.52 * bestAlignment + 0.28 * compactness + 0.2 * bestSpacing).toFixed(4));
+}
+
 function bodySlotsFor(
   candidates: TemplateElement[],
   compiled: CompiledSlide,
@@ -725,7 +833,7 @@ function bodySlotsFor(
         && box.y < other.y + other.height && box.y + box.height > other.y;
     })) continue;
     available.push(element);
-    if (available.length >= (allowMultiple ? 4 : 1)) break;
+    if (available.length >= (allowMultiple ? MAX_BODY_SLOT_CANDIDATES : 1)) break;
   }
   const elements = available.sort((left, right) => geometryOf(left)!.y - geometryOf(right)!.y
     || geometryOf(left)!.x - geometryOf(right)!.x || left.order - right.order);
@@ -769,7 +877,7 @@ function bodySlotsFor(
             if (!previous) continue;
             const text = blocks.slice(start, end).join('');
             const fit = estimatedLineFit(text, selected[regionIndex]!);
-            if (fit < 0.55) continue;
+            if (fit < MIN_PROJECTED_BODY_FIT) continue;
             const utilization = demandFor(text, selected[regionIndex]!) / capacities[regionIndex]!;
             const next: Partition = {
               cost: previous.cost + utilization * utilization,
@@ -836,10 +944,10 @@ function candidateFor(
     sourceResidueRisk: 'unassessed',
     visualElementIds,
     visualClassification: visualClasses.map((item) => `${item.elementId}:${item.kind}:${item.reason}`),
-    preservedTextElementIds: [], replacedTextElementIds: [], clearedTextElementIds: [], blockedTextElementIds: [],
+    preservedTextElementIds: [], replacedTextElementIds: [], clearedTextElementIds: [], removedTextElementIds: [], blockedTextElementIds: [],
     gate: 'candidate-filter', rejectReason: null, familyKey: null, projectedCompositionSignature: null,
     projectionSafe: null, contentSafe: null, roleCompatible: false,
-    titleGeometryNormalized: null, bodyGeometryNormalized: null, titleBodyFontHierarchy: null, evidence: [],
+    titleGeometryNormalized: null, bodyGeometryNormalized: null, titleBodyFontHierarchy: null, designFeatures: null, evidence: [],
   };
   const reject = (gate: string, reason: string): CandidateBuild => {
     diagnostics?.recordDuration('composition.candidateBuild', performance.now() - startedAt);
@@ -879,8 +987,8 @@ function candidateFor(
   if (!title || !title.nativeId || !titleBox) return reject('title-role', 'no usable mapped title text shape with native ID and geometry');
   const bodySamples = (bodyEvidence?.sourceEvidence ?? []).filter((item) => item.sourcePart === slide.sourcePart && item.slideIndex === slide.index);
   // Profiles describe every source text region, not just the bounded number of
-  // regions the projector can fill. bodySlotsFor keeps the actual search capped
-  // at four; other explicitly mapped body regions are cleared below so their
+  // regions the projector can fill. bodySlotsFor keeps the candidate pool capped
+  // at six and the projected output capped at four; other explicitly mapped body regions are cleared below so their
   // source copy cannot leak into the projected slide.
   const semanticBodyCandidates = trustedProfile?.bodyElementIds.map((id) => slide.elements.find((element) => element.id === id))
     .filter((element): element is TemplateElement => Boolean(element));
@@ -925,9 +1033,11 @@ function candidateFor(
   const projectedTitle = projectedTitleFit(compiled.title, title, body);
   const titleFit = projectedTitle.fit;
   const bodyFit = Math.min(...bodyChoice.fits);
+  const bodyArrangement = bodyArrangementScore(bodies);
   const contentFit = Math.min(titleFit, bodyFit);
   diagnostic.projectedFit = { title: titleFit, body: bodyFit, combined: contentFit };
-  if (titleFit < projectedTitle.minimum || bodyFit < 0.55) return reject('projected-text-fit', `projected title/body text fit title=${titleFit} (minimum ${projectedTitle.minimum}), body=${bodyFit} (minimum 0.55)`);
+  if (titleFit < projectedTitle.minimum || bodyFit < MIN_PROJECTED_BODY_FIT) return reject('projected-text-fit',
+    `projected title/body text fit title=${titleFit} (minimum ${projectedTitle.minimum}), body=${bodyFit} (minimum ${MIN_PROJECTED_BODY_FIT})`);
   const confidence = trustedProfile
     ? Number((0.42 * trustedProfile.confidence + 0.22 * geometryFit + 0.18 * styleHierarchy + 0.18 * contentFit).toFixed(4))
     : Number((0.36 * (titleEvidence?.confidence ?? 0) + 0.36 * (bodyEvidence?.confidence ?? 0)
@@ -947,9 +1057,9 @@ function candidateFor(
   const titleHeightShare = archetype.titleHeightShare;
   const mappedBodyIds = new Set(trustedProfile?.bodyElementIds ?? bodies.map((item) => item.id));
   const selectedBodyIds = new Set(bodies.map((element) => element.id));
-  // Mapped body roles are validated template-source content. When the current
-  // source has fewer body blocks than the donor has regions, clear the unused
-  // sample regions instead of treating them as unknown text or preserving old facts.
+  // Mapped body roles are validated template-source content. An unused top-level
+  // body shape is safe to omit as a whole: clearing only its copy would leave an
+  // empty card/panel. Nested/related shapes are not removed and remain fail-closed.
   const unprojectedMappedBodies = trustedProfile
     ? textShapes.filter((element) => mappedBodyIds.has(element.id) && !selectedBodyIds.has(element.id))
     : [];
@@ -959,14 +1069,21 @@ function candidateFor(
   const preservedText = textShapes.filter((element) => (preservedChromeIds.has(element.id) || semanticPreservedIds.has(element.id))
     && !replacedTextIds.includes(element.id));
   const unusedMappedBodyIds = new Set(unprojectedMappedBodies.map((element) => element.id));
-  const explicitlyReplaceableText = textShapes.filter((element) => (semanticReplaceableIds.has(element.id) || unusedMappedBodyIds.has(element.id))
+  const removableUnusedBodyIds = new Set(unprojectedMappedBodies.filter((element) => element.parentId === null
+    && Boolean(element.nativeId) && element.kind.toLowerCase() === 'shape' && element.relationshipIds.length === 0)
+    .map((element) => element.id));
+  const removableUnusedBodies = unprojectedMappedBodies.filter((element) => removableUnusedBodyIds.has(element.id));
+  const explicitlyReplaceableText = textShapes.filter((element) => (semanticReplaceableIds.has(element.id)
+    || unusedMappedBodyIds.has(element.id) && !removableUnusedBodyIds.has(element.id))
     && !replacedTextIds.includes(element.id) && !preservedText.includes(element));
+  const projectedAwayText = [...explicitlyReplaceableText, ...removableUnusedBodies];
   const blockedText = textShapes.filter((element) => !replacedTextIds.includes(element.id)
-    && !preservedText.includes(element) && !explicitlyReplaceableText.includes(element));
+    && !preservedText.includes(element) && !projectedAwayText.includes(element));
   diagnostic.sourceResidueRisk = blockedText.length ? 'ambiguous' : 'clear';
   diagnostic.preservedTextElementIds = preservedText.map((element) => element.id);
   diagnostic.replacedTextElementIds = replacedTextIds;
   diagnostic.clearedTextElementIds = explicitlyReplaceableText.map((element) => element.id);
+  diagnostic.removedTextElementIds = removableUnusedBodies.map((element) => element.id);
   diagnostic.blockedTextElementIds = blockedText.map((element) => element.id);
   const bodyLineCapacity = Math.max(0.25, bodies.reduce((sum, item) => {
     const box = geometryOf(item)!;
@@ -992,27 +1109,44 @@ function candidateFor(
   const contentSafe = projectionSafe && contentGateReasons.length === 0 && (trustedProfile !== null || structuralContentRole);
 
   const confidenceScore = 0.32 * confidence + 0.23 * geometryFit + 0.15 * styleHierarchy + 0.3 * contentFit;
-  const preferredByVariant: Record<CompiledSlide['variantId'], string[]> = {
-    A: ['content', 'content-split', 'cover', 'hero'],
-    B: ['visual-led', 'content-split', 'metric-evidence'],
-    C: ['content-dense', 'metric-evidence', 'table-data', 'content'],
-  };
-  const intentPreference = compiled.intent === 'title' ? ['cover', 'hero']
-    : compiled.intent === 'section' ? ['section-divider', 'hero']
-      : compiled.intent === 'summary' ? ['closing', 'content-dense', 'content'] : [];
-  const semanticBoost = trustedProfile
-    ? (intentPreference.includes(chosenArchetype) ? 0.16 : 0)
-      + (preferredByVariant[compiled.variantId].includes(chosenArchetype) ? 0.12 : -0.04)
-      + (semanticConflict ? -0.025 : 0)
-    : compiled.intent === 'title'
-      ? archetype.archetype === 'cover' ? 0.16 : archetype.archetype === 'hero' ? 0.1 : 0
-      : compiled.intent === 'section'
-        ? ['section-divider', 'hero'].includes(archetype.archetype) ? 0.16 : 0
-        : ['content', 'content-dense'].includes(archetype.archetype) ? 0.12 : -0.12;
+  const strategyArchetype = archetype.archetype;
+  const profileArchetype = chosenArchetype;
+  const strategyScore = VARIANT_ARCHETYPE_PREFERENCE[compiled.variantId][strategyArchetype] ?? 0;
+  const profileStrategyScore = (VARIANT_ARCHETYPE_PREFERENCE[compiled.variantId][profileArchetype] ?? 0) * 2.5;
+  const hasSourceBackedStructuredData = Boolean(compiled.visualization.tableData || compiled.visualization.chartData || compiled.visualization.kpi);
+  const unsupportedDataArchetypePenalty = !hasSourceBackedStructuredData
+    && ['table-data', 'metric-evidence'].some((archetypeName) => archetypeName === strategyArchetype || archetypeName === profileArchetype)
+    ? 0.52 : 0;
+  const roleScore = rolePreference(compiled.intent, strategyArchetype);
+  const semanticConflictPenalty = semanticConflict ? 0.04 : 0;
+  const connectorCount = slide.elements.filter((element) => element.kind.toLowerCase() === 'connector').length;
+  const requestedVisualType = compiled.visualization.type;
+  const visualIntentScore = ['process', 'timeline', 'diagram'].includes(requestedVisualType)
+    ? Math.min(0.12, connectorCount * 0.03 + archetype.visualAreaShare * 0.2)
+    : requestedVisualType === 'comparison'
+      ? strategyArchetype === 'content-split' || strategyArchetype === 'table-data' ? 0.12 : 0
+      : ['kpi', 'chart', 'table'].includes(requestedVisualType)
+        ? compiled.visualization.tableData || compiled.visualization.chartData || compiled.visualization.kpi
+          ? strategyArchetype === 'table-data' || strategyArchetype === 'metric-evidence' ? 0.14 : 0.04
+          : 0
+        : requestedVisualType === 'image' && compiled.imageRefs.length > 0 && ['visual-led', 'content-split'].includes(strategyArchetype) ? 0.14 : 0;
+  const targetDensity = compiled.targetDensity ?? 'balanced';
+  const densityPreference = targetDensity === 'detailed'
+    ? (['content-dense', 'table-data', 'metric-evidence'].includes(strategyArchetype) ? 0.08 : -0.02)
+    : targetDensity === 'compact'
+      ? (['cover', 'hero', 'visual-led', 'content'].includes(strategyArchetype) ? 0.05 : 0)
+      : (['content', 'content-split'].includes(strategyArchetype) ? 0.04 : 0);
+  const bodyPointCount = compiled.body.length;
+  const bodyRegionMatch = Math.max(-0.12, 0.06 - Math.abs(bodies.length - bodyPointCount) * 0.04);
+  const unusedBodyPenalty = Math.min(0.3, removableUnusedBodies.length * 0.025);
+  const bodyArrangementPreference = (bodyArrangement - 0.5) * 0.3;
+  const semanticBoost = roleScore + strategyScore + profileStrategyScore + visualIntentScore + densityPreference
+    + bodyRegionMatch + bodyArrangementPreference - unusedBodyPenalty - semanticConflictPenalty - unsupportedDataArchetypePenalty;
   const segmentedRegionBoost = bodies.length > 1 && bodyChoice.segmentation.method !== 'existing-blocks' ? 0.08 : 0;
   const score = confidenceScore + semanticBoost + segmentedRegionBoost - Math.min(0.25, contentGateReasons.length * 0.1)
     - (textDensity < 0.08 && bodyAreaShare > 0.3 ? 0.12 : 0);
   const clearElementNativeIds = [...new Set(explicitlyReplaceableText)].map((element) => element.nativeId!);
+  const removeElementNativeIds = [...new Set(removableUnusedBodies)].map((element) => element.nativeId!);
   const renderableVisual = hasRenderableVisual(compiled);
   const visualSlots = renderableVisual ? visualClasses.filter((item) => item.kind === 'content-slot'
     && (visualElementIds.includes(item.elementId) || /picture|image|chart|table|graphic/i.test(
@@ -1044,8 +1178,9 @@ function candidateFor(
     ...archetype.evidence,
     ...(semanticConflict ? [`semantic/structural conflict: profile=${trustedProfile!.archetype}, structural=${archetype.archetype}; structural safety remains authoritative`] : []),
     `projected body density estimate ${textDensity.toFixed(3)}`,
+    `projected body region arrangement score ${bodyArrangement.toFixed(3)}`,
     ...contentGateReasons.map((reason) => `content-sanity gate: ${reason}`),
-    `${textShapes.length} text shapes classified: ${preservedText.length} preserved, ${replacedTextIds.length} replaced, ${clearElementNativeIds.length} cleared, ${blockedText.length} blocked`,
+    `${textShapes.length} text shapes classified: ${preservedText.length} preserved, ${replacedTextIds.length} replaced, ${clearElementNativeIds.length} cleared, ${removeElementNativeIds.length} unused body panel(s) removed, ${blockedText.length} blocked`,
     `${visualClasses.length} visual object(s) classified as ${Object.entries(visualClassCounts).map(([kind, count]) => `${kind}=${count}`).join(', ') || 'none'}`,
     `${slide.elements.filter((element) => element.kind.toLowerCase() === 'connector').length} native connectors and ${slide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && !normalizedText(element)).length} unlabelled shapes retained`,
     `${titleSupport} title evidence records and ${bodySupport} body evidence records refer to this source slide`,
@@ -1075,16 +1210,29 @@ function candidateFor(
         preserved: preservedText.map((element) => element.nativeId!).filter(Boolean),
         replaced: replacedTextIds.map((id) => slide.elements.find((element) => element.id === id)?.nativeId).filter((id): id is string => Boolean(id)),
         cleared: clearElementNativeIds,
+        removed: removeElementNativeIds,
         blocked: blockedText.map((element) => element.nativeId!).filter(Boolean),
       },
       clearElementNativeIds,
+      removeElementNativeIds,
       preserveChromeNativeIds,
       familyKey: familyKey(slide, title, body, template),
-      projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies, compiled.body.some((text) => text.trim()),
+      projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies, removableUnusedBodyIds, compiled.body.some((text) => text.trim()),
         new Set([...preservedChromeIds, ...preservedText.map((element) => element.id)]), template, visualSlot),
       titleGeometryNormalized: titleNormalized,
       bodyGeometryNormalized: bodyNormalized,
       titleBodyFontHierarchy: { titlePt: maxFont(title), bodyPt: maxFont(body), ratio: Number(fontRatio.toFixed(3)) },
+      designFeatures: {
+        structuralArchetype: archetype.archetype,
+        mappedBodyRegionCount: trustedProfile?.bodyElementIds.length ?? bodies.length,
+        projectedBodyRegionCount: bodies.length,
+        unusedMappedBodyRegionCount: removableUnusedBodies.length,
+        visualAreaShare: Number(archetype.visualAreaShare.toFixed(4)),
+        bodyAreaShare: Number(bodyAreaShare.toFixed(4)),
+        bodyArrangementScore: bodyArrangement,
+        textDensity,
+        connectorCount,
+      },
       selectionReason: '',
       evidence,
       limitations: trustedProfile ? ['Semantic body regions are mapped in reading order; unsupported visual/data structures remain fail-closed.']
@@ -1104,6 +1252,7 @@ function candidateFor(
   diagnostic.titleGeometryNormalized = selection.titleGeometryNormalized;
   diagnostic.bodyGeometryNormalized = selection.bodyGeometryNormalized;
   diagnostic.titleBodyFontHierarchy = selection.titleBodyFontHierarchy;
+  diagnostic.designFeatures = selection.designFeatures;
   diagnostic.evidence = evidence;
   const candidate: Candidate = { selection, score, projectionSafe, contentSafe, selectionReason, diagnostic };
   diagnostics?.recordDuration('composition.candidateBuild', performance.now() - startedAt);
@@ -1274,8 +1423,19 @@ export function assessExemplarSelection(
       ],
     };
   });
-  const familyIndex = VARIANT_FAMILY_INDEX[compiled.variantId];
-  const selection = safeSelections[familyIndex] ?? null;
+  // Preserve deterministic A/B/C family ranks when candidates are structurally
+  // equivalent. When a stronger safe candidate matches this track's semantic
+  // archetype or narrative role, honor that design intent instead of selecting
+  // a lower-quality donor solely because this is the second or third track.
+  const rankedSelection = safeSelections[VARIANT_FAMILY_INDEX[compiled.variantId]] ?? null;
+  const strategyAffinity = (candidate: ExemplarSlideSelection) =>
+    (VARIANT_ARCHETYPE_PREFERENCE[compiled.variantId][candidate.semanticArchetype] ?? 0) * 2.5
+      + rolePreference(compiled.intent, candidate.semanticArchetype);
+  const bestStrategySelection = safeSelections.reduce<ExemplarSlideSelection | null>((best, candidate) =>
+    !best || strategyAffinity(candidate) > strategyAffinity(best) ? candidate : best, null);
+  const selection = bestStrategySelection && rankedSelection
+    && strategyAffinity(bestStrategySelection) > strategyAffinity(rankedSelection)
+    ? bestStrategySelection : rankedSelection;
   const result = {
     selection,
     safeSelections,
@@ -1320,6 +1480,7 @@ export function assignSafeVariantCompositions(
 ): VariantCompositionAssignment[] {
   if (optionsByVariant.length !== 3 || optionsByVariant.some((options) => options.length === 0)) return [];
   let best: VariantCompositionAssignment[] | null = null;
+  let bestDistinctDonorCount = -1;
   let bestDistinctCount = -1;
   let bestExemplarCount = -1;
   let bestRankCost = Number.POSITIVE_INFINITY;
@@ -1329,13 +1490,18 @@ export function assignSafeVariantCompositions(
   const visit = (variantIndex: number): void => {
     if (variantIndex === optionsByVariant.length) {
       const complete = chosen.map((option, index) => option ?? optionsByVariant[index]![0]!);
+      const distinctDonorCount = new Set(complete.map((option) => option.compositionFamilyKey ?? (option.exemplarSelection
+        ? `${option.exemplarSelection.sourcePart}|${option.exemplarSelection.sourceSlideIndex}`
+        : `${option.compositionKind}|${option.layoutCandidateIndex}`))).size;
       const distinctCount = new Set(complete.map((option) => option.projectedCompositionSignature)).size;
       const exemplarCount = complete.filter((option) => option.compositionKind === 'exemplar-backed').length;
       const rankCost = complete.reduce((cost, option, index) => cost + optionsByVariant[index]!.indexOf(option), 0);
       if (distinctCount > bestDistinctCount
           || distinctCount === bestDistinctCount && (exemplarCount > bestExemplarCount
-            || exemplarCount === bestExemplarCount && rankCost < bestRankCost)) {
+            || exemplarCount === bestExemplarCount && (distinctDonorCount > bestDistinctDonorCount
+              || distinctDonorCount === bestDistinctDonorCount && rankCost < bestRankCost))) {
         best = complete;
+        bestDistinctDonorCount = distinctDonorCount;
         bestDistinctCount = distinctCount;
         bestExemplarCount = exemplarCount;
         bestRankCost = rankCost;
@@ -1369,6 +1535,7 @@ export function assessVariantCompositionDistinctness(
   semanticProfile?: TemplateSemanticProfile,
   diagnostics?: PerformanceDiagnosticsPort,
   visualClassificationCache?: CompositionVisualClassificationCache,
+  history?: ExemplarSelectionHistory,
 ): VariantCompositionDistinctness {
   const variants = ['A', 'B', 'C'];
   if (slides.length !== variants.length || variants.some((variant) => !slides.some((slide) => slide.variantId === variant))) {
@@ -1387,6 +1554,7 @@ export function assessVariantCompositionDistinctness(
       compositionKind: 'safe-generated-fallback',
       layoutCandidateIndex: slide.selectedCandidateIndex,
       projectedCompositionSignature: signatures[index]!,
+      compositionFamilyKey: `fallback:${signatures[index]}`,
     }));
     const availableDistinctFamilies = new Set(signatures).size;
     const distinct = signatures.length === variants.length && availableDistinctFamilies === variants.length;
@@ -1408,6 +1576,7 @@ export function assessVariantCompositionDistinctness(
         compositionKind: 'exemplar-backed',
         layoutCandidateIndex: slide.selectedCandidateIndex,
         projectedCompositionSignature: selection.projectedCompositionSignature,
+        compositionFamilyKey: `exemplar:${selection.sourcePart}|${selection.sourceSlideIndex}`,
         exemplarSelection: selection,
       });
       slide.layoutCandidates.forEach((candidate, candidateIndex) => {
@@ -1418,14 +1587,34 @@ export function assessVariantCompositionDistinctness(
           compositionKind: 'layout-placeholder-backed',
           layoutCandidateIndex: candidateIndex,
           projectedCompositionSignature: generatedFallbackCompositionSignature(nativeSlide, template),
+          compositionFamilyKey: `layout:${candidate.sourcePart}|${candidate.layoutId}`,
         });
       });
       const signaturesSeen = new Set<string>();
-      return options.filter((option) => {
+      const uniqueOptions = options.filter((option) => {
         if (signaturesSeen.has(option.projectedCompositionSignature)) return false;
         signaturesSeen.add(option.projectedCompositionSignature);
         return true;
       });
+      const prior = history?.[slide.variantId] ?? [];
+      const priorLast = prior.at(-1);
+      const preferenceCost = (option: Option, index: number) => {
+        const selection = option.exemplarSelection;
+        if (!selection) return index;
+        const sameDonorCount = prior.filter((entry) => entry.sourcePart === selection.sourcePart
+          && entry.sourceSlideIndex === selection.sourceSlideIndex).length;
+        const sameFamilyCount = prior.filter((entry) => Boolean(entry.familyKey) && entry.familyKey === selection.familyKey).length;
+        const adjacentDonorRepeat = priorLast?.sourcePart === selection.sourcePart
+          && priorLast.sourceSlideIndex === selection.sourceSlideIndex;
+        const adjacentFamilyRepeat = priorLast?.familyKey === selection.familyKey;
+        const sourceRepeatPenalty = sameDonorCount ? uniqueOptions.length * (sameDonorCount + 1) : 0;
+        const familyRepeatPenalty = sameFamilyCount ? Math.ceil(uniqueOptions.length * 0.35) * sameFamilyCount : 0;
+        const adjacentPenalty = adjacentDonorRepeat ? uniqueOptions.length * 0.4 : adjacentFamilyRepeat ? uniqueOptions.length * 0.2 : 0;
+        return index + sourceRepeatPenalty + familyRepeatPenalty + adjacentPenalty;
+      };
+      return uniqueOptions.map((option, index) => ({ option, index, cost: preferenceCost(option, index) }))
+        .sort((left, right) => left.cost - right.cost || left.index - right.index)
+        .map(({ option }) => option);
     });
     const assignments = assignSafeVariantCompositions(optionsByVariant);
     signatures = assignments.map((option) => option.projectedCompositionSignature);

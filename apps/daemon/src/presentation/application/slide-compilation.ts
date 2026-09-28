@@ -80,6 +80,8 @@ export interface CompiledSlide {
   id: string;
   sourceDeckPlanSlideId: string;
   intent: SlideIntent;
+  /** Planning density guides composition ranking; it never changes factual payload. */
+  targetDensity?: DeckPlanSlide['targetDensity'];
   layoutId: string;
   layoutSourcePart: string;
   variantId: PresentationVariantId;
@@ -90,11 +92,11 @@ export interface CompiledSlide {
   visualization: {
     type: SemanticVisualType;
     sourceRefs: string[];
-    status: 'none' | 'referenced' | 'unresolved';
+    status: 'none' | 'referenced' | 'generated' | 'unresolved';
     tableData: string[][] | null;
     tableCellRefs: string[][] | null;
     chartData: CompiledChartData | null;
-    processSteps: Array<{ text: string; sourceRef: string }>;
+    processSteps: CompiledProcessStep[];
     kpi: { label: string; value: string; sourceRefs: string[] } | null;
   };
   imageRefs: Array<{ contentUnitId: string; sourceId: string; sourcePath: string; mediaType: string; sha256: string }>;
@@ -107,6 +109,18 @@ export interface CompiledSlide {
   /** Runtime-only exact donor chosen by the joint A/B/C resolver; revalidated by the renderer. */
   exemplarSelection?: ExemplarSlideSelection;
 }
+
+/** Process labels can be source-backed or generated copy; only the former are evidence refs. */
+export type CompiledProcessStep = {
+  text: string;
+  origin: 'source-backed';
+  sourceRef: string;
+} | {
+  text: string;
+  origin: 'generated-from-brief';
+  sourceRef: null;
+  generatedBodyPointIndex: number;
+};
 
 export interface CompiledChartData {
   kind: 'column' | 'line';
@@ -142,7 +156,7 @@ export interface CanonicalFactualPayload {
   table: { values: string[][]; sourceRefs: string[][] } | null;
   chart: CompiledChartData | null;
   kpi: { label: string; value: string; sourceRefs: string[] } | null;
-  process: Array<{ text: string; sourceRef: string }>;
+  process: CompiledProcessStep[];
   images: Array<{ sourceId: string; sha256: string }>;
 }
 
@@ -628,12 +642,23 @@ function chartDataFor(units: ContentUnit[], title: string): CompiledChartData | 
   };
 }
 
-function processStepsFor(units: ContentUnit[]): Array<{ text: string; sourceRef: string }> {
+function processStepsFor(units: ContentUnit[]): CompiledProcessStep[] {
   const textUnits = units.filter((unit) => unit.text && unit.kind !== 'json-value');
   if (textUnits.length < 2 || textUnits.some((unit) => !/^\s*(?:\d+[.)]|[-*•])\s+/.test(unit.text!))) return [];
   return textUnits.map((unit) => ({
     text: unit.text!.replace(/^\s*(?:\d+[.)]|[-*•])\s+/, '').trim(),
+    origin: 'source-backed' as const,
     sourceRef: unit.id,
+  }));
+}
+
+function generatedProcessStepsFor(points: readonly GeneratedBodyPoint[] | undefined): CompiledProcessStep[] {
+  if (!points || points.length < 2) return [];
+  return points.map((point, generatedBodyPointIndex) => ({
+    text: point.text,
+    origin: 'generated-from-brief' as const,
+    sourceRef: null,
+    generatedBodyPointIndex,
   }));
 }
 
@@ -684,7 +709,10 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
   const tableData = slide.semanticVisualType === 'table' ? tableDataFor(displayable) : null;
   const tableCellRefs = tableData ? tableCellRefsFor(displayable) : null;
   const chartData = slide.semanticVisualType === 'chart' ? chartDataFor(displayable, slide.takeaway) : null;
-  const processSteps = slide.semanticVisualType === 'process' ? processStepsFor(displayable) : [];
+  const sequenceVisualRequested = ['process', 'timeline', 'diagram'].includes(slide.semanticVisualType);
+  const sourceProcessSteps = sequenceVisualRequested ? processStepsFor(displayable) : [];
+  const processSteps = sourceProcessSteps.length ? sourceProcessSteps
+    : sequenceVisualRequested ? generatedProcessStepsFor(slide.bodyPoints) : [];
   const kpi = slide.semanticVisualType === 'kpi' ? kpiFor(displayable) : null;
   const body = slide.bodyPoints?.map((point) => point.text) ?? displayable.flatMap((unit) => {
     if ((tableData || chartData || kpi) && unit.kind === 'table-cell') return [];
@@ -704,7 +732,7 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
     const hasBody = candidate.slotEvidence.body !== null;
     const hasVisual = candidate.slotEvidence.visual !== null;
     const bodyCanHostVisual = body.length === 0
-      || slide.semanticVisualType === 'process' && body.length <= processSteps.length;
+      || sequenceVisualRequested && body.length <= processSteps.length;
     const contentHasSlot = imageRefs.length > 0
       ? hasVisual
       : !requiresVisualSlot || hasVisual || bodyCanHostVisual;
@@ -715,7 +743,12 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
   if (!chosen.titleBox || !chosen.bodyBox) throw new TypeError('Selected layout candidate lost required slot geometry');
   const visualStatus = slide.semanticVisualType === 'none'
     ? 'none'
-    : tableData || imageRefs.length || chartData || processSteps.length >= 2 || kpi ? 'referenced' : 'unresolved';
+    : slide.semanticVisualType === 'comparison' && body.length >= 2
+      ? sourceBackedRefs.length ? 'referenced' : 'generated'
+      : slide.semanticVisualType === 'kpi' && !kpi && body.length > 0
+        ? sourceBackedRefs.length ? 'referenced' : 'generated'
+    : processSteps.some((step) => step.origin === 'generated-from-brief') ? 'generated'
+      : tableData || imageRefs.length || chartData || processSteps.length >= 2 || kpi ? 'referenced' : 'unresolved';
   const visualPlacement = requiresVisualSlot && chosen.visualBox
     ? fitVisualBoxToCanvas(chosen.visualBox, template)
     : chosen.visualBox;
@@ -726,6 +759,7 @@ function makeSlide(slide: DeckPlanSlide, contentIR: ContentIR, template: Templat
     id: `compiled_${slide.id}_${policy.id}`,
     sourceDeckPlanSlideId: slide.id,
     intent: intentFor(slide),
+    targetDensity: slide.targetDensity,
     layoutId: chosen.layoutId,
     layoutSourcePart: chosen.sourcePart,
     variantId: policy.id,

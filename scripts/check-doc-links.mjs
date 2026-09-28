@@ -28,6 +28,7 @@ const requiredFiles = [
   'apps/daemon/prompts/contextual-deck-audit.v4.md',
   'apps/daemon/prompts/template-profiler.v1.md',
   'apps/daemon/prompts/template-profiler.v2.md',
+  'apps/daemon/prompts/template-profiler.v3.md',
   'skills/README.md',
   'apps/daemon/src/presentation/contracts/agent-workflows.v1.json',
   'apps/daemon/src/presentation/contracts/template-profiler.v1.json',

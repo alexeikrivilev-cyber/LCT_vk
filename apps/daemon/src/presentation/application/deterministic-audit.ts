@@ -447,14 +447,18 @@ export function auditCompiledPresentation(
       }
     }
     if (slide.visualization.processSteps.length) {
-      const invalidRefs = slide.visualization.processSteps.filter((step) => !unitIds.has(step.sourceRef));
-      if (invalidRefs.length) {
+      const invalidRefs = slide.visualization.processSteps.filter((step) => step.origin === 'source-backed' && !unitIds.has(step.sourceRef));
+      const invalidGeneratedCopy = slide.visualization.processSteps.filter((step) => step.origin === 'generated-from-brief'
+        && slide.generatedBodyPoints?.[step.generatedBodyPointIndex]?.text !== step.text);
+      if (invalidRefs.length || invalidGeneratedCopy.length) {
         addFinding(findings, {
           slideId: slide.id,
-          ruleId: 'integrity.process-source-reference',
+          ruleId: invalidGeneratedCopy.length ? 'integrity.generated-process-copy' : 'integrity.process-source-reference',
           severity: 'error',
-          message: 'One or more process steps do not reference source ContentIR units.',
-          evidence: { invalidReferenceCount: invalidRefs.length },
+          message: invalidGeneratedCopy.length
+            ? 'Generated process labels differ from their exact generated-from-brief body points.'
+            : 'One or more source-backed process steps do not reference source ContentIR units.',
+          evidence: { invalidReferenceCount: invalidRefs.length, invalidGeneratedCopyCount: invalidGeneratedCopy.length },
           autofixAvailable: false,
           suggestedRepair: null,
         });

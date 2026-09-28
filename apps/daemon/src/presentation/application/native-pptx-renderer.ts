@@ -285,6 +285,19 @@ export async function renderNativePptx(input: {
     templatePreservationStatus: 'unknown',
     validationIssues: unsupportedVisualIssues,
     unresolvedVisualTypes,
+    visualIntents: input.compiledPresentation.slides.map((slide) => {
+      const requestedType = slide.visualization.type;
+      if (requestedType === 'none') return { slideId: slide.id, requestedType, realizedType: 'none' as const, fallbackReason: null };
+      if (requestedType === 'table' && slide.visualization.tableData) {
+        return { slideId: slide.id, requestedType, realizedType: 'table' as const, fallbackReason: null };
+      }
+      return {
+        slideId: slide.id,
+        requestedType,
+        realizedType: 'unresolved' as const,
+        fallbackReason: 'The custom renderer does not materialize this visual type; source-backed text remains in the slide.',
+      };
+    }),
     projectedCompositions: input.compiledPresentation.slides.map((slide) => ({
       slideId: slide.id,
       variantId: slide.variantId,

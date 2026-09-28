@@ -234,7 +234,13 @@ function verifyCompiledProvenance(
   for (const ref of slide.visualization.tableCellRefs?.flat() ?? []) checkRef(ref, 'fact');
   for (const ref of slide.visualization.chartData?.provenanceRefs ?? []) checkRef(ref, 'fact');
   for (const ref of slide.visualization.kpi?.sourceRefs ?? []) checkRef(ref, 'fact');
-  for (const step of slide.visualization.processSteps) checkRef(step.sourceRef, 'fact');
+  for (const step of slide.visualization.processSteps) {
+    if (step.origin === 'source-backed') checkRef(step.sourceRef, 'fact');
+    else if (slide.generatedBodyPoints?.[step.generatedBodyPointIndex]?.text !== step.text) {
+      add({ severity: 'error', ruleId: 'deck.generated-process-copy-mismatch', slideId: slide.sourceDeckPlanSlideId,
+        message: 'A generated process label differs from its generated presentation copy.', evidence: { generatedBodyPointIndex: step.generatedBodyPointIndex } });
+    }
+  }
   for (const image of slide.imageRefs) checkRef(image.contentUnitId, 'media');
 
   for (let row = 0; row < (slide.visualization.tableData?.length ?? 0); row += 1) {
@@ -273,6 +279,7 @@ function verifyCompiledProvenance(
     }
   }
   for (const step of slide.visualization.processSteps) {
+    if (step.origin === 'generated-from-brief') continue;
     const unit = units.get(step.sourceRef);
     const expected = unit?.text?.replace(/^\s*(?:\d+[.)]|[-*•])\s+/, '').trim();
     if (!unit || expected !== step.text) add({ severity: 'error', ruleId: 'deck.provenance-process-label-mismatch', slideId: slide.sourceDeckPlanSlideId,

@@ -32,7 +32,7 @@ import { PerformanceDiagnostics } from '../src/presentation/performance-diagnost
 import { OfficeKitPptxRenderer } from '../src/presentation/adapters/office-kit-pptx-renderer.ts';
 import { OfficeKitPreviewAdapter } from '../src/presentation/adapters/office-kit-preview-adapter.ts';
 import { isValidTemplateSemanticProfile } from '../src/presentation/application/template-semantic-profiler.ts';
-import { findSlideLayoutByPartName, getShapeId, getShapeKind, getShapePlaceholderType, getShapeText, getShapeRunFormatEffective, getSlideCharts, getSlideLayoutPlaceholders, getSlideShapes, getSlides, hasShapeText, isShapePlaceholder, loadPresentation } from '@office-kit/pptx/node';
+import { findSlideLayoutByPartName, getShapeId, getShapeKind, getShapePlaceholderType, getShapeText, getShapeRunFormatEffective, getShapeStrokeColor, getSlideCharts, getSlideLayoutPlaceholders, getSlideShapes, getSlides, hasShapeText, isShapePlaceholder, loadPresentation } from '@office-kit/pptx/node';
 import { briefHash } from '../src/presentation/domain/brief.ts';
 import { canonicalizeDeckPlan } from '../src/presentation/domain/deck-plan.ts';
 import { sha256Json, templateIRHashPayload } from '../src/presentation/domain/template-ir.ts';
@@ -45,6 +45,7 @@ import {
   createCrossLayoutFooterTemplate,
   createExemplarTemplate,
   createFamilyExemplarTemplate,
+  createSixRegionGridExemplarTemplate,
   createHybridExemplarTemplate,
   createRoleExemplarTemplate,
   createTwoRegionExemplarTemplate,
@@ -468,16 +469,26 @@ test('brief/task instructions never become slide copy, source evidence, or proce
   assert.deepEqual(withContext.provenanceRefs, [], 'brief fields never become source provenance');
 
   const generatedCopy = 'Сформулировать ключевую мысль и определить следующий шаг.';
-  const generatedPlan = makePlan([], [{ text: generatedCopy, origin: 'generated-from-brief', evidenceRefs: [] }], 'Ключевая мысль ведёт к следующему шагу.');
+  const generatedProcessPoints = [
+    { text: generatedCopy, origin: 'generated-from-brief', evidenceRefs: [] },
+    { text: 'Проверить результат и согласовать продолжение.', origin: 'generated-from-brief', evidenceRefs: [] },
+  ];
+  const generatedPlan = makePlan([], generatedProcessPoints, 'Ключевая мысль ведёт к следующему шагу.');
   const generatedSlide = compilePresentation(generatedPlan, contentIR, template, VARIANT_POLICIES[0]).slides[0];
-  assert.deepEqual(generatedSlide.body, [generatedCopy], 'generated copy fills task-only slides without copying instructions');
+  assert.deepEqual(generatedSlide.body, generatedProcessPoints.map((point) => point.text), 'generated copy fills task-only slides without copying instructions');
   assert.deepEqual(generatedSlide.provenanceRefs, []);
+  assert.deepEqual(generatedSlide.visualization.processSteps, generatedProcessPoints.map((point, generatedBodyPointIndex) => ({
+    text: point.text, origin: 'generated-from-brief', sourceRef: null, generatedBodyPointIndex,
+  })), 'a requested process uses native sequence labels while keeping brief-generated copy separate from source evidence');
+  assert.equal(generatedSlide.visualization.status, 'generated');
   const generatedReport = auditCompiledPresentation({ schemaVersion: 1, variantId: 'A', variantPolicyVersion: VARIANT_POLICIES[0].version,
     deckPlanId: generatedPlan.id, deckPlanHash: generatedPlan.hash, contentIRHash: contentIR.hash,
     templateIRId: template.id, templateIRHash: template.hash, slides: [generatedSlide] }, contentIR, template);
   assert.ok(!generatedReport.findings.some((finding) => finding.ruleId === 'integrity.generated-copy-provenance'));
   assert.ok(!generatedReport.findings.some((finding) => finding.ruleId === 'fidelity.unsupported-number'),
     'ordinary qualitative generated narrative is not treated as an unsupported fact');
+  assert.ok(!generatedReport.findings.some((finding) => finding.ruleId === 'integrity.process-source-reference'),
+    'generated process labels do not require fabricated ContentIR references');
 
   const unsupportedGeneratedPlan = makePlan([], [{ text: 'Показатель вырос на 2025%.', origin: 'generated-from-brief', evidenceRefs: [] }], 'Показатель заметно вырос.');
   const unsupportedGeneratedSlide = compilePresentation(unsupportedGeneratedPlan, contentIR, template, VARIANT_POLICIES[0]).slides[0];
@@ -818,14 +829,25 @@ test('exemplar selection maps exact donor shapes, ranks three supported families
   });
   const tracks = selectTracks(first.templateIR);
   const selections = tracks.map((track) => track.selected);
-  assert.ok(selections.every(Boolean), 'the source deck contains three compatible structural families');
-  assert.equal(new Set(selections.map((selection) => selection.familyKey)).size, 3);
-  assert.equal(new Set(selections.map((selection) => selection.projectedCompositionSignature)).size, 3,
-    'A/B/C choices have distinct post-projection compositions');
-  assert.equal(new Set(selections.map((selection) => selection.sourceSlideIndex)).size, 3);
-  const distinctness = assessVariantCompositionDistinctness(tracks.map((track) => track.compiled), first.templateIR, 'office-kit');
+  assert.ok(selections.every(Boolean), 'the source deck contains a safe composition for each track');
+  const profile = semanticProfileFor(first.templateIR);
+  const distinctness = assessVariantCompositionDistinctnessRaw(tracks.map((track) => track.compiled), first.templateIR, 'office-kit', profile);
   assert.equal(distinctness.distinct, true);
   assert.equal(distinctness.availableDistinctFamilies, 3);
+  assert.equal(new Set(distinctness.assignments.map((assignment) => assignment.projectedCompositionSignature)).size, 3,
+    'the joint resolver assigns three distinct compositions when all three safe families are available');
+  const previousAssignment = distinctness.assignments.find((assignment) => assignment.exemplarSelection);
+  assert.ok(previousAssignment?.exemplarSelection);
+  const historyAware = assessVariantCompositionDistinctnessRaw(tracks.map((track) => track.compiled), first.templateIR, 'office-kit', profile,
+    undefined, undefined, { [previousAssignment.variantId]: [{
+      sourcePart: previousAssignment.exemplarSelection.sourcePart,
+      sourceSlideIndex: previousAssignment.exemplarSelection.sourceSlideIndex,
+    }] });
+  const historyChoice = historyAware.assignments.find((assignment) => assignment.variantId === previousAssignment.variantId);
+  assert.ok(historyChoice);
+  assert.ok(!historyChoice.exemplarSelection
+    || historyChoice.exemplarSelection.sourceSlideIndex !== previousAssignment.exemplarSelection.sourceSlideIndex,
+  'a safe unused donor or measured native layout is preferred on later slides within the same track');
   for (const selection of selections) {
     const donor = first.templateIR.slides.find((slide) => slide.sourcePart === selection.sourcePart);
     assert.ok(donor?.elements.some((element) => element.id === selection.slots.title.elementId && element.nativeId === selection.slots.title.nativeId));
@@ -841,7 +863,7 @@ test('exemplar selection maps exact donor shapes, ranks three supported families
   assert.equal(selectExemplarSlide(uncertain, first.templateIR, null), null, 'low-confidence donor geometry fails closed without semantic mapping');
 });
 
-test('trusted profiles may classify more than four body regions while projection stays bounded and clears unused source copy', async (t) => {
+test('trusted profiles may classify more than four body regions while projection stays bounded and removes unused panels', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-many-profile-bodies-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const template = await exemplarFixture(root, 'many-profile-bodies.pptx', {
@@ -874,10 +896,66 @@ test('trusted profiles may classify more than four body regions while projection
     const element = donor.elements.find((candidate) => candidate.id === elementId);
     assert.ok(element?.nativeId);
     if (!selectedElementIds.has(element.id)) {
-      assert.ok(donorDiagnostic.clearedTextElementIds.includes(element.id),
-        'unused profile-mapped body sample text is explicitly cleared');
+      assert.ok(donorDiagnostic.removedTextElementIds.includes(element.id)
+        || donorDiagnostic.clearedTextElementIds.includes(element.id),
+      'unused profile-mapped body sample is removed when it is a safe top-level shape, otherwise its text is cleared');
     }
   }
+});
+
+test('sparse copy selects an aligned compact subset from a larger body grid', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-grid-coherence-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'six-region-grid.pptx', { create: createSixRegionGridExemplarTemplate });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiledDeck = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const compiled = compiledDeck.slides[1];
+  assert.ok(compiled);
+  const bodyIdsBySlide = Object.fromEntries(template.templateIR.slides.map((slide) => [slide.index,
+    slide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+      && element.text?.startsWith('Source panel')).map((element) => element.id)]));
+  assert.ok(Object.values(bodyIdsBySlide).every((ids) => ids.length === 6));
+  const semanticProfile = semanticProfileForMultiRegion(template.templateIR,
+    template.templateIR.slides.map((slide) => slide.index), bodyIdsBySlide);
+  const sparseCopy = {
+    ...compiled,
+    body: ['Первый короткий тезис.', 'Второй короткий тезис.', 'Третий короткий тезис.'],
+    visualization: { ...compiled.visualization, type: 'none', status: 'none', tableData: null, tableCellRefs: null, chartData: null, processSteps: [], kpi: null },
+    imageRefs: [],
+  };
+  const assessment = assessExemplarSelection(sparseCopy, template.templateIR, semanticProfile);
+  assert.ok(assessment.selection, JSON.stringify(assessment.candidateDiagnostics.filter((candidate) => candidate.projectionSafe === true)));
+  assert.ok(assessment.selection.slots.bodySlots.length >= 2 && assessment.selection.slots.bodySlots.length <= 3);
+  assert.ok(assessment.selection.designFeatures.bodyArrangementScore >= 0.8,
+    `selected body regions should form a compact row or column; score=${assessment.selection.designFeatures.bodyArrangementScore}`);
+  const boxes = assessment.selection.slots.bodySlots.map((slot) => {
+    const element = template.templateIR.slides.find((slide) => slide.sourcePart === assessment.selection.sourcePart)
+      ?.elements.find((candidate) => candidate.id === slot.elementId);
+    return element?.geometry.resolved ?? element?.geometry.direct;
+  });
+  assert.ok(boxes.every(Boolean));
+  const sameRow = Math.max(...boxes.map((box) => box.y)) - Math.min(...boxes.map((box) => box.y)) < boxes[0].height * 0.1;
+  const sameColumn = Math.max(...boxes.map((box) => box.x)) - Math.min(...boxes.map((box) => box.x)) < boxes[0].width * 0.1;
+  assert.ok(sameRow || sameColumn, 'three cards should share one geometric row/column instead of leaving irregular holes');
+
+  const qualitativeKpi = {
+    ...sparseCopy,
+    visualization: { ...sparseCopy.visualization, type: 'kpi', status: 'generated', kpi: null },
+  };
+  const renderPath = path.join(root, 'rendered', 'qualitative-kpi-downgrade.pptx');
+  await mkdir(path.dirname(renderPath), { recursive: true });
+  const rendered = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: { ...compiledDeck, id: `${compiledDeck.id}_qualitative_kpi_downgrade`, slides: [qualitativeKpi] },
+    contentIR, templateIR: template.templateIR, semanticProfile,
+    templatePath: template.templatePath, outputPath: renderPath,
+  });
+  assert.deepEqual(rendered.visualIntents, [{
+    slideId: qualitativeKpi.id,
+    requestedType: 'kpi',
+    realizedType: 'comparison',
+    fallbackReason: 'No source-backed numeric value was available; the safe visual slot was removed and qualitative copy uses measured side-by-side body regions.',
+  }], 'a qualitative KPI is downgraded to a measured editable layout, never a fabricated number');
+  assert.deepEqual(rendered.unresolvedVisualTypes, []);
 });
 
 test('Office Kit renderer preserves distinct projected A/B/C composition signatures', async (t) => {
@@ -1080,7 +1158,10 @@ test('validated semantic archetypes change donor ranking and structural conflict
   assert.ok(structural.selection);
   assert.ok(semantic.selection);
   assert.equal(structural.selection.semanticArchetype, 'content');
-  assert.equal(semantic.selection.semanticArchetype, 'content-dense');
+  assert.equal(semantic.selection.semanticArchetype, 'content-dense', JSON.stringify(semantic.safeSelections.slice(0, 10).map((item) => ({
+    sourceSlideIndex: item.sourceSlideIndex, archetype: item.semanticArchetype, structural: item.designFeatures.structuralArchetype,
+    confidence: item.confidence, unused: item.designFeatures.unusedMappedBodyRegionCount, evidence: item.evidence.slice(0, 2),
+  }))));
   assert.ok(semantic.selection.sourceSlideIndex >= 5 && semantic.selection.sourceSlideIndex <= 8,
     'the profile ranking selects its higher-confidence variant-preferred family');
   assert.notEqual(semantic.selection.projectedCompositionSignature, structural.selection.projectedCompositionSignature,
@@ -1167,8 +1248,8 @@ test('semantic projection assigns complete body blocks across two native regions
   const unusedMappedBodyId = mappedProfileSlide?.bodyElementIds.find((id) => !selectedBodyIds.has(id));
   const unusedMappedBody = template.templateIR.slides.find((item) => item.sourcePart === oneBlockAssessment.selection.sourcePart)
     ?.elements.find((element) => element.id === unusedMappedBodyId);
-  assert.ok(unusedMappedBody?.nativeId && oneBlockAssessment.selection.clearElementNativeIds.includes(unusedMappedBody.nativeId),
-    'a validated donor body region with no assigned source block is cleared as template sample text');
+  assert.ok(unusedMappedBody?.nativeId && oneBlockAssessment.selection.removeElementNativeIds.includes(unusedMappedBody.nativeId),
+    'a validated donor body panel with no assigned source block is removed as a whole shape');
 
   const multiSentenceBlock = {
     ...oneBlockSlide,
@@ -1195,6 +1276,13 @@ test('semantic projection assigns complete body blocks across two native regions
   });
   assert.equal(oneBlockRender.reopenStatus, 'passed');
   const oneBlockReopened = await inspectPptx(oneBlockPath);
+  const oneBlockOfficeKit = await loadPresentation(await readFile(oneBlockPath));
+  const oneBlockOfficeKitSlide = getSlides(oneBlockOfficeKit)[0];
+  assert.ok(oneBlockOfficeKitSlide);
+  const remainingNativeIds = new Set(getSlideShapes(oneBlockOfficeKitSlide).map((shape) => String(getShapeId(shape))));
+  for (const nativeId of oneBlockAssessment.selection.removeElementNativeIds) {
+    assert.ok(!remainingNativeIds.has(nativeId), `unused mapped card shape ${nativeId} is absent from the reopened PPTX`);
+  }
   assert.ok(!oneBlockReopened.inspection.slides[0]?.elements.some((element) => /Left source region|Right source region/.test(element.text)),
     'unused mapped sample text cannot leak from the source template when the projected content has fewer blocks');
 });
@@ -1425,7 +1513,8 @@ test('dark template keeps native title/body styling and derives generated proces
   const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
   const slide = compiled.slides[3];
   assert.equal(slide?.visualization.processSteps.length, 3);
-  assert.ok(assessExemplarSelection(slide, template.templateIR, template.semanticProfile).selection?.slots.visual);
+  const selection = assessExemplarSelection(slide, template.templateIR, template.semanticProfile).selection;
+  assert.ok(selection);
   const outputPath = path.join(root, 'output', 'dark-process.pptx');
   await mkdir(path.dirname(outputPath), { recursive: true });
   const result = await new OfficeKitPptxRenderer().render({
@@ -1434,12 +1523,27 @@ test('dark template keeps native title/body styling and derives generated proces
     templatePath: template.templatePath, outputPath,
   });
   assert.equal(result.reopenStatus, 'passed');
+  assert.equal(result.nativeConnectorCount, 2, 'the body-hosted process is connected after using a measured native body region');
+  assert.deepEqual(result.unresolvedVisualTypes, [], 'process intent is not reported as realized unless its nodes/connectors were rendered');
+  assert.deepEqual(result.visualIntents, [{
+    slideId: slide.id,
+    requestedType: 'process',
+    realizedType: 'process',
+    fallbackReason: 'Sequence labels reuse measured native body geometry because no separate safe visual slot was selected.',
+  }], 'the diagnostic records the concrete native realization without exposing model content');
   const generatedText = result.qualityEvidence.textObjects.filter((item) => item.slideId === slide.id && item.role === 'other');
   assert.equal(generatedText.length, 3, 'each native process node is inspected after the PPTX was reopened');
   assert.ok(generatedText.every((item) => item.color === '#F9FAFB'), JSON.stringify(generatedText));
   assert.ok(generatedText.every((item) => item.fontSizePt === 16), JSON.stringify(generatedText));
   const reopened = await loadPresentation(await readFile(outputPath));
   const outputSlide = getSlides(reopened)[0];
+  const reopenedShapes = getSlideShapes(outputSlide);
+  const connectors = reopenedShapes.filter((shape) => getShapeKind(shape) === 'connector');
+  assert.equal(connectors.length, 2, 'reopened PPTX contains two editable native connectors');
+  assert.ok(connectors.every((shape) => getShapeStrokeColor(shape) === '#F9FAFB'),
+    'connectors use the dark template body role color rather than an invisible default black stroke');
+  assert.ok(!reopenedShapes.some((shape) => hasShapeText(shape) && /Mapped source body/u.test(getShapeText(shape))),
+    'source-specific body sample text is removed before generated sequence labels are placed');
   const processShape = getSlideShapes(outputSlide).find((shape) => getShapeText(shape) === 'Parse the template');
   assert.ok(processShape);
   assert.equal(getShapeRunFormatEffective(reopened, processShape, 0, 0).color, '#F9FAFB');
@@ -1610,6 +1714,19 @@ test('A/B/C composition uniqueness is enforced across complete decks, allowing s
     C: [twoSafeSlide[2].projectedCompositionSignature, 'c-track'],
   });
   assert.equal(twoChoiceDecks.distinct, true);
+
+  const donorOption = (variantId, sourceSlideIndex, signature) => ({
+    ...option(variantId, signature),
+    compositionKind: 'exemplar-backed',
+    exemplarSelection: { sourcePart: `ppt/slides/slide${sourceSlideIndex}.xml`, sourceSlideIndex },
+  });
+  const visuallyDiverseTracks = assignSafeVariantCompositions([
+    [donorOption('A', 1, 'a-1'), donorOption('A', 2, 'a-2'), donorOption('A', 3, 'a-3')],
+    [donorOption('B', 1, 'b-1'), donorOption('B', 2, 'b-2'), donorOption('B', 3, 'b-3')],
+    [donorOption('C', 1, 'c-1'), donorOption('C', 2, 'c-2'), donorOption('C', 3, 'c-3')],
+  ]);
+  assert.equal(new Set(visuallyDiverseTracks.map((item) => item.exemplarSelection.sourceSlideIndex)).size, 3,
+    'when safe donor alternatives exist, A/B/C prefer different native template compositions over card-position-only differences');
 
   assert.deepEqual(assignSafeVariantCompositions([
     [option('A', 'one')], [], [option('C', 'two')],
@@ -2093,6 +2210,8 @@ test('offline matrix emits three validated distinct Office Kit tracks with injec
     assert.equal(report.compiledPresentationId, output.compiledPresentationId);
     assert.equal(report.render.backend, 'office-kit');
     assert.equal(report.render.reopenStatus, 'passed');
+    assert.deepEqual(output.visualIntents, report.render.visualIntents,
+      'matrix outputs and full audit records expose the same realized/downgraded visual intent');
     const projected = report.render.projectedCompositions[0];
     const qualifiedVariant = qualification.slides[0].variants.find((variant) => variant.variantId === output.variantId);
     assert.equal(projected.projectedCompositionSignature, qualifiedVariant?.projectedCompositionSignature,

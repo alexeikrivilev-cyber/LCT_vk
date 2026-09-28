@@ -193,7 +193,13 @@ function applyRoleTextStyle(
   role: 'title' | 'body',
   preferredShapes: readonly ReturnType<typeof getSlideShapes>[number][] = [],
 ): void {
-  const style = roleTextStyle(presentation, slide, role, preferredShapes);
+  applyResolvedRoleTextStyle(shape, roleTextStyle(presentation, slide, role, preferredShapes));
+}
+
+function applyResolvedRoleTextStyle(
+  shape: ReturnType<typeof getSlideShapes>[number],
+  style: ReturnType<typeof roleTextStyle>,
+): void {
   setShapeTextFormat(shape, {
     color: asColor(style.color),
     ...(style.size ? { size: style.size } : {}),
@@ -202,6 +208,14 @@ function applyRoleTextStyle(
     ...(style.fontComplexScript ? { fontComplexScript: style.fontComplexScript } : {}),
   });
 }
+
+function requiredTemplateColor(color: string) {
+  const resolved = asColor(color);
+  if (!resolved) throw new PptxBackendError('TEMPLATE_TEXT_STYLE_UNRESOLVED', 'Could not derive a connector color from the template body text role.');
+  return resolved;
+}
+
+const PROCESS_CONNECTOR_WIDTH_EMU = 19_050;
 
 function projectExemplarText(
   slide: ReturnType<typeof getSlides>[number],
@@ -236,6 +250,14 @@ function projectExemplarText(
     }
   }
   const replacementIds = new Set([selection.slots.title.nativeId, ...bodySlots.map((slot) => slot.nativeId)]);
+  for (const nativeId of selection.removeElementNativeIds) {
+    if (replacementIds.has(nativeId)) throw new PptxBackendError('EXEMPLAR_CLEANUP_MAPPING_FAILED', 'A mapped title/body object cannot also be removed.');
+    const shape = byNativeId.get(nativeId);
+    if (!shape || getShapeKind(shape) !== 'shape' || !hasShapeText(shape)) {
+      throw new PptxBackendError('EXEMPLAR_CLEANUP_MAPPING_FAILED', `A validated unused body panel on exemplar slide ${selection.sourceSlideIndex} could not be removed safely.`);
+    }
+    removeShape(shape);
+  }
   for (const nativeId of selection.clearElementNativeIds) {
     if (replacementIds.has(nativeId)) continue;
     const shape = byNativeId.get(nativeId);
@@ -301,6 +323,7 @@ async function addProjectedVisual(
     counts.shapes += 2;
   }
   if (compiled.visualization.processSteps.length >= 2) {
+    const bodyStyle = roleTextStyle(presentation, slide, 'body', roleSources.body ? [roleSources.body] : []);
     const gap = Math.max(1, Math.round(visualBox.width * 0.025));
     const nodeWidth = Math.max(1, Math.floor((visualBox.width - gap * (compiled.visualization.processSteps.length - 1)) / compiled.visualization.processSteps.length));
     const nodeY = visualBox.y + Math.floor(visualBox.height * 0.2);
@@ -316,7 +339,8 @@ async function addProjectedVisual(
     for (let index = 0; index < nodes.length - 1; index += 1) {
       const from = nodes[index]!;
       const to = nodes[index + 1]!;
-      addSlideLine(slide, { from: { x: emu(from.x + nodeWidth), y: emu(from.centerY) }, to: { x: emu(to.x), y: emu(to.centerY) } });
+      addSlideLine(slide, { from: { x: emu(from.x + nodeWidth), y: emu(from.centerY) }, to: { x: emu(to.x), y: emu(to.centerY) },
+        color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
       counts.connectors += 1;
     }
   }
@@ -330,6 +354,144 @@ async function addProjectedVisual(
     counts.images += 1;
   }
   return counts;
+}
+
+/**
+ * A process/timeline may safely occupy measured native body regions when the
+ * template has no separate visual slot. Reuse those editable regions as nodes
+ * and connect only a verified row/column; never draw guessed/crossing lines.
+ */
+function addBodyHostedSequence(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
+  slide: ReturnType<typeof getSlides>[number],
+  compiled: CompiledSlide,
+  selection: ExemplarSlideSelection,
+): { textShapes: number; connectors: number } | null {
+  const slots = selection.slots.bodySlots.length ? selection.slots.bodySlots : [selection.slots.body];
+  if (slots.length < 1 || compiled.visualization.processSteps.length < 2) return null;
+  const shapes = getSlideShapes(slide);
+  const nodes = slots.map((slot) => {
+    const shape = shapes.find((candidate) => String(getShapeId(candidate)) === slot.nativeId);
+    const bounds = shape ? getShapeBoundsResolved(presentation, shape) : null;
+    return shape && bounds ? { shape, bounds } : null;
+  });
+  if (nodes.some((node) => node === null)) return null;
+  const resolvedNodes = nodes as Array<NonNullable<(typeof nodes)[number]>>;
+
+  if (resolvedNodes.length === 1) {
+    const { shape, bounds } = resolvedNodes[0]!;
+    const bodyStyle = roleTextStyle(presentation, slide, 'body', [shape]);
+    const gap = Math.max(12_700, Math.round(bounds.w * 0.025));
+    const nodeWidth = Math.floor((bounds.w - gap * (compiled.visualization.processSteps.length - 1)) / compiled.visualization.processSteps.length);
+    const nodeHeight = Math.floor(bounds.h * 0.72);
+    if (nodeWidth < 2 * 25_400 || nodeHeight < 2 * 25_400) return null;
+    setShapeText(shape, '');
+    const nodeY = bounds.y + Math.floor((bounds.h - nodeHeight) / 2);
+    const generatedNodes = compiled.visualization.processSteps.map((step, index) => {
+      const x = bounds.x + index * (nodeWidth + gap);
+      const textShape = addSlideTextBox(slide, {
+        x: emu(x), y: emu(nodeY), w: emu(nodeWidth), h: emu(nodeHeight), text: step.text,
+      });
+      applyResolvedRoleTextStyle(textShape, bodyStyle);
+      return { x, y: nodeY + Math.floor(nodeHeight / 2) };
+    });
+    for (let index = 0; index < generatedNodes.length - 1; index += 1) {
+      const from = generatedNodes[index]!;
+      const to = generatedNodes[index + 1]!;
+      const edge = from.x + nodeWidth;
+      const end = to.x;
+      const inset = Math.min(Math.round((end - edge) * 0.15), Math.round(nodeHeight * 0.04));
+      addSlideLine(slide, { from: { x: emu(edge + inset), y: emu(from.y) }, to: { x: emu(end - inset), y: emu(to.y) },
+        color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
+    }
+    return { textShapes: generatedNodes.length, connectors: generatedNodes.length - 1 };
+  }
+
+  const minGap = Math.max(12_700, Math.round(Math.min(...resolvedNodes.map((node) => Math.min(node.bounds.w, node.bounds.h))) * 0.02));
+  const aligned = (axis: 'x' | 'y') => {
+    const crossAxis = axis === 'x' ? 'y' : 'x';
+    const extent = axis === 'x' ? 'w' : 'h';
+    const crossExtent = crossAxis === 'x' ? 'w' : 'h';
+    const maxCrossExtent = Math.max(...resolvedNodes.map((node) => node.bounds[crossExtent]));
+    for (let index = 0; index < resolvedNodes.length; index += 1) {
+      const current = resolvedNodes[index]!.bounds;
+      const currentCenter = current[crossAxis] + current[crossExtent] / 2;
+      const firstCenter = resolvedNodes[0]!.bounds[crossAxis] + resolvedNodes[0]!.bounds[crossExtent] / 2;
+      if (Math.abs(currentCenter - firstCenter) > maxCrossExtent * 0.2) return false;
+      if (index === 0) continue;
+      const previous = resolvedNodes[index - 1]!.bounds;
+      if (current[axis] - (previous[axis] + previous[extent]) < minGap) return false;
+    }
+    return true;
+  };
+  const horizontal = aligned('x');
+  const vertical = aligned('y');
+  const axis = horizontal ? 'x' : vertical ? 'y' : null;
+  if (!axis) return null;
+  const bodyStyleSource = resolvedNodes[0]!.shape;
+  const bodyStyle = roleTextStyle(presentation, slide, 'body', [bodyStyleSource]);
+  const crossAxis = axis === 'x' ? 'y' : 'x';
+  const extent = axis === 'x' ? 'w' : 'h';
+  const crossExtent = crossAxis === 'x' ? 'w' : 'h';
+  const connectorSegments: Parameters<typeof addSlideLine>[1][] = [];
+  for (let index = 0; index < resolvedNodes.length - 1; index += 1) {
+    const from = resolvedNodes[index]!.bounds;
+    const to = resolvedNodes[index + 1]!.bounds;
+    const center = Math.round((from[crossAxis] + from[crossExtent] / 2 + to[crossAxis] + to[crossExtent] / 2) / 2);
+    const fromEdge = from[axis] + from[extent];
+    const toEdge = to[axis];
+    const gap = toEdge - fromEdge;
+    const inset = Math.min(Math.round(gap * 0.15), Math.round(Math.min(from[crossExtent], to[crossExtent]) * 0.08));
+    if (gap <= inset * 2 + 12_700) return null;
+    connectorSegments.push(axis === 'x'
+      ? { from: { x: emu(fromEdge + inset), y: emu(center) }, to: { x: emu(toEdge - inset), y: emu(center) },
+        color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU }
+      : { from: { x: emu(center), y: emu(fromEdge + inset) }, to: { x: emu(center), y: emu(toEdge - inset) },
+        color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
+  }
+  for (const connector of connectorSegments) addSlideLine(slide, connector);
+  return { textShapes: 0, connectors: resolvedNodes.length - 1 };
+}
+
+function sideBySideBodyComposition(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
+  slide: ReturnType<typeof getSlides>[number],
+  selection: ExemplarSlideSelection,
+): boolean {
+  const slots = selection.slots.bodySlots.length ? selection.slots.bodySlots : [selection.slots.body];
+  if (slots.length < 2) return false;
+  const shapes = getSlideShapes(slide);
+  const nodes = slots.map((slot) => {
+    const shape = shapes.find((candidate) => String(getShapeId(candidate)) === slot.nativeId);
+    const bounds = shape ? getShapeBoundsResolved(presentation, shape) : null;
+    return shape && bounds ? { shape, bounds } : null;
+  });
+  if (nodes.some((node) => node === null)) return false;
+  const ordered = (nodes as Array<NonNullable<(typeof nodes)[number]>>).sort((left, right) => left.bounds.x - right.bounds.x);
+  const tolerance = Math.min(...ordered.map((node) => node.bounds.h)) * 0.2;
+  const baseline = ordered[0]!.bounds.y + ordered[0]!.bounds.h / 2;
+  return ordered.every((node, index) => {
+    const center = node.bounds.y + node.bounds.h / 2;
+    if (Math.abs(center - baseline) > tolerance) return false;
+    if (!index) return true;
+    const previous = ordered[index - 1]!.bounds;
+    return node.bounds.x - (previous.x + previous.w) >= 12_700;
+  });
+}
+
+function realizedNativeVisualType(
+  compiled: CompiledSlide,
+  counts: { tables: number; charts: number; images: number; text: number; connectors: number },
+): CompiledSlide['visualization']['type'] | null {
+  const requested = compiled.visualization.type;
+  if (requested === 'table' && compiled.visualization.tableData && counts.tables > 0) return 'table';
+  if (requested === 'chart' && compiled.visualization.chartData && counts.charts > 0) return 'chart';
+  if (requested === 'kpi' && compiled.visualization.kpi && counts.text >= 2) return 'kpi';
+  if (requested === 'image' && compiled.imageRefs.length > 0 && counts.images > 0) return 'image';
+  if (['process', 'timeline', 'diagram'].includes(requested)
+      && compiled.visualization.processSteps.length >= 2
+      && counts.connectors >= compiled.visualization.processSteps.length - 1) return requested;
+  return null;
 }
 
 function matchingNativePlaceholder(
@@ -470,23 +632,79 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
     let nativeShapeCount = 0;
     let nativeConnectorCount = 0;
     const unresolvedVisualTypes = new Set<string>();
+    const visualIntentBySlide = new Map<string, NonNullable<PptxRenderResult['visualIntents']>[number]>();
+    const recordVisualIntent = (compiled: CompiledSlide,
+      realizedType: NonNullable<PptxRenderResult['visualIntents']>[number]['realizedType'],
+      fallbackReason: string | null = null) => {
+      visualIntentBySlide.set(compiled.id, {
+        slideId: compiled.id,
+        requestedType: compiled.visualization.type,
+        realizedType,
+        fallbackReason,
+      });
+    };
     const textStyleWarnings: string[] = [];
     for (const compiled of input.compiledPresentation.slides) {
       const selection = exemplarSelections.get(compiled.id);
       let slide = duplicatedSlides.get(compiled.id);
       if (selection && slide) {
         projectExemplarText(slide, compiled, selection, textStyleWarnings);
-        if (selection.slots.visual) {
+        if (compiled.visualization.type === 'kpi' && !compiled.visualization.kpi) {
+          // A qualitative KPI request has no source-backed value to render. If
+          // the selected donor has a source-free visual shape, remove it and
+          // use only a measured side-by-side body composition as a downgrade.
+          let visualSlotWasSafelyRemoved = !selection.slots.visual;
+          if (selection.slots.visual) {
+            const visualShape = getSlideShapes(slide).find((shape) => String(getShapeId(shape)) === selection.slots.visual!.nativeId);
+            if (!visualShape) throw new PptxBackendError('EXEMPLAR_VISUAL_SLOT_MISSING', 'The selected source-free visual slot could not be mapped to its Office Kit shape.');
+            if (getShapeKind(visualShape) === 'shape') {
+              removeShape(visualShape);
+              visualSlotWasSafelyRemoved = true;
+            }
+          }
+          if (visualSlotWasSafelyRemoved && sideBySideBodyComposition(presentation, slide, selection)) {
+            recordVisualIntent(compiled, 'comparison', 'No source-backed numeric value was available; the safe visual slot was removed and qualitative copy uses measured side-by-side body regions.');
+          } else {
+            unresolvedVisualTypes.add('kpi');
+            recordVisualIntent(compiled, 'unresolved', 'No source-backed numeric value or measured side-by-side body composition was available.');
+          }
+        } else if (selection.slots.visual) {
           const visualShape = getSlideShapes(slide).find((shape) => String(getShapeId(shape)) === selection.slots.visual!.nativeId);
           if (!visualShape) throw new PptxBackendError('EXEMPLAR_VISUAL_SLOT_MISSING', 'The selected source-free visual slot could not be mapped to its Office Kit shape.');
           removeShape(visualShape);
           const titleStyleSource = requiredDonorShape(slide, selection.slots.title.nativeId, 'title style');
           const bodySlot = selection.slots.bodySlots[0] ?? selection.slots.body;
           const bodyStyleSource = getSlideShapes(slide).find((shape) => String(getShapeId(shape)) === bodySlot.nativeId);
-          await addProjectedVisual(presentation, slide, compiled, selection.slots.visual.geometry,
+          const visualCounts = await addProjectedVisual(presentation, slide, compiled, selection.slots.visual.geometry,
             { title: titleStyleSource, body: bodyStyleSource }, input);
+          const realizedType = realizedNativeVisualType(compiled, visualCounts);
+          if (realizedType) recordVisualIntent(compiled, realizedType);
+          else {
+            unresolvedVisualTypes.add(compiled.visualization.type);
+            recordVisualIntent(compiled, 'unresolved', 'No native visual object was emitted for the requested visual type.');
+          }
+        } else if (compiled.visualization.processSteps.length >= 2) {
+          const sequence = addBodyHostedSequence(presentation, slide, compiled, selection);
+          if (sequence && sequence.connectors >= compiled.visualization.processSteps.length - 1) {
+            recordVisualIntent(compiled, compiled.visualization.type,
+              'Sequence labels reuse measured native body geometry because no separate safe visual slot was selected.');
+          } else {
+            unresolvedVisualTypes.add(compiled.visualization.type);
+            recordVisualIntent(compiled, 'unresolved', 'Measured body regions could not host a non-overlapping ordered sequence.');
+          }
+        } else if (compiled.visualization.type === 'comparison'
+            && sideBySideBodyComposition(presentation, slide, selection)) {
+          recordVisualIntent(compiled, 'comparison');
         } else if (compiled.visualization.status === 'unresolved') {
           unresolvedVisualTypes.add(compiled.visualization.type);
+          recordVisualIntent(compiled, 'unresolved', compiled.visualization.type === 'kpi'
+            ? 'No source-backed numeric value or safe side-by-side fallback was available.'
+            : `No safe native slot could realize the requested ${compiled.visualization.type} visual.`);
+        } else if (compiled.visualization.type !== 'none') {
+          unresolvedVisualTypes.add(compiled.visualization.type);
+          recordVisualIntent(compiled, 'unresolved', `The selected composition retained text but did not materialize ${compiled.visualization.type}.`);
+        } else {
+          recordVisualIntent(compiled, 'none');
         }
         const counts = countExemplarObjects(slide);
         nativeTextShapeCount += counts.textShapes;
@@ -530,6 +748,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
           rows: compiled.visualization.tableData,
         });
         nativeTableCount += 1;
+        recordVisualIntent(compiled, 'table');
       }
       if (compiled.visualization.chartData) {
         const visualBox = compiled.placements.visual ?? (compiled.body.length ? null : compiled.placements.body);
@@ -545,6 +764,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
             },
           });
           nativeChartCount += 1;
+          recordVisualIntent(compiled, 'chart');
         }
       }
       if (compiled.visualization.kpi) {
@@ -564,12 +784,16 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
           applyRoleTextStyle(presentation, slide, label, 'body', bodyRolePlaceholder ? [bodyRolePlaceholder] : []);
           nativeTextShapeCount += 2;
           nativeShapeCount += 2;
+          recordVisualIntent(compiled, 'kpi');
           void value;
         }
       }
       if (compiled.visualization.processSteps.length >= 2) {
         const visualBox = compiled.placements.visual ?? (compiled.body.length <= compiled.visualization.processSteps.length ? compiled.placements.body : null);
-        if (!visualBox) unresolvedVisualTypes.add('process');
+        if (!visualBox) {
+          unresolvedVisualTypes.add('process');
+          recordVisualIntent(compiled, 'unresolved', 'No measured visual/body region could contain the process sequence.');
+        }
         else {
           const gap = Math.max(1, Math.round(visualBox.width * 0.025));
           const nodeWidth = Math.max(1, Math.floor((visualBox.width - gap * (compiled.visualization.processSteps.length - 1)) / compiled.visualization.processSteps.length));
@@ -586,15 +810,21 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
           for (let index = 0; index < nodes.length - 1; index += 1) {
             const from = nodes[index]!;
             const to = nodes[index + 1]!;
-            addSlideLine(slide, { from: { x: emu(from.x + nodeWidth), y: emu(from.centerY) }, to: { x: emu(to.x), y: emu(to.centerY) } });
+            const bodyStyle = roleTextStyle(presentation, slide, 'body', bodyRolePlaceholder ? [bodyRolePlaceholder] : []);
+            addSlideLine(slide, { from: { x: emu(from.x + nodeWidth), y: emu(from.centerY) }, to: { x: emu(to.x), y: emu(to.centerY) },
+              color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
             nativeConnectorCount += 1;
           }
+          recordVisualIntent(compiled, compiled.visualization.type);
         }
       }
       if (compiled.imageRefs.length) {
         if (compiled.imageRefs.length > 1) throw new PptxBackendError('MULTIPLE_IMAGES_UNSUPPORTED', 'A slide currently supports one source-backed image in its selected visual slot.', compiled.imageRefs[1]!.sourcePath);
         const visualBox = compiled.placements.visual ?? (compiled.body.length ? null : compiled.placements.body);
-        if (!visualBox) unresolvedVisualTypes.add('image');
+        if (!visualBox) {
+          unresolvedVisualTypes.add('image');
+          recordVisualIntent(compiled, 'unresolved', 'No measured image-capable region was available.');
+        }
         else {
           const image = compiled.imageRefs[0]!;
           const imageBytes = await readVerifiedImage(input, image);
@@ -602,9 +832,33 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
             x: emu(visualBox.x), y: emu(visualBox.y), w: emu(visualBox.width), h: emu(visualBox.height), fit: 'contain',
           });
           nativeImageCount += 1;
+          recordVisualIntent(compiled, 'image');
         }
       }
-      if (compiled.visualization.type !== 'none' && compiled.visualization.status === 'unresolved') unresolvedVisualTypes.add(compiled.visualization.type);
+      if (compiled.visualization.type === 'comparison' && !visualIntentBySlide.has(compiled.id)) {
+        unresolvedVisualTypes.add('comparison');
+        recordVisualIntent(compiled, 'unresolved', 'The selected native layout did not provide measured side-by-side body regions.');
+      } else if (compiled.visualization.type === 'kpi' && !compiled.visualization.kpi && !visualIntentBySlide.has(compiled.id)) {
+        unresolvedVisualTypes.add('kpi');
+        recordVisualIntent(compiled, 'unresolved', 'No source-backed numeric value or safe side-by-side fallback was available.');
+      } else if (compiled.visualization.type !== 'none' && compiled.visualization.status === 'unresolved'
+          && !visualIntentBySlide.has(compiled.id)) {
+        unresolvedVisualTypes.add(compiled.visualization.type);
+        recordVisualIntent(compiled, 'unresolved', `No native visual data was available for ${compiled.visualization.type}.`);
+      } else if (compiled.visualization.type !== 'none' && !visualIntentBySlide.has(compiled.id)) {
+        unresolvedVisualTypes.add(compiled.visualization.type);
+        recordVisualIntent(compiled, 'unresolved', `The native layout retained text but did not materialize ${compiled.visualization.type}.`);
+      } else if (compiled.visualization.type === 'none' && !visualIntentBySlide.has(compiled.id)) {
+        recordVisualIntent(compiled, 'none');
+      }
+    }
+    for (const compiled of input.compiledPresentation.slides) {
+      if (visualIntentBySlide.has(compiled.id)) continue;
+      if (compiled.visualization.type === 'none') recordVisualIntent(compiled, 'none');
+      else {
+        unresolvedVisualTypes.add(compiled.visualization.type);
+        recordVisualIntent(compiled, 'unresolved', 'The renderer did not record a realized visual intent for this slide.');
+      }
     }
 
     stageStartedAt = performance.now();
@@ -737,6 +991,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       templatePreservationStatus,
       validationIssues,
       unresolvedVisualTypes: [...unresolvedVisualTypes],
+      visualIntents: input.compiledPresentation.slides.map((compiled) => visualIntentBySlide.get(compiled.id)!),
       projectedCompositions: input.compiledPresentation.slides.map((compiled) => {
         const assessment: ExemplarSelectionAssessment = exemplarAssessments.get(compiled.id)!;
         const selection = exemplarSelections.get(compiled.id) ?? null;

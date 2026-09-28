@@ -13,7 +13,7 @@ import { sha256Json, templateIRHashPayload } from '../src/presentation/domain/te
 import { startFakeSemanticEndpoint, deterministicPlanningResponse } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
 
 const model = 'offline-fake-planner';
-const profilerPromptPath = path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md');
+const profilerPromptPath = path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v3.md');
 
 async function profilerPrompt() {
   return (await readFile(profilerPromptPath, 'utf8')).replace(/\s+/gu, ' ').trim();
@@ -84,16 +84,21 @@ test('semantic template profile loads its versioned prompt, validates references
     const allIds = sourceSlide.elements.map((element) => element.id);
     const replaceableIds = sourceSlide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
       && element.nativeId && element.text?.trim()).map((element) => element.id);
-    assert.deepEqual(branch.properties.titleElementId.enum, [null, ...textIds]);
+    const definitions = profileSchema.$defs;
+    const titleStringRef = branch.properties.titleElementId.anyOf.find((candidate) => candidate.$ref)?.$ref;
+    assert.deepEqual(titleStringRef ? definitions[titleStringRef.split('/').at(-1)].enum : [null], textIds.length ? textIds : [null]);
     for (const [field, allowedIds] of [['bodyElementIds', textIds], ['visualElementIds', allIds],
       ['preservedElementIds', allIds], ['replaceableTextElementIds', replaceableIds]]) {
       const arraySchema = branch.properties[field];
       assert.equal(arraySchema.maxItems, allowedIds.length);
-      if (allowedIds.length) assert.deepEqual(arraySchema.items.enum, allowedIds, `${field} is limited to IDs valid for this slide and role`);
+      if (allowedIds.length) {
+        assert.ok(arraySchema.items.$ref, `${field} uses the bounded ID definition`);
+        assert.deepEqual(definitions[arraySchema.items.$ref.split('/').at(-1)].enum, allowedIds, `${field} is limited to IDs valid for this slide and role`);
+      }
       else assert.equal('items' in arraySchema, false, `${field} is restricted to an empty list when no IDs qualify`);
     }
   }
-  const configuredPrompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8')).replace(/\s+/g, ' ').trim();
+  const configuredPrompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v3.md'), 'utf8')).replace(/\s+/g, ' ').trim();
   assert.equal(request.messages[0].content, configuredPrompt, 'the runtime sends the versioned Markdown prompt without rewriting its content');
   const evidence = JSON.parse(request.messages.at(-1).content);
   assert.ok(evidence.slides[0].elements.some((element) => element.id));
@@ -213,8 +218,9 @@ test('batch schema narrows profile references and runtime validation reports saf
           if (invalid === 'invented-element-id') {
             const textIds = firstSlide.elements.filter((element) => element.text?.trim()).map((element) => element.id);
             const schemaBranch = observedSchema.properties.slides.items.anyOf.find((branch) => branch.properties.sourceSlideIndex.enum[0] === firstSlide.index);
-            assert.ok(!schemaBranch.properties.bodyElementIds.items.enum.includes('invented-element-id'), 'the provider schema excludes an invented ID before runtime validation');
-            assert.ok(!schemaBranch.properties.bodyElementIds.items.enum.includes(otherSlideTextId), 'the provider schema excludes an ID belonging to another slide');
+            const bodyIdDefinition = observedSchema.$defs[schemaBranch.properties.bodyElementIds.items.$ref.split('/').at(-1)];
+            assert.ok(!bodyIdDefinition.enum.includes('invented-element-id'), 'the provider schema excludes an invented ID before runtime validation');
+            assert.ok(!bodyIdDefinition.enum.includes(otherSlideTextId), 'the provider schema excludes an ID belonging to another slide');
             assert.ok(textIds.includes(firstTextId));
           }
           mutate(content);
@@ -556,6 +562,76 @@ test('a single dense slide keeps every exposed element ID while shortening text 
   assert.ok(evidence.slides[0].elements.every((element) => !element.text || element.text.length <= 320));
 });
 
+test('strict profiler schema exposes only element IDs present in bounded slide evidence', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-evidence-schema-alignment-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR } = await fixture(root, { slideCount: 1 });
+  const slide = templateIR.slides[0];
+  const sourceElement = structuredClone(slide.elements.find((element) => element.text?.trim()));
+  assert.ok(sourceElement, 'fixture provides a text element');
+  slide.elements = Array.from({ length: 132 }, (_, index) => ({
+    ...structuredClone(sourceElement),
+    id: `bounded_evidence_${index + 1}`,
+    nativeId: String(index + 1),
+    order: index + 1,
+    text: `Bounded evidence sample ${index + 1}`,
+  }));
+  templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
+
+  const schema = templateSemanticProfileJsonSchema(templateIR, [slide]);
+  const branch = schema.properties.slides.items.anyOf[0];
+  const evidenceIds = slide.elements.slice(0, 120).map((element) => element.id);
+  const definitions = schema.$defs;
+  const allowed = (field) => {
+    const item = branch.properties[field].items;
+    return item.$ref ? definitions[item.$ref.split('/').at(-1)].enum : [];
+  };
+  for (const field of ['bodyElementIds', 'visualElementIds', 'preservedElementIds', 'replaceableTextElementIds']) {
+    assert.deepEqual(allowed(field), field === 'bodyElementIds'
+      ? evidenceIds
+      : evidenceIds, `${field} cannot reference elements omitted from bounded evidence`);
+    assert.ok(!allowed(field).includes('bounded_evidence_121'));
+  }
+});
+
+test('bounded profile evidence keeps readable text and the strongest non-text candidates before smaller decoration', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-priority-evidence-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR } = await fixture(root, { slideCount: 1 });
+  const slide = templateIR.slides[0];
+  const textTemplate = structuredClone(slide.elements.find((element) => element.text?.trim()));
+  const visualTemplate = structuredClone(slide.elements.find((element) => !element.text?.trim()));
+  assert.ok(textTemplate && visualTemplate, 'fixture provides text and non-text elements');
+  const textElements = Array.from({ length: 25 }, (_, index) => ({
+    ...structuredClone(textTemplate), id: `priority_text_${index + 1}`, nativeId: String(index + 1), order: index + 1,
+    text: `Readable template claim ${index + 1}`,
+  }));
+  const visualElements = Array.from({ length: 100 }, (_, index) => ({
+    ...structuredClone(visualTemplate), id: `priority_visual_${index + 1}`, nativeId: String(index + 101),
+    order: index + 26, kind: index < 3 ? 'picture' : 'shape', text: null, placeholder: null,
+    geometry: {
+      ...structuredClone(visualTemplate.geometry),
+      direct: { x: 100, y: 200, width: (100 - index) * 1000, height: (100 - index) * 1000, rotation: 0, unit: 'EMU' },
+      resolved: { x: 100, y: 200, width: (100 - index) * 1000, height: (100 - index) * 1000, rotation: 0, unit: 'EMU' },
+    },
+  }));
+  slide.elements = [...textElements, ...visualElements];
+  slide.designElementIds = [];
+  templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
+
+  const plan = planTemplateSemanticProfileBatches(templateIR, await profilerPrompt());
+  const evidence = plan.batches.flatMap((batch) => JSON.parse(batch.evidence).slides)
+    .find((item) => item.sourceSlideIndex === slide.index);
+  assert.ok(evidence, 'bounded profile plan includes the source slide');
+  const ids = new Set(evidence.elements.map((element) => element.id));
+  assert.equal(evidence.elements.length, 45, 'all readable text plus the configured top 20 non-text elements fit');
+  assert.ok(textElements.every((element) => ids.has(element.id)), 'source text is not displaced by decoration');
+  assert.ok(visualElements.slice(0, 20).every((element) => ids.has(element.id)), 'media and largest visual objects are retained first');
+  assert.ok(visualElements.slice(20).every((element) => !ids.has(element.id)), 'low-priority remainder is omitted deterministically');
+  assert.equal(evidence.evidenceTruncated, true);
+  assert.equal(evidence.textEvidenceTruncated, undefined, 'all readable text survived evidence prioritization');
+});
+
 test('dense schema makes the planner split a batch even when the evidence alone fits', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-schema-budget-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -630,7 +706,7 @@ test('corrupt or invalid persisted semantic profiles are discarded and reprofile
   t.after(() => endpoint.close());
   const cache = projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile');
   const profiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache);
-  const promptText = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8')).replace(/\s+/g, ' ').trim();
+  const promptText = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v3.md'), 'utf8')).replace(/\s+/g, ' ').trim();
   const promptSha256 = createHash('sha256').update(promptText, 'utf8').digest('hex');
   const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, promptSha256);
   const profilePath = path.join(root, 'projects', 'project-profile', '.template-compiler', 'semantic-profiles', `${cacheKey}.json`);
@@ -654,15 +730,15 @@ test('changing the versioned template-profiler prompt invalidates its project pr
   const { templateIR, presentationDesignSystem } = await fixture(root);
   const promptDirectory = path.join(root, 'prompts');
   await mkdir(promptDirectory, { recursive: true });
-  const sourcePrompt = await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8');
+  const sourcePrompt = await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v3.md'), 'utf8');
   const normalizedPrompt = sourcePrompt.replace(/\s+/g, ' ');
-  assert.match(normalizedPrompt, /AT MOST ONE role/u);
+  assert.match(normalizedPrompt, /AT MOST ONE(?: of)?/u);
   for (const role of ['titleElementId', 'bodyElementIds', 'visualElementIds', 'preservedElementIds', 'replaceableTextElementIds']) {
     assert.ok(normalizedPrompt.includes(role), `the role-exclusivity rule must name ${role}`);
   }
-  assert.match(normalizedPrompt, /Never use the same ID in two fields/u);
-  assert.match(normalizedPrompt, /single best-supported role/u);
-  const promptPath = path.join(promptDirectory, 'template-profiler.v2.md');
+  assert.match(normalizedPrompt, /Never (?:duplicate an ID across fields|use the same ID in two fields)/u);
+  assert.match(normalizedPrompt, /(?:single|one) best-supported role/u);
+  const promptPath = path.join(promptDirectory, 'template-profiler.v3.md');
   await writeFile(promptPath, sourcePrompt, 'utf8');
   const endpoint = await startFakeSemanticEndpoint({ model });
   t.after(() => endpoint.close());
@@ -686,20 +762,21 @@ test('profiler config version invalidates profiles produced from the previous ev
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root);
   const contract = JSON.parse(await readFile(path.join(process.cwd(), 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
-  assert.equal(contract.configVersion, 'template-profiler-config.v7');
+  assert.equal(contract.configVersion, 'template-profiler-config.v8');
   assert.equal(contract.maxSlidesPerBatch, 4);
   assert.equal(contract.maxBatchEvidenceBytes, 24 * 1024);
+  assert.equal(contract.maxNonTextEvidenceElementsPerSlide, 20);
   assert.equal(contract.maxBatches, 16);
   assert.equal(contract.maxEstimatedRequestBytes, 48 * 1024);
   assert.equal(contract.requestEnvelopeOverheadBytes, 2048);
   assert.equal(contract.outputTokenByteReserve, 4);
   assert.equal(contract.maxOutputTokens, 4096);
   assert.equal(contract.timeoutMs, 180000);
-  const prompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v2.md'), 'utf8')).replace(/\s+/g, ' ').trim();
+  const prompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v3.md'), 'utf8')).replace(/\s+/g, ' ').trim();
   const promptSha256 = createHash('sha256').update(prompt, 'utf8').digest('hex');
   const oldCacheKey = createHash('sha256').update(JSON.stringify({
     templateIRHash: templateIR.hash,
-    promptVersion: 'template-profiler.v2',
+    promptVersion: 'template-profiler.v3',
     promptSha256,
     schemaCompatibility: 'template_semantic_profile_v1',
     configVersion: 'template-profiler-config.v6',

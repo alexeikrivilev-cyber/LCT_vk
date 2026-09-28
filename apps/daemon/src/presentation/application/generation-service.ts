@@ -25,6 +25,7 @@ import {
   exemplarSelectionReference,
   generatedFallbackCompositionSignature,
   type ExemplarSelectionReference,
+  type ExemplarSelectionHistoryEntry,
   type VariantCompositionAssignment,
 } from './exemplar-slide-selector.js';
 import { renderPresentation } from '../adapters/pptx-renderer-factory.js';
@@ -1083,6 +1084,7 @@ export class PresentationGenerationService {
       const visualClassificationCache = createCompositionVisualClassificationCache();
       const assignedSlidesById = new Map<string, CompiledSlide[]>();
       const compositionSignatures: Record<PresentationVariantId, string[]> = { A: [], B: [], C: [] };
+      const compositionHistory: Record<PresentationVariantId, ExemplarSelectionHistoryEntry[]> = { A: [], B: [], C: [] };
       // Qualify all safe slide assignments first. A/B/C distinctness is a property
       // of the ordered decks, so a safe per-slide composition may be reused.
       for (const pack of initial.slides) {
@@ -1091,6 +1093,11 @@ export class PresentationGenerationService {
             const signature = pack.variants[variant].compositionChoice?.signature;
             if (!signature) throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_MISSING', `Ready slide ${pack.index} has no persisted ${variant} composition signature.`, 422);
             compositionSignatures[variant].push(signature);
+            const exemplar = pack.variants[variant].compositionChoice?.exemplar;
+            if (exemplar) compositionHistory[variant].push({
+              sourcePart: exemplar.sourcePart,
+              sourceSlideIndex: exemplar.sourceSlideIndex,
+            });
           }
           continue;
         }
@@ -1102,7 +1109,7 @@ export class PresentationGenerationService {
         });
         const compositionStartedAt = performance.now();
         const assessment = assessVariantCompositionDistinctness(variantSlides, context.templateIR, this.options.backend, context.semanticProfile,
-          this.options.performanceDiagnostics, visualClassificationCache);
+          this.options.performanceDiagnostics, visualClassificationCache, compositionHistory);
         recordElapsed(this.options.performanceDiagnostics, 'generation.resolveCompositions', compositionStartedAt);
         this.options.performanceDiagnostics?.increment('generation.compositionResolverCallCount');
         this.options.performanceDiagnostics?.increment('generation.compositionOptionCount', assessment.candidateCounts.safeExemplarOptions
@@ -1119,6 +1126,12 @@ export class PresentationGenerationService {
           const assignment = assessment.assignments.find((candidate) => candidate.variantId === slide.variantId);
           if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
           compositionSignatures[slide.variantId].push(assignment.projectedCompositionSignature);
+          if (assignment.exemplarSelection) compositionHistory[slide.variantId].push({
+            sourcePart: assignment.exemplarSelection.sourcePart,
+            sourceSlideIndex: assignment.exemplarSelection.sourceSlideIndex,
+            familyKey: assignment.exemplarSelection.familyKey,
+            semanticArchetype: assignment.exemplarSelection.semanticArchetype,
+          });
           return applyVariantCompositionAssignment(slide, assignment, context.templateIR, context.semanticProfile);
         });
         recordElapsed(this.options.performanceDiagnostics, 'generation.applyCompositionAssignments', assignmentStartedAt);
