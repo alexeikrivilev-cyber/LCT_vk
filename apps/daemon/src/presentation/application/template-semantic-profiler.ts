@@ -629,7 +629,7 @@ function isValidTemplateSemanticProfileBatch(
   return diagnoseTemplateSemanticProfileBatch(value, templateIR, expectedSlides) === null;
 }
 
-/** Remove only cross-role duplicates, preserving the role with the highest deterministic precedence. */
+/** Remove repeated assignments, preserving first occurrence and the highest-precedence role. */
 function normalizeDuplicateElementRoles(value: unknown): number {
   if (!isRecord(value) || !Array.isArray(value.slides)) return 0;
   let resolvedConflictCount = 0;
@@ -655,7 +655,7 @@ function normalizeDuplicateElementRoles(value: unknown): number {
           continue;
         }
         const priorRole = seenRoles.get(id);
-        if (priorRole !== undefined && priorRole !== role) {
+        if (priorRole !== undefined) {
           resolvedIds.add(id);
           continue;
         }

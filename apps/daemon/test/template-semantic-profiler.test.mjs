@@ -197,14 +197,6 @@ test('batch schema narrows profile references and runtime validation reports saf
       slide.preservedElementIds = slide.preservedElementIds.filter((id) => id !== nonTextId);
       slide.replaceableTextElementIds = [nonTextId];
     }],
-    ['duplicate-within-one-role', 'DUPLICATE_ELEMENT_ROLE', (value) => {
-      const slide = value.slides[0];
-      slide.titleElementId = null;
-      slide.bodyElementIds = [firstTextId, firstTextId];
-      slide.visualElementIds = slide.visualElementIds.filter((id) => id !== firstTextId);
-      slide.preservedElementIds = slide.preservedElementIds.filter((id) => id !== firstTextId);
-      slide.replaceableTextElementIds = slide.replaceableTextElementIds.filter((id) => id !== firstTextId);
-    }],
   ];
   for (const [invalid, validationFailureCode, mutate] of cases) {
     await t.test(invalid, async (subtest) => {
@@ -244,7 +236,7 @@ test('batch schema narrows profile references and runtime validation reports saf
   }
 });
 
-test('profiler resolves only cross-role duplicates by deterministic precedence before strict validation', async (t) => {
+test('profiler resolves same-role and cross-role duplicates before strict validation', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-role-normalization-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root, { groupTransform: {} });
@@ -313,6 +305,39 @@ test('profiler resolves only cross-role duplicates by deterministic precedence b
   assert.ok(!JSON.stringify(safeLog).includes(textIds[0]), 'safe telemetry contains no element ID');
   assert.ok(!JSON.stringify(safeLog).includes(firstSlide.elements.find((element) => element.id === textIds[0]).text),
     'safe telemetry contains no slide text');
+
+  await t.test('same-role duplicates are stably deduplicated through the adapter contract', async () => {
+    const repeatedBody = await runScenario((slide) => {
+      slide.titleElementId = null;
+      slide.bodyElementIds = [textIds[1], textIds[0], textIds[1], textIds[0]];
+      slide.visualElementIds = [];
+      slide.preservedElementIds = [];
+      slide.replaceableTextElementIds = [];
+    });
+    assert.ok(repeatedBody.profile, 'repeated body IDs pass the existing runtime validator after normalization');
+    assert.deepEqual(repeatedBody.profile.slides[0].bodyElementIds, [textIds[1], textIds[0]],
+      'first occurrence order is stable');
+    assert.equal(repeatedBody.batchTelemetry.roleConflictResolved, true);
+    assert.equal(repeatedBody.batchTelemetry.resolvedConflictCount, 2,
+      'telemetry counts distinct IDs whose repeated assignments were removed');
+
+    const repeatedVisualWithLowerPriorityConflict = await runScenario((slide) => {
+      slide.titleElementId = null;
+      slide.bodyElementIds = [];
+      slide.visualElementIds = [nonTextId, textIds[0], nonTextId];
+      slide.preservedElementIds = [nonTextId];
+      slide.replaceableTextElementIds = [];
+    });
+    assert.ok(repeatedVisualWithLowerPriorityConflict.profile,
+      'repeated visual IDs and a lower-priority role conflict are normalized before validation');
+    assert.deepEqual(repeatedVisualWithLowerPriorityConflict.profile.slides[0].visualElementIds, [nonTextId, textIds[0]],
+      'visual IDs retain stable first-occurrence ordering');
+    assert.deepEqual(repeatedVisualWithLowerPriorityConflict.profile.slides[0].preservedElementIds, [],
+      'the higher-priority visual assignment wins over preserved');
+    assert.equal(repeatedVisualWithLowerPriorityConflict.batchTelemetry.roleConflictResolved, true);
+    assert.equal(repeatedVisualWithLowerPriorityConflict.batchTelemetry.resolvedConflictCount, 1,
+      'the duplicate and cross-role conflict for one ID are counted once');
+  });
 
   const preservedAndReplaceable = await runScenario((slide) => {
     slide.titleElementId = null;
