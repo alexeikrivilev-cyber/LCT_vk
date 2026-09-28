@@ -158,6 +158,7 @@ export interface PresentationGenerationServiceOptions {
   getPreparedTemplateProfile?: (projectId: string, template: TemplateCompilationResponse) => Promise<TemplateSemanticProfile | null>;
   performanceDiagnostics?: PerformanceDiagnosticsPort;
   now?: () => Date;
+  createGenerationId?: () => string;
 }
 
 export class PresentationGenerationError extends Error {
@@ -399,9 +400,11 @@ export class PresentationGenerationService {
   private readonly inspectPackage: typeof inspectOfficeKitPackage;
   private readonly pdfExporter: Pick<OfficeKitPdfExportAdapter, 'export'>;
   private readonly htmlExporter: Pick<SemanticHtmlExportAdapter, 'export'>;
+  private readonly createGenerationId: () => string;
 
   constructor(private readonly options: PresentationGenerationServiceOptions) {
     this.now = options.now ?? (() => new Date());
+    this.createGenerationId = options.createGenerationId ?? randomUUID;
     this.renderer = options.renderer ?? { id: options.backend, render: (input) => renderPresentation(input, options.backend) };
     this.preview = options.preview ?? new OfficeKitPreviewAdapter(options.performanceDiagnostics);
     this.inspectPackage = options.inspectPackage ?? inspectOfficeKitPackage;
@@ -484,7 +487,7 @@ export class PresentationGenerationService {
     const state: PresentationGenerationState = {
       schemaVersion: 1,
       projectId,
-      generationId: randomUUID(),
+      generationId: this.createGenerationId(),
       idempotencyKey: keyValue,
       inputFingerprint: context.fingerprint,
       planId: context.deckPlan.id,

@@ -212,7 +212,12 @@ function isSafeAuditState(value: unknown): value is ProductContextualAuditState 
   const current = value.schemaVersion === CONTEXTUAL_AUDIT_SCHEMA_VERSION
     && value.ruleSetVersion === CONTEXTUAL_AUDIT_RULE_SET_VERSION
     && value.auditVersionFingerprint === CONTEXTUAL_AUDIT_VERSION_FINGERPRINT;
-  if (!legacy && !current) return false;
+  // A failed audit has no accepted findings, so allow it to be retried after a prompt fingerprint change.
+  const retryableStaleFailure = value.status === 'failed' && value.findings === null
+    && value.schemaVersion === CONTEXTUAL_AUDIT_SCHEMA_VERSION
+    && value.ruleSetVersion === CONTEXTUAL_AUDIT_RULE_SET_VERSION
+    && safeFingerprint(value.auditVersionFingerprint);
+  if (!legacy && !current && !retryableStaleFailure) return false;
   if (value.telemetry !== null && (!isRecord(value.telemetry) || typeof value.telemetry.model !== 'string' || value.telemetry.model.length > 160
       || !Number.isFinite(value.telemetry.wallTimeMs) || Number(value.telemetry.wallTimeMs) < 0
       || !(value.telemetry.finishReason === null || typeof value.telemetry.finishReason === 'string' && value.telemetry.finishReason.length <= 64))) return false;

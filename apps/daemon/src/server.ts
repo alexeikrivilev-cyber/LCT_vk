@@ -87,6 +87,12 @@ export interface StartServerOptions {
   presentationPreview?: PptxPreviewPort;
   /** Scoped local measurement seam for deterministic qualification runs. */
   performanceDiagnostics?: PerformanceDiagnosticsPort;
+  /** Offline golden replay seam; omitted by normal daemon startup. */
+  planningNow?: () => Date;
+  /** Offline golden replay seam; omitted by normal daemon startup. */
+  planningCreateId?: () => string;
+  /** Offline golden replay seam; omitted by normal daemon startup. */
+  generationCreateId?: () => string;
 }
 
 export interface StartedPresentationServer {
@@ -328,6 +334,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     projectRoot,
     projectsRoot,
     getInferenceAdapter: getSemanticAdapter,
+    ...(options.planningNow ? { now: options.planningNow } : {}),
+    ...(options.planningCreateId ? { createId: options.planningCreateId } : {}),
   });
   const generationService = new PresentationGenerationService({
     db,
@@ -339,6 +347,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     ...(options.performanceDiagnostics ? { performanceDiagnostics: options.performanceDiagnostics } : {}),
     ...(options.presentationRenderer ? { renderer: options.presentationRenderer } : {}),
     ...(options.presentationPreview ? { preview: options.presentationPreview } : {}),
+    ...(options.generationCreateId ? { createGenerationId: options.generationCreateId } : {}),
   });
   const productWorkflowService = new ProductWorkflowService({
     projectRoot,

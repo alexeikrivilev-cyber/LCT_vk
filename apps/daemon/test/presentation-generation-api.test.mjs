@@ -806,6 +806,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
       failure: { code: 'INVALID_STRUCTURED_OUTPUT', stage: 'contextual_audit', retryable: true },
       contextualAudit: {
         ...persistedWorkflow.contextualAudit,
+        auditVersionFingerprint: '777b8e3b90004b494fb348772d3819c73b136f48c114e222eb36f43014aa5326',
         status: 'failed',
         deckFingerprint: createHash('sha256').update('audit retry regression').digest('hex'),
         findings: null,

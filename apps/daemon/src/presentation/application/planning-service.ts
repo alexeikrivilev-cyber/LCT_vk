@@ -163,6 +163,7 @@ export interface PlanningServiceOptions {
   projectsRoot: string;
   getInferenceAdapter: () => SemanticInferenceAdapter;
   now?: () => Date;
+  createId?: () => string;
 }
 
 export class PlanningServiceError extends Error {
@@ -860,9 +861,11 @@ function outcomeMessage(error: unknown): PlanningFailure {
 export class PlanningService {
   private readonly activeProjects = new Map<string, { controller: AbortController; done: Promise<void>; resolveDone: () => void }>();
   private readonly now: () => Date;
+  private readonly createId: () => string;
 
   constructor(private readonly options: PlanningServiceOptions) {
     this.now = options.now ?? (() => new Date());
+    this.createId = options.createId ?? randomUUID;
   }
 
   async get(projectId: string): Promise<PlanningResponse> {
@@ -1031,12 +1034,12 @@ export class PlanningService {
         timeoutMs: 150_000,
         deadlineAtEpochMs,
         signal: operation.controller.signal,
-        metadata: { projectId, generationId: randomUUID() },
+        metadata: { projectId, generationId: this.createId() },
       };
       const workerResponse = await adapter.infer(workerRequest);
       ensureActive();
       const workerDraft = asDraft(workerResponse.value, contentIR, brief);
-      const planId = `dp_${randomUUID().replaceAll('-', '')}`;
+      const planId = `dp_${this.createId().replaceAll('-', '')}`;
       const checkpoint = canonicalizeDeckPlan(workerDraft, {
         id: planId,
         version: 1,
@@ -1109,7 +1112,7 @@ export class PlanningService {
             { role: 'user', content: revisionEvidenceText },
           ],
           signal: operation.controller.signal,
-          metadata: { projectId, generationId: randomUUID(), checkpointId: checkpoint.id },
+          metadata: { projectId, generationId: this.createId(), checkpointId: checkpoint.id },
         };
         const revisionResponse = await adapter.infer(revisionRequest);
         ensureActive();
