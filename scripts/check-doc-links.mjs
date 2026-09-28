@@ -80,7 +80,7 @@ if (liveQualificationContract.schemaVersion !== 7
     || liveQualificationContract.coreMaxSemanticRequests !== requiredSemanticRequests + optionalSemanticRequests
     || liveQualificationContract.optionalOperations?.['deck-plan-revision']?.min !== 0
     || liveQualificationContract.optionalOperations?.['deck-plan-revision']?.max !== 1
-    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 16
+    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 32
     || liveQualificationContract.fullWorkflowMaxSemanticRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
       + liveQualificationContract.coreMaxSemanticRequests
     || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.fullWorkflowMaxSemanticRequests
@@ -89,7 +89,7 @@ if (liveQualificationContract.schemaVersion !== 7
 }
 const profilerContract = JSON.parse(await readFile(path.join(root, 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
 if (profilerContract.maxBatches !== liveQualificationContract.maxProfilerRequests
-    || profilerContract.maxSlidesPerBatch !== 4 || profilerContract.maxBatchEvidenceBytes !== 24 * 1024
+    || profilerContract.maxSlidesPerBatch !== 2 || profilerContract.maxBatchEvidenceBytes !== 24 * 1024
     || profilerContract.maxEstimatedRequestBytes !== 48 * 1024
     || profilerContract.requestEnvelopeOverheadBytes !== 2048 || profilerContract.outputTokenByteReserve !== 4
     || profilerContract.maxOutputTokens !== 4096 || profilerContract.timeoutMs !== 180000) {

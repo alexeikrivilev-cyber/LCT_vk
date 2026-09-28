@@ -66,18 +66,21 @@ test('semantic template profile loads its versioned prompt, validates references
     assert.equal(new Set(classified).size, classified.length, 'a text element cannot be simultaneously preserved and cleared');
     assert.ok(classified.every((id) => sourceSlide.elements.some((element) => element.id === id)));
   }
-  assert.equal(endpoint.state.inference.length, 1);
-  const request = endpoint.state.inference[0].request;
-  assert.equal(request.response_format.type, 'json_schema');
-  assert.equal(request.response_format.json_schema.strict, true);
-  assert.equal(request.response_format.json_schema.name, 'template_semantic_profile_v1');
-  const profileSchema = request.response_format.json_schema.schema;
-  assert.deepEqual(profileSchema.properties.templateIRHash.enum, [templateIR.hash], 'the schema binds responses to this exact TemplateIR');
-  assert.equal(profileSchema.properties.slides.minItems, templateIR.slides.length);
-  assert.equal(profileSchema.properties.slides.maxItems, templateIR.slides.length);
-  const slideSchemaBranches = profileSchema.properties.slides.items.anyOf;
-  assert.equal(slideSchemaBranches.length, templateIR.slides.length);
-  for (const sourceSlide of templateIR.slides) {
+  assert.equal(endpoint.state.inference.length, 2, 'three source slides are profiled in two bounded batches');
+  const requests = endpoint.state.inference.map((record) => record.request);
+  for (const request of requests) {
+    assert.equal(request.response_format.type, 'json_schema');
+    assert.equal(request.response_format.json_schema.strict, true);
+    assert.equal(request.response_format.json_schema.name, 'template_semantic_profile_v1');
+    const profileSchema = request.response_format.json_schema.schema;
+    assert.deepEqual(profileSchema.properties.templateIRHash.enum, [templateIR.hash], 'the schema binds responses to this exact TemplateIR');
+    const requestEvidence = JSON.parse(request.messages.at(-1).content);
+    assert.equal(profileSchema.properties.slides.minItems, requestEvidence.slides.length);
+    assert.equal(profileSchema.properties.slides.maxItems, requestEvidence.slides.length);
+    const slideSchemaBranches = profileSchema.properties.slides.items.anyOf;
+    assert.equal(slideSchemaBranches.length, requestEvidence.slides.length);
+    for (const evidenceSlide of requestEvidence.slides) {
+      const sourceSlide = templateIR.slides.find((slide) => slide.index === evidenceSlide.sourceSlideIndex);
     const branch = slideSchemaBranches.find((candidate) => candidate.properties.sourceSlideIndex.enum[0] === sourceSlide.index);
     assert.ok(branch, `schema has a branch for source slide ${sourceSlide.index}`);
     const textIds = sourceSlide.elements.filter((element) => element.text?.trim()).map((element) => element.id);
@@ -97,12 +100,14 @@ test('semantic template profile loads its versioned prompt, validates references
       }
       else assert.equal('items' in arraySchema, false, `${field} is restricted to an empty list when no IDs qualify`);
     }
+    }
   }
+  const request = requests[0];
   const configuredPrompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v3.md'), 'utf8')).replace(/\s+/g, ' ').trim();
   assert.equal(request.messages[0].content, configuredPrompt, 'the runtime sends the versioned Markdown prompt without rewriting its content');
   const evidence = JSON.parse(request.messages.at(-1).content);
   assert.ok(evidence.slides[0].elements.some((element) => element.id));
-  assert.equal(evidence.slides.length, templateIR.slides.length);
+  assert.equal(evidence.slides.length, 2, 'each request carries only its bounded source-slide batch');
   assert.equal(evidence.canvas.width, templateIR.slideSize.width);
   assert.equal(evidence.canvas.height, templateIR.slideSize.height);
   const serializedEvidence = request.messages.at(-1).content;
@@ -138,7 +143,7 @@ test('semantic template profile loads its versioned prompt, validates references
   first.slides[0].reasonCodes.push('caller_mutation');
   const cached = await profiler.profile(templateIR, presentationDesignSystem);
   assert.ok(!cached.slides[0].reasonCodes.includes('caller_mutation'));
-  assert.equal(endpoint.state.inference.length, 1, 'same TemplateIR hash uses the cached profile');
+  assert.equal(endpoint.state.inference.length, 2, 'same TemplateIR hash uses the cached profile');
 
   const promptSha256 = createHash('sha256').update(configuredPrompt, 'utf8').digest('hex');
   const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, promptSha256);
@@ -148,14 +153,14 @@ test('semantic template profile loads its versioned prompt, validates references
   const reloadedProfiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-profile'));
   const afterReload = await reloadedProfiler.profile(templateIR, presentationDesignSystem);
   assert.equal(afterReload.templateIRHash, templateIR.hash);
-  assert.equal(endpoint.state.inference.length, 1, 'a new profiler instance uses the project-owned cache after daemon reload');
+  assert.equal(endpoint.state.inference.length, 2, 'a new profiler instance uses the project-owned cache after daemon reload');
 
   const changed = structuredClone(templateIR);
   changed.source.originalName = 'renamed-template.pptx';
   changed.hash = sha256Json(templateIRHashPayload(changed));
   const changedPds = derivePresentationDesignSystem(changed);
   await profiler.profile(changed, changedPds);
-  assert.equal(endpoint.state.inference.length, 2, 'a different validated TemplateIR hash gets a different cached profile');
+  assert.equal(endpoint.state.inference.length, 4, 'a different validated TemplateIR hash gets two requests for its independently profiled batches');
 });
 
 test('batch schema narrows profile references and runtime validation reports safe invariant codes', async (t) => {
@@ -255,7 +260,11 @@ test('profiler resolves same-role and cross-role duplicates before strict valida
       respond(request) {
         const response = deterministicPlanningResponse(request);
         const value = JSON.parse(response.choices[0].message.content);
-        mutate(value.slides[0]);
+        const expectedSlideIndexes = request.response_format.json_schema.schema.properties.slides.items.anyOf
+          .map((branch) => branch.properties.sourceSlideIndex.enum[0]);
+        if (expectedSlideIndexes.includes(firstSlide.index)) {
+          mutate(value.slides.find((slide) => slide.sourceSlideIndex === firstSlide.index));
+        }
         return completion(value);
       },
     });
@@ -271,7 +280,9 @@ test('profiler resolves same-role and cross-role duplicates before strict valida
           try { return await delegate.infer(request); }
           finally {
             console.log = previousLog;
-            batchTelemetry = structuredClone(request.metadata.templateProfilerBatch);
+            if (request.metadata.templateProfilerBatch.sourceSlideIndexes.includes(firstSlide.index)) {
+              batchTelemetry = structuredClone(request.metadata.templateProfilerBatch);
+            }
           }
         },
       };
@@ -294,12 +305,14 @@ test('profiler resolves same-role and cross-role duplicates before strict valida
     slide.preservedElementIds = [textIds[0]];
     slide.replaceableTextElementIds = [];
   });
-  assert.ok(bodyAndPreserved.profile, 'body/preserved conflict passes the existing runtime validator after normalization');
+  assert.ok(bodyAndPreserved.profile, `body/preserved conflict passes the existing runtime validator after normalization: ${bodyAndPreserved.error?.message ?? 'no profile returned'}`);
   assert.deepEqual(bodyAndPreserved.profile.slides[0].bodyElementIds, [textIds[0]]);
   assert.deepEqual(bodyAndPreserved.profile.slides[0].preservedElementIds, []);
   assert.equal(bodyAndPreserved.batchTelemetry.roleConflictResolved, true);
   assert.equal(bodyAndPreserved.batchTelemetry.resolvedConflictCount, 1);
-  const safeLog = JSON.parse(bodyAndPreserved.logRecords[0]);
+  const safeLog = bodyAndPreserved.logRecords.map((record) => JSON.parse(record))
+    .find((record) => record.roleConflictResolved === true);
+  assert.ok(safeLog, 'safe telemetry includes the batch where normalization occurred');
   assert.equal(safeLog.roleConflictResolved, true);
   assert.equal(safeLog.resolvedConflictCount, 1);
   assert.ok(!JSON.stringify(safeLog).includes(textIds[0]), 'safe telemetry contains no element ID');
@@ -406,8 +419,8 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
   const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 17 });
   const plan = planTemplateSemanticProfileBatches(templateIR, await profilerPrompt());
   assert.ok(plan.batches.length > 1);
-  assert.ok(plan.batches.length <= 16);
-  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 4));
+  assert.ok(plan.batches.length <= 32);
+  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 2));
   assert.ok(plan.batches.every((batch) => batch.evidenceBytes <= 24 * 1024));
   assert.ok(plan.batches.every((batch) => batch.estimatedTotalRequestBytes <= 48 * 1024));
   assert.ok(plan.batches.every((batch) => batch.estimatedTotalRequestBytes === batch.systemPromptBytes + batch.evidenceBytes
@@ -415,7 +428,7 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
   assert.ok(plan.batches.every((batch) => batch.outputTokenReserveBytes === batch.maxOutputTokens * 4));
   assert.ok(plan.batches.every((batch) => batch.maxOutputTokens === Math.max(2048, batch.sourceSlideIndexes.length * 1024)));
   assert.ok(plan.batches.every((batch) => batch.maxOutputTokens >= 2048 && batch.maxOutputTokens <= 4096));
-  assert.ok(plan.batches.some((batch) => batch.sourceSlideIndexes.length === 4 && batch.maxOutputTokens === 4096));
+  assert.ok(plan.batches.some((batch) => batch.sourceSlideIndexes.length === 2 && batch.maxOutputTokens === 2048));
   assert.deepEqual(plan.batches.flatMap((batch) => batch.sourceSlideIndexes), templateIR.slides.map((slide) => slide.index));
 
   const endpoint = await startFakeSemanticEndpoint({
@@ -472,6 +485,32 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
 
   await profiler.profile(templateIR, presentationDesignSystem);
   assert.equal(endpoint.state.inference.length, plan.batches.length, 'the complete in-memory profile cache avoids later provider requests');
+});
+
+test('two-slide batching covers qualification-sized templates within their batch and byte budgets', async (t) => {
+  for (const { slideCount, maximumBatches } of [
+    { slideCount: 10, maximumBatches: 5 },
+    { slideCount: 29, maximumBatches: 15 },
+    { slideCount: 55, maximumBatches: 28 },
+  ]) {
+    await t.test(`${slideCount} slides`, async (subtest) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), `lct-template-profile-${slideCount}-slides-`));
+      subtest.after(() => rm(root, { recursive: true, force: true }));
+      const { templateIR } = await fixture(root, { slideCount });
+      const plan = planTemplateSemanticProfileBatches(templateIR, await profilerPrompt());
+      const indexes = plan.batches.flatMap((batch) => batch.sourceSlideIndexes);
+
+      assert.ok(plan.batches.length <= maximumBatches, `at most ${maximumBatches} batches`);
+      assert.ok(plan.batches.length < 32, 'the template does not approach the configured 32-batch ceiling');
+      assert.deepEqual(indexes, templateIR.slides.map((slide) => slide.index), 'all indexes are covered once in source order');
+      assert.equal(new Set(indexes).size, slideCount, 'no source slide index is duplicated');
+      assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 2));
+      assert.ok(plan.batches.every((batch) => batch.evidenceBytes <= 24 * 1024));
+      assert.ok(plan.batches.every((batch) => batch.estimatedTotalRequestBytes <= 48 * 1024));
+      assert.ok(plan.batches.every((batch) => batch.maxOutputTokens >= 2048 && batch.maxOutputTokens <= 4096));
+      assert.ok(plan.batches.every((batch) => batch.maxOutputTokens === 2048), 'one- and two-slide batches retain the 2048-token floor');
+    });
+  }
 });
 
 test('profile preparation bounds concurrent batches, merges deterministically, and read-only cache misses make no requests', async (t) => {
@@ -664,17 +703,18 @@ test('dense schema makes the planner split a batch even when the evidence alone 
   for (const slide of templateIR.slides) {
     const sourceElement = structuredClone(slide.elements[0]);
     assert.ok(sourceElement, 'synthetic slide has a source element to clone');
-    slide.elements = Array.from({ length: 26 }, (_, index) => ({
+    slide.elements = Array.from({ length: 30 }, (_, index) => ({
       ...structuredClone(sourceElement),
-      id: `schema_dense_slide_${slide.index}_element_${index}_${'x'.repeat(160)}`,
-      nativeId: String(index + 1), name: `Dense asset ${index + 1}`, order: index + 1, kind: 'picture', text: null, placeholder: null,
+      id: `schema_dense_slide_${slide.index}_element_${index}_${'x'.repeat(220)}`,
+      nativeId: String(index + 1), name: `Dense text ${index + 1}`, order: index + 1,
+      kind: 'shape', text: `Dense synthetic sample copy ${index + 1}`, placeholder: null,
     }));
     slide.designElementIds = [];
   }
   templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
   const prompt = await profilerPrompt();
   const plan = planTemplateSemanticProfileBatches(templateIR, prompt);
-  const candidateSlides = templateIR.slides.slice(0, 3);
+  const candidateSlides = templateIR.slides.slice(0, 2);
   const candidateEvidence = {
     templateIRHash: templateIR.hash,
     canvas: { width: templateIR.slideSize.width, height: templateIR.slideSize.height },
@@ -688,13 +728,13 @@ test('dense schema makes the planner split a batch even when the evidence alone 
   const oversizedRequestBytes = Buffer.byteLength(prompt, 'utf8') + evidenceBytes + schemaBytes + 2048 + maxOutputTokens * 4;
 
   assert.ok(evidenceBytes <= 24 * 1024, `the combined evidence alone fits the evidence ceiling (${evidenceBytes} bytes)`);
-  assert.ok(oversizedRequestBytes > 48 * 1024, 'the generated strict schema pushes the full request beyond budget');
+  assert.ok(oversizedRequestBytes > 48 * 1024, `the generated strict schema pushes the full request beyond budget (evidence=${evidenceBytes}, schema=${schemaBytes}, total=${oversizedRequestBytes})`);
   assert.ok(plan.batches.length > 1, 'planner splits rather than emitting the oversized request');
-  assert.ok(plan.batches.length <= 16);
+  assert.ok(plan.batches.length <= 32);
   assert.deepEqual(plan.batches.flatMap((batch) => batch.sourceSlideIndexes), templateIR.slides.map((slide) => slide.index),
     'all source slides are covered exactly once and in source order');
   assert.equal(new Set(plan.batches.flatMap((batch) => batch.sourceSlideIndexes)).size, templateIR.slides.length);
-  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 4));
+  assert.ok(plan.batches.every((batch) => batch.sourceSlideIndexes.length <= 2));
   assert.ok(plan.batches.every((batch) => batch.evidenceBytes <= 24 * 1024));
   assert.ok(plan.batches.every((batch) => batch.estimatedTotalRequestBytes <= 48 * 1024));
   assert.ok(plan.batches.every((batch) => batch.schemaBytes === Buffer.byteLength(JSON.stringify(batch.schema), 'utf8')));
@@ -739,13 +779,13 @@ test('corrupt or invalid persisted semantic profiles are discarded and reprofile
 
   await writeFile(profilePath, '{broken-json', 'utf8');
   await profiler.profile(templateIR, presentationDesignSystem);
-  assert.equal(endpoint.state.inference.length, 1, 'malformed JSON is removed and replaced by a validated strict response');
+  assert.equal(endpoint.state.inference.length, 2, 'malformed JSON is removed and replaced by a validated strict response across two batches');
   assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).templateIRHash, templateIR.hash);
 
   profiler.clear();
   await writeFile(profilePath, JSON.stringify({ templateIRHash: templateIR.hash, slides: [] }), 'utf8');
   await profiler.profile(templateIR, presentationDesignSystem);
-  assert.equal(endpoint.state.inference.length, 2, 'a parsed cache with invalid slide coverage is also discarded');
+  assert.equal(endpoint.state.inference.length, 4, 'a parsed cache with invalid slide coverage is also discarded and both batches are regenerated');
   assert.equal(JSON.parse(await readFile(profilePath, 'utf8')).slides.length, templateIR.slides.length);
 });
 
@@ -772,14 +812,14 @@ test('changing the versioned template-profiler prompt invalidates its project pr
   const first = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache, { promptDirectory });
   const initialCacheKey = await first.profileCacheKey(templateIR);
   await first.profile(templateIR, presentationDesignSystem);
-  assert.equal(endpoint.state.inference.length, 1);
+  assert.equal(endpoint.state.inference.length, 2, 'the three-slide fixture is split into two profile requests');
   await writeFile(promptPath, `${sourcePrompt}\nUse no inferred template identity.\n`, 'utf8');
 
   const changedPrompt = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache, { promptDirectory });
   assert.notEqual(await changedPrompt.profileCacheKey(templateIR), initialCacheKey,
     'changed prompt content must change the semantic-profile cache fingerprint');
   await changedPrompt.profile(templateIR, presentationDesignSystem);
-  assert.equal(endpoint.state.inference.length, 2, 'prompt contents contribute to the persistent cache key');
+  assert.equal(endpoint.state.inference.length, 4, 'prompt contents contribute to the persistent cache key for both bounded batches');
 });
 
 test('profiler config version invalidates profiles produced from the previous evidence shape', async (t) => {
@@ -788,10 +828,10 @@ test('profiler config version invalidates profiles produced from the previous ev
   const { templateIR, presentationDesignSystem } = await fixture(root);
   const contract = JSON.parse(await readFile(path.join(process.cwd(), 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
   assert.equal(contract.configVersion, 'template-profiler-config.v8');
-  assert.equal(contract.maxSlidesPerBatch, 4);
+  assert.equal(contract.maxSlidesPerBatch, 2);
   assert.equal(contract.maxBatchEvidenceBytes, 24 * 1024);
   assert.equal(contract.maxNonTextEvidenceElementsPerSlide, 20);
-  assert.equal(contract.maxBatches, 16);
+  assert.equal(contract.maxBatches, 32);
   assert.equal(contract.maxEstimatedRequestBytes, 48 * 1024);
   assert.equal(contract.requestEnvelopeOverheadBytes, 2048);
   assert.equal(contract.outputTokenByteReserve, 4);
@@ -828,6 +868,6 @@ test('profiler config version invalidates profiles produced from the previous ev
   const profiler = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), cache);
 
   const currentProfile = await profiler.profile(templateIR, presentationDesignSystem);
-  assert.equal(endpoint.state.inference.length, 1, 'a profile cache entry with the previous configVersion is ignored');
+  assert.equal(endpoint.state.inference.length, 2, 'a profile cache entry with the previous configVersion is ignored and both batches are profiled');
   assert.ok(!currentProfile.slides[0].reasonCodes.includes('legacy_cache_entry'));
 });

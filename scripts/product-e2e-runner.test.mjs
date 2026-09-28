@@ -63,7 +63,7 @@ async function makeTemplate(filePath, { slideCount = 3 } = {}) {
 
 function workflowOptions(templatePath, outputDir, slides, task, enableTemplateProfiler = true) {
   return { mode: 'fake', templatePath, task, context: '', sources: [], slides, providerLabel: 'local-test', outputDir,
-    enableTemplateProfiler, maxSemanticRequests: enableTemplateProfiler ? 20 : 4, dryRun: false, preflightOnly: false };
+    enableTemplateProfiler, maxSemanticRequests: enableTemplateProfiler ? 36 : 4, dryRun: false, preflightOnly: false };
 }
 
 test('CLI validates external dry-run config without making any network request or printing secrets', async (t) => {
@@ -105,10 +105,10 @@ test('versioned qualification contract separates core, profile preparation, and 
   const contract = JSON.parse(readFileSync(path.join(repoRoot, 'scripts/lib/live-qualification-contract.json'), 'utf8'));
   assert.equal(contract.schemaVersion, 7);
   assert.equal(contract.coreMaxSemanticRequests, 4);
-  assert.equal(contract.profilePreparationMaxSemanticRequests, 16);
-  assert.equal(contract.fullWorkflowMaxSemanticRequests, 20);
-  assert.equal(contract.profilerDiagnosticMaxSemanticRequests, 20);
-  assert.equal(contract.maxProfilerRequests, 16);
+  assert.equal(contract.profilePreparationMaxSemanticRequests, 32);
+  assert.equal(contract.fullWorkflowMaxSemanticRequests, 36);
+  assert.equal(contract.profilerDiagnosticMaxSemanticRequests, 36);
+  assert.equal(contract.maxProfilerRequests, 32);
   assert.deepEqual(contract.requiredOperations, { 'deck-plan': 1, 'plan-review': 1, 'contextual-deck-audit': 1 });
   assert.deepEqual(contract.optionalOperations, { 'deck-plan-revision': { min: 0, max: 1 } });
   assert.equal(contract.generationSemanticRequests, 0);
@@ -117,10 +117,10 @@ test('versioned qualification contract separates core, profile preparation, and 
 test('product CLI uses full qualification budget while the adapter separately caps core generation', () => {
   const core = ['--semantic-mode', 'external', '--template', 'x.pptx', '--task', 'x'];
   const coreOptions = parseArgs(core);
-  assert.equal(coreOptions.maxSemanticRequests, 20);
+  assert.equal(coreOptions.maxSemanticRequests, 36);
   assert.equal(coreOptions.enableTemplateProfiler, true);
   assert.equal(parseArgs([...core, '--max-semantic-requests', '20']).maxSemanticRequests, 20);
-  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '21']), /between 1 and 20/u);
+  assert.throws(() => parseArgs([...core, '--max-semantic-requests', '37']), /between 1 and 36/u);
   assert.equal(parseArgs([...core, '--preflight-only']).preflightOnly, true);
   assert.throws(() => parseArgs(['--semantic-mode', 'fake', '--template', 'x.pptx', '--task', 'x', '--preflight-only']), /requires --semantic-mode external/u);
 });
@@ -243,7 +243,7 @@ test('profiler cannot run after Generate starts and core cannot start before a p
   assert.equal(budget.rejectedAttempts, 2);
 });
 
-test('full product request budget allows sixteen profile batches plus four bounded core stages', async () => {
+test('full product request budget allows 32 profile batches plus four bounded core stages', async () => {
   const delegated = [];
   const delegate = {
     model: 'Qwen/Qwen3.8-27B',
@@ -253,15 +253,15 @@ test('full product request budget allows sixteen profile batches plus four bound
         finishReason: 'stop', promptTokens: 1, completionTokens: 1 } };
     },
   };
-  const budget = createRequestBudgetAdapter(delegate, 20);
+  const budget = createRequestBudgetAdapter(delegate, 36);
   const request = (operation) => ({ role: 'worker', operation, messages: [{ role: 'user', content: 'safe test payload' }], output: { schema: {}, validate: () => true } });
-  for (let index = 0; index < 16; index += 1) await budget.adapter.infer(request('template-semantic-profile'));
+  for (let index = 0; index < 32; index += 1) await budget.adapter.infer(request('template-semantic-profile'));
   await assert.rejects(budget.adapter.infer(request('template-semantic-profile')), (error) => error.code === 'RATE_LIMITED');
   budget.markProfilePrepared();
   for (const operation of ['deck-plan', 'plan-review', 'deck-plan-revision', 'contextual-deck-audit']) await budget.adapter.infer(request(operation));
   await assert.rejects(budget.adapter.infer(request('unexpected-after-budget')), (error) => error.code === 'RATE_LIMITED');
-  assert.equal(delegated.length, 20);
-  assert.equal(budget.records.length, 20);
+  assert.equal(delegated.length, 36);
+  assert.equal(budget.records.length, 36);
   assert.equal(budget.rejectedAttempts, 2);
 });
 
@@ -296,7 +296,7 @@ test('canonical fake E2E prepares the profile before Generate and runs no profil
       revisionWorker: 0, other: 0, generation: 0, total: manifest.workflow.templatePreparation.profileRequests + 3,
     });
     assert.equal(manifest.semantic.requestCount, manifest.workflow.templatePreparation.profileRequests + 3);
-    assert.equal(manifest.semantic.requestBudget, 20);
+    assert.equal(manifest.semantic.requestBudget, 36);
     assert.equal(manifest.workflow.templatePreparation.structuralStatus, 'ready');
     assert.equal(manifest.workflow.templatePreparation.semanticProfileStatus, 'ready');
     assert.equal(manifest.workflow.templatePreparation.cachedStatusRead, true);
@@ -354,15 +354,15 @@ test('profile batches remain bounded and run before all three downstream semanti
   const manifest = await runProductE2E(options, { startFakeSemanticEndpoint: endpointFactory });
   assert.equal(manifest.result, 'PASS', `failed at ${manifest.failure?.stage}: ${manifest.failure?.code}`);
   assert.equal(manifest.templateProfilerEnabled, true);
-  assert.equal(manifest.semantic.requestBudget, 20);
-  assert.equal(manifest.semantic.requestCount, 6);
+  assert.equal(manifest.semantic.requestBudget, 36);
+  assert.equal(manifest.semantic.requestCount, 8);
   assert.deepEqual(manifest.semantic.operationCounts, {
-    profiler: 3, worker: 1, planningSupervisor: 1, contextualAudit: 1,
-    revisionWorker: 0, other: 0, generation: 0, total: 6,
+    profiler: 5, worker: 1, planningSupervisor: 1, contextualAudit: 1,
+    revisionWorker: 0, other: 0, generation: 0, total: 8,
   });
-  assert.deepEqual(manifest.semantic.requests.slice(0, 3).map((request) => request.templateProfilerBatch?.batchNumber), [1, 2, 3]);
+  assert.deepEqual(manifest.semantic.requests.slice(0, 5).map((request) => request.templateProfilerBatch?.batchNumber), [1, 2, 3, 4, 5]);
   assert.equal(manifest.generation.variantsReady, 9);
-  assert.equal(endpoints[0].state.inference.length, 6);
+  assert.equal(endpoints[0].state.inference.length, 8);
 });
 
 test('fake profile preparation stops after one failure and does not retry', async (t) => {

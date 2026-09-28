@@ -37,11 +37,11 @@ const optionalOperationNames = ['deck-plan-revision'];
 const optionalOperationMaximumTotal = liveQualificationContract.optionalOperations
   && Object.values(liveQualificationContract.optionalOperations).reduce((total, limit) => total + limit.max, 0);
 if (liveQualificationContract.schemaVersion !== 7 || liveQualificationContract.coreMaxSemanticRequests !== 4
-    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 16
-    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 20
+    || liveQualificationContract.profilePreparationMaxSemanticRequests !== 32
+    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 36
     || !Number.isSafeInteger(liveQualificationContract.profilerDiagnosticMaxSemanticRequests)
     || !Number.isSafeInteger(liveQualificationContract.maxProfilerRequests)
-    || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 16
+    || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 32
     || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.fullWorkflowMaxSemanticRequests
     || liveQualificationContract.maxProfilerRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
     || !liveQualificationContract.requiredOperations

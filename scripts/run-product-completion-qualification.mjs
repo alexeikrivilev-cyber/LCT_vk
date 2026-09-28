@@ -20,7 +20,7 @@ const plans = [
   { flag: '--education', label: 'Education', slides: 3, formats: ['pptx'] },
   { flag: '--aios', label: 'AIOS held-out', slides: 3, formats: ['pptx'] },
 ];
-const MAX_PROFILE_PREPARATION_REQUESTS = 16;
+const MAX_PROFILE_PREPARATION_REQUESTS = 32;
 
 function parseArgs(argv) {
   const values = new Map();

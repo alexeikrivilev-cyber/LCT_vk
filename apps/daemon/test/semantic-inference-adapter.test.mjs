@@ -128,8 +128,8 @@ test('profiler failure telemetry preserves safe batch diagnostics and available 
         name: 'template_semantic_profile_v1', schema: { type: 'object' }, validate: () => false,
         diagnoseValidationFailure: () => 'UNKNOWN_ELEMENT_ID',
       },
-      maxOutputTokens: 4096,
-      metadata: { templateProfilerBatch: { batchNumber: 1, totalBatches: 8, sourceSlideIndexes: [1, 2, 3, 4] } },
+      maxOutputTokens: 2048,
+      metadata: { templateProfilerBatch: { batchNumber: 1, totalBatches: 16, sourceSlideIndexes: [1, 2] } },
     }), (error) => {
       assert.equal(error.code, 'INVALID_STRUCTURED_OUTPUT');
       assert.equal(error.telemetry.runtimeSchemaValidation, 'failed');
@@ -141,10 +141,10 @@ test('profiler failure telemetry preserves safe batch diagnostics and available 
   } finally { console.log = previous; }
   const record = JSON.parse(logs[0][0]);
   assert.equal(record.httpStatus, 200);
-  assert.equal(record.maxOutputTokens, 4096);
+  assert.equal(record.maxOutputTokens, 2048);
   assert.equal(record.responseFormat, 'json_schema');
   assert.equal(record.strictJsonSchema, true);
-  assert.deepEqual(record.templateProfilerBatch, { batchNumber: 1, totalBatches: 8, sourceSlideIndexes: [1, 2, 3, 4] });
+  assert.deepEqual(record.templateProfilerBatch, { batchNumber: 1, totalBatches: 16, sourceSlideIndexes: [1, 2] });
   assert.equal(record.evidenceBytes, Buffer.byteLength(evidence, 'utf8'));
   assert.equal(record.promptTokens, 42);
   assert.equal(record.completionTokens, 13);
@@ -202,7 +202,7 @@ test('validates structured output and keeps Worker and Supervisor evidence in se
   assert.doesNotMatch(JSON.stringify(supervisor.telemetry), /WORKER_SENTINEL|SUPERVISOR_SENTINEL/);
 });
 
-test('accepts the sixteenth bounded template-profile batch in the full-product request budget', async (t) => {
+test('accepts the thirty-second bounded template-profile batch in the full-product request budget', async (t) => {
   let calls = 0;
   const { baseUrl } = await startServer(t, async (_request, reply) => {
     calls += 1;
@@ -213,10 +213,31 @@ test('accepts the sixteenth bounded template-profile batch in the full-product r
   });
   const request = workerSmokeRequest();
   request.operation = 'template-semantic-profile';
-  request.metadata = { templateProfilerBatch: { batchNumber: 16, totalBatches: 16, sourceSlideIndexes: [500] } };
+  request.metadata = { templateProfilerBatch: { batchNumber: 32, totalBatches: 32, sourceSlideIndexes: [500] } };
   const response = await adapter(baseUrl).infer(request);
   assert.equal(response.value.summary, WORKER_SENTINEL);
   assert.equal(calls, 1);
+});
+
+test('rejects profiler metadata beyond 32 batches or above two slides before provider dispatch', async (t) => {
+  let calls = 0;
+  const { baseUrl } = await startServer(t, async (_request, reply) => {
+    calls += 1;
+    reply.writeHead(200, { 'content-type': 'application/json' });
+    reply.end(JSON.stringify(openAIResponse(JSON.stringify({
+      status: 'ok', summary: WORKER_SENTINEL, nextAction: 'continue',
+    }))));
+  });
+  const request = workerSmokeRequest();
+  request.operation = 'template-semantic-profile';
+  for (const metadata of [
+    { batchNumber: 33, totalBatches: 33, sourceSlideIndexes: [500] },
+    { batchNumber: 1, totalBatches: 1, sourceSlideIndexes: [1, 2, 3] },
+  ]) {
+    request.metadata = { templateProfilerBatch: metadata };
+    await assert.rejects(adapter(baseUrl).infer(request), (error) => error.code === 'INVALID_REQUEST');
+  }
+  assert.equal(calls, 0, 'invalid profiler metadata never reaches the provider');
 });
 
 test('maps the optional adapter thinking setting to request-level chat template kwargs', async (t) => {
