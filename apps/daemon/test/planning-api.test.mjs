@@ -505,7 +505,7 @@ test('planning input fingerprint changes when prompt assets or the agent workflo
   assert.notEqual(planningInputFingerprint({ ...input, workerPromptSha256: '1'.repeat(64) }), baseline);
   assert.notEqual(planningInputFingerprint({ ...input, supervisorPromptSha256: '2'.repeat(64) }), baseline);
   assert.notEqual(planningInputFingerprint({ ...input, agentWorkflowContractSha256: '3'.repeat(64) }), baseline);
-  assert.equal(AGENT_WORKFLOW_VERSIONS.worker.promptVersion, 'worker-deck-plan.v5');
+  assert.equal(AGENT_WORKFLOW_VERSIONS.worker.promptVersion, 'worker-deck-plan.v6');
   assert.equal(AGENT_WORKFLOW_VERSIONS.worker.schemaVersion, 'deck_plan_draft_v4');
   assert.equal(AGENT_WORKFLOW_VERSIONS.supervisor.schemaVersion, 'supervisor_plan_review_v1');
   assert.match(AGENT_WORKFLOW_CONTRACT_SHA256, /^[a-f0-9]{64}$/);
@@ -536,7 +536,7 @@ test('legacy v4 generated-copy title overflow invalidates only the saved plan an
 
   const savedPath = path.join(dataDir, 'projects', projectId, '.planning', 'state.json');
   const legacy = JSON.parse(await readFile(savedPath, 'utf8'));
-  assert.equal(legacy.lastSuccessful.promptVersions.worker, 'worker-deck-plan.v5');
+  assert.equal(legacy.lastSuccessful.promptVersions.worker, 'worker-deck-plan.v6');
   // Recreate the persisted v4 violation that existed before the generated title cap.
   legacy.lastSuccessful.promptVersions.worker = 'worker-deck-plan.v4';
   const longTitle = 'A legacy generated-copy title exceeding the current forty character limit';

@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { buildOfflineQualificationPlan } from './offline-qualification-plan.mjs';
 
 function completion(model, value, finishReason = 'stop') {
   return {
@@ -43,32 +44,23 @@ function deterministicPlanningResponse(request) {
     }
     if (section?.contentUnits.length) sections.push(section);
     if (!sections.length) sections.push({ heading: null, contentUnits: [] });
-    const generatedCopy = (takeaway, index) => [
-      `Раскрыть тему «${takeaway}» с точки зрения аудитории.`,
-      ['Показать связь этого тезиса с общей логикой презентации.', 'Уточнить роль этого блока в общей логике презентации.', 'Связать вывод с практическим контекстом.'][index % 3],
-      ['Сформулировать вывод, который ведёт к следующему шагу.', 'Зафиксировать изменение для пользователя.', 'Подвести аудиторию к следующему решению.'][index % 3],
-    ];
     const count = Math.max(1, Math.min(30, evidence.requestedSlideCount ?? 1));
+    const syntheticStory = buildOfflineQualificationPlan(count).slides;
     const slides = Array.from({ length: count }, (_, index) => {
       const sectionIndex = count === 1 ? 0 : Math.round(index * (sections.length - 1) / (count - 1));
       const selectedSection = sections[sectionIndex % sections.length];
-      const heading = selectedSection.heading?.text.replace(/^#+\s*/, '').trim();
-      const proposedTakeaway = heading || [
-        'Главная мысль и контекст', 'Ключевые наблюдения и решение', 'Механизм и следующий шаг',
-      ][index % 3];
-      const takeaway = conciseTitle(proposedTakeaway, schemaName === 'deck_plan_draft_v4' ? 40 : 56, index);
+      const story = syntheticStory[index];
+      if (!story) throw new RangeError('Fake story does not cover the requested slide count');
       return {
-        narrativeRole: count > 1 && index === 0 ? 'opening' : count > 1 && index === count - 1 ? 'closing' : 'content',
-        purpose: index === 0 ? 'Открыть тему и задать контекст.'
-          : index === count - 1 ? 'Сформулировать следующий шаг.'
-            : 'Раскрыть этап общей истории.',
-        takeaway,
+        narrativeRole: story.narrativeRole,
+        purpose: story.purpose,
+        takeaway: story.takeaway,
         contentRefs: [...(selectedSection.heading ? [selectedSection.heading] : []), ...selectedSection.contentUnits]
           .slice(0, 5).map((unit) => unit.id),
-        bodyPoints: generatedCopy(takeaway, index).map((text) => ({ text, origin: 'generated-from-brief', evidenceRefs: [] })),
+        bodyPoints: story.bodyPoints,
         mediaRefs: [],
-        semanticVisualType: 'none',
-        targetDensity: 'balanced',
+        semanticVisualType: story.semanticVisualType,
+        targetDensity: story.targetDensity,
       };
     });
     return completion(request.model, {
@@ -201,19 +193,6 @@ function deterministicPlanningResponse(request) {
     return completion(request.model, { templateIRHash: evidence.templateIRHash, slides });
   }
   return completion(request.model, { unknown: true });
-}
-
-function conciseTitle(value, maxLength, index) {
-  const text = value.trim().replace(/\s+/gu, ' ');
-  if (Array.from(text).length <= maxLength) return text;
-  const words = text.split(' ');
-  let result = '';
-  for (const word of words) {
-    const candidate = result ? `${result} ${word}` : word;
-    if (Array.from(candidate).length > maxLength) break;
-    result = candidate;
-  }
-  return result || ['Главная мысль', 'Решение и подход', 'Следующий шаг'][index % 3];
 }
 
 async function readJson(request, limit = 4 * 1024 * 1024) {

@@ -10,12 +10,23 @@
 | 3:30–5:00 | Просмотреть A/B/C, выбрать или закрепить подходящий вариант, открыть аудит | Варианты, deterministic findings и локализованные contextual suggestions | Выбраны только готовые безопасные варианты; контекстная проверка не исправляет факты автоматически | Если вариант withheld, показать короткую причину; не обходить safety gate |
 | 5:00–7:00 | При наличии безопасной починки применить её, скачать PPTX и при необходимости PDF/HTML | Редактируемый PPTX и форматы просмотра | Export прошёл структурную проверку и доступен для скачивания | При сбое экспорта показать сохранённый status/error code и ограничения форматов |
 
-## Подтверждённая локальная квалификация
+## Последняя локальная проверка (2026-09-28)
 
-- One-click fake flow прошёл на VK Tech (12 слайдов), WorkSpace, Education и held-out AIOS (по 3 слайда, task-only). На каждом reopened selected/A/B/C PPTX; детерминированный аудит не содержал ошибок.
-- У AIOS проверено отсутствие 80 template-specific фраз во всех четырёх export modes. Это bounded held-out test, не универсальная гарантия для любых шаблонов.
-- VK Tech PDF повторно открыт с 12 страницами; HTML содержит 12 секций слайдов. PDF использует approximate raster preview; HTML — отдельный формат просмотра.
-- 12-slide VK Tech fake flow занял 78.645 s до завершения contextual audit и экспорта. Время live inference неизвестно.
-- PowerPoint/LibreOffice визуальная проверка, browser visual walkthrough и полный 7-minute rehearsal не выполнялись. Не заявлять их результат как PASS.
+- Использован fake semantic endpoint; qualification report фиксирует 65 semantic requests и `noExternalCalls=true`. Это проверка pipeline, не оценка Qwen.
+- VK Tech: 12 слайдов, A/B/C — 36/36 вариантов; deterministic audit и структурное открытие selected/A/B/C PPTX прошли. PDF повторно открыт с 12 страницами; HTML содержит 12 секций.
+- WorkSpace и Education: по 3 слайда и 9/9 вариантов; deterministic audit и структурное открытие selected/A/B/C PPTX прошли.
+- Held-out AIOS: generation остановлена fail-closed на `VARIANTS_NOT_DISTINCT`; qualified previews и exports отсутствуют. Не показывать этот шаблон как успешный fallback.
+- Визуальные листы обнаруживают повтор hero-визуала на VK Tech, пустые/слабо заполненные области и слабое различие композиций на WorkSpace/Education. Структурный PASS не означает визуальную готовность.
+- VK Tech до контекстуального аудита: 62.556 s; последующие экспорты заняли 1,328.353 s, полный flow — 1,390.909 s. Полный семиминутный сценарий не репетирован; экспортный бюджет демонстрации не подтверждён.
+- UI проверен на начальном экране и после свежей загрузки проекта: состояние восстановилось, русский текст, варианты, аудит и экспорты видны. Viewport был около 1265×720, а не 1440×900; файловые UI screenshots не сохранены.
+- Golden replay заблокирован: текущий deck-plan system prompt не совпадает с immutable captured fixture. Не переписывать golden expectations ради PASS.
+
+Актуальные machine-readable результаты и contact sheets: `.lct/overnight/overnight-wow-2026-09-28/morning-freeze-matrix-v1/`. Подробный статус: [отчёт утренней приёмки](./overnight/MORNING_DEMO_REPORT.md). Время live inference неизвестно.
+
+PowerPoint/LibreOffice visual acceptance и полный 7-minute rehearsal не выполнялись. Не заявлять их результат как PASS.
+
+## Предусловие перед семиминутным сценарием
+
+До запуска таймера проверьте, что semantic profile шаблона сохранён со статусом READY и относится к текущему файлу/версии prompt. Его подготовка — отдельный этап до Generate; не рассчитывайте выполнить медленные profiler batches внутри семиминутного показа. При смене шаблона сначала завершите подготовку, затем открывайте demo-проект. Если профиля нет, остановитесь на подготовке и не обходите prerequisite structural fallback.
 
 Актуальный статус: [RELEASE_READINESS.md](../RELEASE_READINESS.md). Детали продуктовых ограничений: [руководство](./product/guide.md).

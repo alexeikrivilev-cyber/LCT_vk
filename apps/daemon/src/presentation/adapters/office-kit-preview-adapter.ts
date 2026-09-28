@@ -8,7 +8,7 @@ import {
   getSlides,
 } from '@office-kit/pptx/node';
 import { auditTextLayout, renderSlideToSvg } from '@office-kit/pptx-preview';
-import { renderSlideToImage } from '@office-kit/pptx-preview/node';
+import { buildFontkitMeasurer, renderSlideToImage } from '@office-kit/pptx-preview/node';
 
 import type { PptxPreviewPort, PptxPreviewResult } from '../application/pptx-preview-port.js';
 import { recordElapsed, type PerformanceDiagnosticsPort } from '../performance-diagnostics.js';
@@ -42,7 +42,10 @@ export class OfficeKitPreviewAdapter implements PptxPreviewPort {
     const slides = getSlides(presentation);
     if (slideIndexes.some((index) => !slides[index])) throw new RangeError('Preview slide index does not exist');
     const auditStartedAt = performance.now();
-    const allTextLayoutIssues = auditTextLayout(presentation);
+    // Use the dependency's Node glyph measurer. The default browser-safe
+    // heuristic marks every Office Kit issue approximate, hiding exact OOXML
+    // text-box overflow from offline qualification.
+    const allTextLayoutIssues = auditTextLayout(presentation, { measureText: buildFontkitMeasurer() });
     recordElapsed(this.diagnostics, 'preview.auditTextLayout', auditStartedAt);
     const results: Array<{ slideIndex: number; result: PptxPreviewResult }> = [];
     const renderStartedAt = performance.now();

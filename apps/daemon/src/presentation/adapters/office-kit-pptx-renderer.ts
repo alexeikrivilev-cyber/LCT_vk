@@ -7,6 +7,7 @@ import {
   addSlideChart,
   addSlideImage,
   addSlideLine,
+  addSlideShape,
   addSlideTable,
   addSlideTextBox,
   asColor,
@@ -24,6 +25,7 @@ import {
   getShapeParagraphCount,
   getShapeRunCount,
   getShapeRunFormatEffective,
+  getShapeTextMargins,
   getShapeText,
   getShapeTextAutoFitParams,
   getSlideCharts,
@@ -40,13 +42,21 @@ import {
   resolveDeckBodyTextColor,
   savePresentation,
   setShapeText,
+  setShapeAlignment,
+  setShapeNoFill,
+  setShapeStroke,
+  setShapeStrokeArrow,
+  setShapeTextAnchor,
+  setShapeTextMargins,
   setShapeTextAutoFit,
   setShapeTextFormat,
+  sortSlides,
   validatePresentation,
 } from '@office-kit/pptx/node';
 import JSZip from 'jszip';
 
 import { auditCompiledPresentation } from '../application/deterministic-audit.js';
+import { fitProcessNodeLayout, fitsProcessLabel, type ProcessLayoutBox, type ProcessNodeLayout } from '../application/process-layout.js';
 import {
   assessExemplarSelection,
   generatedFallbackCompositionSignature,
@@ -166,7 +176,7 @@ function roleTextStyle(
     : new Set(['body', 'obj', 'subTitle']);
   const shapes = getSlideShapes(slide);
   const candidates = [...preferredShapes, ...shapes.filter((shape) => allowedTypes.has(getShapePlaceholderType(shape) ?? '')),
-    ...shapes.filter((shape) => hasShapeText(shape))];
+  ];
   const seen = new Set<object>();
   for (const shape of candidates) {
     if (seen.has(shape)) continue;
@@ -215,7 +225,85 @@ function requiredTemplateColor(color: string) {
   return resolved;
 }
 
-const PROCESS_CONNECTOR_WIDTH_EMU = 19_050;
+function boxesOverlap(left: { x: number; y: number; width: number; height: number }, right: { x: number; y: number; width: number; height: number }): boolean {
+  return left.x < right.x + right.width && left.x + left.width > right.x
+    && left.y < right.y + right.height && left.y + left.height > right.y;
+}
+
+function safeProcessVisualBox(compiled: CompiledSlide, bodyFontPt: number): ProcessLayoutBox | null {
+  const title = compiled.placements.title;
+  const body = compiled.placements.body;
+  const candidate = compiled.placements.visual;
+  const stepCount = compiled.visualization.processSteps.length;
+  const labels = compiled.visualization.processSteps.map((step) => step.text);
+  const candidates = candidate && !boxesOverlap(candidate, title) && !boxesOverlap(candidate, body)
+    ? [candidate]
+    : compiled.body.length <= stepCount && !boxesOverlap(body, title) ? [body] : [];
+  return candidates.find((box) => fitProcessNodeLayout(box, labels, bodyFontPt) !== null) ?? null;
+}
+
+const PROCESS_CONNECTOR_WIDTH_EMU = 25_400;
+const PROCESS_NODE_TEXT_MARGIN_EMU = 45_720;
+
+function addProcessNode(
+  slide: ReturnType<typeof getSlides>[number],
+  text: string,
+  box: { x: number; y: number; width: number; height: number },
+  color: string,
+  bodyStyle: ReturnType<typeof roleTextStyle>,
+) {
+  const node = addSlideShape(slide, {
+    preset: 'roundRect', x: emu(box.x), y: emu(box.y), w: emu(box.width), h: emu(box.height), text, textAnchor: 'ctr',
+    name: 'lct-generated-process-step',
+  });
+  setShapeNoFill(node);
+  setShapeStroke(node, { color: requiredTemplateColor(color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
+  setShapeAlignment(node, 'center');
+  setShapeTextAnchor(node, 'center');
+  setShapeTextMargins(node, {
+    left: PROCESS_NODE_TEXT_MARGIN_EMU, right: PROCESS_NODE_TEXT_MARGIN_EMU,
+    top: PROCESS_NODE_TEXT_MARGIN_EMU, bottom: PROCESS_NODE_TEXT_MARGIN_EMU,
+  });
+  applyResolvedRoleTextStyle(node, bodyStyle);
+  return node;
+}
+
+function addProcessConnector(
+  slide: ReturnType<typeof getSlides>[number],
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  color: string,
+) {
+  const connector = addSlideLine(slide, {
+    from: { x: emu(from.x), y: emu(from.y) }, to: { x: emu(to.x), y: emu(to.y) },
+    color: requiredTemplateColor(color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU,
+    name: 'lct-generated-process-connector',
+  });
+  setShapeStrokeArrow(connector, 'tail', { type: 'triangle', width: 'sm', length: 'sm' });
+  return connector;
+}
+
+function connectProcessNodes(
+  slide: ReturnType<typeof getSlides>[number],
+  layout: ProcessNodeLayout,
+  color: string,
+): void {
+  for (let index = 0; index < layout.nodes.length - 1; index += 1) {
+    const from = layout.nodes[index]!;
+    const to = layout.nodes[index + 1]!;
+    if (layout.axis === 'x') {
+      const gap = to.x - (from.x + from.width);
+      const y = from.y + Math.floor(from.height / 2);
+      const inset = Math.min(Math.round(gap * 0.08), PROCESS_CONNECTOR_WIDTH_EMU);
+      addProcessConnector(slide, { x: from.x + from.width + inset, y }, { x: to.x - inset, y }, color);
+    } else {
+      const gap = to.y - (from.y + from.height);
+      const x = from.x + Math.floor(from.width / 2);
+      const inset = Math.min(Math.round(gap * 0.08), PROCESS_CONNECTOR_WIDTH_EMU);
+      addProcessConnector(slide, { x, y: from.y + from.height + inset }, { x, y: to.y - inset }, color);
+    }
+  }
+}
 
 function projectExemplarText(
   slide: ReturnType<typeof getSlides>[number],
@@ -253,8 +341,8 @@ function projectExemplarText(
   for (const nativeId of selection.removeElementNativeIds) {
     if (replacementIds.has(nativeId)) throw new PptxBackendError('EXEMPLAR_CLEANUP_MAPPING_FAILED', 'A mapped title/body object cannot also be removed.');
     const shape = byNativeId.get(nativeId);
-    if (!shape || getShapeKind(shape) !== 'shape' || !hasShapeText(shape)) {
-      throw new PptxBackendError('EXEMPLAR_CLEANUP_MAPPING_FAILED', `A validated unused body panel on exemplar slide ${selection.sourceSlideIndex} could not be removed safely.`);
+    if (!shape || getShapeKind(shape) !== 'shape') {
+      throw new PptxBackendError('EXEMPLAR_CLEANUP_MAPPING_FAILED', `A validated unused exemplar object on source slide ${selection.sourceSlideIndex} could not be removed safely.`);
     }
     removeShape(shape);
   }
@@ -324,25 +412,19 @@ async function addProjectedVisual(
   }
   if (compiled.visualization.processSteps.length >= 2) {
     const bodyStyle = roleTextStyle(presentation, slide, 'body', roleSources.body ? [roleSources.body] : []);
-    const gap = Math.max(1, Math.round(visualBox.width * 0.025));
-    const nodeWidth = Math.max(1, Math.floor((visualBox.width - gap * (compiled.visualization.processSteps.length - 1)) / compiled.visualization.processSteps.length));
-    const nodeY = visualBox.y + Math.floor(visualBox.height * 0.2);
-    const nodeHeight = Math.max(1, Math.floor(visualBox.height * 0.6));
-    const nodes = compiled.visualization.processSteps.map((step, index) => {
-      const x = visualBox.x + index * (nodeWidth + gap);
-      const node = addSlideTextBox(slide, { x: emu(x), y: emu(nodeY), w: emu(nodeWidth), h: emu(nodeHeight), text: step.text });
-      applyRoleTextStyle(presentation, slide, node, 'body', roleSources.body ? [roleSources.body] : []);
-      return { x, centerY: nodeY + Math.floor(nodeHeight / 2) };
-    });
-    counts.text += nodes.length;
-    counts.shapes += nodes.length;
-    for (let index = 0; index < nodes.length - 1; index += 1) {
-      const from = nodes[index]!;
-      const to = nodes[index + 1]!;
-      addSlideLine(slide, { from: { x: emu(from.x + nodeWidth), y: emu(from.centerY) }, to: { x: emu(to.x), y: emu(to.centerY) },
-        color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
-      counts.connectors += 1;
-    }
+    const actualTitle = getShapeBoundsResolved(presentation, roleSources.title);
+    const actualBody = roleSources.body ? getShapeBoundsResolved(presentation, roleSources.body) : null;
+    if (actualTitle && boxesOverlap(visualBox, { x: actualTitle.x, y: actualTitle.y, width: actualTitle.w, height: actualTitle.h })
+        || actualBody && boxesOverlap(visualBox, { x: actualBody.x, y: actualBody.y, width: actualBody.w, height: actualBody.h })) return counts;
+    const nodeLayout = bodyStyle.size
+      ? fitProcessNodeLayout(visualBox, compiled.visualization.processSteps.map((step) => step.text), bodyStyle.size)
+      : null;
+    if (!nodeLayout) return counts;
+    compiled.visualization.processSteps.forEach((step, index) => addProcessNode(slide, step.text, nodeLayout.nodes[index]!, bodyStyle.color, bodyStyle));
+    connectProcessNodes(slide, nodeLayout, bodyStyle.color);
+    counts.text += nodeLayout.nodes.length;
+    counts.shapes += nodeLayout.nodes.length;
+    counts.connectors += nodeLayout.nodes.length - 1;
   }
   if (compiled.imageRefs.length) {
     if (compiled.imageRefs.length > 1) throw new PptxBackendError('MULTIPLE_IMAGES_UNSUPPORTED', 'A slide currently supports one source-backed image in its selected visual slot.', compiled.imageRefs[1]!.sourcePath);
@@ -381,30 +463,13 @@ function addBodyHostedSequence(
   if (resolvedNodes.length === 1) {
     const { shape, bounds } = resolvedNodes[0]!;
     const bodyStyle = roleTextStyle(presentation, slide, 'body', [shape]);
-    const gap = Math.max(12_700, Math.round(bounds.w * 0.025));
-    const nodeWidth = Math.floor((bounds.w - gap * (compiled.visualization.processSteps.length - 1)) / compiled.visualization.processSteps.length);
-    const nodeHeight = Math.floor(bounds.h * 0.72);
-    if (nodeWidth < 2 * 25_400 || nodeHeight < 2 * 25_400) return null;
+    const layout = fitProcessNodeLayout({ x: bounds.x, y: bounds.y, width: bounds.w, height: bounds.h },
+      compiled.visualization.processSteps.map((step) => step.text), bodyStyle.size ?? 0);
+    if (!layout) return null;
     setShapeText(shape, '');
-    const nodeY = bounds.y + Math.floor((bounds.h - nodeHeight) / 2);
-    const generatedNodes = compiled.visualization.processSteps.map((step, index) => {
-      const x = bounds.x + index * (nodeWidth + gap);
-      const textShape = addSlideTextBox(slide, {
-        x: emu(x), y: emu(nodeY), w: emu(nodeWidth), h: emu(nodeHeight), text: step.text,
-      });
-      applyResolvedRoleTextStyle(textShape, bodyStyle);
-      return { x, y: nodeY + Math.floor(nodeHeight / 2) };
-    });
-    for (let index = 0; index < generatedNodes.length - 1; index += 1) {
-      const from = generatedNodes[index]!;
-      const to = generatedNodes[index + 1]!;
-      const edge = from.x + nodeWidth;
-      const end = to.x;
-      const inset = Math.min(Math.round((end - edge) * 0.15), Math.round(nodeHeight * 0.04));
-      addSlideLine(slide, { from: { x: emu(edge + inset), y: emu(from.y) }, to: { x: emu(end - inset), y: emu(to.y) },
-        color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
-    }
-    return { textShapes: generatedNodes.length, connectors: generatedNodes.length - 1 };
+    compiled.visualization.processSteps.forEach((step, index) => addProcessNode(slide, step.text, layout.nodes[index]!, bodyStyle.color, bodyStyle));
+    connectProcessNodes(slide, layout, bodyStyle.color);
+    return { textShapes: compiled.visualization.processSteps.length, connectors: compiled.visualization.processSteps.length - 1 };
   }
 
   const minGap = Math.max(12_700, Math.round(Math.min(...resolvedNodes.map((node) => Math.min(node.bounds.w, node.bounds.h))) * 0.02));
@@ -428,6 +493,17 @@ function addBodyHostedSequence(
   const vertical = aligned('y');
   const axis = horizontal ? 'x' : vertical ? 'y' : null;
   if (!axis) return null;
+  const processSteps = compiled.visualization.processSteps;
+  if (resolvedNodes.length !== processSteps.length || selection.bodyContentSegments.length !== processSteps.length) return null;
+  for (const [index, node] of resolvedNodes.entries()) {
+    const label = selection.bodyContentSegments[index];
+    const step = processSteps[index];
+    if (!label || !step || normalizedVisibleText(label) !== normalizedVisibleText(step.text)) return null;
+    const style = roleTextStyle(presentation, slide, 'body', [node.shape]);
+    let margins: ReturnType<typeof getShapeTextMargins>;
+    try { margins = getShapeTextMargins(node.shape); } catch { return null; }
+    if (!style.size || !fitsProcessLabel({ x: node.bounds.x, y: node.bounds.y, width: node.bounds.w, height: node.bounds.h }, label, style.size, margins)) return null;
+  }
   const bodyStyleSource = resolvedNodes[0]!.shape;
   const bodyStyle = roleTextStyle(presentation, slide, 'body', [bodyStyleSource]);
   const crossAxis = axis === 'x' ? 'y' : 'x';
@@ -449,7 +525,10 @@ function addBodyHostedSequence(
       : { from: { x: emu(center), y: emu(fromEdge + inset) }, to: { x: emu(center), y: emu(toEdge - inset) },
         color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
   }
-  for (const connector of connectorSegments) addSlideLine(slide, connector);
+  for (const connector of connectorSegments) {
+    const shape = addSlideLine(slide, connector);
+    setShapeStrokeArrow(shape, 'tail', { type: 'triangle', width: 'sm', length: 'sm' });
+  }
   return { textShapes: 0, connectors: resolvedNodes.length - 1 };
 }
 
@@ -586,9 +665,16 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
     }));
     const sourceSlides = [...getSlides(presentation)];
     const sourceSlidesByPart = new Map(sourceSlides.map((slide) => [normalizePart(getSlidePartName(slide)), slide]));
-    const exemplarAssessments = new Map(input.compiledPresentation.slides.map((compiled) => [
-      compiled.id, assessExemplarSelection(compiled, input.templateIR, input.semanticProfile),
-    ] as const));
+    type RendererExemplarAssessment = Pick<ExemplarSelectionAssessment, 'selection' | 'safeSelections' | 'availableDistinctFamilies' | 'evidence'>;
+    const exemplarAssessments = new Map<string, RendererExemplarAssessment>(input.compiledPresentation.slides.map((compiled) => {
+      const selected = compiled.exemplarSelection;
+      const validation = compiled.exemplarSelectionValidation;
+      const alreadyQualified = selected && validation?.templateIRHash === input.templateIR.hash
+        && validation.signature === selected.projectedCompositionSignature;
+      return [compiled.id, alreadyQualified
+        ? { selection: selected, safeSelections: [selected], availableDistinctFamilies: selected.availableDistinctFamilies, evidence: selected.evidence }
+        : assessExemplarSelection(compiled, input.templateIR, input.semanticProfile)] as const;
+    }));
     const exemplarSelections = new Map(input.compiledPresentation.slides.flatMap((compiled) => {
       const assessment = exemplarAssessments.get(compiled.id);
       const selected = compiled.exemplarSelection;
@@ -605,7 +691,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       return [[compiled.id, selection] as const];
     }));
     recordElapsed(this.diagnostics, 'renderer.prepareLayoutsAndSources', stageStartedAt);
-    const duplicatedSlides = new Map<string, ReturnType<typeof duplicateSlide>>();
+    const outputSlidesById = new Map<string, ReturnType<typeof duplicateSlide>>();
     stageStartedAt = performance.now();
     for (const compiled of input.compiledPresentation.slides) {
       const selection = exemplarSelections.get(compiled.id);
@@ -614,7 +700,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       if (!sourceSlide) throw new PptxBackendError('EXEMPLAR_SOURCE_SLIDE_MISSING', `The selected source slide ${selection.sourceSlideIndex} is unavailable in the loaded package.`);
       const duplicate = duplicateSlide(presentation, sourceSlide);
       removeSlideNotes(duplicate);
-      duplicatedSlides.set(compiled.id, duplicate);
+      outputSlidesById.set(compiled.id, duplicate);
     }
     recordElapsed(this.diagnostics, 'renderer.duplicateSlides', stageStartedAt);
     stageStartedAt = performance.now();
@@ -646,7 +732,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
     const textStyleWarnings: string[] = [];
     for (const compiled of input.compiledPresentation.slides) {
       const selection = exemplarSelections.get(compiled.id);
-      let slide = duplicatedSlides.get(compiled.id);
+      let slide = outputSlidesById.get(compiled.id);
       if (selection && slide) {
         projectExemplarText(slide, compiled, selection, textStyleWarnings);
         if (compiled.visualization.type === 'kpi' && !compiled.visualization.kpi) {
@@ -718,6 +804,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       const layout = layoutsByPart.get(compiled.layoutSourcePart);
       if (!layout) throw new TypeError(`Office Kit cannot resolve selected layout part ${compiled.layoutSourcePart}`);
       slide = addSlide(presentation, { layout });
+      outputSlidesById.set(compiled.id, slide);
       const titlePlaceholder = matchingNativePlaceholder(presentation, slide, layout, compiled.placements.title, 'title');
       if (titlePlaceholder) {
         setShapeText(titlePlaceholder, compiled.title);
@@ -729,7 +816,8 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         const chartHasSlot = Boolean(compiled.placements.visual || compiled.body.length === 0);
         const imageHasSlot = Boolean(compiled.placements.visual || compiled.body.length === 0);
         const kpiHasSlot = Boolean(compiled.placements.visual || compiled.body.length === 0);
-        const processHasSlot = Boolean(compiled.placements.visual || compiled.body.length <= compiled.visualization.processSteps.length);
+        const processHasSlot = Boolean(safeProcessVisualBox(compiled, bodyRolePlaceholder
+          ? roleTextStyle(presentation, slide, 'body', [bodyRolePlaceholder]).size ?? 0 : 0));
         const specialVisualUsesBody = Boolean((compiled.visualization.chartData && chartHasSlot) || (compiled.visualization.kpi && kpiHasSlot)
           || (compiled.visualization.processSteps.length >= 2 && processHasSlot)
           || (compiled.imageRefs.length && imageHasSlot) || compiled.visualization.tableData);
@@ -789,33 +877,26 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         }
       }
       if (compiled.visualization.processSteps.length >= 2) {
-        const visualBox = compiled.placements.visual ?? (compiled.body.length <= compiled.visualization.processSteps.length ? compiled.placements.body : null);
+        const bodyStyle = bodyRolePlaceholder ? roleTextStyle(presentation, slide, 'body', [bodyRolePlaceholder]) : null;
+        const visualBox = bodyStyle?.size ? safeProcessVisualBox(compiled, bodyStyle.size) : null;
         if (!visualBox) {
           unresolvedVisualTypes.add('process');
           recordVisualIntent(compiled, 'unresolved', 'No measured visual/body region could contain the process sequence.');
         }
         else {
-          const gap = Math.max(1, Math.round(visualBox.width * 0.025));
-          const nodeWidth = Math.max(1, Math.floor((visualBox.width - gap * (compiled.visualization.processSteps.length - 1)) / compiled.visualization.processSteps.length));
-          const nodeY = visualBox.y + Math.floor(visualBox.height * 0.2);
-          const nodeHeight = Math.max(1, Math.floor(visualBox.height * 0.6));
-          const nodes = compiled.visualization.processSteps.map((step, index) => {
-            const x = visualBox.x + index * (nodeWidth + gap);
-            const node = addSlideTextBox(slide, { x: emu(x), y: emu(nodeY), w: emu(nodeWidth), h: emu(nodeHeight), text: step.text });
-            applyRoleTextStyle(presentation, slide, node, 'body', bodyRolePlaceholder ? [bodyRolePlaceholder] : []);
-            return { x, centerY: nodeY + Math.floor(nodeHeight / 2) };
-          });
-          nativeTextShapeCount += nodes.length;
-          nativeShapeCount += nodes.length;
-          for (let index = 0; index < nodes.length - 1; index += 1) {
-            const from = nodes[index]!;
-            const to = nodes[index + 1]!;
-            const bodyStyle = roleTextStyle(presentation, slide, 'body', bodyRolePlaceholder ? [bodyRolePlaceholder] : []);
-            addSlideLine(slide, { from: { x: emu(from.x + nodeWidth), y: emu(from.centerY) }, to: { x: emu(to.x), y: emu(to.centerY) },
-              color: requiredTemplateColor(bodyStyle.color), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU });
-            nativeConnectorCount += 1;
+          const bodyStyle = roleTextStyle(presentation, slide, 'body', bodyRolePlaceholder ? [bodyRolePlaceholder] : []);
+          const nodeLayout = fitProcessNodeLayout(visualBox, compiled.visualization.processSteps.map((step) => step.text), bodyStyle.size ?? 0);
+          if (!nodeLayout) {
+            unresolvedVisualTypes.add('process');
+            recordVisualIntent(compiled, 'unresolved', 'No measured body region could fit the process labels at the template body font size.');
+          } else {
+            compiled.visualization.processSteps.forEach((step, index) => addProcessNode(slide, step.text, nodeLayout.nodes[index]!, bodyStyle.color, bodyStyle));
+            connectProcessNodes(slide, nodeLayout, bodyStyle.color);
+            nativeTextShapeCount += nodeLayout.nodes.length;
+            nativeShapeCount += nodeLayout.nodes.length;
+            nativeConnectorCount += nodeLayout.nodes.length - 1;
+            recordVisualIntent(compiled, compiled.visualization.type);
           }
-          recordVisualIntent(compiled, compiled.visualization.type);
         }
       }
       if (compiled.imageRefs.length) {
@@ -860,6 +941,19 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         recordVisualIntent(compiled, 'unresolved', 'The renderer did not record a realized visual intent for this slide.');
       }
     }
+
+    // Office Kit duplicates adjacent to their donor. Sort every generated
+    // slide, including layout-only fallbacks, back to the immutable DeckPlan
+    // order before serializing the package.
+    const plannedIndexByPart = new Map<string, number>();
+    for (const [index, compiled] of input.compiledPresentation.slides.entries()) {
+      const slide = outputSlidesById.get(compiled.id);
+      if (!slide) throw new PptxBackendError('SLIDE_PROJECTION_FAILED', 'A generated slide could not be mapped back to its DeckPlan position.');
+      plannedIndexByPart.set(normalizePart(getSlidePartName(slide)), index);
+    }
+    sortSlides(presentation, (left, right) =>
+      (plannedIndexByPart.get(normalizePart(getSlidePartName(left))) ?? Number.MAX_SAFE_INTEGER)
+      - (plannedIndexByPart.get(normalizePart(getSlidePartName(right))) ?? Number.MAX_SAFE_INTEGER));
 
     stageStartedAt = performance.now();
     const savedBytes = await savePresentation(presentation);
@@ -907,6 +1001,12 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         ? (selection.slots.bodySlots.length ? selection.slots.bodySlots : [selection.slots.body]).map((slot) => slot.nativeId)
         : []);
       const outputShapes = getSlideShapes(outputSlide);
+      const expectedTitle = compiled.title.replace(/\s+/g, ' ').trim();
+      const hasExpectedTitle = outputShapes.some((shape) => hasShapeText(shape)
+        && getShapeText(shape).replace(/\s+/g, ' ').trim() === expectedTitle);
+      if (!hasExpectedTitle) {
+        throw new PptxBackendError('SLIDE_ORDER_MISMATCH', 'The reopened PPTX slide order does not match the generated DeckPlan.');
+      }
       for (const shape of outputShapes) {
         if (!hasShapeText(shape)) continue;
         const text = getShapeText(shape).trim();
@@ -993,7 +1093,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       unresolvedVisualTypes: [...unresolvedVisualTypes],
       visualIntents: input.compiledPresentation.slides.map((compiled) => visualIntentBySlide.get(compiled.id)!),
       projectedCompositions: input.compiledPresentation.slides.map((compiled) => {
-        const assessment: ExemplarSelectionAssessment = exemplarAssessments.get(compiled.id)!;
+        const assessment: RendererExemplarAssessment = exemplarAssessments.get(compiled.id)!;
         const selection = exemplarSelections.get(compiled.id) ?? null;
         return selection ? {
           slideId: compiled.id,

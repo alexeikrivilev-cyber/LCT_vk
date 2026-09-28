@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { TemplateSemanticProfiler } from '../apps/daemon/src/presentation/application/template-semantic-profiler.js';
+import { installLoopbackFetchGuard, isPathInside } from './lib/offline-safety.mjs';
 
 const repoRoot = process.cwd();
 if (!process.argv[2]) {
@@ -13,20 +15,12 @@ if (!process.argv[2]) {
 }
 const bundleRoot = path.resolve(process.argv[2]);
 const reportPath = path.join(bundleRoot, 'offline-replay-report.json');
+const immutableGoldenRoot = path.resolve(repoRoot, '.lct', 'golden-live-workspace');
+let canWriteReport = !isPathInside(bundleRoot, immutableGoldenRoot);
+const networkGuard = installLoopbackFetchGuard();
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const readJson = async (file) => JSON.parse(await readFile(file, 'utf8'));
 const daemonRequire = createRequire(path.join(repoRoot, 'apps/daemon/package.json'));
-const blockedNetwork = [];
-const originalFetch = globalThis.fetch;
-globalThis.fetch = async (input, init) => {
-  const rawUrl = input instanceof Request ? input.url : String(input);
-  const url = new URL(rawUrl);
-  if (!['127.0.0.1', 'localhost', '::1'].includes(url.hostname)) {
-    blockedNetwork.push(url.hostname);
-    throw new Error('Offline replay blocked non-loopback network access.');
-  }
-  return originalFetch(input, init);
-};
 async function closeServer(started) {
   await started.shutdown();
   started.server.closeAllConnections();
@@ -38,7 +32,7 @@ async function apiJson(base, route, init, expected = 200) {
   assert.equal(response.status, expected, 'Unexpected local API status: ' + response.status + ' ' + JSON.stringify(body));
   return body;
 }
-async function installFixtureProfile(bundle, projectDir, expectedTemplateHash) {
+async function installFixtureProfile(bundle, projectDir, expectedTemplateHash, currentProfileCacheKey) {
   const identity = await readJson(path.join(bundle, 'template-identities.json'));
   const profile = await readJson(path.join(bundle, 'semantic-profile-cache.json'));
   const status = await readJson(path.join(bundle, 'semantic-profile-status.json'));
@@ -46,13 +40,29 @@ async function installFixtureProfile(bundle, projectDir, expectedTemplateHash) {
   assert.equal(profile.templateIRHash, expectedTemplateHash);
   assert.equal(status.status, 'ready');
   assert.equal(status.profileCacheKey, identity.semanticProfile.profileCacheKey);
+  assert.match(currentProfileCacheKey, /^[a-f0-9]{64}$/u);
   const compilerDir = path.join(projectDir, '.template-compiler');
   await mkdir(path.join(compilerDir, 'semantic-profiles'), { recursive: true });
   await mkdir(path.join(compilerDir, 'semantic-profile-status'), { recursive: true });
-  await writeFile(path.join(compilerDir, 'semantic-profiles', status.profileCacheKey + '.json'), JSON.stringify(profile));
-  await writeFile(path.join(compilerDir, 'semantic-profile-status', status.profileCacheKey + '.json'), JSON.stringify(status));
+  // Bind the immutable captured profile to the current prompt fingerprint only
+  // inside this disposable replay project. Production cache invalidation remains
+  // prompt-aware; this fixture path exercises downstream code without inference.
+  await writeFile(path.join(compilerDir, 'semantic-profiles', currentProfileCacheKey + '.json'), JSON.stringify(profile));
+  await writeFile(path.join(compilerDir, 'semantic-profile-status', currentProfileCacheKey + '.json'),
+    JSON.stringify({ ...status, profileCacheKey: currentProfileCacheKey }));
 }
 async function main() {
+  try {
+    const [resolvedBundle, resolvedGoldenRoot] = await Promise.all([realpath(bundleRoot), realpath(immutableGoldenRoot)]);
+    if (isPathInside(resolvedBundle, resolvedGoldenRoot)) canWriteReport = false;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (!canWriteReport) {
+    const error = new Error('The golden live fixture is immutable; replay only from a disposable bundle copy.');
+    error.code = 'GOLDEN_FIXTURE_IMMUTABLE';
+    throw error;
+  }
   const golden = await readJson(path.join(bundleRoot, 'golden-manifest.json'));
   assert.equal(golden.status, 'PASS');
   const identity = await readJson(path.join(bundleRoot, 'template-identities.json'));
@@ -118,6 +128,7 @@ async function main() {
   const { startServer } = await import(pathToFileURL(path.join(repoRoot, 'apps/daemon/src/server.ts')));
   process.env.LCT_PPTX_BACKEND = 'office-kit';
   let templateFilePath;
+  let compiled;
   let server = await startServer({
     host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
     semanticInferenceAdapter: { model: 'offline-compile-only', async infer() { throw new Error('Inference is forbidden during template compilation.'); } },
@@ -135,7 +146,7 @@ async function main() {
     const uploaded = await uploadedResponse.json();
     templateFilePath = uploaded.files.find((file) => file.originalName === golden.template.originalName)?.path;
     assert.ok(templateFilePath);
-    const compiled = await apiJson(server.url, '/api/projects/' + encodeURIComponent(projectId) + '/template/compile', {
+    compiled = await apiJson(server.url, '/api/projects/' + encodeURIComponent(projectId) + '/template/compile', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: templateFilePath }),
     });
     assert.equal(compiled.templateIR.hash, golden.template.templateIRHash);
@@ -144,7 +155,8 @@ async function main() {
     server = null;
   }
 
-  await installFixtureProfile(bundleRoot, projectDir, golden.template.templateIRHash);
+  const currentProfileCacheKey = await new TemplateSemanticProfiler(fixtureAdapter).profileCacheKey(compiled.templateIR);
+  await installFixtureProfile(bundleRoot, projectDir, golden.template.templateIRHash, currentProfileCacheKey);
   const semanticCalls = [];
   const guardedAdapter = {
     model: fixtureAdapter.model,
@@ -235,12 +247,12 @@ async function main() {
       }
       exported.push({ mode: 'selected', format, bytes: bytes.length, sha256: sha256(bytes) });
     }
-    assert.equal(blockedNetwork.length, 0);
+    assert.equal(networkGuard.blockedRequestCount, 0);
     const replayReport = {
       status: 'PASS', mode: 'offline-real-fixture-replay', projectId,
       templateIRHash: template.templateIR.hash, pdsHash: identity.presentationDesignSystem.hash,
       contentIRHash: planning.contentIR.hash, deckPlanHash: planning.deckPlan.hash,
-      semanticFixtureCalls: calls, noProfilerCalls: true, noNetwork: blockedNetwork.length === 0,
+      semanticFixtureCalls: calls, noProfilerCalls: true, noNetwork: networkGuard.blockedRequestCount === 0,
       variantSlides: generation.slides.length, readyVariants: generation.slides.length * 3,
       deterministicAuditErrors: runManifest.auditSummary.errors, contextualAudit: 'PASS',
       exports: exported, sourceTemplateHash: sha256(sourceBytes),
@@ -254,13 +266,17 @@ async function main() {
     console.log(JSON.stringify(replayReport, null, 2));
   } finally {
     if (server) await closeServer(server);
-    await rm(tempRoot, { recursive: true, force: true });
+    if (process.env.LCT_GOLDEN_REPLAY_KEEP_TMP === '1') {
+      console.error(JSON.stringify({ event: 'golden.replay.temp_retained', path: tempRoot }));
+    } else {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   }
 }
 main().catch(async (error) => {
   const report = { status: 'FAIL', code: error?.code ?? 'GOLDEN_REPLAY_FAILED',
-    message: String(error?.message ?? error).slice(0, 800), diagnostic: error?.detail ?? null, deniedExternalRequests: blockedNetwork.length };
-  await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n').catch(() => undefined);
+    message: String(error?.message ?? error).slice(0, 800), diagnostic: error?.detail ?? null, deniedExternalRequests: networkGuard.blockedRequestCount };
+  if (canWriteReport) await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n').catch(() => undefined);
   console.error(JSON.stringify(report));
   process.exitCode = 1;
-});
+}).finally(() => networkGuard.restore());

@@ -3,6 +3,7 @@ import type { PerformanceDiagnosticsPort } from '../performance-diagnostics.js';
 
 import type { CompiledSlide, CompatibleLayoutMatchCandidate } from './slide-compilation.js';
 import type { TemplateElement, TemplateGeometry, TemplateIR, TemplateSlide } from '../domain/template-ir.js';
+import { fitProcessNodeLayout } from './process-layout.js';
 import { validateTemplateSemanticProfile, type TemplateSemanticProfile, type TemplateSemanticSlideProfile } from './template-semantic-profiler.js';
 
 const MIN_EXEMPLAR_CONFIDENCE = 0.72;
@@ -67,7 +68,7 @@ export interface ExemplarSlideSelection {
     blocked: string[];
   };
   clearElementNativeIds: string[];
-  /** Whole source shapes removed only when a trusted profile marks them as unused body copy. */
+  /** Source body copy and a uniquely geometry-associated panel may be removed when a trusted profile marks the slot unused. */
   removeElementNativeIds: string[];
   preserveChromeNativeIds: string[];
   /** Legacy source morphology key, retained as evidence only. It is not used for A/B/C deduplication. */
@@ -82,6 +83,7 @@ export interface ExemplarSlideSelection {
     mappedBodyRegionCount: number;
     projectedBodyRegionCount: number;
     unusedMappedBodyRegionCount: number;
+    unusedVisualSlotAreaShare: number;
     visualAreaShare: number;
     bodyAreaShare: number;
     bodyArrangementScore: number;
@@ -97,6 +99,8 @@ export interface ExemplarSelectionAssessment {
   selection: ExemplarSlideSelection | null;
   /** Every distinct candidate that passed all hard projection and geometry gates, ranked deterministically. */
   safeSelections: ExemplarSlideSelection[];
+  /** Exact already-qualified native/exemplar options by variant for bounded whole-deck assignment. */
+  safeOptionsByVariant?: Record<CompiledSlide['variantId'], VariantCompositionAssignment[]>;
   availableDistinctFamilies: number;
   distinctSourceFamilyKeys: string[];
   candidateDiagnostics: Array<{
@@ -118,6 +122,7 @@ export interface ExemplarSelectionAssessment {
     replacedTextElementIds: string[];
     clearedTextElementIds: string[];
     removedTextElementIds: string[];
+    removedPanelElementIds: string[];
     blockedTextElementIds: string[];
     gate: string;
     rejectReason: string | null;
@@ -134,6 +139,7 @@ export interface ExemplarSelectionAssessment {
       mappedBodyRegionCount: number;
       projectedBodyRegionCount: number;
       unusedMappedBodyRegionCount: number;
+      unusedVisualSlotAreaShare: number;
       visualAreaShare: number;
       bodyAreaShare: number;
       bodyArrangementScore: number;
@@ -257,12 +263,69 @@ function topLevelTextShapes(slide: TemplateSlide): TemplateElement[] {
   return slide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && Boolean(normalizedText(element)));
 }
 
-function overlapFraction(box: NonNullable<ReturnType<typeof geometryOf>>, region: { x: number; y: number; width: number; height: number }): number {
+function overlapFraction(box: { x: number; y: number; width: number; height: number }, region: { x: number; y: number; width: number; height: number }): number {
   const left = Math.max(box.x, region.x);
   const top = Math.max(box.y, region.y);
   const right = Math.min(box.x + box.width, region.x + region.width);
   const bottom = Math.min(box.y + box.height, region.y + region.height);
   return Math.max(0, right - left) * Math.max(0, bottom - top) / Math.max(1, area(box));
+}
+
+function associatedUnusedBodyPanels(
+  slide: TemplateSlide,
+  unusedBodies: readonly TemplateElement[],
+  protectedElementIds: ReadonlySet<string>,
+  template: TemplateIR,
+): TemplateElement[] {
+  const canvasArea = template.slideSize.width * template.slideSize.height;
+  const textElements = slide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && normalizedText(element));
+  const associations = unusedBodies.map((body) => {
+    const bodyBox = geometryOf(body);
+    if (!bodyBox || body.parentId !== null) return { panel: null as TemplateElement | null };
+    const matches = slide.elements.filter((element) => {
+      if (protectedElementIds.has(element.id) || element.parentId !== body.parentId || element.kind.toLowerCase() !== 'shape'
+          || element.placeholder !== null || normalizedText(element) || !element.nativeId || element.relationshipIds.length
+          || (!element.directStyles.fillColor && !element.directStyles.lineColor) || !geometryOf(element)) return false;
+      const panelBox = geometryOf(element)!;
+      const panelArea = area(panelBox);
+      return inCanvas(panelBox, template) && panelArea >= area(bodyBox) && panelArea <= canvasArea * 0.3
+        && panelArea / Math.max(1, area(bodyBox)) <= 2.2
+        && overlapFraction(bodyBox, panelBox) >= 0.92
+        && !textElements.some((text) => text.id !== body.id && geometryOf(text)
+          && overlapFraction(geometryOf(text)!, panelBox) >= 0.2);
+    });
+    return { panel: matches.length === 1 ? matches[0]! : null };
+  });
+  const panelCounts = new Map<string, number>();
+  for (const item of associations) if (item.panel) panelCounts.set(item.panel.id, (panelCounts.get(item.panel.id) ?? 0) + 1);
+  return associations.flatMap((item) => item.panel && panelCounts.get(item.panel.id) === 1 ? [item.panel] : []);
+}
+
+function unusedSemanticVisualSlots(
+  slide: TemplateSlide,
+  visualElementIds: readonly string[],
+  protectedTextIds: ReadonlySet<string>,
+  template: TemplateIR,
+): TemplateElement[] {
+  const canvasArea = template.slideSize.width * template.slideSize.height;
+  const protectedText = slide.elements.filter((element) => protectedTextIds.has(element.id) && normalizedText(element));
+  return slide.elements.filter((element) => {
+    if (!visualElementIds.includes(element.id) || element.parentId !== null || !element.nativeId
+        || element.kind.toLowerCase() !== 'shape' || element.placeholder !== null || normalizedText(element)
+        || element.relationshipIds.length) return false;
+    const box = geometryOf(element);
+    const visualArea = area(box);
+    // Only remove a large, explicitly profiled, empty vector slot. Keep small
+    // template accents and linked/native visual assets, and fail closed on unknown shapes.
+    // PPTX EMU conversion can leave a one-unit edge overhang (as in some
+    // Office Kit inspected layouts). Treat only that sub-pixel rounding as
+    // on-canvas; larger out-of-bounds objects remain protected.
+    const withinCanvasRounding = box && box.x >= -1 && box.y >= -1
+      && box.x + box.width <= template.slideSize.width + 1
+      && box.y + box.height <= template.slideSize.height + 1;
+    if (!box || !withinCanvasRounding || visualArea < canvasArea * 0.04 || visualArea > canvasArea * 0.32) return false;
+    return !protectedText.some((text) => geometryOf(text) && overlapFraction(geometryOf(text)!, box) >= 0.2);
+  });
 }
 
 function geometryBand(value: number, unit: number): number {
@@ -729,7 +792,7 @@ interface CandidateBuild {
   diagnostic: CandidateDiagnostic;
 }
 
-function inCanvas(box: TemplateGeometry, template: TemplateIR): boolean {
+function inCanvas(box: { x: number; y: number; width: number; height: number }, template: TemplateIR): boolean {
   return box.x >= 0 && box.y >= 0 && box.width > 0 && box.height > 0
     && box.x + box.width <= template.slideSize.width && box.y + box.height <= template.slideSize.height;
 }
@@ -837,6 +900,34 @@ function bodySlotsFor(
   }
   const elements = available.sort((left, right) => geometryOf(left)!.y - geometryOf(right)!.y
     || geometryOf(left)!.x - geometryOf(right)!.x || left.order - right.order);
+  const normalizeSequenceLabel = (value: string) => value.replace(/^\s*(?:\d+[.)]|[-*•])\s+/u, '')
+    .trim().replace(/\s+/gu, ' ').toLowerCase();
+  const sequenceLabels = compiled.visualization.processSteps.map((step) => step.text);
+  const bodyHostsSequence = sequenceLabels.length >= 2 && compiled.body.length > 0
+    && compiled.body.length <= sequenceLabels.length
+    && compiled.body.every((text) => sequenceLabels.some((step) => normalizeSequenceLabel(text) === normalizeSequenceLabel(step)));
+  if (bodyHostsSequence) {
+    const choices = elements.flatMap((element): BodySlotsChoice[] => {
+      const box = geometryOf(element)!;
+      if (!fitProcessNodeLayout({ x: box.x, y: box.y, width: box.width, height: box.height }, sequenceLabels, maxFont(element))) return [];
+      return [{
+        elements: [element],
+        ranges: [{ start: 0, end: compiled.body.length }],
+        fits: [1],
+        segments: [compiled.body.join('\n')],
+        segmentation: {
+          method: 'existing-blocks',
+          sourceTextSha256: createHash('sha256').update(sourceText).digest('hex'),
+          sourceBodyBlockCount: compiled.body.length,
+          fragmentCount: compiled.body.length,
+          regionCount: 1,
+        },
+      }];
+    });
+    diagnostics?.recordDuration('composition.bodySlotSearch', performance.now() - startedAt);
+    diagnostics?.increment('composition.bodySlotChoiceCount', choices.length);
+    return choices;
+  }
   // Splitting a single Worker block is permitted only with trusted, explicit
   // multi-region semantics. Sentence/paragraph boundaries remain intact and
   // every resulting segment is independently fit-checked below.
@@ -944,7 +1035,7 @@ function candidateFor(
     sourceResidueRisk: 'unassessed',
     visualElementIds,
     visualClassification: visualClasses.map((item) => `${item.elementId}:${item.kind}:${item.reason}`),
-    preservedTextElementIds: [], replacedTextElementIds: [], clearedTextElementIds: [], removedTextElementIds: [], blockedTextElementIds: [],
+    preservedTextElementIds: [], replacedTextElementIds: [], clearedTextElementIds: [], removedTextElementIds: [], removedPanelElementIds: [], blockedTextElementIds: [],
     gate: 'candidate-filter', rejectReason: null, familyKey: null, projectedCompositionSignature: null,
     projectionSafe: null, contentSafe: null, roleCompatible: false,
     titleGeometryNormalized: null, bodyGeometryNormalized: null, titleBodyFontHierarchy: null, designFeatures: null, evidence: [],
@@ -1068,22 +1159,33 @@ function candidateFor(
   const semanticReplaceableIds = new Set(trustedProfile?.replaceableTextElementIds ?? []);
   const preservedText = textShapes.filter((element) => (preservedChromeIds.has(element.id) || semanticPreservedIds.has(element.id))
     && !replacedTextIds.includes(element.id));
+  const unprojectedReplaceableText = textShapes.filter((element) => semanticReplaceableIds.has(element.id)
+    && !replacedTextIds.includes(element.id) && !preservedText.includes(element));
+  const removableUnusedReplaceableText = unprojectedReplaceableText.filter((element) => element.parentId === null
+    && Boolean(element.nativeId) && element.kind.toLowerCase() === 'shape' && element.relationshipIds.length === 0);
+  const removableUnusedReplaceableIds = new Set(removableUnusedReplaceableText.map((element) => element.id));
   const unusedMappedBodyIds = new Set(unprojectedMappedBodies.map((element) => element.id));
   const removableUnusedBodyIds = new Set(unprojectedMappedBodies.filter((element) => element.parentId === null
     && Boolean(element.nativeId) && element.kind.toLowerCase() === 'shape' && element.relationshipIds.length === 0)
     .map((element) => element.id));
   const removableUnusedBodies = unprojectedMappedBodies.filter((element) => removableUnusedBodyIds.has(element.id));
-  const explicitlyReplaceableText = textShapes.filter((element) => (semanticReplaceableIds.has(element.id)
+  const removableUnusedPanels = associatedUnusedBodyPanels(slide, [...removableUnusedBodies, ...removableUnusedReplaceableText],
+    new Set([...preservedChromeIds, ...visualElementIds, ...preservedText.map((element) => element.id), title.id, ...bodies.map((element) => element.id)]), template);
+  const renderableVisual = hasRenderableVisual(compiled);
+  const removableUnusedVisuals = renderableVisual ? [] : unusedSemanticVisualSlots(slide, visualElementIds,
+    new Set([...preservedChromeIds, ...preservedText.map((element) => element.id), title.id, ...bodies.map((element) => element.id)]), template);
+  const explicitlyReplaceableText = textShapes.filter((element) => (semanticReplaceableIds.has(element.id) && !removableUnusedReplaceableIds.has(element.id)
     || unusedMappedBodyIds.has(element.id) && !removableUnusedBodyIds.has(element.id))
     && !replacedTextIds.includes(element.id) && !preservedText.includes(element));
-  const projectedAwayText = [...explicitlyReplaceableText, ...removableUnusedBodies];
+  const projectedAwayText = [...explicitlyReplaceableText, ...removableUnusedBodies, ...removableUnusedReplaceableText];
   const blockedText = textShapes.filter((element) => !replacedTextIds.includes(element.id)
     && !preservedText.includes(element) && !projectedAwayText.includes(element));
   diagnostic.sourceResidueRisk = blockedText.length ? 'ambiguous' : 'clear';
   diagnostic.preservedTextElementIds = preservedText.map((element) => element.id);
   diagnostic.replacedTextElementIds = replacedTextIds;
   diagnostic.clearedTextElementIds = explicitlyReplaceableText.map((element) => element.id);
-  diagnostic.removedTextElementIds = removableUnusedBodies.map((element) => element.id);
+  diagnostic.removedTextElementIds = [...removableUnusedBodies, ...removableUnusedReplaceableText].map((element) => element.id);
+  diagnostic.removedPanelElementIds = removableUnusedPanels.map((element) => element.id);
   diagnostic.blockedTextElementIds = blockedText.map((element) => element.id);
   const bodyLineCapacity = Math.max(0.25, bodies.reduce((sum, item) => {
     const box = geometryOf(item)!;
@@ -1117,6 +1219,9 @@ function candidateFor(
   const unsupportedDataArchetypePenalty = !hasSourceBackedStructuredData
     && ['table-data', 'metric-evidence'].some((archetypeName) => archetypeName === strategyArchetype || archetypeName === profileArchetype)
     ? 0.52 : 0;
+  const noVisualContentPenalty = !renderableVisual
+    && ['visual-led', 'hero'].some((archetypeName) => archetypeName === strategyArchetype || archetypeName === profileArchetype)
+    ? 0.5 : 0;
   const roleScore = rolePreference(compiled.intent, strategyArchetype);
   const semanticConflictPenalty = semanticConflict ? 0.04 : 0;
   const connectorCount = slide.elements.filter((element) => element.kind.toLowerCase() === 'connector').length;
@@ -1139,15 +1244,17 @@ function candidateFor(
   const bodyPointCount = compiled.body.length;
   const bodyRegionMatch = Math.max(-0.12, 0.06 - Math.abs(bodies.length - bodyPointCount) * 0.04);
   const unusedBodyPenalty = Math.min(0.3, removableUnusedBodies.length * 0.025);
+  const unusedVisualSlotAreaShare = Number((removableUnusedVisuals.reduce((sum, element) => sum + area(geometryOf(element)), 0) / canvasArea).toFixed(4));
+  const unusedVisualSlotPenalty = Math.min(0.24, unusedVisualSlotAreaShare * 0.8);
   const bodyArrangementPreference = (bodyArrangement - 0.5) * 0.3;
   const semanticBoost = roleScore + strategyScore + profileStrategyScore + visualIntentScore + densityPreference
-    + bodyRegionMatch + bodyArrangementPreference - unusedBodyPenalty - semanticConflictPenalty - unsupportedDataArchetypePenalty;
+    + bodyRegionMatch + bodyArrangementPreference - unusedBodyPenalty - unusedVisualSlotPenalty - semanticConflictPenalty
+    - unsupportedDataArchetypePenalty - noVisualContentPenalty;
   const segmentedRegionBoost = bodies.length > 1 && bodyChoice.segmentation.method !== 'existing-blocks' ? 0.08 : 0;
   const score = confidenceScore + semanticBoost + segmentedRegionBoost - Math.min(0.25, contentGateReasons.length * 0.1)
     - (textDensity < 0.08 && bodyAreaShare > 0.3 ? 0.12 : 0);
   const clearElementNativeIds = [...new Set(explicitlyReplaceableText)].map((element) => element.nativeId!);
-  const removeElementNativeIds = [...new Set(removableUnusedBodies)].map((element) => element.nativeId!);
-  const renderableVisual = hasRenderableVisual(compiled);
+  const removeElementNativeIds = [...new Set([...removableUnusedBodies, ...removableUnusedReplaceableText, ...removableUnusedPanels, ...removableUnusedVisuals])].map((element) => element.nativeId!);
   const visualSlots = renderableVisual ? visualClasses.filter((item) => item.kind === 'content-slot'
     && (visualElementIds.includes(item.elementId) || /picture|image|chart|table|graphic/i.test(
       `${slide.elements.find((element) => element.id === item.elementId)?.placeholder?.type ?? ''} ${slide.elements.find((element) => element.id === item.elementId)?.placeholder?.role ?? ''}`)))
@@ -1179,8 +1286,9 @@ function candidateFor(
     ...(semanticConflict ? [`semantic/structural conflict: profile=${trustedProfile!.archetype}, structural=${archetype.archetype}; structural safety remains authoritative`] : []),
     `projected body density estimate ${textDensity.toFixed(3)}`,
     `projected body region arrangement score ${bodyArrangement.toFixed(3)}`,
+    `strategy preference=${strategyScore.toFixed(3)}, profile preference=${profileStrategyScore.toFixed(3)}, no-visual-content penalty=${noVisualContentPenalty.toFixed(3)}, unused-body penalty=${unusedBodyPenalty.toFixed(3)}, unused-visual-slot area=${unusedVisualSlotAreaShare.toFixed(4)} penalty=${unusedVisualSlotPenalty.toFixed(3)}`,
     ...contentGateReasons.map((reason) => `content-sanity gate: ${reason}`),
-    `${textShapes.length} text shapes classified: ${preservedText.length} preserved, ${replacedTextIds.length} replaced, ${clearElementNativeIds.length} cleared, ${removeElementNativeIds.length} unused body panel(s) removed, ${blockedText.length} blocked`,
+    `${textShapes.length} text shapes classified: ${preservedText.length} preserved, ${replacedTextIds.length} replaced, ${clearElementNativeIds.length} cleared; ${removableUnusedBodies.length} unused body region(s), ${removableUnusedReplaceableText.length} unused replaceable text shape(s), ${removableUnusedPanels.length} associated panel(s), and ${removableUnusedVisuals.length} empty profiled visual slot(s) removed; ${blockedText.length} blocked`,
     `${visualClasses.length} visual object(s) classified as ${Object.entries(visualClassCounts).map(([kind, count]) => `${kind}=${count}`).join(', ') || 'none'}`,
     `${slide.elements.filter((element) => element.kind.toLowerCase() === 'connector').length} native connectors and ${slide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && !normalizedText(element)).length} unlabelled shapes retained`,
     `${titleSupport} title evidence records and ${bodySupport} body evidence records refer to this source slide`,
@@ -1217,7 +1325,9 @@ function candidateFor(
       removeElementNativeIds,
       preserveChromeNativeIds,
       familyKey: familyKey(slide, title, body, template),
-      projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies, removableUnusedBodyIds, compiled.body.some((text) => text.trim()),
+      projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies,
+        new Set([...removableUnusedBodyIds, ...removableUnusedReplaceableIds, ...removableUnusedPanels.map((element) => element.id), ...removableUnusedVisuals.map((element) => element.id)]),
+        compiled.body.some((text) => text.trim()),
         new Set([...preservedChromeIds, ...preservedText.map((element) => element.id)]), template, visualSlot),
       titleGeometryNormalized: titleNormalized,
       bodyGeometryNormalized: bodyNormalized,
@@ -1227,6 +1337,7 @@ function candidateFor(
         mappedBodyRegionCount: trustedProfile?.bodyElementIds.length ?? bodies.length,
         projectedBodyRegionCount: bodies.length,
         unusedMappedBodyRegionCount: removableUnusedBodies.length,
+        unusedVisualSlotAreaShare,
         visualAreaShare: Number(archetype.visualAreaShare.toFixed(4)),
         bodyAreaShare: Number(bodyAreaShare.toFixed(4)),
         bodyArrangementScore: bodyArrangement,
@@ -1287,8 +1398,21 @@ function nativePlaceholderFallbackSupported(
   if (!titleBox || !bodyBox || !inCanvas(titleBox, template) || !inCanvas(bodyBox, template)
       || (titleBox.x < bodyBox.x + bodyBox.width && titleBox.x + titleBox.width > bodyBox.x
         && titleBox.y < bodyBox.y + bodyBox.height && titleBox.y + titleBox.height > bodyBox.y)
-      || projectedTitle.fit < projectedTitle.minimum
-      || compiled.body.length > 0 && estimatedLineFit(compiled.body.join('\n'), body) < 0.55) return false;
+      || projectedTitle.fit < projectedTitle.minimum) return false;
+  const processSteps = compiled.visualization.processSteps;
+  if (processSteps.length >= 2) {
+    const fontPt = maxFont(body);
+    if (fontPt < 7.5) return false;
+    const visualBox = candidate.visualBox;
+    const separateVisualIsSafe = Boolean(visualBox && inCanvas(visualBox, template)
+      && ![titleBox, bodyBox].some((box) => box.x < visualBox.x + visualBox.width && box.x + box.width > visualBox.x
+        && box.y < visualBox.y + visualBox.height && box.y + box.height > visualBox.y));
+    const processBox = separateVisualIsSafe ? visualBox
+      : compiled.body.length <= processSteps.length ? bodyBox : null;
+    if (!processBox) return false;
+    if (!fitProcessNodeLayout({ x: processBox.x, y: processBox.y, width: processBox.width, height: processBox.height },
+      processSteps.map((step) => step.text), fontPt)) return false;
+  } else if (compiled.body.length > 0 && estimatedLineFit(compiled.body.join('\n'), body) < 1) return false;
   const master = sourceLayout.masterId ? template.masters.find((candidate) => candidate.id === sourceLayout.masterId) : null;
   // Static inherited text is not editable through the generated slide. Repetition
   // across sibling layouts is insufficient evidence that sample copy is chrome.
@@ -1317,6 +1441,7 @@ export function applyVariantCompositionAssignment(
   assignment: VariantCompositionAssignment,
   template: TemplateIR,
   semanticProfile?: TemplateSemanticProfile,
+  qualifiedOptions?: readonly VariantCompositionAssignment[],
 ): CompiledSlide {
   if (compiled.variantId !== assignment.variantId) throw new TypeError('Composition assignment does not match the compiled variant');
   if (assignment.compositionKind === 'exemplar-backed') {
@@ -1325,14 +1450,17 @@ export function applyVariantCompositionAssignment(
         || selection.projectedCompositionSignature !== assignment.projectedCompositionSignature) {
       throw new TypeError('Qualified exemplar assignment is missing its exact validated donor selection');
     }
-    const assessment = assessExemplarSelection(compiled, template, semanticProfile);
-    if (!assessment.safeSelections.some((candidate) => candidate.sourcePart === selection.sourcePart
-        && candidate.sourceSlideIndex === selection.sourceSlideIndex
-        && candidate.projectedCompositionSignature === selection.projectedCompositionSignature)) {
-      throw new TypeError('Qualified exemplar assignment no longer passes the current hard projection gates');
+    if (!qualifiedOptions?.includes(assignment)) {
+      const assessment = assessExemplarSelection(compiled, template, semanticProfile);
+      if (!assessment.safeSelections.some((candidate) => candidate.sourcePart === selection.sourcePart
+          && candidate.sourceSlideIndex === selection.sourceSlideIndex
+          && candidate.projectedCompositionSignature === selection.projectedCompositionSignature)) {
+        throw new TypeError('Qualified exemplar assignment no longer passes the current hard projection gates');
+      }
     }
-    const { nativeLayoutFallback: _fallback, ...automatic } = compiled;
-    return { ...automatic, exemplarSelection: selection };
+    const { nativeLayoutFallback: _fallback, exemplarSelectionValidation: _priorValidation, ...automatic } = compiled;
+    return { ...automatic, exemplarSelection: selection,
+      exemplarSelectionValidation: { templateIRHash: template.hash, signature: selection.projectedCompositionSignature } };
   }
   if (assignment.compositionKind === 'safe-generated-fallback') {
     const { nativeLayoutFallback: _fallback, exemplarSelection: _exemplar, ...automatic } = compiled;
@@ -1342,7 +1470,7 @@ export function applyVariantCompositionAssignment(
   if (!candidate || !nativePlaceholderFallbackSupported(compiled, template, candidate)) {
     throw new TypeError('Qualified native layout composition is no longer safe for the compiled slide');
   }
-  const { exemplarSelection: _exemplar, ...withoutExemplar } = withLayoutCandidate(compiled, candidate, assignment.layoutCandidateIndex);
+  const { exemplarSelection: _exemplar, exemplarSelectionValidation: _validation, ...withoutExemplar } = withLayoutCandidate(compiled, candidate, assignment.layoutCandidateIndex);
   return { ...withoutExemplar, nativeLayoutFallback: true };
 }
 
@@ -1350,10 +1478,10 @@ export function applyVariantCompositionAssignment(
  * Inspect donor choices and return explicit distinct-family evidence even when the requested rank is unavailable.
  * A/B/C are deduplicated after text replacement, source-text cleanup, chrome retention, and note removal.
  */
-export function assessExemplarSelection(
+function assessExemplarSelectionWithValidatedProfile(
   compiled: CompiledSlide,
   template: TemplateIR,
-  semanticProfileInput?: TemplateSemanticProfile,
+  semanticProfile?: TemplateSemanticProfile,
   diagnostics?: PerformanceDiagnosticsPort,
   visualClassificationCache?: CompositionVisualClassificationCache,
 ): ExemplarSelectionAssessment {
@@ -1368,9 +1496,6 @@ export function assessExemplarSelection(
     supportedCandidateCount: 0,
     evidence: ['the qualified composition assignment requires the measured native layout placeholders'],
   };
-  const validationStartedAt = performance.now();
-  const semanticProfile = semanticProfileInput ? validateTemplateSemanticProfile(semanticProfileInput, template) : undefined;
-  diagnostics?.recordDuration('composition.semanticProfileValidation', performance.now() - validationStartedAt);
   const layout = compiled.layoutCandidates.find((candidate) => candidate.layoutId === compiled.layoutId
     && candidate.sourcePart === compiled.layoutSourcePart);
   const titleEvidence = layout?.slotEvidence.title;
@@ -1453,6 +1578,22 @@ export function assessExemplarSelection(
   return result;
 }
 
+export function assessExemplarSelection(
+  compiled: CompiledSlide,
+  template: TemplateIR,
+  semanticProfileInput?: TemplateSemanticProfile,
+  diagnostics?: PerformanceDiagnosticsPort,
+  visualClassificationCache?: CompositionVisualClassificationCache,
+): ExemplarSelectionAssessment {
+  if (compiled.nativeLayoutFallback) {
+    return assessExemplarSelectionWithValidatedProfile(compiled, template, undefined, diagnostics, visualClassificationCache);
+  }
+  const validationStartedAt = performance.now();
+  const semanticProfile = semanticProfileInput ? validateTemplateSemanticProfile(semanticProfileInput, template) : undefined;
+  diagnostics?.recordDuration('composition.semanticProfileValidation', performance.now() - validationStartedAt);
+  return assessExemplarSelectionWithValidatedProfile(compiled, template, semanticProfile, diagnostics, visualClassificationCache);
+}
+
 /** Select the safe post-projection family rank for this variant, or null if that distinct rank is unavailable. */
 export function selectExemplarSlide(compiled: CompiledSlide, template: TemplateIR, semanticProfile?: TemplateSemanticProfile): ExemplarSlideSelection | null {
   return assessExemplarSelection(compiled, template, semanticProfile).selection;
@@ -1471,6 +1612,8 @@ export interface VariantCompositionDistinctness {
   candidateCounts: { sourceCandidates: number; safeExemplarOptions: number; safeLayoutOptions: number; distinctSafeSignatures: number };
   signatures: string[];
   assignments: VariantCompositionAssignment[];
+  /** Exact qualified options by track for bounded deck-level distinctness assignment. */
+  safeOptionsByVariant: Record<CompiledSlide['variantId'], VariantCompositionAssignment[]>;
   evidence: string[];
 }
 
@@ -1479,6 +1622,11 @@ export function assignSafeVariantCompositions(
   optionsByVariant: readonly (readonly VariantCompositionAssignment[])[],
 ): VariantCompositionAssignment[] {
   if (optionsByVariant.length !== 3 || optionsByVariant.some((options) => options.length === 0)) return [];
+  // This local choice only supplies a preferred option for each track. The
+  // complete safe-option lists remain available to assignDeckVariantCompositions.
+  // Bound the local preference search because arbitrary templates can contribute
+  // hundreds of qualified donors per slide.
+  const rankedOptions = optionsByVariant.map((options) => options.slice(0, 16));
   let best: VariantCompositionAssignment[] | null = null;
   let bestDistinctDonorCount = -1;
   let bestDistinctCount = -1;
@@ -1489,13 +1637,13 @@ export function assignSafeVariantCompositions(
 
   const visit = (variantIndex: number): void => {
     if (variantIndex === optionsByVariant.length) {
-      const complete = chosen.map((option, index) => option ?? optionsByVariant[index]![0]!);
+      const complete = chosen.map((option, index) => option ?? rankedOptions[index]![0]!);
       const distinctDonorCount = new Set(complete.map((option) => option.compositionFamilyKey ?? (option.exemplarSelection
         ? `${option.exemplarSelection.sourcePart}|${option.exemplarSelection.sourceSlideIndex}`
         : `${option.compositionKind}|${option.layoutCandidateIndex}`))).size;
       const distinctCount = new Set(complete.map((option) => option.projectedCompositionSignature)).size;
       const exemplarCount = complete.filter((option) => option.compositionKind === 'exemplar-backed').length;
-      const rankCost = complete.reduce((cost, option, index) => cost + optionsByVariant[index]!.indexOf(option), 0);
+      const rankCost = complete.reduce((cost, option, index) => cost + rankedOptions[index]!.indexOf(option), 0);
       if (distinctCount > bestDistinctCount
           || distinctCount === bestDistinctCount && (exemplarCount > bestExemplarCount
             || exemplarCount === bestExemplarCount && (distinctDonorCount > bestDistinctDonorCount
@@ -1509,7 +1657,7 @@ export function assignSafeVariantCompositions(
       return;
     }
 
-    for (const option of optionsByVariant[variantIndex]!) {
+    for (const option of rankedOptions[variantIndex]!) {
       if (usedSignatures.has(option.projectedCompositionSignature)) continue;
       usedSignatures.add(option.projectedCompositionSignature);
       chosen.push(option);
@@ -1525,6 +1673,146 @@ export function assignSafeVariantCompositions(
   };
   visit(0);
   return best ?? [];
+}
+
+interface DeckSequenceCandidate {
+  assignments: VariantCompositionAssignment[];
+  signatures: string[];
+  signature: string;
+  cost: number;
+}
+
+function deckSequenceDistance(left: readonly string[], right: readonly string[]): number {
+  let differentSlides = 0;
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    if (left[index] !== right[index]) differentSlides += 1;
+  }
+  return differentSlides;
+}
+
+function retainDiverseDeckCandidates(
+  candidates: readonly DeckSequenceCandidate[],
+  limit: number,
+): DeckSequenceCandidate[] {
+  const ranked = [...candidates].sort((left, right) => left.cost - right.cost || left.signature.localeCompare(right.signature));
+  if (ranked.length <= limit) return ranked;
+
+  // Keep low-cost anchors for the track policy, then reserve the rest of the
+  // bounded search beam for different safe slide sequences. A cost-only beam
+  // can otherwise discard the alternatives needed for visibly distinct decks.
+  const anchors = Math.min(24, Math.floor(limit / 3));
+  const selected = ranked.slice(0, anchors);
+  const selectedSignatures = new Set(selected.map((candidate) => candidate.signature));
+  const remaining = ranked.slice(anchors, Math.min(ranked.length, limit * 8));
+  const nearestDistance = new Map(remaining.map((candidate) => [candidate.signature,
+    selected.length ? Math.min(...selected.map((existing) => deckSequenceDistance(candidate.signatures, existing.signatures))) : 0]));
+  while (selected.length < limit && remaining.length > 0) {
+    let bestIndex = 0;
+    let bestDistance = -1;
+    for (let index = 0; index < remaining.length; index += 1) {
+      const candidate = remaining[index]!;
+      const minimumDistance = nearestDistance.get(candidate.signature) ?? 0;
+      const current = remaining[bestIndex]!;
+      if (minimumDistance > bestDistance
+          || (minimumDistance === bestDistance && (candidate.cost < current.cost
+            || (candidate.cost === current.cost && candidate.signature.localeCompare(current.signature) < 0)))) {
+        bestIndex = index;
+        bestDistance = minimumDistance;
+      }
+    }
+    const [candidate] = remaining.splice(bestIndex, 1);
+    if (candidate && !selectedSignatures.has(candidate.signature)) {
+      selected.push(candidate);
+      selectedSignatures.add(candidate.signature);
+      for (const other of remaining) {
+        nearestDistance.set(other.signature, Math.min(nearestDistance.get(other.signature) ?? 0,
+          deckSequenceDistance(candidate.signatures, other.signatures)));
+      }
+    }
+  }
+  return selected.sort((left, right) => left.cost - right.cost || left.signature.localeCompare(right.signature));
+}
+
+/**
+ * Selects among exact per-slide safe options so A/B/C are as different as
+ * possible as complete ordered decks. Pairwise slide difference is optimized
+ * before strategy/rank cost; no candidate is synthesized or allowed past an
+ * existing hard gate. The search is bounded to 128 sequences and 64 options
+ * per slide.
+ */
+export function assignDeckVariantCompositions(
+  slides: readonly Record<CompiledSlide['variantId'], readonly VariantCompositionAssignment[]>[],
+): Record<CompiledSlide['variantId'], VariantCompositionAssignment[]> | null {
+  if (!slides.length || slides.some((slide) => (['A', 'B', 'C'] as const).some((variant) => slide[variant].length === 0
+      || slide[variant].some((option) => option.variantId !== variant)))) return null;
+  const beamWidth = 128;
+  const optionLimit = 64;
+  const deckCandidates = {} as Record<CompiledSlide['variantId'], DeckSequenceCandidate[]>;
+  for (const variant of ['A', 'B', 'C'] as const) {
+    let beam: DeckSequenceCandidate[] = [{ assignments: [], signatures: [], signature: '', cost: 0 }];
+    for (const slide of slides) {
+      const options = slide[variant].slice(0, optionLimit);
+      const next = new Map<string, DeckSequenceCandidate>();
+      for (const prefix of beam) for (const [rank, option] of options.entries()) {
+        const previous = prefix.assignments.at(-1);
+        const family = option.compositionFamilyKey
+          ?? (option.exemplarSelection ? `${option.exemplarSelection.sourcePart}|${option.exemplarSelection.sourceSlideIndex}` : option.projectedCompositionSignature);
+        const previousFamily = previous?.compositionFamilyKey
+          ?? (previous?.exemplarSelection ? `${previous.exemplarSelection.sourcePart}|${previous.exemplarSelection.sourceSlideIndex}` : previous?.projectedCompositionSignature);
+        const familyUseCount = prefix.assignments.filter((assigned) => {
+          const assignedFamily = assigned.compositionFamilyKey
+            ?? (assigned.exemplarSelection ? `${assigned.exemplarSelection.sourcePart}|${assigned.exemplarSelection.sourceSlideIndex}` : assigned.projectedCompositionSignature);
+          return assignedFamily === family;
+        }).length;
+        const repeatCost = (previousFamily === family ? 1.25 : 0)
+          + familyUseCount * Math.max(1, options.length / Math.max(2, slides.length / 2));
+        const assignments = [...prefix.assignments, option];
+        const signatures = [...prefix.signatures, option.projectedCompositionSignature];
+        const signature = signatures.join('\u001f');
+        const candidate = { assignments, signatures, signature, cost: prefix.cost + rank + repeatCost };
+        const existing = next.get(signature);
+        if (!existing || candidate.cost < existing.cost) next.set(signature, candidate);
+      }
+      beam = retainDiverseDeckCandidates([...next.values()], beamWidth);
+    }
+    deckCandidates[variant] = beam;
+  }
+
+  let best: [DeckSequenceCandidate, DeckSequenceCandidate, DeckSequenceCandidate] | null = null;
+  let bestMinimumDistance = -1;
+  let bestTotalDistance = -1;
+  let bestCost = Number.POSITIVE_INFINITY;
+  let bestSignature = '';
+  for (const a of deckCandidates.A) for (const b of deckCandidates.B) {
+    if (a.signature === b.signature) continue;
+    const distanceAB = deckSequenceDistance(a.signatures, b.signatures);
+    for (const c of deckCandidates.C) {
+      if (c.signature === a.signature || c.signature === b.signature) continue;
+      const distanceAC = deckSequenceDistance(a.signatures, c.signatures);
+      const distanceBC = deckSequenceDistance(b.signatures, c.signatures);
+      const minimumDistance = Math.min(distanceAB, distanceAC, distanceBC);
+      const totalDistance = distanceAB + distanceAC + distanceBC;
+      const cost = a.cost + b.cost + c.cost;
+      const signature = `${a.signature}\u001e${b.signature}\u001e${c.signature}`;
+      if (minimumDistance > bestMinimumDistance
+          || (minimumDistance === bestMinimumDistance && totalDistance > bestTotalDistance)
+          || (minimumDistance === bestMinimumDistance && totalDistance === bestTotalDistance && cost < bestCost)
+          || (minimumDistance === bestMinimumDistance && totalDistance === bestTotalDistance && cost === bestCost
+            && (bestSignature === '' || signature.localeCompare(bestSignature) < 0))) {
+        best = [a, b, c];
+        bestMinimumDistance = minimumDistance;
+        bestTotalDistance = totalDistance;
+        bestCost = cost;
+        bestSignature = signature;
+      }
+    }
+  }
+  if (!best) return null;
+  return {
+    A: best[0].assignments,
+    B: best[1].assignments,
+    C: best[2].assignments,
+  };
 }
 
 /** Check one planned slide across all three tracks before presenting them as A/B/C alternatives. */
@@ -1563,11 +1851,15 @@ export function assessVariantCompositionDistinctness(
       distinct, availableDistinctFamilies,
       candidateCounts: { sourceCandidates: 0, safeExemplarOptions: 0, safeLayoutOptions: 0, distinctSafeSignatures: availableDistinctFamilies },
       signatures, assignments,
+      safeOptionsByVariant: Object.fromEntries(assignments.map((assignment) => [assignment.variantId, [assignment]])) as Record<CompiledSlide['variantId'], VariantCompositionAssignment[]>,
       evidence: distinct ? ['A/B/C have three distinct projected composition signatures']
         : [`availableDistinctFamilies=${availableDistinctFamilies}; duplicate projected compositions are withheld`],
     };
   } else {
-    const assessments = ordered.map((slide) => assessExemplarSelection(slide, template, semanticProfile, diagnostics, visualClassificationCache));
+    const validationStartedAt = performance.now();
+    const validatedProfile = semanticProfile ? validateTemplateSemanticProfile(semanticProfile, template) : undefined;
+    diagnostics?.recordDuration('composition.semanticProfileValidation', performance.now() - validationStartedAt);
+    const assessments = ordered.map((slide) => assessExemplarSelectionWithValidatedProfile(slide, template, validatedProfile, diagnostics, visualClassificationCache));
     type Option = VariantCompositionAssignment;
     const optionsByVariant = ordered.map((slide, index) => {
       const options: Option[] = [];
@@ -1637,6 +1929,7 @@ export function assessVariantCompositionDistinctness(
       },
       signatures,
       assignments,
+      safeOptionsByVariant: Object.fromEntries(variants.map((variant, index) => [variant, optionsByVariant[index]!])) as Record<CompiledSlide['variantId'], VariantCompositionAssignment[]>,
       evidence: assignments.length === variants.length
         ? [
           `availableDistinctFamilies=${availableDistinctFamilies}; safe assignments are available for every track`,

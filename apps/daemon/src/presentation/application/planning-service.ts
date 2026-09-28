@@ -569,7 +569,7 @@ function validateStoredState(value: unknown): StoredPlanningState {
         || !Array.isArray(saved.contentFiles) || saved.contentFiles.length > MAX_SELECTED_FILES
         || saved.contentFiles.some((item) => typeof item !== 'string') || !isHexHash(saved.inputFingerprint)
         || !isRecord(saved.promptVersions) || !exactKeys(saved.promptVersions, ['worker', 'supervisor'])
-        || !['worker-deck-plan.v1', 'worker-deck-plan.v2', 'worker-deck-plan.v3', 'worker-deck-plan.v4', WORKER_PLAN_PROMPT_VERSION].includes(String(saved.promptVersions.worker))
+        || !['worker-deck-plan.v1', 'worker-deck-plan.v2', 'worker-deck-plan.v3', 'worker-deck-plan.v4', 'worker-deck-plan.v5', WORKER_PLAN_PROMPT_VERSION].includes(String(saved.promptVersions.worker))
         || saved.promptVersions.supervisor !== SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION
         || !(saved.agentWorkflowVersions === undefined || isAgentWorkflowVersions(saved.agentWorkflowVersions))
         || typeof saved.model !== 'string' || saved.model.length > 256

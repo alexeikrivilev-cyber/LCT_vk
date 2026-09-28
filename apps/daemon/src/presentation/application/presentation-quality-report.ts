@@ -65,6 +65,13 @@ export interface PresentationQualityReport {
   deterministicSafetyAuditIsSeparate: true;
 }
 
+/** Hard qualification blockers; heuristic pre-render capacity estimates remain review evidence. */
+export function presentationQualityBlockers(report: PresentationQualityReport): PresentationQualityFinding[] {
+  return report.findings.filter((finding) => finding.severity === 'error'
+    && !(finding.ruleId === 'text-fit.pre-render-capacity-exceeded' && finding.confidence === 'medium')
+    || finding.ruleId === 'template-consistency.track-strategy-not-distinct' && finding.severity === 'warning');
+}
+
 export interface PresentationQualityCompositionEvidence {
   signaturesByVariant: Partial<Record<PresentationVariantId, readonly string[]>>;
   kindsByVariant?: Partial<Record<PresentationVariantId, readonly string[]>>;
@@ -122,7 +129,24 @@ function roleStyles(input: BuildPresentationQualityReportInput, slide: CompiledS
   };
 }
 
-function bodyCapacityFit(slide: CompiledSlide, fontPt: number): number | null {
+function bodyCapacityFit(slide: CompiledSlide, fontPt: number, renderEvidence?: BuildPresentationQualityReportInput['renderEvidence']): number | null {
+  const renderedBody = renderEvidence?.textObjects.filter((item) => item.slideId === slide.id && item.role === 'body'
+    && item.textLength > 0 && item.bounds && item.bounds.width > 0 && item.bounds.height > 0) ?? [];
+  if (renderedBody.length) {
+    const ratios = renderedBody.flatMap((item) => {
+      const bounds = item.bounds!;
+      const actualFontPt = item.fontSizePt ?? fontPt;
+      if (actualFontPt <= 0) return [];
+      const charsPerLine = Math.max(1, (bounds.width / 12700) / (actualFontPt * 0.58));
+      const availableLines = Math.max(0.25, (bounds.height / 12700) / (actualFontPt * 1.2));
+      return [Math.max(1, Math.ceil(item.textLength / charsPerLine)) / availableLines];
+    });
+    return ratios.length ? Math.max(...ratios) : null;
+  }
+  // A body-hosted process sequence is emitted as native visual nodes rather
+  // than a body text region; do not estimate the same copy against an empty
+  // compiled body placeholder.
+  if (slide.visualization.processSteps.length >= 2) return null;
   const { width, height } = slide.placements.body;
   if (width <= 0 || height <= 0 || fontPt <= 0) return null;
   const widthPt = width / 12700;
@@ -199,7 +223,7 @@ export function buildPresentationQualityReport(input: BuildPresentationQualityRe
     }
 
     if (bodyPt !== null && slide.body.length) {
-      const fitRatio = bodyCapacityFit(slide, bodyPt);
+      const fitRatio = bodyCapacityFit(slide, bodyPt, input.renderEvidence);
       if (fitRatio !== null) {
         if (fitRatio > 1) add({ category: 'text-fit', severity: 'error', slideId: slide.id, ruleId: 'text-fit.pre-render-capacity-exceeded',
           message: 'Estimated body text exceeds measured template slot capacity.', evidence: { requiredToAvailableLineRatio: Number(fitRatio.toFixed(3)), bodyFontPt: bodyPt }, confidence: 'medium' });
@@ -253,8 +277,9 @@ export function buildPresentationQualityReport(input: BuildPresentationQualityRe
   for (const issue of textIssues) {
     const record = typeof issue === 'object' && issue !== null ? issue as Record<string, unknown> : {};
     const officeKitEvidence = typeof record.source === 'string' && record.source.startsWith('@office-kit/');
-    const approximate = record.approximate === true || record.confidence === 'low' || officeKitEvidence;
-    const severity = approximate || record.confidence === 'unknown' ? 'warning' as const
+    const approximate = record.approximate === true || record.confidence === 'low'
+      || officeKitEvidence && record.classification === 'PREVIEW_TEXT_METRIC_APPROXIMATION';
+    const severity = approximate ? 'warning' as const
       : record.severity === 'error' ? 'error' as const : 'warning' as const;
     add({ category: 'text-fit', severity, slideId: typeof record.slideIndex === 'number'
       ? input.presentation.slides[record.slideIndex]?.id ?? null : null,
@@ -266,7 +291,7 @@ export function buildPresentationQualityReport(input: BuildPresentationQualityRe
       kind: typeof record.kind === 'string' ? record.kind : 'unknown', approximate,
       overflowPx: typeof record.overflowPx === 'number' ? record.overflowPx : null,
       extraLines: typeof record.extraLines === 'number' ? record.extraLines : null },
-      confidence: approximate ? 'low' : 'medium' });
+      confidence: approximate ? 'low' : record.severity === 'error' ? 'high' : 'medium' });
   }
 
   if (input.safetyAudit) {

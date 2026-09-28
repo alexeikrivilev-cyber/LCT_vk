@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "createdAt": "2026-09-26",
-  "updatedAt": "2026-09-27",
+  "updatedAt": "2026-09-28",
   "recordKind": "agent-skill-workflow-contract",
   "agents": {
     "worker": {
@@ -9,7 +9,7 @@
       "agentVersion": "deck-plan-worker.v1",
       "skillId": "presentation-planning",
       "skillVersion": "presentation-planning.v1",
-      "promptVersion": "worker-deck-plan.v5",
+      "promptVersion": "worker-deck-plan.v6",
       "schemaVersion": "deck_plan_draft_v4",
       "modelRole": "worker"
     },

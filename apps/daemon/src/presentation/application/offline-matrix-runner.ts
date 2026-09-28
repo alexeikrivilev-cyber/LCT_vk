@@ -8,13 +8,15 @@ import type { DeckPlan } from '../domain/deck-plan.js';
 import type { TemplateIR } from '../domain/template-ir.js';
 import { validateTemplateSemanticProfile, type TemplateSemanticProfile } from './template-semantic-profiler.js';
 import { auditCompiledPresentation } from './deterministic-audit.js';
-import { buildPresentationQualityReport } from './presentation-quality-report.js';
+import { buildPresentationQualityReport, presentationQualityBlockers } from './presentation-quality-report.js';
 import { assessDeckCompositionDistinctness, reviewDeckLevel, type DeckCompositionDistinctnessReport, type DeckReviewComposition } from './deck-level-review.js';
 import {
   applyVariantCompositionAssignment,
+  assignDeckVariantCompositions,
   assessExemplarSelection,
   assessVariantCompositionDistinctness,
   createCompositionVisualClassificationCache,
+  type VariantCompositionAssignment,
 } from './exemplar-slide-selector.js';
 import { renderPresentation, resolvePptxBackend } from '../adapters/pptx-renderer-factory.js';
 import type { PptxBackendId, PptxRenderResult } from './pptx-backend-port.js';
@@ -32,9 +34,16 @@ function classifyMatrixSourceTemplateBleed(issue: unknown, compiledSlide: Return
 }
 
 function matrixPreviewStatus(preview: Awaited<ReturnType<NonNullable<PptxPreviewPort>['preview']>>, geometryIssues: readonly unknown[]): MatrixPreviewStatus {
-  if (preview.status === 'failed' && geometryIssues.some((issue) => typeof issue !== 'object' || issue === null || !('severity' in issue) || issue.severity !== 'warning')) return 'failed';
-  if (preview.status === 'failed' && preview.textLayoutIssues.some((issue) => typeof issue !== 'object' || issue === null || !('severity' in issue) || issue.severity === 'error')) return 'failed';
+  const blockingGeometry = geometryIssues.some((issue) => typeof issue !== 'object' || issue === null || !('severity' in issue) || issue.severity !== 'warning');
+  const blockingText = preview.textLayoutIssues.some((issue) => typeof issue !== 'object' || issue === null
+    || !('severity' in issue) || issue.severity === 'error' && !('approximate' in issue && issue.approximate === true));
+  if (blockingGeometry || blockingText) return 'failed';
+  // A failed preview with no diagnostic evidence is not a pass. A failure
+  // whose every reported issue is explicitly approximate/inherited is a
+  // warning, not a hard geometry failure.
+  if (preview.status === 'failed' && !preview.textLayoutIssues.length && !geometryIssues.length) return 'failed';
   if (preview.status === 'warning' || preview.textLayoutIssues.length || geometryIssues.length) return 'passed-with-warnings';
+  if (preview.status === 'failed') return 'failed';
   return 'passed';
 }
 
@@ -182,6 +191,7 @@ export async function runOfflinePresentationMatrix(input: {
     ] as const));
     timings.compile += performance.now() - compileStarted;
     const qualifiedSlides: OfflineMatrixResult['templateQualifications'][number]['slides'] = [];
+    const safeOptionsBySlide: Record<VariantPolicy['id'], VariantCompositionAssignment[]>[] = [];
     for (let slideIndex = 0; slideIndex < input.deckPlan.slides.length; slideIndex += 1) {
       const variantSlides = policies.map((policy) => compiledByVariant.get(policy.id)!.slides[slideIndex]!);
       const distinctness = assessVariantCompositionDistinctness(variantSlides, template.templateIR, backend, semanticProfile,
@@ -198,6 +208,10 @@ export async function runOfflinePresentationMatrix(input: {
           return applyVariantCompositionAssignment(slide, assignment, template.templateIR, semanticProfile);
         })
         : variantSlides;
+      safeOptionsBySlide.push(Object.fromEntries(policies.map((policy) => [
+        policy.id,
+        distinctness.safeOptionsByVariant[policy.id] ?? distinctness.assignments.filter((assignment) => assignment.variantId === policy.id),
+      ])) as Record<VariantPolicy['id'], VariantCompositionAssignment[]>);
       if (distinctness.hasSafeAssignments) for (const assigned of assignedVariantSlides) {
         const presentation = compiledByVariant.get(assigned.variantId)!;
         compiledByVariant.set(assigned.variantId, {
@@ -244,8 +258,59 @@ export async function runOfflinePresentationMatrix(input: {
       });
     }
     const safeAssignmentsPassed = qualifiedSlides.every((slide) => slide.status === 'passed');
+    const deckAssignments = safeAssignmentsPassed ? assignDeckVariantCompositions(safeOptionsBySlide) : null;
+    if (deckAssignments) {
+      for (const policy of policies) {
+        const presentation = compiledByVariant.get(policy.id)!;
+        const slides = presentation.slides.map((slide, slideIndex) => applyVariantCompositionAssignment(
+          slide,
+          deckAssignments[policy.id][slideIndex]!,
+          template.templateIR,
+          semanticProfile,
+          safeOptionsBySlide[slideIndex]![policy.id],
+        ));
+        compiledByVariant.set(policy.id, { ...presentation, slides });
+      }
+      for (let slideIndex = 0; slideIndex < qualifiedSlides.length; slideIndex += 1) {
+        const row = qualifiedSlides[slideIndex]!;
+        row.variants = row.variants.map((previous) => {
+          const assignment = deckAssignments[previous.variantId as VariantPolicy['id']][slideIndex]!;
+          const selection = assignment.compositionKind === 'exemplar-backed' ? assignment.exemplarSelection ?? null : null;
+          const sourceSlide = selection?.sourceSlideIndex;
+          const donorDiagnostic = sourceSlide === undefined ? null
+            : previous.candidateDiagnostics.find((candidate) => candidate.sourceSlideIndex === sourceSlide) ?? null;
+          const slide = compiledByVariant.get(previous.variantId as VariantPolicy['id'])!.slides[slideIndex]!;
+          return {
+            ...previous,
+            compositionKind: assignment.compositionKind,
+            layoutCandidateIndex: assignment.layoutCandidateIndex,
+            layoutId: assignment.compositionKind === 'layout-placeholder-backed'
+              ? slide.layoutCandidates[assignment.layoutCandidateIndex]?.layoutId ?? null : selection?.layoutId ?? slide.layoutId,
+            projectedCompositionSignature: assignment.projectedCompositionSignature,
+            selectedDonor: selection ? {
+              sourceSlideIndex: selection.sourceSlideIndex,
+              structuralArchetype: donorDiagnostic?.structuralArchetype ?? selection.semanticArchetype,
+              semanticArchetype: selection.semanticArchetype,
+              semanticConfidence: selection.confidence,
+              titleElementId: selection.slots.title.elementId,
+              bodyElementIds: selection.slots.bodySlots.map((slot) => slot.elementId),
+              bodySegmentation: selection.bodySegmentation,
+              projectedCompositionSignature: selection.projectedCompositionSignature,
+              projectionSafe: true,
+              contentSafe: donorDiagnostic?.contentSafe ?? null,
+              roleCompatible: donorDiagnostic?.roleCompatible ?? false,
+            } : null,
+          };
+        });
+        row.signatures = row.variants.flatMap((variant) => variant.projectedCompositionSignature ? [variant.projectedCompositionSignature] : []);
+        row.evidence = [...row.evidence.filter((item) => !item.startsWith('deck-level assignment:')),
+          'deck-level assignment: selected only among exact per-slide safe options'];
+      }
+    }
     const signaturesByVariant = Object.fromEntries(policies.map((policy) => [policy.id,
-      qualifiedSlides.map((slide) => slide.variants.find((candidate) => candidate.variantId === policy.id)?.projectedCompositionSignature ?? ''),
+      deckAssignments
+        ? deckAssignments[policy.id].map((assignment) => assignment.projectedCompositionSignature)
+        : qualifiedSlides.map((slide) => slide.variants.find((candidate) => candidate.variantId === policy.id)?.projectedCompositionSignature ?? ''),
     ])) as Record<VariantPolicy['id'], string[]>;
     const deckCompositionDistinctness = safeAssignmentsPassed
       ? assessDeckCompositionDistinctness(signaturesByVariant)
@@ -404,6 +469,11 @@ export async function runOfflinePresentationMatrix(input: {
             : { status: 'unknown', reason: 'No preview adapter was supplied.' },
           factualEquivalenceStatus,
         }, null, 2)}\n`, 'utf8');
+        const qualityBlockers = presentationQualityBlockers(presentationQuality);
+        if (qualityBlockers.length) {
+          const details = qualityBlockers.slice(0, 6).map((finding) => finding.ruleId).join(', ');
+          throw new TypeError(`Template ${templateIndex + 1} ${policy.id} failed the presentation-quality gate: ${qualityBlockers.length} blocker(s) (${details})`);
+        }
         templateOutputs.push({
           templateIndex: templateIndex + 1,
           variantId: policy.id,
@@ -481,7 +551,8 @@ export async function runOfflinePresentationMatrix(input: {
         }
       } else await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
       qualification.status = 'blocked';
-      const previewFailed = error instanceof Error && error.message.includes('Office Kit preview found an exact geometry/text blocker');
+      const previewFailed = error instanceof Error && (error.message.includes('Office Kit preview found an exact geometry/text blocker')
+        || error.message.includes('text-fit.rendered-layout-issue'));
       qualification.renderStatus = previewFailed ? 'passed' : 'failed';
       qualification.previewStatus = previewFailed ? 'failed' : 'not-run';
       qualification.previewIssueCounts = previewIssueCounts;

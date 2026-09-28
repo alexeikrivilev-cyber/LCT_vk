@@ -20,6 +20,7 @@ import { auditCompiledPresentation, type DeterministicAuditReport } from './dete
 import {
   applyPersistedExemplarSelection,
   applyVariantCompositionAssignment,
+  assignDeckVariantCompositions,
   assessVariantCompositionDistinctness,
   createCompositionVisualClassificationCache,
   exemplarSelectionReference,
@@ -1085,20 +1086,31 @@ export class PresentationGenerationService {
       const assignedSlidesById = new Map<string, CompiledSlide[]>();
       const compositionSignatures: Record<PresentationVariantId, string[]> = { A: [], B: [], C: [] };
       const compositionHistory: Record<PresentationVariantId, ExemplarSelectionHistoryEntry[]> = { A: [], B: [], C: [] };
+      const optionsBySlideId = new Map<string, Record<PresentationVariantId, VariantCompositionAssignment[]>>();
       // Qualify all safe slide assignments first. A/B/C distinctness is a property
       // of the ordered decks, so a safe per-slide composition may be reused.
       for (const pack of initial.slides) {
         if (pack.status === 'ready') {
+          const fixed = {} as Record<PresentationVariantId, VariantCompositionAssignment[]>;
           for (const variant of VARIANT_IDS) {
-            const signature = pack.variants[variant].compositionChoice?.signature;
+            const savedVariant = pack.variants[variant];
+            const choice = savedVariant.compositionChoice;
+            const signature = choice?.signature;
             if (!signature) throw new PresentationGenerationError('COMPOSITION_ASSIGNMENT_MISSING', `Ready slide ${pack.index} has no persisted ${variant} composition signature.`, 422);
-            compositionSignatures[variant].push(signature);
-            const exemplar = pack.variants[variant].compositionChoice?.exemplar;
+            const exemplar = choice.exemplar;
             if (exemplar) compositionHistory[variant].push({
               sourcePart: exemplar.sourcePart,
               sourceSlideIndex: exemplar.sourceSlideIndex,
             });
+            fixed[variant] = [{
+              variantId: variant,
+              compositionKind: choice.kind,
+              layoutCandidateIndex: savedVariant.layoutCandidateIndex,
+              projectedCompositionSignature: signature,
+              compositionFamilyKey: exemplar ? `exemplar:${exemplar.sourcePart}|${exemplar.sourceSlideIndex}` : `persisted:${signature}`,
+            }];
           }
+          optionsBySlideId.set(pack.slideId, fixed);
           continue;
         }
         const variantSlides = VARIANT_IDS.map((variant) => {
@@ -1121,18 +1133,62 @@ export class PresentationGenerationService {
             422,
           );
         }
+        const options = {} as Record<PresentationVariantId, VariantCompositionAssignment[]>;
+        for (const variant of VARIANT_IDS) {
+          const preferred = assessment.assignments.find((candidate) => candidate.variantId === variant);
+          if (!preferred) throw new TypeError(`Qualified composition is missing the ${variant} assignment`);
+          const qualified = assessment.safeOptionsByVariant?.[variant] ?? [preferred];
+          options[variant] = [preferred, ...qualified.filter((candidate) => candidate !== preferred
+            && (candidate.projectedCompositionSignature !== preferred.projectedCompositionSignature
+              || candidate.compositionKind !== preferred.compositionKind
+              || candidate.layoutCandidateIndex !== preferred.layoutCandidateIndex))];
+          const assignment = preferred;
+          if (assignment.exemplarSelection) compositionHistory[variant].push({
+            sourcePart: assignment.exemplarSelection.sourcePart,
+            sourceSlideIndex: assignment.exemplarSelection.sourceSlideIndex,
+            familyKey: assignment.exemplarSelection.familyKey,
+            semanticArchetype: assignment.exemplarSelection.semanticArchetype,
+          });
+        }
+        optionsBySlideId.set(pack.slideId, options);
+      }
+      const slideOptions = initial.slides.map((pack) => {
+        const options = optionsBySlideId.get(pack.slideId);
+        if (!options) throw new TypeError(`No qualified composition options were recorded for slide ${pack.index}`);
+        return options;
+      });
+      const deckAssignments = assignDeckVariantCompositions(slideOptions);
+      if (!deckAssignments) {
+        const defaults: Record<PresentationVariantId, string[]> = { A: [], B: [], C: [] };
+        for (const options of slideOptions) for (const variant of VARIANT_IDS) defaults[variant].push(options[variant][0]!.projectedCompositionSignature);
+        const differences = assessDeckCompositionDistinctness(defaults).differingSlideCounts;
+        throw new PresentationGenerationError(
+          'VARIANTS_NOT_DISTINCT',
+          `No pairwise-distinct A/B/C deck assignment exists among the already-qualified safe compositions (slides differing: A/B=${differences.AB}, A/C=${differences.AC}, B/C=${differences.BC}).`,
+          422,
+        );
+      }
+      for (const [packIndex, pack] of initial.slides.entries()) {
+        const assignmentsByVariant = Object.fromEntries(VARIANT_IDS.map((variant) => [variant, deckAssignments[variant][packIndex]!])) as Record<PresentationVariantId, VariantCompositionAssignment>;
+        for (const variant of VARIANT_IDS) compositionSignatures[variant].push(assignmentsByVariant[variant].projectedCompositionSignature);
+        if (pack.status === 'ready') continue;
+        const variantSlides = VARIANT_IDS.map((variant) => {
+          const presentation = variantsById(tracks, variant);
+          const slide = presentation.slides.find((candidate) => candidate.sourceDeckPlanSlideId === pack.slideId);
+          if (!slide) throw new PresentationGenerationError('PLAN_CHANGED', 'A planned slide is missing from the compiled output.', 409);
+          return slide;
+        });
         const assignmentStartedAt = performance.now();
         const assigned = variantSlides.map((slide) => {
-          const assignment = assessment.assignments.find((candidate) => candidate.variantId === slide.variantId);
-          if (!assignment) throw new TypeError(`Qualified composition is missing the ${slide.variantId} assignment`);
-          compositionSignatures[slide.variantId].push(assignment.projectedCompositionSignature);
+          const assignment = assignmentsByVariant[slide.variantId];
           if (assignment.exemplarSelection) compositionHistory[slide.variantId].push({
             sourcePart: assignment.exemplarSelection.sourcePart,
             sourceSlideIndex: assignment.exemplarSelection.sourceSlideIndex,
             familyKey: assignment.exemplarSelection.familyKey,
             semanticArchetype: assignment.exemplarSelection.semanticArchetype,
           });
-          return applyVariantCompositionAssignment(slide, assignment, context.templateIR, context.semanticProfile);
+          const qualifiedOptions = optionsBySlideId.get(pack.slideId)?.[slide.variantId];
+          return applyVariantCompositionAssignment(slide, assignment, context.templateIR, context.semanticProfile, qualifiedOptions);
         });
         recordElapsed(this.options.performanceDiagnostics, 'generation.applyCompositionAssignments', assignmentStartedAt);
         assignedSlidesById.set(pack.slideId, assigned);

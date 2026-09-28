@@ -9,6 +9,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
+import { installLoopbackFetchGuard } from './lib/offline-safety.mjs';
 import { createQualificationSemanticCapture } from './lib/qualification-semantic-capture.mjs';
 import {
   OpenAICompatibleSemanticInferenceAdapter,
@@ -567,6 +568,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
   const semanticEndpointFactory = dependencies.startFakeSemanticEndpoint ?? startFakeSemanticEndpoint;
   let fakeEndpoint = null;
   let startedServer = null;
+  const networkGuard = options.mode === 'fake' ? installLoopbackFetchGuard() : null;
   let stage = 'configuration';
   let lastStage = null;
   const observe = (operation) => {
@@ -850,11 +852,22 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     try { await fakeEndpoint?.close(); }
     catch { if (manifest.result === 'PASS') { manifest.result = 'FAIL'; manifest.failure = { stage: 'shutdown', code: 'FAKE_ENDPOINT_SHUTDOWN_FAILED' }; } }
     manifest.semantic.localCapture = await semanticCapture.summary();
+    if (networkGuard) {
+      manifest.networkGuard = {
+        blockedExternalAttempts: networkGuard.blockedRequestCount,
+        noExternalCalls: networkGuard.blockedRequestCount === 0,
+      };
+      if (networkGuard.blockedRequestCount > 0) {
+        manifest.result = 'FAIL';
+        manifest.failure = { stage: 'offline-network-guard', code: 'EXTERNAL_FETCH_BLOCKED' };
+      }
+    }
     for (const key of RUNNER_ENV_KEYS) {
       if (envBackup[key] === undefined) delete env[key];
       else env[key] = envBackup[key];
     }
-    await writeManifest(outputDir, manifest);
+    try { await writeManifest(outputDir, manifest); }
+    finally { networkGuard?.restore(); }
   }
   return manifest;
 }

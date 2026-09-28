@@ -6,7 +6,9 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
+import { deterministicPlanningResponse, startFakeSemanticEndpoint } from './lib/fake-openai-compatible-endpoint.mjs';
+import { offlineQualificationResponse } from './lib/offline-qualification-plan.mjs';
+import { installLoopbackFetchGuard } from './lib/offline-safety.mjs';
 import { register } from 'tsx/esm/api';
 
 register();
@@ -18,6 +20,7 @@ const plans = [
   { flag: '--education', label: 'Education', slides: 3, formats: ['pptx'] },
   { flag: '--aios', label: 'AIOS held-out', slides: 3, formats: ['pptx'] },
 ];
+const MAX_PROFILE_PREPARATION_REQUESTS = 16;
 
 function parseArgs(argv) {
   const values = new Map();
@@ -147,6 +150,8 @@ async function main() {
   const report = {
     schemaVersion: 1,
     status: 'running',
+    qualificationScope: 'local-fake-structural-only',
+    semanticQuality: 'not-evaluated',
     runId,
     inference: { mode: 'local-fake-openai-compatible', externalRequests: 0, operations: {} },
     imageGeneration: { configured: false, networkRequests: 0 },
@@ -154,7 +159,9 @@ async function main() {
     templates: [],
     artifactDirectory: path.relative(repoRoot, outputDir).replaceAll('\\', '/'),
   };
-  const fake = await startFakeSemanticEndpoint({ model: 'offline-fake-planner' });
+  const fake = await startFakeSemanticEndpoint({ model: 'offline-fake-planner', respond: async (request, context) =>
+    offlineQualificationResponse(request) ?? deterministicPlanningResponse(request, context) });
+  const networkGuard = installLoopbackFetchGuard();
   let server = null;
   let failures = [];
   try {
@@ -210,7 +217,8 @@ async function main() {
       const templatePreparationMs = Math.round(performance.now() - templatePreparationStartedAt);
       const profileRequestCount = fake.state.inference.slice(inferenceOffset)
         .filter((call) => call.operation === 'template-semantic-profile').length;
-      assert.ok(profileRequestCount >= 1 && profileRequestCount <= 14, `${template.label}: profile request count must be bounded`);
+      assert.ok(profileRequestCount >= 1 && profileRequestCount <= MAX_PROFILE_PREPARATION_REQUESTS,
+        `${template.label}: profile request count ${profileRequestCount} must not exceed ${MAX_PROFILE_PREPARATION_REQUESTS}`);
       const flowStartedAt = performance.now();
       const begin = await requestJson(server.url, `/api/projects/${encodeURIComponent(projectId)}/workflow/generate`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -317,7 +325,13 @@ async function main() {
         stage: operation.stage,
         readyVariants: template.slides * 3,
         deterministicAudit: 'passed',
-        contextualAudit: { status: 'passed', findings: 9, requests: callsByOperation['contextual-deck-audit'] },
+        contextualAudit: {
+          requestStatus: finishedProject.contextualAudit.status,
+          reviewerMode: 'deterministic-fake-response',
+          semanticQuality: 'not-evaluated',
+          findings: finishedProject.contextualAudit.findings.length,
+          requests: callsByOperation['contextual-deck-audit'],
+        },
         semanticCalls: { count: caseCalls.length, byOperation: callsByOperation },
         templatePreparationMs,
         timeToThreeVariantsReadyMs: operation.timeToThreeVariantsReadyMs,
@@ -337,7 +351,9 @@ async function main() {
     report.inference.operations = Object.fromEntries([...new Set(fake.state.inference.map((entry) => entry.operation))]
       .map((operation) => [operation, fake.state.inference.filter((entry) => entry.operation === operation).length]));
     report.inference.totalRequests = fake.state.inference.length;
-    report.inference.noExternalCalls = true;
+    report.inference.blockedExternalAttempts = networkGuard.blockedRequestCount;
+    report.inference.noExternalCalls = networkGuard.blockedRequestCount === 0;
+    assert.equal(networkGuard.blockedRequestCount, 0, 'offline qualification attempted a non-loopback fetch');
     report.status = report.performance?.targetUnder180Seconds && report.templates.length === 4 ? 'PASS' : 'BLOCKED';
   } catch (error) {
     failures.push(error instanceof Error ? error.message : String(error));
@@ -346,10 +362,12 @@ async function main() {
     report.inference.totalRequests = fake.state.inference.length;
     report.inference.operations = Object.fromEntries([...new Set(fake.state.inference.map((entry) => entry.operation))]
       .map((operation) => [operation, fake.state.inference.filter((entry) => entry.operation === operation).length]));
-    report.inference.noExternalCalls = true;
+    report.inference.blockedExternalAttempts = networkGuard.blockedRequestCount;
+    report.inference.noExternalCalls = networkGuard.blockedRequestCount === 0;
     report.failures = failures;
     await closeServer(server).catch((error) => failures.push(`daemon shutdown: ${error instanceof Error ? error.message : String(error)}`));
     await fake.close().catch((error) => failures.push(`fake endpoint shutdown: ${error instanceof Error ? error.message : String(error)}`));
+    networkGuard.restore();
     for (const key of envKeys) {
       if (previousEnv[key] === undefined) delete process.env[key];
       else process.env[key] = previousEnv[key];

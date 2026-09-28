@@ -1,7 +1,7 @@
 # Готовность продукта к live qualification
 
 **STATUS: LIVE_GENERATION_BLOCKED (pre-live fake acceptance)**
-**Текущий profile-before-Generate fake matrix: BLOCKED; live requests в этом pass: 0.** WorkSpace (29 source slides, SHA-256 `1b8883114486c69dff706e9c4fd9382727c4506c2cfa3ec34f86987f1e852f2f`) прошёл profile preparation (6 batches) и Generate без profiler calls: 3/3 slides, A/B/C 9/9, audits, PPTX/PDF/HTML, source unchanged. Manifest: `.lct/prepared-profile-fake-workspace-20260927/manifest.json`. Exact held-out AIOS (16 source slides, SHA-256 `18198cc08df9fc3ea5aee5f509d89e70a4ade68bb539fed61a957581ee365ad1`) подготовил профиль (4 batches), Worker и planning Supervisor прошли, но Generate fail-closed остановился на `VARIANTS_NOT_DISTINCT` (0/3 variants; audit/export не запускались). Manifest: `.lct/prepared-profile-fake-aios-20260927/manifest.json`. По заданному stop condition VK Tech fake и все live requests не запускались. RunPod не останавливался/перезапускался; Docker не пересобирался; weights не скачивались. Предыдущие no-profiler результаты ниже являются историческими и не описывают текущую стратегию.
+**Текущий morning-freeze offline acceptance: BLOCKED; live requests: 0.** Свежий fake run прошёл pipeline на VK Tech (12 слайдов), WorkSpace и Education (по 3), но held-out AIOS завершился `VARIANTS_NOT_DISTINCT`. VK Tech/WorkSpace/Education получили A/B/C и структурные экспорты; AIOS — нет. Визуальные contact sheets показывают незакрытые дефекты композиции и пустых областей. Golden replay также заблокирован несовпадением current deck-plan prompt с immutable fixture. Полный тестовый набор: 282/288, 6 FAIL. Подробности и artifact paths: [утренняя приёмка](./docs/overnight/MORNING_DEMO_REPORT.md). RunPod не запускался; external inference = 0; commit/push не выполнялись.
 
 The older profiler live attempt remains separate historical evidence: WorkSpace batch 1/5 returned HTTP 200 but `finish_reason=length` at `maxOutputTokens=1024`; validation was not reached (38.017 s, no provider token usage). It did not qualify the core flow. The preceding monolithic request returned HTTP 400 context overflow. Pod was not stopped or restarted. `CASE_COMPLIANCE_STATUS: BLOCKED`; required live VK inference is unverified. No commit/push.
 
@@ -10,7 +10,7 @@ The older profiler live attempt remains separate historical evidence: WorkSpace 
 - Этот отчёт подтверждает локальный product flow и не переобъявляет полную organizer acceptance. Трассировка требований и статусы находятся в [CASE_REQUIREMENTS.md](./docs/compliance/CASE_REQUIREMENTS.md); unknown/partial строки остаются таковыми до отдельных доказательств.
 - Organizer source: официальный 7-страничный PDF прочитан ранее; SHA-256 и provenance без выдуманной ссылки записаны в CASE_REQUIREMENTS.md. Самого PDF в Git нет; organizer source/version ещё нужно закрепить в tracked source register.
 - В qualification использованы обязательная задача без загруженных source files; для VK Tech добавлен явно синтетический контекст. WorkSpace, Education и held-out AIOS проверены task-only. Контекст и файлы остаются optional.
-- Qwen был вызван только один раз на template-profile stage и запрос отклонён по context limit; содержательное качество модели не проверялось. VK inference и open-weight image-provider deployment остаются неподтверждёнными.
+- Исторически Qwen был вызван один раз на template-profile stage и запрос отклонён по context limit; содержательное качество модели не проверялось. В morning-freeze pass live requests = 0. VK inference и open-weight image-provider deployment остаются неподтверждёнными.
 
 ## ONE-CLICK FLOW / STATE
 
@@ -18,6 +18,23 @@ The older profiler live attempt remains separate historical evidence: WorkSpace 
 - Duplicate request возвращает текущую операцию; status/pipeline сохраняются и восстанавливаются после refresh/restart. Автоматические тесты также проверяют resume после сохранённых стадий.
 - Windows reliability fix: временная блокировка target при замене `.workflow/state.json` больше не сразу завершает workflow; `EPERM`, `EACCES` и `EBUSY` повторяются ограниченное число раз с backoff. Другие ошибки не повторяются.
 - Contextual output проходит строгую schema и reference validation, локализуется по message codes и не может отменить deterministic errors или изменить исходные факты.
+
+## MORNING FREEZE (2026-09-28)
+
+| Шаблон | Результат | Проверенные выходы |
+|---|---|---|
+| VK Tech | 12 slides; A/B/C 36/36; audit passed | selected/A/B/C PPTX structurally reopened; PDF 12 pages; HTML 12 sections |
+| WorkSpace | 3 slides; A/B/C 9/9; audit passed | selected/A/B/C PPTX structurally reopened |
+| Education | 3 slides; A/B/C 9/9; audit passed | selected/A/B/C PPTX structurally reopened |
+| AIOS held-out | BLOCKED: `VARIANTS_NOT_DISTINCT` | no qualified variants or exports |
+
+Все проверки использовали локальный fake endpoint: 65 semantic requests, zero external calls. Source template hashes совпали с сохранёнными входами. Это не подтверждает real-model semantic quality. Визуальный осмотр выявил повторяющийся VK Tech hero-визуал, пустые области и слабую track distinctness на WorkSpace/Education. Contact sheets: `.lct/overnight/overnight-wow-2026-09-28/morning-freeze-matrix-v1/contact-sheets/`.
+
+Golden replay с disposable copy заблокирован точным mismatch deck-plan system prompt: expected 3305 bytes / SHA-256 `46251f…69b0`, actual 3398 bytes / SHA-256 `9f1b8e…0112`; external requests denied = 0. Golden fixture не изменялся.
+
+Текущие gates: frozen install, typecheck, production build, docs:check, boundary, lint:craft и `git diff --check` — PASS; полный test suite — **282/288**, 6 FAIL (5 устаревших ожиданий English fake titles; 1 one-click workflow `VARIANTS_NOT_DISTINCT`). Next.js build временно переписал `apps/web/next-env.d.ts`; файл восстановлен к точным байтам до build, все существовавшие пользовательские изменения сохранены.
+
+UI проверен только в доступном embedded viewport около 1265×720 и после свежей загрузки проекта; refresh восстановил состояние. Приёмка 1440×900 и сохранённые файловые UI screenshots отсутствуют. Полная визуальная и семиминутная demo acceptance не подтверждены.
 
 ## INPUT / IMAGE GENERATION
 
@@ -40,28 +57,28 @@ The older profiler live attempt remains separate historical evidence: WorkSpace 
 
 В исторической acceptance-матрице было 16 fake semantic calls: по 1 profiler, Worker, planning Supervisor и contextual audit на каждый из четырёх шаблонов. Внешних запросов — 0. Её persisted contextual results содержат 9 правил v1 и теперь считаются stale evidence; это не текущая проверка v2. На всех reopened PPTX проверены число слайдов, native editable text на каждом слайде, отсутствие notes и ошибок package validation. PDF повторно открыт и содержит 12 страниц; HTML содержит 12 slide sections.
 
-## AUDIT / EXPORT
+## AUDIT / EXPORT — исторические acceptance runs
 
 - Deterministic audit прошёл без ошибок во всех четырёх workflow runs; каждая A/B/C variant была ready.
 - Исторические runs использовали contextual audit v1/9 rules; см. текущие versioned v2 runs ниже.
 - PPTX структурно прошёл package reopen; визуальное открытие/сохранение в PowerPoint или LibreOffice не выполнялось.
 - PDF построен из approximate preview и прошёл reopen/page-count проверку. HTML прошёл escaping/структурные тесты и содержит все slide sections; проверка в браузере не выполнялась. Они не заявляются как pixel-identical PowerPoint output.
 
-## PERFORMANCE
+## PERFORMANCE — исторические результаты
 
-Предыдущий canonical fake one-click run на 54-слайдовом VK Tech template завершился за 87.597 s; затем результат был superseded более полными прогонами ниже. Самое свежее повторное измерение этого acceptance pass — 95.753 s. Это offline pipeline measurement, не latency настоящего inference.
+Предыдущие canonical fake one-click runs на VK Tech template завершились за 87.597 s и 95.753 s. Это offline pipeline measurements, не latency настоящего inference. Текущие morning-freeze timings указаны выше: 62.556 s до contextual audit и 1,390.909 s на полный flow вместе с export.
 
-## DUAL-MODE RUNNER
+## DUAL-MODE RUNNER — исторический status до morning freeze
 
-**LIVE_PATH_STATUS: BLOCKED** — текущий profile-before-Generate fake gate остановился на held-out AIOS после успешной подготовки профиля, Worker и planning Supervisor: `VARIANTS_NOT_DISTINCT`. Текущий WorkSpace fake profile lifecycle прошёл; VK Tech fake матрица и live inference не запускались. Исторический внешний WorkSpace workflow остановился на profiler batch с `finish_reason=length`; он не достиг Worker. Endpoint URL и credentials в manifest отсутствуют. Предшествовавший HTTP 400 context overflow был на monolithic profiler до batching.
+Этот status был записан до нового morning-freeze fake matrix. Текущая матрица и точный blocker указаны выше; текущих live calls не было. Исторический внешний WorkSpace workflow остановился на profiler batch с `finish_reason=length`; он не достиг Worker. Endpoint URL и credentials в manifest отсутствуют. Предшествовавший HTTP 400 context overflow был на monolithic profiler до batching.
 
-## UI / DOCUMENTATION
+## UI / DOCUMENTATION — предшествующий pass
 
-- Русский typed message catalog; regression test подтверждает отсутствие русских UI literals в app chrome и централизованную локализацию. Полный визуальный browser walkthrough в этой qualification не запускался.
+- Русский typed message catalog; regression test подтверждает отсутствие русских UI literals в app chrome и централизованную локализацию. В текущем pass проверены initial screen и восстановление сохранённого проекта после fresh page load; целевой viewport 1440×900 не проверен, UI screenshots не сохранены.
 - README, product guide, AUDIT, configuration, RELEASE_READINESS и READY_FOR_QWEN синхронизированы с результатами этого этапа. Конфигурация в `.env.example` не содержит credentials.
-- PowerPoint/LibreOffice visual QA, browser rendering review и полный customer-facing rehearsal остаются непроверенными и не подменяются structural PASS.
+- PowerPoint/LibreOffice visual QA и полный customer-facing rehearsal остаются непроверенными и не подменяются structural PASS. Contact sheets актуального fake run перечислены выше.
 
-## TESTS
+## TESTS — предшествующий pass
 
 Предыдущий core-opt-in pass: full suite **239/239 PASS**; web and daemon typecheck/build, boundary, lint and docs check — PASS. Для текущего prepared-profile diff после fake AIOS stop condition полный набор gates не запускался. Целевые suites прошли: daemon 25/25; runner + web Russian messages 22/22; `git diff --check` PASS. Старые full-gate results не считаются проверкой текущего diff.
 

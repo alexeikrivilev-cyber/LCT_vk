@@ -12,6 +12,7 @@ import {
   addSlideLine,
   addSlideTable,
   duplicateSlide,
+  getSlidePartName,
   findSlidePlaceholder,
   getAllCharts,
   getAllImages,
@@ -33,7 +34,9 @@ import {
   getSlideLayoutPlaceholders,
   loadPresentation,
   removeSlideNotes,
+  removeSlide,
   savePresentation,
+  sortSlides,
   setShapeImageCrop,
   setShapeText,
   setSlideNotes,
@@ -257,4 +260,45 @@ test('Office Kit round-trips a synthetic template and authors native objects', a
     return crop?.left === 0.15 && crop.top === 0.1;
   }));
   assert.deepEqual(validatePresentation(reopened), []);
+});
+
+test('Office Kit can place donor copies in DeckPlan order instead of donor order', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'lct-office-kit-order-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const bytes = await makeSyntheticTemplate(directory);
+  const presentation = await loadPresentation(bytes);
+  const layout = getSlideLayouts(presentation).find((candidate) =>
+    getSlideLayoutPlaceholders(candidate).some((placeholder) => placeholder.type === 'title'),
+  );
+  assert.ok(layout);
+  const secondDonor = addSlide(presentation, { layout });
+  const secondTitle = findSlidePlaceholder(secondDonor, 'title');
+  assert.ok(secondTitle);
+  setShapeText(secondTitle, 'Second donor');
+  const firstDonor = getSlides(presentation)[0];
+  assert.ok(firstDonor);
+  const firstTitle = findSlidePlaceholder(firstDonor, 'title');
+  assert.ok(firstTitle);
+  setShapeText(firstTitle, 'First donor');
+  const originalSlides = [...getSlides(presentation)];
+
+  // Deliberately choose donors in reverse source order, as the composer may.
+  const firstOutput = duplicateSlide(presentation, secondDonor);
+  const secondOutput = duplicateSlide(presentation, firstDonor);
+  for (const slide of originalSlides) removeSlide(presentation, slide);
+  const outputOrder = new Map([
+    [getSlidePartName(firstOutput), 0],
+    [getSlidePartName(secondOutput), 1],
+  ]);
+  sortSlides(presentation, (left, right) =>
+    (outputOrder.get(getSlidePartName(left)) ?? Number.MAX_SAFE_INTEGER)
+    - (outputOrder.get(getSlidePartName(right)) ?? Number.MAX_SAFE_INTEGER));
+
+  const reopened = await loadPresentation(await savePresentation(presentation));
+  const outputTitles = getSlides(reopened).map((slide) => {
+    const title = findSlidePlaceholder(slide, 'title');
+    return title ? getShapeText(title) : null;
+  });
+  assert.deepEqual(outputTitles, ['Second donor', 'First donor']);
 });

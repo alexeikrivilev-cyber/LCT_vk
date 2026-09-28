@@ -7,6 +7,7 @@ import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 
 import { inspectPptx } from '../apps/daemon/src/presentation/adapters/python-inspector.js';
+import { addEffectivePlaceholderTypography } from '../apps/daemon/src/presentation/adapters/office-kit-effective-typography.js';
 import { createTemplateIR } from '../apps/daemon/src/presentation/application/template-mapper.js';
 import { runOfflinePresentationMatrix } from '../apps/daemon/src/presentation/application/offline-matrix-runner.js';
 import { briefHash, validateBrief } from '../apps/daemon/src/presentation/domain/brief.js';
@@ -191,6 +192,10 @@ export async function runOfflineMatrixFromState(args) {
       compiledAt: new Date().toISOString(),
       compilerVersion: 'lct-template-compiler/1',
     });
+    // Match the product template-compile path: placeholders inherit styles via
+    // Office Kit's cascade, which changes measured fit and must not be omitted
+    // by the offline qualification runner.
+    await addEffectivePlaceholderTypography(templateIR, bytes);
     templates.push({ pptxPath, templateIR, ...(args.contentroot ? { contentRoot: path.resolve(args.contentroot) } : {}) });
     templateInspectionMs += performance.now() - parsingStarted;
   }

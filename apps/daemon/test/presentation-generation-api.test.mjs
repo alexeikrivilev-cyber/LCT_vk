@@ -158,9 +158,11 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
   };
   const contentIR = await compileContentIR(projectsRoot, projectId, [sourceFile], { task: brief.purpose });
   const [workerPrompt, supervisorPrompt] = await Promise.all([
-    readFile(path.join(repoRoot, 'apps/daemon/prompts/worker-deck-plan.v5.md'), 'utf8'),
+    readFile(path.join(repoRoot, 'apps/daemon/prompts/worker-deck-plan.v6.md'), 'utf8'),
     readFile(path.join(repoRoot, 'apps/daemon/prompts/supervisor-plan-review.v1.md'), 'utf8'),
   ]);
+  assert.match(workerPrompt, /Prefer 28 characters or fewer/u);
+  assert.match(workerPrompt, /40 characters as a hard maximum/u);
   const fingerprint = planningInputFingerprint({
     templateIRHash: template.templateIR.hash,
     presentationDesignSystemHash: template.presentationDesignSystem.hash,
@@ -207,7 +209,7 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
       contentFiles: [sourceFile], brief, contentIR, inputFingerprint: fingerprint,
       checkpoint: plan, deckPlan: plan, review,
       telemetry: { worker: telemetrySummary, supervisor: { ...telemetrySummary, requestId: 'offline-supervisor' }, totalWallTimeMs: 0 },
-      promptVersions: { worker: 'worker-deck-plan.v4', supervisor: 'supervisor-plan-review.v1' },
+      promptVersions: { worker: 'worker-deck-plan.v6', supervisor: 'supervisor-plan-review.v1' },
       model: 'offline-replay', createdAt: now,
     },
     failure: null,
