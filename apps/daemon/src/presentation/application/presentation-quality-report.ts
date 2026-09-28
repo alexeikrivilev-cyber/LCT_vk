@@ -162,6 +162,19 @@ function areaShare(box: PlacementBox | null, template: TemplateIR): number | nul
   return box.width * box.height / (template.slideSize.width * template.slideSize.height);
 }
 
+function selectedBodyAreaShare(slide: CompiledSlide, template: TemplateIR): number | null {
+  const selected = slide.exemplarSelection?.designFeatures.bodyAreaShare;
+  return Number.isFinite(selected) ? selected! : areaShare(slide.placements.body, template);
+}
+
+function selectedVisualAreaShare(slide: CompiledSlide, template: TemplateIR): number | null {
+  const selection = slide.exemplarSelection;
+  if (!selection) return areaShare(slide.placements.visual ?? slide.placements.body, template);
+  if (selection.slots.visual) return areaShare(selection.slots.visual.geometry, template);
+  if (slide.visualization.processSteps.length >= 2) return selection.designFeatures.bodyAreaShare;
+  return selection.designFeatures.visualAreaShare;
+}
+
 function trackMetrics(input: BuildPresentationQualityReportInput): PresentationQualityReport['trackStrategy'] {
   const variants = ['A', 'B', 'C'] as const;
   const result = {} as PresentationQualityReport['trackStrategy'];
@@ -169,12 +182,15 @@ function trackMetrics(input: BuildPresentationQualityReportInput): PresentationQ
     const track = input.tracks?.find((candidate) => candidate.variantId === variant)
       ?? (input.presentation.variantId === variant ? input.presentation : undefined);
     const slides = track?.slides ?? [];
-    const bodyShares = slides.map((slide) => areaShare(slide.placements.body, input.templateIR)).filter((share): share is number => share !== null);
+    // Exemplar assignment changes the exact geometry the renderer uses, while
+    // placements remain the pre-assignment layout candidate. Measure the
+    // selected donor when present so track strategy reflects rendered output.
+    const bodyShares = slides.map((slide) => selectedBodyAreaShare(slide, input.templateIR)).filter((share): share is number => share !== null);
     const hasComposedVisual = (slide: CompiledSlide) => slide.visualization.status === 'referenced'
       || Boolean(slide.visualization.tableData || slide.visualization.chartData || slide.visualization.kpi
         || slide.visualization.processSteps.length >= 2 || slide.imageRefs.length);
     const visualShares = slides.flatMap((slide) => hasComposedVisual(slide)
-      ? [areaShare(slide.placements.visual ?? slide.placements.body, input.templateIR)] : []).filter((share): share is number => share !== null);
+      ? [selectedVisualAreaShare(slide, input.templateIR)] : []).filter((share): share is number => share !== null);
     const kinds = input.composition?.kindsByVariant?.[variant] ?? [];
     const selectedCompositionKinds: Record<string, number> = {};
     for (const kind of kinds) selectedCompositionKinds[kind] = (selectedCompositionKinds[kind] ?? 0) + 1;
@@ -365,10 +381,12 @@ export function buildPresentationQualityReport(input: BuildPresentationQualityRe
       evidence: { visualEvidenceSlidesAcrossTracks: visualEvidenceCount }, confidence: 'unknown' });
     else {
       const visualLed = strategy.B.medianVisualAreaShare! > strategy.A.medianVisualAreaShare!;
+      const spacious = strategy.B.medianBodyAreaShare !== null && strategy.A.medianBodyAreaShare !== null
+        && strategy.B.medianBodyAreaShare <= strategy.A.medianBodyAreaShare * 0.8;
       const evidenceDense = strategy.C.medianBodyAreaShare! >= strategy.A.medianBodyAreaShare!;
-      if (!visualLed || !evidenceDense) add({ category: 'template-consistency', severity: 'warning', slideId: null, ruleId: 'template-consistency.track-strategy-not-distinct',
-        message: 'Track-level geometry does not consistently distinguish the visual-led B and evidence-dense C strategies.',
-        evidence: { visualLedB: visualLed, evidenceDenseC: evidenceDense,
+      if ((!visualLed && !spacious) || !evidenceDense) add({ category: 'template-consistency', severity: 'warning', slideId: null, ruleId: 'template-consistency.track-strategy-not-distinct',
+        message: 'Track-level geometry does not consistently distinguish the visual-led or spacious B and evidence-dense C strategies.',
+        evidence: { visualLedB: visualLed, spaciousB: spacious, evidenceDenseC: evidenceDense,
           bodyAreaA: strategy.A.medianBodyAreaShare, bodyAreaC: strategy.C.medianBodyAreaShare,
           visualAreaA: strategy.A.medianVisualAreaShare, visualAreaB: strategy.B.medianVisualAreaShare }, confidence: 'medium' });
     }

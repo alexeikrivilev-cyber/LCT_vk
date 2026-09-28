@@ -88,9 +88,49 @@ test('local fake task-only planning generates copy without exporting task wordin
   const draft = JSON.parse(response.choices[0].message.content);
   assert.equal(draft.slides.length, 1);
   assert.deepEqual(draft.slides[0].contentRefs, []);
-  assert.equal(draft.slides[0].takeaway, 'Главная мысль и контекст');
+  assert.equal(draft.slides[0].takeaway, 'Цель задаёт ход');
   assert.equal(draft.slides[0].bodyPoints[0].origin, 'generated-from-brief');
   assert.ok(!JSON.stringify(draft.slides[0]).includes('Prepare a short deck about reliable automation.'));
+});
+
+test('local fake planning links uploaded image media only to a relevant visual slide', () => {
+  const units = [
+    { id: 'heading-overview', sourceId: 'text-source', kind: 'heading', text: '# Цель проекта' },
+    { id: 'text-overview', sourceId: 'text-source', kind: 'text', text: 'Команда определяет задачу и проверяет решение.' },
+    { id: 'heading-workshop', sourceId: 'text-source', kind: 'heading', text: '# Общее пространство мастерской' },
+    { id: 'text-workshop', sourceId: 'text-source', kind: 'text', text: 'Фотография показывает рабочее пространство как иллюстрацию проекта.' },
+  ];
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
+    requestedSlideCount: 2,
+    contentIR: {
+      sources: [{ id: 'text-source', kind: 'text' }],
+      units,
+      mediaAssets: [{ id: 'media-workshop', originalName: 'workshop.jpg', mediaType: 'image/jpeg', sha256: 'a'.repeat(64), order: 0 }],
+    },
+  }));
+  const draft = JSON.parse(response.choices[0].message.content);
+
+  assert.deepEqual(draft.slides[0].mediaRefs, []);
+  assert.deepEqual(draft.slides[1].mediaRefs, ['media-workshop']);
+  assert.equal(draft.slides[1].semanticVisualType, 'image');
+  assert.ok(draft.slides.every((slide) => !slide.contentRefs.includes('media-workshop')));
+});
+
+test('local fake does not invent process or comparison visuals for ordinary source-backed explanations', () => {
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
+    requestedSlideCount: 3,
+    contentIR: { sources: [{ id: 'source', kind: 'text' }], mediaAssets: [], units: [
+      { id: 'h1', sourceId: 'source', kind: 'heading', text: '# Роли команды' },
+      { id: 't1', sourceId: 'source', kind: 'text', text: 'Ведущий задаёт порядок работы. Наставник поддерживает участников.' },
+      { id: 'h2', sourceId: 'source', kind: 'heading', text: '# Правила безопасности' },
+      { id: 't2', sourceId: 'source', kind: 'text', text: 'Команда изучает правила до начала практики. Ведущий проверяет оборудование.' },
+      { id: 'h3', sourceId: 'source', kind: 'heading', text: '# Проверка в несколько шагов' },
+      { id: 't3', sourceId: 'source', kind: 'text', text: '1. Подготовить макет.\n2. Показать команде.' },
+    ] },
+  }));
+  const draft = JSON.parse(response.choices[0].message.content);
+
+  assert.deepEqual(draft.slides.map((slide) => slide.semanticVisualType), ['none', 'none', 'process']);
 });
 
 test('local fake keeps new planning titles within the v4 limit without cutting a word', () => {
@@ -106,7 +146,7 @@ test('local fake keeps new planning titles within the v4 limit without cutting a
   assert.ok(draft.slides[0].takeaway.length <= 40);
 });
 
-test('local fake preserves distinct task-only steps as one grounded source', () => {
+test('local fake task-only planning uses concise generated copy instead of task wording', () => {
   const task = 'Подготовить краткий план запуска презентации.\nПроверить готовность исходных материалов.\nСогласовать следующий проверяемый шаг команды.';
   const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
     brief: { purpose: task },
@@ -117,9 +157,62 @@ test('local fake preserves distinct task-only steps as one grounded source', () 
   }));
   const draft = JSON.parse(response.choices[0].message.content);
   assert.deepEqual(draft.slides.map((slide) => slide.contentRefs), [[], [], []]);
-  assert.ok(draft.slides.every((slide) => slide.bodyPoints.length >= 3 && slide.bodyPoints.length <= 4
+  assert.deepEqual(draft.slides.map((slide) => slide.bodyPoints.length), [2, 3, 2]);
+  assert.ok(draft.slides.every((slide) => slide.bodyPoints.length >= 1 && slide.bodyPoints.length <= 4
     && slide.bodyPoints.every((point) => point.origin === 'generated-from-brief'
       && !point.text.includes('Проверить готовность исходных материалов'))));
+});
+
+test('local fake planner obeys the same per-slide title and body region budgets without cutting sentences', () => {
+  const family = {
+    familyKey: 'family-1', archetype: 'cover', supportedContentModes: ['text', 'mixed'],
+    titleRegion: { maxCharacters: 40, maxLines: 1, maxCharactersPerLine: 40 },
+    bodyRegions: [{ maxCharacters: 60, maxLines: 2, maxCharactersPerLine: 60 }],
+    body: { maxCharacters: 60, maxPoints: 1, maxCharactersPerPoint: 60 },
+  };
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
+    brief: { purpose: 'Подготовить обзор без неподтверждённых сведений.' },
+    requestedSlideCount: 1,
+    contentBudgets: {
+      version: 'fit-aware-copy-budget.v1',
+      profileSha256: 'a'.repeat(64),
+      candidateFamilies: [family],
+      slides: [{ order: 1, candidateFamilyKeys: ['family-1'] }],
+    },
+    contentIR: { sources: [{ id: 'task-source', kind: 'brief-task' }], units: [
+      { id: 'task', sourceId: 'task-source', kind: 'text', text: 'Подготовить обзор без неподтверждённых сведений.' },
+    ] },
+  }));
+  const slide = JSON.parse(response.choices[0].message.content).slides[0];
+  assert.ok(Array.from(slide.takeaway).length <= family.titleRegion.maxCharacters);
+  assert.ok(slide.bodyPoints.length <= family.body.maxPoints);
+  assert.ok(slide.bodyPoints.every((point) => Array.from(point.text).length <= family.body.maxCharactersPerPoint));
+  assert.ok(slide.bodyPoints.reduce((sum, point) => sum + Array.from(point.text).length, 0) <= family.body.maxCharacters);
+  assert.ok(slide.bodyPoints.every((point) => point.text.endsWith('.') || point.text.endsWith('!') || point.text.endsWith('?')));
+});
+
+test('local fake never removes or truncates source-backed copy to satisfy a region budget', () => {
+  const sentence = 'Исходное утверждение содержит важную деталь, которую нельзя удалять или сокращать при подборе текста для узкой области.';
+  const family = {
+    familyKey: 'family-1', archetype: 'cover', supportedContentModes: ['text'],
+    titleRegion: { maxCharacters: 8, maxLines: 1, maxCharactersPerLine: 8 },
+    bodyRegions: [{ maxCharacters: 12, maxLines: 1, maxCharactersPerLine: 12 }],
+    body: { maxCharacters: 12, maxPoints: 1, maxCharactersPerPoint: 12 },
+  };
+  const response = deterministicPlanningResponse(request('deck_plan_draft_v4', {
+    requestedSlideCount: 1,
+    contentBudgets: {
+      version: 'fit-aware-copy-budget.v1', profileSha256: 'b'.repeat(64),
+      candidateFamilies: [family], slides: [{ order: 1, candidateFamilyKeys: ['family-1'] }],
+    },
+    contentIR: { sources: [{ id: 'source', kind: 'text' }], units: [
+      { id: 'heading', sourceId: 'source', kind: 'heading', text: '# Проверка' },
+      { id: 'fact', sourceId: 'source', kind: 'text', text: sentence },
+    ] },
+  }));
+  const slide = JSON.parse(response.choices[0].message.content).slides[0];
+  assert.equal(slide.takeaway, 'Проверка');
+  assert.ok(slide.bodyPoints.some((point) => point.text === sentence));
 });
 
 test('local fake returns generic strict-schema template role mappings from supplied evidence', () => {

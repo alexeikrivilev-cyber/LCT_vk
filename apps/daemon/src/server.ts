@@ -44,6 +44,7 @@ import {
   probeSemanticEndpoint,
   semanticInferenceConfigFromEnvironment,
 } from './presentation/adapters/openai-compatible-semantic-inference.js';
+import { derivePlanningContentBudgets } from './presentation/adapters/office-kit-planning-content-budgets.js';
 import { SemanticInferenceError, type SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
 import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
 import { ProductWorkflowError, ProductWorkflowService } from './presentation/application/product-workflow-service.js';
@@ -334,6 +335,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     projectRoot,
     projectsRoot,
     getInferenceAdapter: getSemanticAdapter,
+    ...(semanticProfilingEnabled ? {
+      getPreparedTemplateProfile: readPreparedTemplateProfile,
+      getPlanningContentBudgets: (input) => derivePlanningContentBudgets({ projectsRoot, ...input }),
+    } : {}),
     ...(options.planningNow ? { now: options.planningNow } : {}),
     ...(options.planningCreateId ? { createId: options.planningCreateId } : {}),
   });

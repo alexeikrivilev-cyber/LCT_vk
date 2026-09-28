@@ -252,8 +252,9 @@ async function main() {
     assert.ok(![...(deckPlanEvidenceContentIR?.units ?? [])].some((unit) => instructionSourceIds.has(unit.sourceId)));
     assert.equal(new Set(planning.deckPlan.slides.map((slide) => slide.takeaway.trim().toLocaleLowerCase())).size,
       planning.deckPlan.slides.length, 'synthetic long-deck plan must not repeat takeaways');
-    assert.equal(new Set(planning.deckPlan.slides.map((slide) => [...slide.contentRefs].sort().join('|'))).size,
-      planning.deckPlan.slides.length, 'synthetic long-deck plan must not repeat its source claims');
+    const sourceBackedSlides = planning.deckPlan.slides.filter((slide) => slide.contentRefs.length > 0);
+    assert.equal(new Set(sourceBackedSlides.map((slide) => [...slide.contentRefs].sort().join('|'))).size,
+      sourceBackedSlides.length, 'source-backed slides must not repeat the same source claim set');
     report.gates.content = 'passed';
     report.gates.plan = 'passed';
     report.plan = { id: planning.deckPlan.id, hash: planning.deckPlan.hash, slides: planning.deckPlan.slides.length };
@@ -449,10 +450,13 @@ async function main() {
     const performanceSnapshot = performanceDiagnostics.snapshot();
     const performanceCounts = performanceSnapshot.counts;
     const initialRendererCallCount = (performanceCounts.rendererCallCount ?? 0) - 4;
-    assert.ok(initialRendererCallCount <= args.slideCount + 1,
-      'renderer work is bounded to one initial A/B/C pack per slide plus at most one targeted repair');
-    assert.ok((performanceCounts.previewDeckLoadCount ?? 0) <= args.slideCount + 1,
-      'batched A/B/C previewing loads each pack once, plus at most one targeted repair');
+    const previewFallbackAttempts = performanceCounts['generation.previewCompositionFallbackAttemptCount'] ?? 0;
+    assert.ok(previewFallbackAttempts <= args.slideCount * 7,
+      'preview/audit repair remains within seven bounded alternatives per slide pack');
+    assert.ok(initialRendererCallCount <= args.slideCount + previewFallbackAttempts,
+      'renderer work is bounded to one initial A/B/C pack per slide plus each recorded qualified-candidate retry');
+    assert.ok((performanceCounts.previewDeckLoadCount ?? 0) <= args.slideCount + previewFallbackAttempts,
+      'batched A/B/C previewing loads each pack once, plus each recorded qualified-candidate retry');
     assert.ok((performanceCounts['composition.visualClassificationCacheMiss'] ?? 0) <= report.templateIR.slides,
       'generation-scoped immutable classification cache resolves each template slide at most once');
     assert.ok((performanceCounts['composition.visualClassificationCacheHit'] ?? 0) > 0,

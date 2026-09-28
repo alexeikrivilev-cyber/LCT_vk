@@ -10,6 +10,108 @@ function completion(model, value, finishReason = 'stop') {
   };
 }
 
+function conciseHeading(value, limit = 40) {
+  const heading = String(value ?? '').replace(/^\s{0,3}#{1,6}\s+/u, '').replace(/\s+/gu, ' ').trim();
+  if (heading.length <= limit) return heading;
+  const bounded = heading.slice(0, limit + 1);
+  const boundary = bounded.lastIndexOf(' ');
+  return (boundary > 0 ? bounded.slice(0, boundary) : bounded.slice(0, limit)).trim();
+}
+
+function sourceBodyPoints(section, fallback) {
+  const sentences = (section?.contentUnits ?? []).flatMap((unit) => String(unit.text ?? '')
+    .replace(/^\s{0,3}[-*+]\s+/gmu, '')
+    .split(/(?<=[.!?])\s+/u))
+    .map((text) => text.replace(/\s+/gu, ' ').trim())
+    .filter((text) => text.length > 0);
+  const selected = [...new Set(sentences)].slice(0, 4);
+  return (selected.length ? selected : fallback).map((text) => ({ text, origin: 'generated-from-brief', evidenceRefs: [] }));
+}
+
+function familyForPlannedSlide(evidence, order, slide) {
+  const budgets = evidence.contentBudgets;
+  if (!budgets || budgets.version !== 'fit-aware-copy-budget.v1') return null;
+  const row = budgets.slides?.find((item) => item.order === order);
+  const available = new Set(row?.candidateFamilyKeys ?? []);
+  const families = (budgets.candidateFamilies ?? []).filter((item) => available.has(item.familyKey));
+  const roleArchetypes = slide.narrativeRole === 'opening' ? ['cover', 'visual-led', 'content']
+    : slide.narrativeRole === 'closing' ? ['closing', 'section-divider', 'content', 'visual-led']
+      : slide.narrativeRole === 'section-divider' ? ['section-divider', 'content']
+        : slide.narrativeRole === 'agenda' ? ['content', 'content-split', 'content-dense', 'section-divider']
+          : ['content', 'content-split', 'content-dense', 'metric-evidence', 'table-data', 'visual-led'];
+  const applicable = families.filter((item) => roleArchetypes.includes(item.archetype));
+  const contentModes = slide.semanticVisualType === 'table' || slide.semanticVisualType === 'comparison' ? ['table', 'mixed']
+    : slide.semanticVisualType === 'chart' || slide.semanticVisualType === 'kpi' ? ['chart', 'metrics', 'mixed']
+      : slide.semanticVisualType === 'diagram' || slide.semanticVisualType === 'process' || slide.semanticVisualType === 'timeline' ? ['diagram', 'mixed']
+        : slide.semanticVisualType === 'image' ? ['image', 'mixed'] : ['text', 'mixed'];
+  const roleMatched = applicable.length ? applicable : families;
+  const modeMatched = roleMatched.filter((item) => contentModes.some((mode) => item.supportedContentModes?.includes(mode)));
+  const candidates = modeMatched.length ? modeMatched : roleMatched;
+  const copyFit = (family) => {
+    const titleFits = Array.from(slide.takeaway).length <= (family.titleRegion?.maxCharacters ?? 0);
+    const bodyLimit = family.body?.maxCharacters ?? 0;
+    const pointLimit = Math.min(180, family.body?.maxCharactersPerPoint ?? 0);
+    const pointLimitCount = family.body?.maxPoints ?? 0;
+    let total = 0;
+    let fittingPoints = 0;
+    for (const point of slide.bodyPoints ?? []) {
+      const sentence = String(point.text).split(/(?<=[.!?])\s+/u).map((value) => value.trim()).find((value) => Array.from(value).length <= pointLimit);
+      if (!sentence || fittingPoints >= pointLimitCount || total + Array.from(sentence).length > bodyLimit) continue;
+      total += Array.from(sentence).length;
+      fittingPoints += 1;
+    }
+    const roleRank = roleArchetypes.indexOf(family.archetype);
+    return { titleFits, fittingPoints, roleRank: roleRank < 0 ? roleArchetypes.length : roleRank,
+      capacity: (family.body?.maxCharacters ?? 0) + (family.titleRegion?.maxCharacters ?? 0) };
+  };
+  return [...candidates].sort((left, right) => {
+    const a = copyFit(left);
+    const b = copyFit(right);
+    return Number(b.titleFits) - Number(a.titleFits)
+      || b.fittingPoints - a.fittingPoints
+      || a.roleRank - b.roleRank
+      || b.capacity - a.capacity;
+  })[0] ?? null;
+}
+
+function fitGeneratedCopy(slide, family) {
+  if (!family) return slide;
+  // Source-backed claims are never shortened or removed by the deterministic
+  // fake planner. If they do not fit, the same runtime budget validator must
+  // reject the draft so a semantic planner can make a source-preserving edit.
+  if (slide.contentRefs.length > 0) return slide;
+  const titleLimit = Math.max(1, family.titleRegion?.maxCharacters ?? 40);
+  const bodyLimit = Math.max(0, family.body?.maxCharacters ?? 0);
+  const pointLimit = Math.max(1, Math.min(180, family.body?.maxCharactersPerPoint ?? 180));
+  const pointCount = Math.max(1, Math.min(4, family.body?.maxPoints ?? 4));
+  const fitted = [];
+  let used = 0;
+  for (const point of slide.bodyPoints ?? []) {
+    const candidates = String(point.text).split(/(?<=[.!?])\s+/u).map((value) => value.trim()).filter(Boolean);
+    const fullText = Array.from(point.text).length <= pointLimit ? point.text : candidates.find((value) => Array.from(value).length <= pointLimit);
+    if (!fullText) continue;
+    const length = Array.from(fullText).length;
+    if (used + length > bodyLimit || fitted.length >= pointCount) continue;
+    fitted.push({ ...point, text: fullText });
+    used += length;
+  }
+  // Removing complete lower-priority generated sentences is safe. If none
+  // can fit, preserve the original wording and let runtime validation fail
+  // closed instead of inventing filler or dropping the slide's takeaway.
+  if (fitted.length > 0 && Array.from(slide.takeaway).length <= titleLimit) slide.bodyPoints = fitted;
+  return slide;
+}
+
+function sourceVisualType(section) {
+  const units = section?.contentUnits ?? [];
+  if (units.some((unit) => ['table', 'table-row', 'table-cell'].includes(String(unit.kind ?? '').toLowerCase()))) return 'table';
+  const text = units.map((unit) => String(unit.text ?? '')).join('\n');
+  const orderedItems = text.split(/\r?\n/u).filter((line) => /^\s*(?:\d+[.)]|[-*+])\s+\S/u.test(line));
+  if (orderedItems.length >= 2) return 'process';
+  if (/(?:сравнен|сопоставлен|вариант\s+[а-яa-z]|преимуществ\s+и\s+ограничен)/iu.test(text)) return 'comparison';
+  return 'none';
+}
+
 function deterministicPlanningResponse(request) {
   const schemaName = request.response_format?.json_schema?.name;
   if (schemaName === 'lct_worker_smoke_v1') {
@@ -19,6 +121,7 @@ function deterministicPlanningResponse(request) {
   if (schemaName === 'deck_plan_draft_v2' || schemaName === 'deck_plan_draft_v3' || schemaName === 'deck_plan_draft_v4') {
     const sourceKinds = new Map((evidence.contentIR.sources ?? []).map((source) => [source.id, source.kind]));
     const hasSourceInventory = sourceKinds.size > 0;
+    const imageUnits = (evidence.contentIR.mediaAssets ?? []).filter((asset) => typeof asset.id === 'string');
     const allTextUnits = evidence.contentIR.units.filter((unit) => unit.kind !== 'media-reference'
       && (!hasSourceInventory || sourceKinds.get(unit.sourceId) === 'text')
       && typeof unit.text === 'string' && unit.text.trim());
@@ -44,6 +147,11 @@ function deterministicPlanningResponse(request) {
     }
     if (section?.contentUnits.length) sections.push(section);
     if (!sections.length) sections.push({ heading: null, contentUnits: [] });
+    const imageTargetSectionIndex = imageUnits.length > 0
+      ? sections.findIndex((candidate) => /(?:фото|фотограф|изображен|иллюстрац)/iu.test(
+        [candidate.heading?.text, ...candidate.contentUnits.map((unit) => unit.text)]
+          .filter((text) => typeof text === 'string').join(' ')))
+      : -1;
     const count = Math.max(1, Math.min(30, evidence.requestedSlideCount ?? 1));
     const syntheticStory = buildOfflineQualificationPlan(count).slides;
     const slides = Array.from({ length: count }, (_, index) => {
@@ -51,17 +159,21 @@ function deterministicPlanningResponse(request) {
       const selectedSection = sections[sectionIndex % sections.length];
       const story = syntheticStory[index];
       if (!story) throw new RangeError('Fake story does not cover the requested slide count');
-      return {
+      const mediaRefs = imageUnits.length > 0 && sectionIndex === imageTargetSectionIndex
+        ? [imageUnits[0].id]
+        : [];
+      const plannedSlide = {
         narrativeRole: story.narrativeRole,
         purpose: story.purpose,
-        takeaway: story.takeaway,
+        takeaway: selectedSection.heading ? conciseHeading(selectedSection.heading.text) : story.takeaway,
         contentRefs: [...(selectedSection.heading ? [selectedSection.heading] : []), ...selectedSection.contentUnits]
           .slice(0, 5).map((unit) => unit.id),
-        bodyPoints: story.bodyPoints,
-        mediaRefs: [],
-        semanticVisualType: story.semanticVisualType,
+        bodyPoints: sourceBodyPoints(selectedSection, story.bodyPoints.map((point) => point.text)),
+        mediaRefs,
+        semanticVisualType: mediaRefs.length ? 'image' : hasHeadings ? sourceVisualType(selectedSection) : story.semanticVisualType,
         targetDensity: story.targetDensity,
       };
+      return fitGeneratedCopy(plannedSlide, familyForPlannedSlide(evidence, index + 1, plannedSlide));
     });
     return completion(request.model, {
       workingTitle: 'План и рекомендуемое решение',

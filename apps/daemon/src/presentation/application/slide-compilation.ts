@@ -106,6 +106,8 @@ export interface CompiledSlide {
   selectedCandidateIndex: number;
   /** Runtime-only selector choice. Set only after A/B/C qualification proves a safe native layout fallback. */
   nativeLayoutFallback?: true;
+  /** Internal last-resort composition made from measured template regions and role styles. */
+  templateDerivedCompositionStrategy?: 'balanced' | 'visual-first' | 'structured-dense';
   /** Runtime-only exact donor chosen by the joint A/B/C resolver. */
   exemplarSelection?: ExemplarSlideSelection;
   /** Runtime-only proof set after the selector has validated this exact donor for the current template. */
@@ -192,13 +194,40 @@ function asBox(geometry: TemplateGeometry | null | undefined): PlacementBox | nu
   return { x: geometry.x, y: geometry.y, width: geometry.width, height: geometry.height, unit: 'EMU' };
 }
 
-function fitVisualBoxToCanvas(box: PlacementBox, template: TemplateIR): PlacementBox | null {
+export function fitVisualBoxToCanvas(box: PlacementBox, template: TemplateIR): PlacementBox | null {
   const left = Math.max(0, box.x);
   const top = Math.max(0, box.y);
   const right = Math.min(template.slideSize.width, box.x + box.width);
   const bottom = Math.min(template.slideSize.height, box.y + box.height);
   if (right <= left || bottom <= top) return null;
   return { x: left, y: top, width: right - left, height: bottom - top, unit: 'EMU' };
+}
+
+/** Apply a previously qualified native layout and keep its visual slot within the canvas. */
+export function applyNativeLayoutCandidate(
+  compiled: CompiledSlide,
+  candidate: CompatibleLayoutMatchCandidate,
+  index: number,
+  template: TemplateIR,
+): CompiledSlide {
+  const visual = candidate.visualBox ? fitVisualBoxToCanvas(candidate.visualBox, template) : null;
+  if (candidate.visualBox && !visual) {
+    throw new TypeError('Qualified native visual slot no longer intersects the template canvas');
+  }
+  const {
+    exemplarSelection: _exemplar,
+    exemplarSelectionValidation: _validation,
+    templateDerivedCompositionStrategy: _priorGeneratedStrategy,
+    ...withoutPriorComposition
+  } = compiled;
+  return {
+    ...withoutPriorComposition,
+    layoutId: candidate.layoutId,
+    layoutSourcePart: candidate.sourcePart,
+    placements: { title: candidate.titleBox, body: candidate.bodyBox, visual },
+    selectedCandidateIndex: index,
+    nativeLayoutFallback: true,
+  };
 }
 
 function intentFor(slide: DeckPlanSlide): SlideIntent {

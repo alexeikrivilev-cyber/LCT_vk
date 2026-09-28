@@ -19,6 +19,7 @@ export interface ProcessTextMargins {
 
 const EMU_PER_POINT = 12_700;
 const NODE_TEXT_MARGIN_EMU = 45_720;
+const PROCESS_LABEL_LINE_HEIGHT_RATIO = 1.32;
 
 function estimatedLineCount(line: string, charactersPerLine: number): number | null {
   const words = line.trim().split(/\s+/u).filter(Boolean);
@@ -55,7 +56,10 @@ function requiredTextHeight(text: string, width: number, fontPt: number, margins
     if (wrapped === null) return null;
     lines += wrapped;
   }
-  return Math.ceil(lines * fontPt * 1.2 * EMU_PER_POINT) + top + bottom;
+  // Leave room for the actual Office renderer's font metrics and baseline
+  // spacing; the earlier 1.2 estimate admitted process labels that overflowed
+  // their OOXML boxes by a few pixels after rendering.
+  return Math.ceil(lines * fontPt * PROCESS_LABEL_LINE_HEIGHT_RATIO * EMU_PER_POINT) + top + bottom;
 }
 
 /** Conservative word-aware fit for an existing native text region. */

@@ -165,12 +165,124 @@ function requiredDonorShape(slide: ReturnType<typeof getSlides>[number], nativeI
   return shape;
 }
 
+function templateRoleSourceShapes(
+  compiled: CompiledSlide,
+  template: PptxRenderInput['templateIR'],
+  sourceSlidesByPart: ReadonlyMap<string, ReturnType<typeof getSlides>[number]>,
+  role: 'title' | 'body',
+): ReturnType<typeof getSlideShapes>[number][] {
+  const candidate = compiled.layoutCandidates[compiled.selectedCandidateIndex];
+  const evidence = candidate?.slotEvidence[role]?.sourceEvidence ?? [];
+  const parts = [...template.slides, ...template.layouts, ...template.masters];
+  const elements = evidence.flatMap((item) => {
+    const sourceElement = parts.find((part) => part.sourcePart === item.sourcePart)?.elements.find((element) => element.id === item.elementId);
+    return sourceElement?.nativeId ? [{ sourcePart: item.sourcePart, element: sourceElement }] : [];
+  });
+  // Layout placeholders often inherit size from the theme/master and expose
+  // geometry without a concrete run size. In that case borrow an actual native
+  // text shape with the same placeholder role from this template. This keeps
+  // generic compositions in the template's typography while avoiding a
+  // guessed universal point size.
+  const acceptedRoles = role === 'title' ? new Set(['title', 'ctrtitle', 'subtitle']) : new Set(['body', 'obj', 'content', 'subtitle']);
+  for (const slide of template.slides) for (const element of slide.elements) {
+    const placeholderRole = String(element.placeholder?.role ?? element.placeholder?.type ?? '').toLowerCase();
+    if (element.nativeId && acceptedRoles.has(placeholderRole)) elements.push({ sourcePart: slide.sourcePart, element });
+  }
+  const unique = new Map(elements.map((item) => [`${item.sourcePart}|${item.element.nativeId}`, item]));
+  const withSizes = [...unique.values()].map((item) => ({ ...item,
+    size: Math.max(0, ...(item.element.effectiveFontSizesPt ?? item.element.directStyles.fontSizesPt ?? [])),
+  }));
+  const knownSizes = withSizes.map((item) => item.size).filter((size) => size > 0).sort((a, b) => a - b);
+  const medianSize = knownSizes.length ? knownSizes[Math.floor(knownSizes.length / 2)]! : 0;
+  const ordered = withSizes.sort((left, right) => Number(right.size > 0) - Number(left.size > 0)
+    || Math.abs(left.size - medianSize) - Math.abs(right.size - medianSize)
+    || left.sourcePart.localeCompare(right.sourcePart)
+    || left.element.id.localeCompare(right.element.id));
+  const result: ReturnType<typeof getSlideShapes>[number][] = [];
+  for (const item of ordered) {
+    const sourceSlide = sourceSlidesByPart.get(normalizePart(item.sourcePart));
+    const shape = sourceSlide && getSlideShapes(sourceSlide).find((candidateShape) => String(getShapeId(candidateShape)) === item.element.nativeId);
+    if (shape && hasShapeText(shape)) result.push(shape);
+  }
+  return result;
+}
+
+function estimatedWrappedLines(text: string, widthEmu: number, fontPt: number): number {
+  const charsPerLine = Math.max(1, widthEmu / 12_700 / Math.max(1, fontPt * 0.56));
+  return Math.max(1, ...text.split(/\r?\n/u).map((line) => Math.max(1, Math.ceil(Array.from(line).length / charsPerLine))));
+}
+
+function partitionTextRegions(
+  box: { x: number; y: number; width: number; height: number },
+  texts: readonly string[],
+  fontPt: number,
+  strategy: NonNullable<CompiledSlide['templateDerivedCompositionStrategy']>,
+): Array<{ text: string; box: { x: number; y: number; width: number; height: number } }> {
+  if (texts.length <= 1) return [{ text: texts[0] ?? '', box }];
+  const groups = strategy === 'visual-first'
+    ? [{ text: texts[0]!, lines: estimatedWrappedLines(texts[0]!, box.width, fontPt) + 1 },
+      // Reserve one additional native text line for the trailing paragraph
+      // block: the preview engine includes OOXML line/paragraph metrics that
+      // the geometric estimator cannot fully resolve. The preview remains the
+      // hard gate; this only allocates the measured region more conservatively.
+      { text: texts.slice(1).join('\n'), lines: texts.slice(1).reduce((sum, text) => sum + estimatedWrappedLines(text, box.width, fontPt), 0) + 1 }]
+    : texts.map((text) => ({ text, lines: estimatedWrappedLines(text, box.width, fontPt) }));
+  const gap = Math.min(Math.round(box.height * 0.025), Math.round(Math.max(1, fontPt) * 0.55 * 12_700));
+  const availableHeight = box.height - gap * (groups.length - 1);
+  const lineTotal = groups.reduce((sum, item) => sum + item.lines, 0);
+  if (availableHeight <= 0 || lineTotal <= 0) return [{ text: texts.join('\n'), box }];
+  let y = box.y;
+  return groups.map((group, index) => {
+    const height = index === groups.length - 1 ? box.y + box.height - y
+      : Math.floor(availableHeight * group.lines / lineTotal);
+    const region = { text: group.text, box: { x: box.x, y, width: box.width, height } };
+    y += height + gap;
+    return region;
+  });
+}
+
+function partitionComparisonRows(
+  box: { x: number; y: number; width: number; height: number },
+  texts: readonly string[],
+  fontPt: number,
+): Array<{ left: { text: string; box: { x: number; y: number; width: number; height: number } }; right: { text: string; box: { x: number; y: number; width: number; height: number } } }> | null {
+  if (texts.length < 2 || !Number.isFinite(fontPt) || fontPt <= 0) return null;
+  const columnGap = Math.max(Math.round(box.width * 0.03), Math.round(fontPt * 0.8 * 12_700));
+  const columnWidth = Math.floor((box.width - columnGap) / 2);
+  if (columnWidth <= 0) return null;
+  const rowGap = Math.min(Math.round(box.height * 0.025), Math.round(fontPt * 0.7 * 12_700));
+  const rows = Array.from({ length: Math.ceil(texts.length / 2) }, (_unused, index) => {
+    const left = texts[index * 2]!;
+    const right = texts[index * 2 + 1] ?? '';
+    return {
+      left,
+      right,
+      lines: Math.max(estimatedWrappedLines(left, columnWidth, fontPt), right ? estimatedWrappedLines(right, columnWidth, fontPt) : 1),
+    };
+  });
+  const availableHeight = box.height - rowGap * (rows.length - 1);
+  const totalLines = rows.reduce((total, row) => total + row.lines, 0);
+  if (availableHeight <= 0 || totalLines <= 0) return null;
+  let y = box.y;
+  return rows.map((row, index) => {
+    const height = index === rows.length - 1 ? box.y + box.height - y
+      : Math.floor(availableHeight * row.lines / totalLines);
+    const result = {
+      left: { text: row.left, box: { x: box.x, y, width: columnWidth, height } },
+      right: { text: row.right, box: { x: box.x + columnWidth + columnGap, y, width: columnWidth, height } },
+    };
+    y += height + rowGap;
+    return result;
+  });
+}
+
 function roleTextStyle(
   presentation: Awaited<ReturnType<typeof loadPresentation>>,
   slide: ReturnType<typeof getSlides>[number],
   role: 'title' | 'body',
   preferredShapes: readonly ReturnType<typeof getSlideShapes>[number][] = [],
-) {
+  templateDerivedFallbackColor?: string | null,
+): { color: string; size?: number; font?: string; fontEastAsian?: string; fontComplexScript?: string } {
   const allowedTypes = role === 'title'
     ? new Set(['title', 'ctrTitle', 'subTitle'])
     : new Set(['body', 'obj', 'subTitle']);
@@ -178,22 +290,136 @@ function roleTextStyle(
   const candidates = [...preferredShapes, ...shapes.filter((shape) => allowedTypes.has(getShapePlaceholderType(shape) ?? '')),
   ];
   const seen = new Set<object>();
+  let resolved: { color?: string; size?: number; font?: string; fontEastAsian?: string; fontComplexScript?: string } = {};
   for (const shape of candidates) {
     if (seen.has(shape)) continue;
     seen.add(shape);
     try {
       const format = getShapeRunFormatEffective(presentation, shape, 0, 0);
       const color = format.color ?? resolveDeckBodyTextColor(slide);
-      if (color) return { color, size: format.size !== undefined && Number.isFinite(format.size) && format.size > 0 ? format.size : undefined,
-        font: format.font ?? undefined, fontEastAsian: format.fontEastAsian ?? undefined,
-        fontComplexScript: format.fontComplexScript ?? undefined };
+      if (!resolved.color && color) resolved.color = color;
+      if (!resolved.size && format.size !== undefined && Number.isFinite(format.size) && format.size > 0) resolved.size = format.size;
+      if (!resolved.font && format.font) resolved.font = format.font;
+      if (!resolved.fontEastAsian && format.fontEastAsian) resolved.fontEastAsian = format.fontEastAsian;
+      if (!resolved.fontComplexScript && format.fontComplexScript) resolved.fontComplexScript = format.fontComplexScript;
+      if (resolved.color && resolved.size) return { ...resolved, color: resolved.color };
     } catch {
       // Try the next template role source; never fall back to a generic black text color.
     }
   }
+  if (resolved.color) return { ...resolved, color: resolved.color };
   const deckBodyColor = resolveDeckBodyTextColor(slide);
   if (deckBodyColor) return { color: deckBodyColor };
+  const themeColor = normalizedHexColor(templateDerivedFallbackColor);
+  if (themeColor) return { ...resolved, color: themeColor };
   throw new PptxBackendError('TEMPLATE_TEXT_STYLE_UNRESOLVED', `Could not derive a ${role} text color from the template role or theme.`);
+}
+
+type TemplateIRValue = PptxRenderInput['templateIR'];
+
+function normalizedHexColor(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const normalized = value.replace(/^#/u, '').trim();
+  return /^[a-f0-9]{6}$/iu.test(normalized) ? `#${normalized.toUpperCase()}` : null;
+}
+
+function templateBackgroundColor(background: NonNullable<TemplateIRValue['layouts'][number]['background']>, template: TemplateIRValue): string | null {
+  if (background.kind !== 'explicit' || background.fill?.kind !== 'solidFill') return null;
+  for (const color of background.fill.colors) {
+    const raw = color.type === 'srgbClr' ? color.attributes.val
+      : color.type === 'sysClr' ? color.attributes.lastClr
+        : color.type === 'schemeClr' ? template.theme?.colors[color.attributes.val ?? '']
+          : undefined;
+    const value = normalizedHexColor(raw);
+    if (value) return value;
+  }
+  return null;
+}
+
+function relativeLuminance(hexColor: string): number {
+  const channels = [1, 3, 5].map((index) => Number.parseInt(hexColor.slice(index, index + 2), 16) / 255)
+    .map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+  return channels[0]! * 0.2126 + channels[1]! * 0.7152 + channels[2]! * 0.0722;
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const luminances = [relativeLuminance(foreground), relativeLuminance(background)].sort((left, right) => right - left);
+  return (luminances[0]! + 0.05) / (luminances[1]! + 0.05);
+}
+
+function boxContains(outer: { x: number; y: number; width: number; height: number }, inner: { x: number; y: number; width: number; height: number }): boolean {
+  return outer.x <= inner.x && outer.y <= inner.y
+    && outer.x + outer.width >= inner.x + inner.width
+    && outer.y + outer.height >= inner.y + inner.height;
+}
+
+function templateDerivedBodyColor(
+  compiled: CompiledSlide,
+  template: TemplateIRValue,
+  titleColor: string,
+  bodyColor: string,
+): string | null {
+  const candidate = compiled.layoutCandidates[compiled.selectedCandidateIndex];
+  const layout = template.layouts.find((item) => item.sourcePart === compiled.layoutSourcePart);
+  const master = template.masters.find((item) => item.id === layout?.masterId);
+  const parts = [layout, master].filter((item): item is NonNullable<typeof item> => Boolean(item));
+
+  // A native filled shape covering the measured body region is stronger
+  // background evidence than the page background, so retain that role's color.
+  const filledPanel = parts.flatMap((part) => part.elements).find((element) => {
+    const fill = normalizedHexColor(element.directStyles.fillColor);
+    const box = element.geometry.resolved ?? element.geometry.direct;
+    return Boolean(fill && box && candidate?.bodyBox && boxContains(box, candidate.bodyBox));
+  });
+  const panelColor = normalizedHexColor(filledPanel?.directStyles.fillColor);
+  if (panelColor) return chooseTemplateTextColor(panelColor, template, titleColor, bodyColor);
+
+  const background = layout?.background ?? master?.background ?? null;
+  if (!background || background.kind !== 'explicit' || !background.fill) return null;
+  const solidColor = templateBackgroundColor(background, template);
+  if (solidColor) return chooseTemplateTextColor(solidColor, template, titleColor, bodyColor);
+
+  const imageBacked = background.fill.kind === 'blipFill'
+    || parts.some((part) => part.relationships.some((relationship) => relationship.nativeId === background.fill?.relationshipNativeId
+      && relationship.type.endsWith('/image')));
+  // An image has no reliable single sampled color in TemplateIR. A native
+  // title color rendered against the same page backdrop is the strongest
+  // available template-derived foreground token for a body region without a
+  // native filled panel.
+  return imageBacked ? normalizedHexColor(titleColor) : null;
+}
+
+function chooseTemplateTextColor(background: string, template: TemplateIRValue, titleColor: string, bodyColor: string): string {
+  const neutralThemeColors = ['lt1', 'dk1'].map((key) => normalizedHexColor(template.theme?.colors[key])).filter((value): value is string => Boolean(value));
+  const candidates = [...new Set([normalizedHexColor(bodyColor), normalizedHexColor(titleColor), ...neutralThemeColors]
+    .filter((value): value is string => Boolean(value)))];
+  const best = candidates.map((color) => ({ color, ratio: contrastRatio(color, background) }))
+    .sort((left, right) => right.ratio - left.ratio || left.color.localeCompare(right.color))[0];
+  if (!best || best.ratio < 4.5) {
+    throw new PptxBackendError('TEMPLATE_DERIVED_CONTRAST_UNRESOLVED', 'The template does not provide a text color with sufficient contrast against the measured generic composition background.');
+  }
+  return best.color;
+}
+
+function templateDerivedThemeForeground(compiled: CompiledSlide, template: TemplateIRValue): string | null {
+  const candidate = compiled.layoutCandidates[compiled.selectedCandidateIndex];
+  const layout = template.layouts.find((item) => item.sourcePart === compiled.layoutSourcePart);
+  const master = template.masters.find((item) => item.id === layout?.masterId);
+  const parts = [layout, master].filter((item): item is NonNullable<typeof item> => Boolean(item));
+  const panel = parts.flatMap((part) => part.elements).find((element) => {
+    const fill = normalizedHexColor(element.directStyles.fillColor);
+    const box = element.geometry.resolved ?? element.geometry.direct;
+    return Boolean(fill && box && candidate?.bodyBox && boxContains(box, candidate.bodyBox));
+  });
+  const panelColor = normalizedHexColor(panel?.directStyles.fillColor);
+  const background = layout?.background ?? master?.background ?? null;
+  const solidColor = panelColor ?? (background ? templateBackgroundColor(background, template) : null);
+  if (!solidColor) return null;
+  const themeColors = ['lt1', 'dk1'].map((key) => normalizedHexColor(template.theme?.colors[key]))
+    .filter((value): value is string => Boolean(value));
+  const best = themeColors.map((color) => ({ color, ratio: contrastRatio(color, solidColor) }))
+    .sort((left, right) => right.ratio - left.ratio || left.color.localeCompare(right.color))[0];
+  return best && best.ratio >= 4.5 ? best.color : null;
 }
 
 function applyRoleTextStyle(
@@ -682,7 +908,11 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         ? assessment?.safeSelections.find((candidate) => candidate.sourcePart === selected.sourcePart
           && candidate.sourceSlideIndex === selected.sourceSlideIndex
           && candidate.projectedCompositionSignature === selected.projectedCompositionSignature)
-        : assessment?.selection;
+        // A template-derived assignment is an explicit tier-3 decision. Do not
+        // silently replace it with an automatically ranked donor during render;
+        // doing so changes the composition after qualification and invalidates
+        // the promised A/B/C strategy.
+        : compiled.templateDerivedCompositionStrategy ? null : assessment?.selection;
       if (selected && !selection) {
         throw new PptxBackendError('EXEMPLAR_ASSIGNMENT_REVALIDATION_FAILED',
           'The jointly qualified donor no longer passes the current template projection checks.');
@@ -805,6 +1035,184 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       if (!layout) throw new TypeError(`Office Kit cannot resolve selected layout part ${compiled.layoutSourcePart}`);
       slide = addSlide(presentation, { layout });
       outputSlidesById.set(compiled.id, slide);
+      if (compiled.templateDerivedCompositionStrategy) {
+        const candidate = compiled.layoutCandidates[compiled.selectedCandidateIndex];
+        if (!candidate || !candidate.titleBox || !candidate.bodyBox) {
+          throw new PptxBackendError('TEMPLATE_DERIVED_GEOMETRY_MISSING', 'The measured template title/body regions are unavailable for the generic composition.');
+        }
+        const titleSources = templateRoleSourceShapes(compiled, input.templateIR, sourceSlidesByPart, 'title');
+        const bodySources = templateRoleSourceShapes(compiled, input.templateIR, sourceSlidesByPart, 'body');
+        const themeForeground = templateDerivedThemeForeground(compiled, input.templateIR);
+        const titlePlaceholder = ['title', 'ctrTitle', 'subTitle'].map((type) => findSlidePlaceholder(slide!, type as 'title' | 'ctrTitle' | 'subTitle'))
+          .find((shape) => Boolean(shape));
+        const bodyPlaceholder = ['body', 'obj', 'subTitle'].map((type) => findSlidePlaceholder(slide!, type as 'body' | 'obj' | 'subTitle'))
+          .find((shape) => Boolean(shape));
+        // Office Kit resolves inherited placeholder run styling only after text
+        // exists. Temporarily seed the new slide's native placeholders, capture
+        // their effective template typography, then clear them before adding the
+        // tier-3 editable boxes. No sample or temporary text reaches the output.
+        if (titlePlaceholder) setShapeText(titlePlaceholder, compiled.title);
+        if (bodyPlaceholder) setShapeText(bodyPlaceholder, compiled.body.join('\n'));
+        const titleStyleBase = roleTextStyle(presentation, slide, 'title', titleSources, themeForeground);
+        const bodyStyleBase = roleTextStyle(presentation, slide, 'body', bodySources, themeForeground);
+        if (titlePlaceholder) setShapeText(titlePlaceholder, '');
+        if (bodyPlaceholder) setShapeText(bodyPlaceholder, '');
+        const roleStyle = (base: ReturnType<typeof roleTextStyle>, role: 'title' | 'body') => {
+          const evidence = candidate.slotEvidence[role].sourceEvidence;
+          const measuredSizes = evidence.flatMap((item) => item.fontSizesPt ?? []).filter((size) => Number.isFinite(size) && size > 0);
+          return {
+            ...base,
+            size: base.size ?? (measuredSizes.length ? Math.max(...measuredSizes) : undefined),
+            font: base.font ?? (role === 'title' ? input.templateIR.theme?.fonts.major : input.templateIR.theme?.fonts.minor) ?? undefined,
+          };
+        };
+        const titleStyle = roleStyle(titleStyleBase, 'title');
+        const bodyStyleBaseResolved = roleStyle(bodyStyleBase, 'body');
+        const bodyColor = templateDerivedBodyColor(compiled, input.templateIR, titleStyle.color, bodyStyleBaseResolved.color);
+        const bodyStyle = bodyColor ? { ...bodyStyleBaseResolved, color: bodyColor } : bodyStyleBaseResolved;
+        if (!titleStyle.size || !bodyStyle.size) {
+          throw new PptxBackendError('TEMPLATE_DERIVED_TYPOGRAPHY_UNRESOLVED', 'The template does not provide a measurable title/body typography role for a safe generic composition.');
+        }
+        const accent = input.templateIR.theme?.colors.accent1 ?? bodyStyle.color;
+        const addRoleText = (text: string, box: { x: number; y: number; width: number; height: number }, role: 'title' | 'body') => {
+          const shape = addSlideTextBox(slide!, {
+            x: emu(box.x), y: emu(box.y), w: emu(box.width), h: emu(box.height), text,
+            name: role === 'title' ? 'lct-template-derived-title' : 'lct-template-derived-body',
+          });
+          setShapeTextMargins(shape, { left: 0, right: 0, top: 0, bottom: 0 });
+          setShapeTextAnchor(shape, 'top');
+          setShapeAlignment(shape, 'left');
+          applyResolvedRoleTextStyle(shape, role === 'title' ? titleStyle : bodyStyle);
+          return shape;
+        };
+        addRoleText(compiled.title, compiled.placements.title, 'title');
+        nativeTextShapeCount += 1;
+        nativeShapeCount += 1;
+        const bodyText = compiled.body;
+        let comparisonRealized = false;
+        if (compiled.visualization.processSteps.length >= 2) {
+          const labels = compiled.visualization.processSteps.map((step) => step.text);
+          if (compiled.templateDerivedCompositionStrategy === 'structured-dense') {
+            const regions = partitionTextRegions(candidate.bodyBox, labels, bodyStyle.size, 'structured-dense');
+            for (const [index, region] of regions.entries()) {
+              addRoleText(region.text, region.box, 'body');
+              nativeTextShapeCount += 1;
+              nativeShapeCount += 1;
+              if (index < regions.length - 1) {
+                const next = regions[index + 1]!;
+                const y = Math.floor((region.box.y + region.box.height + next.box.y) / 2);
+                addProcessConnector(slide, { x: candidate.bodyBox.x + candidate.bodyBox.width / 2, y: y - 2_540 },
+                  { x: candidate.bodyBox.x + candidate.bodyBox.width / 2, y: y + 2_540 }, accent);
+                nativeConnectorCount += 1;
+              }
+            }
+            recordVisualIntent(compiled, 'process', 'The measured body region hosts an editable ordered step sequence.');
+          } else {
+            const nodeLayout = fitProcessNodeLayout(candidate.bodyBox, labels, bodyStyle.size);
+            if (!nodeLayout) throw new PptxBackendError('TEMPLATE_DERIVED_PROCESS_DOES_NOT_FIT', 'The measured template body region cannot safely contain the complete process sequence at the template body font size.');
+            const nodeColor = compiled.templateDerivedCompositionStrategy === 'visual-first' ? accent : bodyStyle.color;
+            for (const [index, label] of labels.entries()) {
+              const node = addProcessNode(slide, label, nodeLayout.nodes[index]!, nodeColor, bodyStyle);
+              void node;
+            }
+            connectProcessNodes(slide, nodeLayout, nodeColor);
+            nativeTextShapeCount += nodeLayout.nodes.length;
+            nativeShapeCount += nodeLayout.nodes.length;
+            nativeConnectorCount += Math.max(0, nodeLayout.nodes.length - 1);
+            recordVisualIntent(compiled, 'process', compiled.templateDerivedCompositionStrategy === 'visual-first'
+              ? 'Editable process nodes use the template accent palette.' : 'Editable process nodes use the measured template body region.');
+          }
+        } else if (compiled.visualization.type === 'comparison') {
+          const rows = partitionComparisonRows(candidate.bodyBox, bodyText, bodyStyle.size);
+          if (!rows) {
+            unresolvedVisualTypes.add(compiled.visualization.type);
+            recordVisualIntent(compiled, 'unresolved', 'The measured template text region cannot safely host the supplied comparison statements.');
+          } else {
+            for (const [index, row] of rows.entries()) {
+              const left = addRoleText(row.left.text, row.left.box, 'body');
+              nativeTextShapeCount += 1;
+              nativeShapeCount += 1;
+              if (row.right.text) {
+                addRoleText(row.right.text, row.right.box, 'body');
+                nativeTextShapeCount += 1;
+                nativeShapeCount += 1;
+              }
+              if (compiled.templateDerivedCompositionStrategy === 'visual-first' && index === 0) {
+                setShapeTextFormat(left, { bold: true });
+              }
+              if (compiled.templateDerivedCompositionStrategy === 'structured-dense' && index < rows.length - 1) {
+                const next = rows[index + 1]!;
+                const y = Math.floor((row.left.box.y + row.left.box.height + next.left.box.y) / 2);
+                addSlideLine(slide, {
+                  from: { x: emu(candidate.bodyBox.x), y: emu(y) },
+                  to: { x: emu(candidate.bodyBox.x + candidate.bodyBox.width), y: emu(y) },
+                  color: requiredTemplateColor(accent), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU,
+                  name: 'lct-template-derived-comparison-separator',
+                });
+                nativeConnectorCount += 1;
+              }
+            }
+            if (compiled.templateDerivedCompositionStrategy === 'visual-first') {
+              const centerX = candidate.bodyBox.x + Math.floor(candidate.bodyBox.width / 2);
+              addSlideLine(slide, {
+                from: { x: emu(centerX), y: emu(candidate.bodyBox.y) },
+                to: { x: emu(centerX), y: emu(candidate.bodyBox.y + candidate.bodyBox.height) },
+                color: requiredTemplateColor(accent), widthEmu: Math.round(PROCESS_CONNECTOR_WIDTH_EMU * 1.5),
+                name: 'lct-template-derived-comparison-divider',
+              });
+              nativeConnectorCount += 1;
+            }
+            comparisonRealized = true;
+            recordVisualIntent(compiled, 'comparison', 'Editable text columns preserve the supplied statements; no table values or metrics are synthesized.');
+          }
+        } else if (bodyText.length) {
+          const strategy = compiled.templateDerivedCompositionStrategy;
+          if (strategy === 'balanced') {
+            addRoleText(bodyText.join('\n'), candidate.bodyBox, 'body');
+            nativeTextShapeCount += 1;
+            nativeShapeCount += 1;
+          } else {
+            const regions = partitionTextRegions(candidate.bodyBox, bodyText, bodyStyle.size, strategy);
+            for (const [index, region] of regions.entries()) {
+              const shape = addRoleText(region.text, region.box, 'body');
+              if (strategy === 'visual-first' && index === 0 && bodyText.length > 1) setShapeTextFormat(shape, { bold: true });
+              nativeTextShapeCount += 1;
+              nativeShapeCount += 1;
+              if (index < regions.length - 1) {
+                const next = regions[index + 1]!;
+                const y = Math.floor((region.box.y + region.box.height + next.box.y) / 2);
+                const line = addSlideLine(slide, {
+                  from: { x: emu(candidate.bodyBox.x), y: emu(y) },
+                  to: { x: emu(candidate.bodyBox.x + candidate.bodyBox.width), y: emu(y) },
+                  color: requiredTemplateColor(accent), widthEmu: PROCESS_CONNECTOR_WIDTH_EMU,
+                  name: 'lct-template-derived-separator',
+                });
+                void line;
+                nativeConnectorCount += 1;
+              }
+            }
+            if (strategy === 'visual-first' && candidate.bodyBox.x > 0) {
+              const x = Math.max(0, candidate.bodyBox.x - Math.min(candidate.bodyBox.x, Math.round(input.templateIR.slideSize.width * 0.012)));
+              addSlideLine(slide, {
+                from: { x: emu(x), y: emu(candidate.bodyBox.y) },
+                to: { x: emu(x), y: emu(candidate.bodyBox.y + candidate.bodyBox.height) },
+                color: requiredTemplateColor(accent), widthEmu: Math.round(PROCESS_CONNECTOR_WIDTH_EMU * 1.5),
+                name: 'lct-template-derived-visual-accent',
+              });
+              nativeConnectorCount += 1;
+            }
+          }
+        }
+        if (compiled.visualization.type === 'none') recordVisualIntent(compiled, 'none');
+        else if (compiled.visualization.type === 'comparison' && comparisonRealized) {
+          // The editable column objects and their explicit strategy separators were recorded above.
+        }
+        else if (compiled.visualization.type !== 'process') {
+          unresolvedVisualTypes.add(compiled.visualization.type);
+          recordVisualIntent(compiled, 'unresolved', 'This generic text composition has no qualified native visual region for the requested data visual.');
+        }
+        continue;
+      }
       const titlePlaceholder = matchingNativePlaceholder(presentation, slide, layout, compiled.placements.title, 'title');
       if (titlePlaceholder) {
         setShapeText(titlePlaceholder, compiled.title);

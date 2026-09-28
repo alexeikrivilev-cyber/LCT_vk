@@ -16,17 +16,62 @@ const { startServer } = await import('../src/server.ts');
 const { PDFDocument } = await import('pdf-lib');
 const { compileContentIR } = await import('../src/presentation/application/content-compiler.ts');
 const { planningInputFingerprint, validatePlanReview } = await import('../src/presentation/application/planning-service.ts');
+const { planningContentProfileFingerprint } = await import('../src/presentation/application/planning-content-budgets.ts');
+const { projectTemplateSemanticProfileCache, TemplateSemanticProfiler } = await import('../src/presentation/application/template-semantic-profiler.ts');
 const { canonicalizeDeckPlan } = await import('../src/presentation/domain/deck-plan.ts');
 const { briefHash } = await import('../src/presentation/domain/brief.ts');
 const { OfficeKitPptxRenderer } = await import('../src/presentation/adapters/office-kit-pptx-renderer.ts');
 const { inspectOfficeKitPackage } = await import('../src/presentation/adapters/office-kit-package-inspector.ts');
-const { PresentationGenerationService } = await import('../src/presentation/application/generation-service.ts');
+const { PresentationGenerationService, orderedPreviewFallbackAssignments } = await import('../src/presentation/application/generation-service.ts');
 const { createPresentationProject, openPresentationStore } = await import('../src/presentation-store.ts');
 const { getPresentationGeneration, startPresentationGeneration } = await import('../src/presentation-generation-store.ts');
 const { startFakeSemanticEndpoint } = await import('../../../scripts/lib/fake-openai-compatible-endpoint.mjs');
 
 const repoRoot = path.resolve(import.meta.dirname, '../../..');
 const variants = ['A', 'B', 'C'];
+
+test('preview fallback ranking spreads bounded attempts across A/B/C track alternatives', () => {
+  const assignment = (variantId, signature, rank) => ({
+    variantId,
+    compositionKind: 'exemplar-backed',
+    layoutCandidateIndex: 0,
+    projectedCompositionSignature: `sha256:${signature.padStart(64, '0')}`,
+    compositionFamilyKey: `${variantId}-family-${rank}`,
+  });
+  const current = { A: assignment('A', '1', 0), B: assignment('B', '2', 0), C: assignment('C', '3', 0) };
+  const options = Object.fromEntries(variants.map((variant) => [variant,
+    [current[variant], assignment(variant, `${variant.charCodeAt(0)}4`, 1), assignment(variant, `${variant.charCodeAt(0)}5`, 2)],
+  ]));
+  const firstSix = orderedPreviewFallbackAssignments(options, current).slice(0, 6);
+  const changedTracks = firstSix.map((candidate) => variants.filter((variant) => candidate[variant] !== current[variant]).join(''));
+  assert.deepEqual(changedTracks.slice(0, 3), ['A', 'B', 'C'], JSON.stringify(changedTracks));
+  assert.deepEqual(changedTracks.slice(3), ['A', 'B', 'C']);
+});
+
+test('preview fallback reserves one final attempt for late template-derived compositions', () => {
+  const assignment = (variantId, signature, rank, compositionKind = 'exemplar-backed') => ({
+    variantId,
+    compositionKind,
+    layoutCandidateIndex: rank,
+    projectedCompositionSignature: `sha256:${signature.padStart(64, '0')}`,
+    compositionFamilyKey: `${variantId}-family-${rank}`,
+  });
+  const current = { A: assignment('A', '1', 0), B: assignment('B', '2', 0), C: assignment('C', '3', 0) };
+  const options = Object.fromEntries(variants.map((variant) => [variant, [
+    current[variant],
+    ...Array.from({ length: 8 }, (_, index) => assignment(variant, `${variant.charCodeAt(0)}${index + 4}`, index + 1)),
+    assignment(variant, `${variant.charCodeAt(0)}ff`, 99, 'template-derived-fallback'),
+  ]]));
+
+  const attempts = orderedPreviewFallbackAssignments(options, current);
+  const changedTracks = attempts.slice(0, 6).map((candidate) => variants
+    .filter((variant) => candidate[variant] !== current[variant]).join(''));
+  assert.deepEqual(changedTracks, ['A', 'B', 'C', 'A', 'B', 'C']);
+
+  const final = attempts.at(-1);
+  assert.ok(final, 'expected the generic template-derived fallback to be reachable');
+  for (const variant of variants) assert.equal(final[variant].compositionKind, 'template-derived-fallback');
+});
 
 async function makeValidSyntheticPptx(directory) {
   await mkdir(directory, { recursive: true });
@@ -157,12 +202,17 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
     requestedSlideCount: 3,
   };
   const contentIR = await compileContentIR(projectsRoot, projectId, [sourceFile], { task: brief.purpose });
+  const profileReader = new TemplateSemanticProfiler({ async infer() { throw new Error('read-only test profile lookup must not infer'); } },
+    projectTemplateSemanticProfileCache(projectsRoot, projectId));
+  const semanticProfile = await profileReader.getPreparedTemplateProfile(template.templateIR, template.presentationDesignSystem);
   const [workerPrompt, supervisorPrompt] = await Promise.all([
-    readFile(path.join(repoRoot, 'apps/daemon/prompts/worker-deck-plan.v6.md'), 'utf8'),
+    readFile(path.join(repoRoot, 'apps/daemon/prompts/worker-deck-plan.v7.md'), 'utf8'),
     readFile(path.join(repoRoot, 'apps/daemon/prompts/supervisor-plan-review.v1.md'), 'utf8'),
   ]);
   assert.match(workerPrompt, /Prefer 28 characters or fewer/u);
   assert.match(workerPrompt, /40 characters as a hard maximum/u);
+  assert.match(workerPrompt, /per-slide, per-region capacity estimates/u);
+  assert.match(workerPrompt, /final preview measurement remains authoritative/u);
   const fingerprint = planningInputFingerprint({
     templateIRHash: template.templateIR.hash,
     presentationDesignSystemHash: template.presentationDesignSystem.hash,
@@ -170,6 +220,7 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
     briefHash: briefHash(brief),
     workerPromptSha256: createHash('sha256').update(workerPrompt).digest('hex'),
     supervisorPromptSha256: createHash('sha256').update(supervisorPrompt).digest('hex'),
+    contentBudgetProfileSha256: planningContentProfileFingerprint(semanticProfile),
   });
   const contentIds = includeChartSource
     ? contentIR.units.filter((unit) => unit.kind === 'table-cell').map((unit) => unit.id)
@@ -209,7 +260,7 @@ async function seedReadyPlanningState(server, dataDir, projectId, sourceText = '
       contentFiles: [sourceFile], brief, contentIR, inputFingerprint: fingerprint,
       checkpoint: plan, deckPlan: plan, review,
       telemetry: { worker: telemetrySummary, supervisor: { ...telemetrySummary, requestId: 'offline-supervisor' }, totalWallTimeMs: 0 },
-      promptVersions: { worker: 'worker-deck-plan.v6', supervisor: 'supervisor-plan-review.v1' },
+      promptVersions: { worker: 'worker-deck-plan.v7', supervisor: 'supervisor-plan-review.v1' },
       model: 'offline-replay', createdAt: now,
     },
     failure: null,
@@ -509,6 +560,125 @@ test('generation API publishes ordered A/B/C packs, merges concurrent edits, rep
   }
 });
 
+test('blocking preview text overflow prevents A/B/C variants from becoming ready', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-generation-preview-overflow-'));
+  t.after(() => removeTempDirectory(temp));
+  const dataDir = path.join(temp, 'data');
+  const projectId = 'preview-overflow-fails-closed';
+  const inferenceCalls = [];
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/Y6sAAAAASUVORK5CYII=', 'base64');
+  const overflowPreview = {
+    async preview(_bytes, slideIndex) {
+      return { slideCount: 1, svg: '<svg/>', png, textLayoutIssues: [{
+        severity: 'error', classification: 'PREVIEW_TEXT_OVERFLOW', approximate: false,
+        source: 'offline-regression', slideIndex, kind: 'overflow-y', overflowPx: 13.28, shapeName: 'Title', message: null,
+      }], geometryIssues: [], status: 'failed', limitations: [] };
+    },
+    async previewDeck(_bytes, slideIndexes) {
+      return slideIndexes.map((slideIndex) => ({ slideIndex, result: {
+        slideCount: slideIndexes.length, svg: '<svg/>', png, textLayoutIssues: [{
+          severity: 'error', classification: 'PREVIEW_TEXT_OVERFLOW', approximate: false,
+          source: 'offline-regression', slideIndex, kind: 'overflow-y', overflowPx: 13.28, shapeName: 'Title', message: null,
+        }], geometryIssues: [], status: 'failed', limitations: [],
+      } }));
+    },
+  };
+  const priorBackend = process.env.LCT_PPTX_BACKEND;
+  process.env.LCT_PPTX_BACKEND = 'office-kit';
+  const started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+    enableSemanticProfiling: true, semanticInferenceAdapter: templateProfileOnlyAdapter(inferenceCalls), presentationPreview: overflowPreview });
+  try {
+    await createProject(started, projectId);
+    const seeded = await seedReadyPlanningState(started, dataDir, projectId);
+    if (!seeded) { t.skip('Python 3.12 unavailable: synthetic PPTX template cannot be compiled'); return; }
+    const response = await fetch(`${started.url}/api/projects/${projectId}/generation`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'Idempotency-Key': 'preview-overflow-generation-v1' }, body: '{}',
+    });
+    assert.equal(response.status, 202, await response.clone().text());
+    await json(response);
+    const final = await waitFor(() => getGeneration(started, projectId), (state) => ['completed', 'failed'].includes(state.status), 'preview overflow rejection');
+    assert.equal(final.status, 'failed');
+    assert.equal(final.failure?.code, 'PREVIEW_LAYOUT_BLOCKED');
+    assert.ok(final.slides.every((pack) => pack.status !== 'ready'), 'a trio with a blocking text overflow must not publish ready variants');
+    assert.ok(final.slides.flatMap((pack) => variants.map((variant) => pack.variants[variant].previewUrl)).every((url) => url === null));
+    assert.equal(final.exports.length, 0);
+    assert.deepEqual(inferenceCalls, ['template-semantic-profile'], 'preview qualification must not trigger additional inference');
+    const exportResponse = await fetch(`${started.url}/api/projects/${projectId}/generation/export`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'B', format: 'pptx' }),
+    });
+    assert.equal(exportResponse.status, 409);
+    assert.equal((await json(exportResponse)).error.code, 'GENERATION_INCOMPLETE');
+  } finally {
+    await closeStartedServer(started);
+    if (priorBackend === undefined) delete process.env.LCT_PPTX_BACKEND;
+    else process.env.LCT_PPTX_BACKEND = priorBackend;
+  }
+});
+
+test('renderer-measured overflow retries only with qualified deck-distinct compositions', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-generation-preview-fallback-'));
+  t.after(() => removeTempDirectory(temp));
+  const dataDir = path.join(temp, 'data');
+  const projectId = 'preview-overflow-fallback';
+  const inferenceCalls = [];
+  const renderer = new OfficeKitPptxRenderer();
+  const renderedAssignments = [];
+  const recordingRenderer = {
+    id: 'office-kit',
+    async render(input) {
+      renderedAssignments.push(input.compiledPresentation.slides.map((slide) => slide.exemplarSelection?.projectedCompositionSignature
+        ?? `${slide.layoutSourcePart}|${slide.layoutId}|${slide.selectedCandidateIndex}`));
+      return renderer.render(input);
+    },
+  };
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/Y6sAAAAASUVORK5CYII=', 'base64');
+  let previewCalls = 0;
+  const measuredPreview = {
+    async preview(_bytes, slideIndex) {
+      return { slideCount: 1, svg: '<svg/>', png, textLayoutIssues: [], geometryIssues: [], status: 'passed', limitations: [], slideIndex };
+    },
+    async previewDeck(_bytes, slideIndexes) {
+      previewCalls += 1;
+      return slideIndexes.map((slideIndex) => ({ slideIndex, result: {
+        slideCount: slideIndexes.length, svg: '<svg/>', png,
+        textLayoutIssues: previewCalls === 1 ? [{
+          severity: 'error', classification: 'PREVIEW_TEXT_OVERFLOW', approximate: false,
+          source: 'offline-regression', slideIndex, kind: 'overflow-y', overflowPx: 4, shapeName: 'Body', message: null,
+        }] : [],
+        geometryIssues: [], status: previewCalls === 1 ? 'failed' : 'passed', limitations: [],
+      } }));
+    },
+  };
+  const priorBackend = process.env.LCT_PPTX_BACKEND;
+  process.env.LCT_PPTX_BACKEND = 'office-kit';
+  const started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+    enableSemanticProfiling: true, presentationRenderer: recordingRenderer, presentationPreview: measuredPreview,
+    semanticInferenceAdapter: templateProfileOnlyAdapter(inferenceCalls) });
+  try {
+    await createProject(started, projectId);
+    const seeded = await seedReadyPlanningState(started, dataDir, projectId);
+    if (!seeded) { t.skip('Python 3.12 unavailable: synthetic PPTX template cannot be compiled'); return; }
+    const response = await fetch(`${started.url}/api/projects/${projectId}/generation`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'Idempotency-Key': 'preview-overflow-fallback-v1' }, body: '{}',
+    });
+    assert.equal(response.status, 202, await response.clone().text());
+    await json(response);
+    const final = await waitFor(() => getGeneration(started, projectId), (state) => ['completed', 'failed'].includes(state.status), 'preview fallback generation');
+    assert.equal(final.status, 'completed', JSON.stringify(final.failure));
+    assert.ok(final.slides.every((pack) => pack.status === 'ready'));
+    const runManifest = JSON.parse(await readFile(path.join(dataDir, 'projects', projectId, '.generation', final.generationId, 'run-manifest.json'), 'utf8'));
+    assert.equal(runManifest.compositionDistinctness?.distinct, true, 'the fallback preserves pairwise-distinct complete A/B/C decks');
+    assert.ok(previewCalls >= 2, 'a measured overflow triggers a bounded render/preview with a qualified alternative');
+    assert.ok(renderedAssignments.length >= 2);
+    assert.notDeepEqual(renderedAssignments[0], renderedAssignments[1], 'the fallback changes an already-qualified composition');
+    assert.deepEqual(inferenceCalls, ['template-semantic-profile'], 'renderer-measured fallback does not make an inference request');
+  } finally {
+    await closeStartedServer(started);
+    if (priorBackend === undefined) delete process.env.LCT_PPTX_BACKEND;
+    else process.env.LCT_PPTX_BACKEND = priorBackend;
+  }
+});
+
 test('a later renderer failure preserves earlier ready packs and explicit cancellation persists', async (t) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-generation-failure-'));
   t.after(() => removeTempDirectory(temp));
@@ -739,7 +909,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
   let started;
   try {
     started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
-      serveWeb: false, returnServer: true });
+      serveWeb: false, returnServer: true, enableSemanticProfiling: true });
     await createProject(started, projectId);
     const imageModels = await json(await fetch(`${started.url}/api/media/models`));
     assert.deepEqual(imageModels.image, []);
@@ -753,18 +923,18 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(preparedResponse.status, 200, await preparedResponse.clone().text());
     const prepared = await json(preparedResponse);
     assert.equal(prepared.status, 'ready');
-    assert.equal(prepared.semanticProfile.status, 'disabled');
-    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, 0);
+    assert.equal(prepared.semanticProfile.status, 'ready');
+    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, 1);
     const persistedTemplateState = await json(await fetch(`${started.url}/api/projects/${projectId}/template`));
     assert.equal(persistedTemplateState.status, 'ready');
-    assert.equal(persistedTemplateState.semanticProfile.status, 'disabled');
+    assert.equal(persistedTemplateState.semanticProfile.status, 'ready');
     assert.equal(Object.hasOwn(persistedTemplateState, 'semanticProfileData'), false, 'status API does not return the full profile');
     const repeatedPreparation = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ filePath: 'synthetic-template.pptx' }),
     });
     assert.equal(repeatedPreparation.status, 200);
-    assert.equal((await json(repeatedPreparation)).semanticProfile.status, 'disabled');
+    assert.equal((await json(repeatedPreparation)).semanticProfile.status, 'ready');
     const profilerCallsBeforeGenerate = endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length;
     const input = {
       templateFilePath: 'synthetic-template.pptx',
@@ -796,6 +966,16 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(ready.readySlides, 3);
     assert.equal(ready.contextualAudit.status, 'ready');
     assert.equal(ready.contextualAudit.findings.length, 11);
+    const workerRequest = endpoint.state.inference.find((entry) => entry.operation === 'deck-plan')?.request;
+    assert.ok(workerRequest, 'the normal one-click plan uses the semantic Worker contract');
+    const workerEvidence = JSON.parse(workerRequest.messages.at(-1).content);
+    assert.equal(workerEvidence.contentBudgets?.version, 'fit-aware-copy-budget.v1');
+    assert.ok(workerEvidence.contentBudgets.candidateFamilies.length > 0);
+    assert.deepEqual(workerEvidence.contentBudgets.slides.map((slide) => slide.order), [1, 2, 3]);
+    assert.ok(workerEvidence.contentBudgets.slides.every((slide) => slide.candidateFamilyKeys.length > 0));
+    const savedPlanning = await json(await fetch(`${started.url}/api/projects/${projectId}/planning`));
+    assert.equal(savedPlanning.status, 'ready');
+    assert.equal(savedPlanning.deckPlan.slides.length, 3, 'the same bounded Worker plan was persisted after runtime copy-budget validation');
 
     const generationBeforeAuditRetry = await getGeneration(started, projectId);
     const workflowStatePath = path.join(dataDir, 'projects', projectId, '.workflow', 'state.json');
@@ -848,10 +1028,11 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(generation.slides.length, 3);
     assert.ok(generation.slides.every((pack) => ['A', 'B', 'C'].every((variant) => pack.variants[variant].status === 'ready')));
     assert.deepEqual(endpoint.state.inference.map((entry) => entry.operation).sort(), [
-      'contextual-deck-audit', 'contextual-deck-audit', 'deck-plan', 'plan-review',
+      'contextual-deck-audit', 'contextual-deck-audit', 'deck-plan', 'plan-review', 'template-semantic-profile',
     ].sort());
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 2);
-    assert.equal(endpoint.state.inference.length, 4);
+    assert.equal(endpoint.state.inference.length, 5);
+    assert.equal(profilerCallsBeforeGenerate, 1, 'initial template preparation profiles once and repeated preparation uses the cache');
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, profilerCallsBeforeGenerate,
       'Generate reuses the prepared profile and makes zero profiler requests');
 
@@ -894,10 +1075,11 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     const afterReload = await getOperation();
     assert.equal(afterReload.operationId, first.operationId);
     assert.equal(afterReload.contextualAudit.stale, true, 'changing the selected deck makes the prior semantic review stale');
-    assert.equal(endpoint.state.inference.length, 4, 'structural compile does not profile and read/export do not issue extra inference');
+    assert.equal(endpoint.state.inference.length, 5, 'only the initial prepared profile, planning and two audits infer; repeated compile, read and export add none');
 
     await closeStartedServer(started);
-    started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true });
+    started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
+      serveWeb: false, returnServer: true, enableSemanticProfiling: true });
     const restored = await getOperation();
     assert.equal(restored.operationId, first.operationId);
     assert.equal(restored.contextualAudit.stale, true);
@@ -905,7 +1087,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(restoredGeneration.defaultTrack, 'C');
     assert.equal(restoredGeneration.slides[0].lockedVariant, 'C');
     assert.equal(restoredGeneration.exports.length, 6);
-    assert.equal(endpoint.state.inference.length, 4, 'restart reuses plan, generation, and contextual review without template profiling');
+    assert.equal(endpoint.state.inference.length, 5, 'restart reuses the prepared profile, plan, generation, and contextual review without new inference');
 
     const sourceProjectId = 'one-click-with-optional-source';
     await createProject(started, sourceProjectId);
@@ -932,7 +1114,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.deepEqual(sourcePlanning.contentFiles, ['market-context.md']);
     assert.ok(sourcePlanning.contentIR.units.some((unit) => unit.text?.includes('three customer segments')));
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 3);
-    assert.equal(endpoint.state.inference.length, 7, 'both product workflows use only Worker, planning Supervisor, and contextual audit, plus one audit-only recovery');
+    assert.equal(endpoint.state.inference.length, 9, 'each workflow prepares its template profile once; generation, audit recovery, and exports reuse persisted state');
 
     const recoveryDataDir = path.join(temp, 'recovery-data');
     const recoveryProjectId = 'one-click-recovery-during-generation';
@@ -970,6 +1152,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(interruptedState.failure, null);
     started = await startServer({
       host: '127.0.0.1', port: 0, dataDir: recoveryDataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+      enableSemanticProfiling: true,
     });
     const recovered = await waitFor(async () => (await json(await fetch(`${started.url}/api/projects/${recoveryProjectId}/workflow`))).operation,
       (operation) => operation?.status === 'ready' || operation?.status === 'failed', 'workflow recovery after generation interruption', 120_000);
@@ -994,7 +1177,8 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
 async function closeAndRestartWithRenderer(started, dataDir, projectRoot, renderer) {
   await closeStartedServer(started);
   return startServer({
-    host: '127.0.0.1', port: 0, dataDir, projectRoot, serveWeb: false, returnServer: true, presentationRenderer: renderer,
+    host: '127.0.0.1', port: 0, dataDir, projectRoot, serveWeb: false, returnServer: true,
+    enableSemanticProfiling: true, presentationRenderer: renderer,
   });
 }
 

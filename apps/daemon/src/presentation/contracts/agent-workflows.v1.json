@@ -9,7 +9,7 @@
       "agentVersion": "deck-plan-worker.v1",
       "skillId": "presentation-planning",
       "skillVersion": "presentation-planning.v1",
-      "promptVersion": "worker-deck-plan.v6",
+      "promptVersion": "worker-deck-plan.v7",
       "schemaVersion": "deck_plan_draft_v4",
       "modelRole": "worker"
     },

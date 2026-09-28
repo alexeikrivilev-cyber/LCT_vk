@@ -30,6 +30,14 @@ import {
 } from './template-compiler.js';
 import { resolvePresentationFilePath } from '../../presentation-files.js';
 import {
+  planningContentProfileFingerprint,
+  PLANNING_CONTENT_BUDGET_VERSION,
+  validateDraftAgainstContentBudgets,
+  type PlanningContentBudgets,
+} from './planning-content-budgets.js';
+import type { TemplateSemanticProfile } from './template-semantic-profiler.js';
+import type { TemplateIR } from '../domain/template-ir.js';
+import {
   SemanticInferenceError,
   type SemanticInferenceAdapter,
   type SemanticInferenceRequest,
@@ -162,6 +170,13 @@ export interface PlanningServiceOptions {
   projectRoot: string;
   projectsRoot: string;
   getInferenceAdapter: () => SemanticInferenceAdapter;
+  getPreparedTemplateProfile?: (projectId: string, template: TemplateCompilationResponse) => Promise<TemplateSemanticProfile | null>;
+  getPlanningContentBudgets?: (input: {
+    projectId: string;
+    template: TemplateIR;
+    semanticProfile: TemplateSemanticProfile;
+    requestedSlideCount: number;
+  }) => Promise<PlanningContentBudgets | null>;
   now?: () => Date;
   createId?: () => string;
 }
@@ -206,6 +221,7 @@ export function planningInputFingerprint(input: {
   briefHash: string;
   workerPromptSha256: string;
   supervisorPromptSha256: string;
+  contentBudgetProfileSha256?: string;
   agentWorkflowContractSha256?: string;
 }): string {
   return sha256({
@@ -213,6 +229,8 @@ export function planningInputFingerprint(input: {
     presentationDesignSystemHash: input.presentationDesignSystemHash,
     contentIRHash: input.contentIRHash,
     briefHash: input.briefHash,
+    contentBudgetVersion: PLANNING_CONTENT_BUDGET_VERSION,
+    contentBudgetProfileSha256: input.contentBudgetProfileSha256 ?? planningContentProfileFingerprint(null),
     workerPromptVersion: WORKER_PLAN_PROMPT_VERSION,
     workerPromptSha256: input.workerPromptSha256,
     supervisorPromptVersion: SUPERVISOR_PLAN_REVIEW_PROMPT_VERSION,
@@ -902,6 +920,7 @@ export class PlanningService {
         task: savedInputs.brief.purpose,
         ...(savedInputs.brief.context ? { context: savedInputs.brief.context } : {}),
       });
+      const semanticProfile = await this.options.getPreparedTemplateProfile?.(projectId, template) ?? null;
       const promptAssets = await readPlanningPromptAssets(this.options.projectRoot);
       const currentFingerprint = planningInputFingerprint({
         templateIRHash: template.templateIR!.hash,
@@ -910,6 +929,7 @@ export class PlanningService {
         briefHash: briefHash(savedInputs.brief),
         workerPromptSha256: promptAssets.workerSha256,
         supervisorPromptSha256: promptAssets.supervisorSha256,
+        contentBudgetProfileSha256: planningContentProfileFingerprint(semanticProfile),
       });
       const inputs: PlanningInputs = {
         ...savedInputs,
@@ -975,6 +995,23 @@ export class PlanningService {
       if (template.status !== 'ready' || !template.templateIR || !template.presentationDesignSystem) {
         throw new PlanningServiceError('TEMPLATE_NOT_READY', 'Analyze the current project PPTX template before generating a plan.', 409);
       }
+      const semanticProfile = await this.options.getPreparedTemplateProfile?.(projectId, template) ?? null;
+      ensureActive();
+      let contentBudgets: PlanningContentBudgets | null = null;
+      if (this.options.getPreparedTemplateProfile) {
+        if (!semanticProfile) throw new PlanningServiceError('TEMPLATE_PROFILE_NOT_READY', 'Prepare the template profile before generating a plan.', 409);
+        try {
+          contentBudgets = await this.options.getPlanningContentBudgets?.({
+            projectId,
+            template: template.templateIR,
+            semanticProfile,
+            requestedSlideCount: brief.requestedSlideCount ?? 30,
+          }) ?? null;
+          if (!contentBudgets) throw new TypeError('Prepared profile is required to derive text budgets.');
+        } catch (error) {
+          throw new PlanningServiceError('TEMPLATE_TEXT_BUDGET_UNAVAILABLE', 'The prepared template does not expose measurable title and body regions for planning.', 409, { cause: error });
+        }
+      }
       const contentIR = await compileContentIR(this.options.projectsRoot, projectId, input.contentFiles, {
         task: brief.purpose,
         ...(brief.context ? { context: brief.context } : {}),
@@ -989,6 +1026,7 @@ export class PlanningService {
         briefHash: briefHash(brief),
         workerPromptSha256: promptAssets.workerSha256,
         supervisorPromptSha256: promptAssets.supervisorSha256,
+        contentBudgetProfileSha256: contentBudgets?.profileSha256 ?? planningContentProfileFingerprint(null),
       });
       const inputs: PlanningInputs = { contentFiles: [...input.contentFiles], brief, contentIR, inputFingerprint: fingerprint };
       state = {
@@ -1010,6 +1048,7 @@ export class PlanningService {
         brief,
         contentIR: compactContentIR(contentIR),
         presentationDesignSystem: designSystem,
+        contentBudgets,
         requestedSlideCount: brief.requestedSlideCount ?? null,
       };
       const workerEvidenceText = JSON.stringify(workerEvidence);
@@ -1039,6 +1078,10 @@ export class PlanningService {
       const workerResponse = await adapter.infer(workerRequest);
       ensureActive();
       const workerDraft = asDraft(workerResponse.value, contentIR, brief);
+      if (contentBudgets) {
+        try { validateDraftAgainstContentBudgets(workerDraft.slides, contentBudgets); }
+        catch (error) { throw new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'Generated slide copy exceeds all qualified template text regions. Shorten the copy in a new plan and retry.', 422, { cause: error }); }
+      }
       const planId = `dp_${this.createId().replaceAll('-', '')}`;
       const checkpoint = canonicalizeDeckPlan(workerDraft, {
         id: planId,
@@ -1099,6 +1142,7 @@ export class PlanningService {
           findings: review.findings,
           contentIR: compactContentIR(contentIR),
           presentationDesignSystem: designSystem,
+          contentBudgets,
           requestedSlideCount: brief.requestedSlideCount ?? null,
         });
         if (revisionEvidenceText.length > MAX_EVIDENCE_CHARS) {
@@ -1117,6 +1161,10 @@ export class PlanningService {
         const revisionResponse = await adapter.infer(revisionRequest);
         ensureActive();
         const revisedDraft = asDraft(revisionResponse.value, contentIR, brief);
+        if (contentBudgets) {
+          try { validateDraftAgainstContentBudgets(revisedDraft.slides, contentBudgets); }
+          catch (error) { throw new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'Revised slide copy exceeds all qualified template text regions. Generate a shorter plan and retry.', 422, { cause: error }); }
+        }
         deckPlan = canonicalizeDeckPlan(revisedDraft, {
           id: checkpoint.id,
           version: checkpoint.version + 1,
@@ -1140,6 +1188,10 @@ export class PlanningService {
       ensureActive();
       const finalPromptAssets = await readPlanningPromptAssets(this.options.projectRoot);
       ensureActive();
+      const finalSemanticProfile = finalTemplate.status === 'ready'
+        ? await this.options.getPreparedTemplateProfile?.(projectId, finalTemplate) ?? null
+        : null;
+      ensureActive();
       const finalFingerprint = finalTemplate.status === 'ready' && finalTemplate.templateIR && finalTemplate.presentationDesignSystem
         ? planningInputFingerprint({
           templateIRHash: finalTemplate.templateIR.hash,
@@ -1148,6 +1200,7 @@ export class PlanningService {
           briefHash: briefHash(brief),
           workerPromptSha256: finalPromptAssets.workerSha256,
           supervisorPromptSha256: finalPromptAssets.supervisorSha256,
+          contentBudgetProfileSha256: planningContentProfileFingerprint(finalSemanticProfile),
         })
         : null;
       if (finalFingerprint !== fingerprint) {

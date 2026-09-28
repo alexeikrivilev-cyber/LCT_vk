@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { PerformanceDiagnosticsPort } from '../performance-diagnostics.js';
 
-import type { CompiledSlide, CompatibleLayoutMatchCandidate } from './slide-compilation.js';
+import type { CompiledSlide, CompatibleLayoutMatchCandidate, PlacementBox } from './slide-compilation.js';
+import { applyNativeLayoutCandidate } from './slide-compilation.js';
 import type { TemplateElement, TemplateGeometry, TemplateIR, TemplateSlide } from '../domain/template-ir.js';
 import { fitProcessNodeLayout } from './process-layout.js';
 import { validateTemplateSemanticProfile, type TemplateSemanticProfile, type TemplateSemanticSlideProfile } from './template-semantic-profiler.js';
@@ -175,7 +176,7 @@ export interface ExemplarArchetypeAssessment {
 
 export interface VariantCompositionAssignment {
   variantId: CompiledSlide['variantId'];
-  compositionKind: 'exemplar-backed' | 'layout-placeholder-backed' | 'safe-generated-fallback';
+  compositionKind: 'exemplar-backed' | 'layout-placeholder-backed' | 'safe-generated-fallback' | 'template-derived-fallback';
   layoutCandidateIndex: number;
   projectedCompositionSignature: string;
   /** Generic native family identity used only to prefer deck-level visual variety. */
@@ -246,6 +247,16 @@ function geometryOf(element: TemplateElement): TemplateGeometry | null {
 
 function maxFont(element: TemplateElement): number {
   return Math.max(0, ...(element.effectiveFontSizesPt ?? element.directStyles.fontSizesPt ?? []));
+}
+
+function representativeTemplateRoleFontPt(template: TemplateIR, role: 'title' | 'body'): number {
+  const accepted = role === 'title' ? new Set(['title', 'ctrtitle', 'subtitle']) : new Set(['body', 'obj', 'content', 'subtitle']);
+  const sizes = template.slides.flatMap((slide) => slide.elements)
+    .filter((element) => accepted.has(String(element.placeholder?.role ?? element.placeholder?.type ?? '').toLowerCase()))
+    .flatMap((element) => element.effectiveFontSizesPt ?? element.directStyles.fontSizesPt ?? [])
+    .filter((size) => Number.isFinite(size) && size > 0)
+    .sort((left, right) => left - right);
+  return sizes.length ? sizes[Math.floor(sizes.length / 2)]! : 0;
 }
 
 function normalizedText(element: TemplateElement): string {
@@ -350,7 +361,7 @@ function projectedTitleFit(text: string, title: TemplateElement, body: TemplateE
   const inheritedSizeEstimate = Math.max(18, maxFont(body) * 2);
   return {
     // Approximate title width conservatively: the previous 0.52-em average
-    // marked real WorkSpace titles as fitting even when PowerPoint clipped them.
+    // marked some long source-template titles as fitting when PowerPoint clipped them.
     fit: estimatedLineFit(text, title, hasMeasuredTitleSize ? 8 : inheritedSizeEstimate, 0.68),
     // Direct and Office Kit resolved placeholder sizes use the ordinary fit
     // threshold. Only genuinely unknown inheritance needs extra headroom.
@@ -766,6 +777,11 @@ function fallbackCompositionSignature(compiled: CompiledSlide, template: Templat
     generatedVisual: compiled.placements.visual
       ? normalizedGeometry({ ...compiled.placements.visual, rotation: 0, unit: 'EMU' }, template)
       : null,
+    templateDerivedCompositionStrategy: compiled.templateDerivedCompositionStrategy ?? null,
+    ...(compiled.templateDerivedCompositionStrategy ? {
+      templateDerivedTitle: normalizedGeometry({ ...compiled.placements.title, rotation: 0, unit: 'EMU' }, template),
+      templateDerivedBody: normalizedGeometry({ ...compiled.placements.body, rotation: 0, unit: 'EMU' }, template),
+    } : {}),
     visualTopology: {
       type: compiled.visualization.type,
       status: compiled.visualization.status,
@@ -1377,7 +1393,7 @@ function semanticCandidates(candidates: Candidate[], intent: CompiledSlide['inte
   return candidates.filter((candidate) => candidate.projectionSafe);
 }
 
-function nativePlaceholderFallbackSupported(
+export function nativePlaceholderFallbackSupported(
   compiled: CompiledSlide,
   template: TemplateIR,
   candidate: CompatibleLayoutMatchCandidate,
@@ -1394,14 +1410,12 @@ function nativePlaceholderFallbackSupported(
       || !/body|obj|content|subtitle/i.test(`${body.placeholder?.type ?? ''} ${body.placeholder?.role ?? ''}`)) return false;
   const titleBox = geometryOf(title);
   const bodyBox = geometryOf(body);
-  const projectedTitle = projectedTitleFit(compiled.title, title, body);
   if (!titleBox || !bodyBox || !inCanvas(titleBox, template) || !inCanvas(bodyBox, template)
       || (titleBox.x < bodyBox.x + bodyBox.width && titleBox.x + titleBox.width > bodyBox.x
-        && titleBox.y < bodyBox.y + bodyBox.height && titleBox.y + titleBox.height > bodyBox.y)
-      || projectedTitle.fit < projectedTitle.minimum) return false;
+        && titleBox.y < bodyBox.y + bodyBox.height && titleBox.y + titleBox.height > bodyBox.y)) return false;
   const processSteps = compiled.visualization.processSteps;
   if (processSteps.length >= 2) {
-    const fontPt = maxFont(body);
+    const fontPt = maxFont(body) || representativeTemplateRoleFontPt(template, 'body');
     if (fontPt < 7.5) return false;
     const visualBox = candidate.visualBox;
     const separateVisualIsSafe = Boolean(visualBox && inCanvas(visualBox, template)
@@ -1412,7 +1426,12 @@ function nativePlaceholderFallbackSupported(
     if (!processBox) return false;
     if (!fitProcessNodeLayout({ x: processBox.x, y: processBox.y, width: processBox.width, height: processBox.height },
       processSteps.map((step) => step.text), fontPt)) return false;
-  } else if (compiled.body.length > 0 && estimatedLineFit(compiled.body.join('\n'), body) < 1) return false;
+  }
+  // These structurally valid native placeholder layouts are measurement
+  // candidates, not publishable output. Estimated font metrics omit inherited
+  // paragraph spacing and internal margins, so the actual rendered preview is
+  // the fit authority; its unchanged blocking gate runs before a variant is
+  // marked ready or exported.
   const master = sourceLayout.masterId ? template.masters.find((candidate) => candidate.id === sourceLayout.masterId) : null;
   // Static inherited text is not editable through the generated slide. Repetition
   // across sibling layouts is insufficient evidence that sample copy is chrome.
@@ -1466,12 +1485,23 @@ export function applyVariantCompositionAssignment(
     const { nativeLayoutFallback: _fallback, exemplarSelection: _exemplar, ...automatic } = compiled;
     return automatic;
   }
+  if (assignment.compositionKind === 'template-derived-fallback') {
+    const candidate = compiled.layoutCandidates[assignment.layoutCandidateIndex];
+    if (!candidate || !templateDerivedCompositionSupported(compiled, template, candidate)) {
+      throw new TypeError('Qualified template-derived composition no longer passes geometry or chrome safety');
+    }
+    const selected = withLayoutCandidate(compiled, candidate, assignment.layoutCandidateIndex);
+    const { nativeLayoutFallback: _nativeFallback, exemplarSelection: _exemplar, exemplarSelectionValidation: _validation, ...automatic } = selected;
+    const title = deriveTemplateTitleBox(candidate);
+    if (!title || !inCanvas(title, template)) throw new TypeError('Qualified template-derived title geometry is outside the slide canvas');
+    return { ...automatic, placements: { ...automatic.placements, title }, templateDerivedCompositionStrategy: compiled.variantId === 'A' ? 'balanced'
+      : compiled.variantId === 'B' ? 'visual-first' : 'structured-dense' };
+  }
   const candidate = compiled.layoutCandidates[assignment.layoutCandidateIndex];
   if (!candidate || !nativePlaceholderFallbackSupported(compiled, template, candidate)) {
     throw new TypeError('Qualified native layout composition is no longer safe for the compiled slide');
   }
-  const { exemplarSelection: _exemplar, exemplarSelectionValidation: _validation, ...withoutExemplar } = withLayoutCandidate(compiled, candidate, assignment.layoutCandidateIndex);
-  return { ...withoutExemplar, nativeLayoutFallback: true };
+  return applyNativeLayoutCandidate(compiled, candidate, assignment.layoutCandidateIndex, template);
 }
 
 /**
@@ -1602,6 +1632,81 @@ export function selectExemplarSlide(compiled: CompiledSlide, template: TemplateI
 /** Signature for the renderer's deterministic text/visual fallback when no safe exemplar rank exists. */
 export function generatedFallbackCompositionSignature(compiled: CompiledSlide, template: TemplateIR): string {
   return fallbackCompositionSignature(compiled, template);
+}
+
+/**
+ * Last-resort Office Kit composition gate. It uses measured title/body region
+ * evidence and an existing layout/master; actual fit and collision checks
+ * remain the renderer preview's hard authority.
+ */
+export function templateDerivedCompositionSupported(
+  compiled: CompiledSlide,
+  template: TemplateIR,
+  candidate: CompatibleLayoutMatchCandidate,
+): boolean {
+  const title = deriveTemplateTitleBox(candidate);
+  const body = candidate.bodyBox;
+  const overlaps = (left: { x: number; y: number; width: number; height: number }, right: { x: number; y: number; width: number; height: number }) =>
+    left.x < right.x + right.width && left.x + left.width > right.x
+      && left.y < right.y + right.height && left.y + left.height > right.y;
+  if (!title || !body || !candidate.slotEvidence.title || !candidate.slotEvidence.body
+      || Math.min(candidate.slotEvidence.title.confidence, candidate.slotEvidence.body.confidence) < MIN_EXEMPLAR_CONFIDENCE
+      || !candidate.slotEvidence.title.sourceEvidence.length || !candidate.slotEvidence.body.sourceEvidence.length
+      || !inCanvas(title, template) || !inCanvas(body, template) || overlaps(title, body)) return false;
+  const layout = template.layouts.find((item) => item.id === candidate.layoutId && item.sourcePart === candidate.sourcePart);
+  if (!layout || inheritedStaticText(template, layout.id, layout.masterId).length) return false;
+  const master = layout.masterId ? template.masters.find((item) => item.id === layout.masterId) : null;
+  const staticElements = [...layout.elements, ...(master?.elements ?? [])].filter((element) => element.placeholder === null);
+  const isContained = (outer: TemplateGeometry, inner: PlacementBox) => inner.x >= outer.x && inner.y >= outer.y
+    && inner.x + inner.width <= outer.x + outer.width && inner.y + inner.height <= outer.y + outer.height;
+  for (const element of staticElements) {
+    const geometry = geometryOf(element);
+    if (!geometry) continue;
+    for (const region of [title, body]) {
+      if (!overlaps(geometry, region)) continue;
+      const fullCanvasBackground = geometry.x <= 0 && geometry.y <= 0
+        && geometry.x + geometry.width >= template.slideSize.width
+        && geometry.y + geometry.height >= template.slideSize.height
+        && element.kind.toLowerCase() === 'shape' && !normalizedText(element) && !element.relationshipIds.length;
+      const panelBehindContent = element.kind.toLowerCase() === 'shape' && !normalizedText(element)
+        && !element.relationshipIds.length && isContained(geometry, region);
+      if (!fullCanvasBackground && !panelBehindContent) return false;
+    }
+  }
+  if (compiled.imageRefs.length && !candidate.visualBox) return false;
+  const textComparison = compiled.visualization.type === 'comparison'
+    && !compiled.visualization.tableData && !compiled.visualization.chartData && !compiled.visualization.kpi
+    && compiled.body.length >= 2;
+  if (compiled.visualization.type !== 'none' && compiled.visualization.type !== 'process' && !textComparison) return false;
+  if ((compiled.visualization.chartData || compiled.visualization.tableData || compiled.visualization.kpi)
+      && !candidate.visualBox && compiled.body.length) return false;
+  if (compiled.visualization.processSteps.length >= 2) {
+    const fontPt = Math.max(0, ...candidate.slotEvidence.body.sourceEvidence.flatMap((item) => item.fontSizesPt ?? []))
+      || representativeTemplateRoleFontPt(template, 'body');
+    if (fontPt <= 0 || !fitProcessNodeLayout(body, compiled.visualization.processSteps.map((step) => step.text), fontPt)) return false;
+  }
+  return true;
+}
+
+/** Borrow only measured whitespace between title/body regions; never reduce type size. */
+export function deriveTemplateTitleBox(candidate: CompatibleLayoutMatchCandidate): PlacementBox | null {
+  let title = candidate.titleBox;
+  const body = candidate.bodyBox;
+  if (!title || !body) return null;
+  const horizontalOverlap = title.x < body.x + body.width && title.x + title.width > body.x;
+  const titleBottom = title.y + title.height;
+  // Some valid OOXML templates place adjacent title/body placeholders with a
+  // small geometric intersection caused by rounding. For a vertically stacked
+  // pair, trim exactly the measured intersection from the generated title box;
+  // preview remains responsible for proving that the retained title still fits.
+  if (horizontalOverlap && title.y <= body.y && titleBottom > body.y) {
+    const nonOverlappingHeight = body.y - title.y;
+    if (nonOverlappingHeight <= 0) return null;
+    title = { ...title, height: nonOverlappingHeight };
+  }
+  const gap = Math.max(0, body.y - (title.y + title.height));
+  const borrowedHeight = Math.min(Math.round(title.height * 0.4), Math.floor(gap * 0.45));
+  return { ...title, height: title.height + borrowedHeight };
 }
 
 export interface VariantCompositionDistinctness {
@@ -1743,6 +1848,24 @@ function retainDiverseDeckCandidates(
 export function assignDeckVariantCompositions(
   slides: readonly Record<CompiledSlide['variantId'], readonly VariantCompositionAssignment[]>[],
 ): Record<CompiledSlide['variantId'], VariantCompositionAssignment[]> | null {
+  // Prefer the already-qualified semantic donors and native placeholder
+  // layouts. Generic template-derived compositions are a last resort for the
+  // exact case where tiers 1–2 cannot form three distinct complete decks.
+  const higherTierOptions = slides.map((slide) => Object.fromEntries(
+    (['A', 'B', 'C'] as const).map((variant) => [variant,
+      slide[variant].filter((option) => option.compositionKind !== 'template-derived-fallback')]),
+  ) as Record<CompiledSlide['variantId'], VariantCompositionAssignment[]>);
+  if (higherTierOptions.length && higherTierOptions.every((slide) => (['A', 'B', 'C'] as const)
+    .every((variant) => slide[variant].length > 0))) {
+    const higherTierAssignment = assignDeckVariantCompositionsFromOptions(higherTierOptions);
+    if (higherTierAssignment) return higherTierAssignment;
+  }
+  return assignDeckVariantCompositionsFromOptions(slides);
+}
+
+function assignDeckVariantCompositionsFromOptions(
+  slides: readonly Record<CompiledSlide['variantId'], readonly VariantCompositionAssignment[]>[],
+): Record<CompiledSlide['variantId'], VariantCompositionAssignment[]> | null {
   if (!slides.length || slides.some((slide) => (['A', 'B', 'C'] as const).some((variant) => slide[variant].length === 0
       || slide[variant].some((option) => option.variantId !== variant)))) return null;
   const beamWidth = 128;
@@ -1873,7 +1996,12 @@ export function assessVariantCompositionDistinctness(
       });
       slide.layoutCandidates.forEach((candidate, candidateIndex) => {
         if (!nativePlaceholderFallbackSupported(slide, template, candidate)) return;
-        const nativeSlide = withLayoutCandidate(slide, candidate, candidateIndex);
+        // Sign the exact normalized assignment used by the renderer. In
+        // particular, applyNativeLayoutCandidate clips an optional visual box
+        // to the canvas; signing the raw candidate first made qualification
+        // disagree with the rendered layout even though both selected the
+        // same native placeholders.
+        const nativeSlide = applyNativeLayoutCandidate(slide, candidate, candidateIndex, template);
         options.push({
           variantId: slide.variantId,
           compositionKind: 'layout-placeholder-backed',
@@ -1888,6 +2016,29 @@ export function assessVariantCompositionDistinctness(
         signaturesSeen.add(option.projectedCompositionSignature);
         return true;
       });
+      // Keep tier 3 as a qualified reserve even when one higher-tier choice
+      // exists: a single safe donor/layout can still be insufficient for three
+      // distinct complete decks. The deck resolver first tries tiers 1–2 and
+      // only escalates to this reserve when those cannot produce distinct A/B/C.
+      const strategy: NonNullable<CompiledSlide['templateDerivedCompositionStrategy']> = slide.variantId === 'A'
+        ? 'balanced' : slide.variantId === 'B' ? 'visual-first' : 'structured-dense';
+      for (const [candidateIndex, candidate] of slide.layoutCandidates.entries()) {
+        if (!templateDerivedCompositionSupported(slide, template, candidate)) continue;
+        const selected = withLayoutCandidate(slide, candidate, candidateIndex);
+        const title = deriveTemplateTitleBox(candidate);
+        if (!title) continue;
+        const projected = { ...selected, placements: { ...selected.placements, title }, templateDerivedCompositionStrategy: strategy };
+        const projectedCompositionSignature = generatedFallbackCompositionSignature(projected, template);
+        if (signaturesSeen.has(projectedCompositionSignature)) continue;
+        signaturesSeen.add(projectedCompositionSignature);
+        uniqueOptions.push({
+          variantId: slide.variantId,
+          compositionKind: 'template-derived-fallback',
+          layoutCandidateIndex: candidateIndex,
+          projectedCompositionSignature,
+          compositionFamilyKey: `template-derived:${strategy}:${candidate.sourcePart}:${projectedCompositionSignature}`,
+        });
+      }
       const prior = history?.[slide.variantId] ?? [];
       const priorLast = prior.at(-1);
       const preferenceCost = (option: Option, index: number) => {

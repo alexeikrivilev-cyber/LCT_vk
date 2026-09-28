@@ -86,7 +86,7 @@ export interface OfflineMatrixResult {
       evidence: string[];
       variants: Array<{
         variantId: string;
-        compositionKind: 'exemplar-backed' | 'layout-placeholder-backed' | 'safe-generated-fallback' | 'unavailable';
+        compositionKind: 'exemplar-backed' | 'layout-placeholder-backed' | 'safe-generated-fallback' | 'template-derived-fallback' | 'unavailable';
         layoutCandidateIndex: number | null;
         layoutId: string | null;
         projectedCompositionSignature: string | null;

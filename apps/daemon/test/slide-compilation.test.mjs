@@ -17,7 +17,7 @@ import { assessDeckCompositionDistinctness } from '../src/presentation/applicati
 import { createTemplateIR } from '../src/presentation/application/template-mapper.ts';
 import { runOfflinePresentationMatrix } from '../src/presentation/application/offline-matrix-runner.ts';
 import { renderNativePptx } from '../src/presentation/application/native-pptx-renderer.ts';
-import { compilePresentation, extractCanonicalFactualPayload, VARIANT_POLICIES } from '../src/presentation/application/slide-compilation.ts';
+import { applyNativeLayoutCandidate, compilePresentation, extractCanonicalFactualPayload, VARIANT_POLICIES } from '../src/presentation/application/slide-compilation.ts';
 import { fitProcessNodeLayout, fitsProcessLabel } from '../src/presentation/application/process-layout.ts';
 import {
   applyVariantCompositionAssignment,
@@ -27,7 +27,10 @@ import {
   assessExemplarSelection as assessExemplarSelectionRaw,
   classifyExemplarArchetype,
   createCompositionVisualClassificationCache,
+  deriveTemplateTitleBox,
   generatedFallbackCompositionSignature,
+  nativePlaceholderFallbackSupported,
+  templateDerivedCompositionSupported,
   selectExemplarSlide as selectExemplarSlideRaw,
 } from '../src/presentation/application/exemplar-slide-selector.ts';
 import { PerformanceDiagnostics } from '../src/presentation/performance-diagnostics.ts';
@@ -164,6 +167,40 @@ async function nativePlaceholderFixture(root, { genericBodyPlaceholder = false, 
   });
   templateIR.slides = [];
   templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
+  return { templatePath, templateIR };
+}
+
+async function inferredRegionTemplateFixture(root, { masterStaticText = null, masterLogo = false, darkTheme = false, darkBodyBlack = false } = {}) {
+  const templatePath = path.join(root, 'inferred-region-template.pptx');
+  const deck = new PptxGenJS();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.theme = { headFontFace: 'Aptos Display', bodyFontFace: 'Aptos', lang: 'ru-RU' };
+  deck.defineSlideMaster({
+    title: 'Inferred region master',
+    background: { color: darkTheme ? '111827' : 'F7F9FC' },
+    objects: [
+      ...(masterLogo ? [{ rect: { x: 1.1, y: 2.1, w: 0.8, h: 0.55, fill: { color: '1769FF' }, line: { color: '1769FF' } } }] : []),
+      ...(masterStaticText ? [{ text: { text: masterStaticText, options: { x: 0.7, y: 0.9, w: 4.5, h: 0.35, fontFace: 'Aptos', fontSize: 12, color: '465569' } } }] : []),
+    ],
+  });
+  for (let index = 0; index < 4; index += 1) {
+    const slide = deck.addSlide({ masterName: 'Inferred region master' });
+    slide.addText(`Example title ${index + 1}`, {
+      x: 0.76, y: 0.55, w: 11.2, h: 0.82, fontFace: 'Aptos Display', fontSize: 30, bold: true, color: darkTheme ? 'F9FAFB' : '172B4D', margin: 0,
+    });
+    slide.addText(`Example body region ${index + 1}. Repeated geometry provides generic title and body evidence.`, {
+      x: 1.04, y: 1.9, w: 10.65, h: 4.8, fontFace: 'Aptos', fontSize: 18,
+      color: darkTheme && darkBodyBlack ? '172B4D' : darkTheme ? 'F9FAFB' : '425466', margin: 0.05,
+    });
+  }
+  await deck.writeFile({ fileName: templatePath });
+  const bytes = await readFile(templatePath);
+  const inspection = await inspectPptx(templatePath);
+  const templateIR = createTemplateIR(inspection, {
+    filePath: path.basename(templatePath), originalName: path.basename(templatePath),
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    compiledAt: '2026-09-28T00:00:00.000Z', compilerVersion: 'lct-template-compiler/1',
+  });
   return { templatePath, templateIR };
 }
 
@@ -737,6 +774,58 @@ test('PresentationQualityReport keeps the safety audit separate, flags tiny body
   assert.ok(report.findings.some((finding) => finding.ruleId === 'hierarchy.autofit-too-small'));
   assert.ok(report.findings.some((finding) => finding.ruleId === 'source-content-residue.unprojected-donor-text'));
 
+  const selectedGeometryTracks = tracks.map((track, variantIndex) => {
+    const bodyAreaShare = [0.12, 0.24, 0.36][variantIndex];
+    const visualWidthShare = [0.2, 0.3, 0.4][variantIndex];
+    return {
+      ...track,
+      slides: track.slides.map((compiledSlide) => ({
+        ...compiledSlide,
+        // Deliberately leave the compile-time body placement unchanged. The
+        // renderer uses the assigned exemplar's measured geometry instead.
+        exemplarSelection: {
+          designFeatures: { bodyAreaShare, visualAreaShare: 0.01 },
+          slots: { visual: { geometry: {
+            x: 0,
+            y: 0,
+            width: templateIR.slideSize.width * visualWidthShare,
+            height: templateIR.slideSize.height * 0.5,
+          } } },
+        },
+      })),
+    };
+  });
+  const assignedGeometryReport = buildPresentationQualityReport({
+    presentation: selectedGeometryTracks[0],
+    tracks: selectedGeometryTracks,
+    contentIR,
+    templateIR,
+  });
+  assert.equal(assignedGeometryReport.trackStrategy.A.medianBodyAreaShare, 0.12);
+  assert.equal(assignedGeometryReport.trackStrategy.B.medianBodyAreaShare, 0.24);
+  assert.equal(assignedGeometryReport.trackStrategy.C.medianBodyAreaShare, 0.36);
+  assert.equal(assignedGeometryReport.trackStrategy.A.medianVisualAreaShare, 0.1);
+  assert.equal(assignedGeometryReport.trackStrategy.B.medianVisualAreaShare, 0.15);
+  assert.equal(assignedGeometryReport.trackStrategy.C.medianVisualAreaShare, 0.2);
+
+  const spaciousBTracks = selectedGeometryTracks.map((track, variantIndex) => ({
+    ...track,
+    slides: track.slides.map((compiledSlide) => ({
+      ...compiledSlide,
+      exemplarSelection: {
+        designFeatures: { bodyAreaShare: [0.12, 0.05, 0.18][variantIndex], visualAreaShare: 0.01 },
+        slots: { visual: { geometry: {
+          x: 0, y: 0, width: templateIR.slideSize.width * 0.1, height: templateIR.slideSize.height * 0.1,
+        } } },
+      },
+    })),
+  }));
+  const spaciousBReport = buildPresentationQualityReport({
+    presentation: spaciousBTracks[0], tracks: spaciousBTracks, contentIR, templateIR,
+  });
+  assert.ok(!spaciousBReport.findings.some((finding) => finding.ruleId === 'template-consistency.track-strategy-not-distinct'),
+    'B can distinguish the track through a materially smaller body allocation when the template offers no larger safe visual region');
+
   const exactOverflowReport = buildPresentationQualityReport({
     presentation, tracks, contentIR, templateIR,
     previewEvidence: [{ slideIndex: 1, textLayoutIssues: [{ slideIndex: 1, kind: 'overflow-x', overflowPx: 5,
@@ -1132,10 +1221,11 @@ test('A/B/C selection deduplicates donor families after source text cleanup', as
   const compiledTracks = VARIANT_POLICIES.map((policy) => compilePresentation(deckPlan, contentIR, template.templateIR, policy).slides[1]);
   assert.ok(compiledTracks.every(Boolean));
   const distinctness = assessVariantCompositionDistinctness(compiledTracks, template.templateIR, 'office-kit');
-  assert.equal(distinctness.distinct, false);
-  assert.equal(distinctness.availableDistinctFamilies, 1);
-  assert.ok(distinctness.evidence.some((item) => item.includes('Some tracks reuse a safe projected composition')),
-    'per-slide reuse is diagnostic and does not fail a complete-deck distinctness gate');
+  assert.equal(distinctness.distinct, true,
+    'generic template-derived strategies recover A/B/C after source-only donor differences collapse');
+  assert.ok(distinctness.assignments.some((item) => item.compositionKind === 'template-derived-fallback'),
+    'collapsed donor families do not masquerade as distinct; a last-resort native composition supplies a needed strategy');
+  assert.equal(new Set(distinctness.assignments.map((item) => item.projectedCompositionSignature)).size, 3);
   const visibleClearedBox = structuredClone(template.templateIR);
   const styledChrome = visibleClearedBox.slides.find((slide) => slide.index === 9)?.elements.find((element) => element.text === 'REPEATED BRAND');
   assert.ok(styledChrome);
@@ -1782,8 +1872,9 @@ test('Office Kit fallback fills native title and body placeholders without dupli
   const single = singleSlidePlan(deckPlan, contentIR, brief);
   const nativeTracks = VARIANT_POLICIES.map((policy) => compilePresentation(single.deckPlan, contentIR, template.templateIR, policy).slides[0]);
   const nativeDistinctness = assessVariantCompositionDistinctnessRaw(nativeTracks, template.templateIR, 'office-kit');
-  assert.equal(nativeDistinctness.distinct, false, 'variant-only text-box estimates cannot manufacture visual distinctness for one native layout');
-  assert.equal(nativeDistinctness.availableDistinctFamilies, 1);
+  assert.equal(nativeDistinctness.distinct, true,
+    'a single native layout is not the limit when template-derived compositions can safely express deck strategies');
+  assert.ok(nativeDistinctness.assignments.some((item) => item.compositionKind === 'template-derived-fallback'));
   const matrix = await runOfflinePresentationMatrix({
     deckPlan: single.deckPlan,
     contentIR,
@@ -1793,12 +1884,88 @@ test('Office Kit fallback fills native title and body placeholders without dupli
     continueOnBlocked: true,
   });
   const qualification = matrix.templateQualifications[0];
-  assert.equal(qualification?.status, 'blocked', 'one native layout must not qualify A/B/C merely because generated placeholder geometry differs');
-  assert.equal(qualification?.slides[0]?.status, 'passed', 'every track still receives the one safe native composition');
-  assert.equal(new Set(qualification?.slides[0]?.signatures ?? []).size, 1, 'the fallback signature represents native layout structure');
-  assert.equal(qualification?.deckCompositionDistinctness?.distinct, false, 'the complete one-slide tracks remain indistinguishable');
-  assert.ok(qualification?.slides[0]?.variants.every((variant) => variant.compositionKind === 'layout-placeholder-backed'));
-  assert.equal(matrix.outputCount, 0);
+  assert.equal(qualification?.status, 'passed', `tier 3 supplies safe A/B/C compositions without relying on generated textbox estimates: ${JSON.stringify(qualification)}`);
+  assert.equal(qualification?.slides[0]?.status, 'passed');
+  assert.equal(new Set(qualification?.slides[0]?.signatures ?? []).size, 3);
+  assert.equal(qualification?.deckCompositionDistinctness?.distinct, true);
+  assert.ok(qualification?.slides[0]?.variants.some((variant) => variant.compositionKind === 'template-derived-fallback'));
+  assert.equal(matrix.outputCount, 3, 'the one-slide fixture exports one editable PPTX per A/B/C track');
+});
+
+test('native placeholder fit estimates nominate candidates for renderer measurement instead of preemptive rejection', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-native-fit-measurement-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await nativePlaceholderFixture(root);
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const slide = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[0];
+  assert.ok(slide);
+  const candidate = slide.layoutCandidates.find((item) => item.layoutId === slide.layoutId
+    && item.sourcePart === slide.layoutSourcePart);
+  assert.ok(candidate);
+  const layout = template.templateIR.layouts.find((item) => item.id === candidate.layoutId && item.sourcePart === candidate.sourcePart);
+  assert.ok(layout);
+  for (const evidence of [candidate.slotEvidence.title, candidate.slotEvidence.body]) {
+    const id = evidence.sourceEvidence[0]?.elementId;
+    const element = layout.elements.find((item) => item.id === id);
+    assert.ok(element?.placeholder, 'candidate is backed by a native title/body placeholder');
+    for (const box of [element.geometry.direct, element.geometry.resolved]) {
+      if (box) box.height = 1_000;
+    }
+  }
+  template.templateIR.hash = sha256Json(templateIRHashPayload(template.templateIR));
+  slide.title = 'A compact takeaway for the presentation audience';
+  slide.body = Array(8).fill('Generated presentation copy with enough words to require accurate renderer measurement.');
+  assert.equal(nativePlaceholderFallbackSupported(slide, template.templateIR, candidate), true,
+    'small estimated boxes remain candidates for a real rendered-preview decision; they are not published without passing that gate');
+});
+
+test('native layout assignment clips a slightly out-of-canvas visual slot and rejects an empty one', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-native-layout-visual-bounds-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await nativePlaceholderFixture(root);
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const slide = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[0];
+  assert.ok(slide);
+  const candidateIndex = slide.layoutCandidates.findIndex((candidate) => candidate.layoutId === slide.layoutId);
+  assert.ok(candidateIndex >= 0);
+  const canvas = template.templateIR.slideSize;
+  const overrun = 7_815;
+  const height = inch(0.1);
+  const candidate = slide.layoutCandidates[candidateIndex];
+  assert.ok(candidate);
+  slide.layoutCandidates[candidateIndex] = {
+    ...candidate,
+    visualBox: { x: canvas.width - inch(1), y: canvas.height - height + overrun,
+      width: inch(1), height, unit: 'EMU' },
+  };
+  const restored = applyNativeLayoutCandidate(slide, slide.layoutCandidates[candidateIndex], candidateIndex, template.templateIR);
+  assert.deepEqual(restored.placements.visual, {
+    x: canvas.width - inch(1), y: canvas.height - height + overrun,
+    width: inch(1), height: height - overrun, unit: 'EMU',
+  }, 'persisted native-layout restoration uses the same bounded visual geometry as initial assignment');
+  const assignment = {
+    variantId: slide.variantId,
+    compositionKind: 'layout-placeholder-backed',
+    layoutCandidateIndex: candidateIndex,
+    projectedCompositionSignature: 'native-layout-visual-bounds-regression',
+  };
+  const assigned = applyVariantCompositionAssignment(slide, assignment, template.templateIR);
+  assert.deepEqual(assigned.placements.visual, {
+    x: canvas.width - inch(1), y: canvas.height - height + overrun,
+    width: inch(1), height: height - overrun, unit: 'EMU',
+  });
+  assert.ok(assigned.placements.visual.y + assigned.placements.visual.height <= canvas.height);
+
+  slide.layoutCandidates[candidateIndex] = {
+    ...slide.layoutCandidates[candidateIndex],
+    visualBox: { x: 0, y: canvas.height + 1, width: inch(1), height, unit: 'EMU' },
+  };
+  assert.throws(() => applyNativeLayoutCandidate(slide, slide.layoutCandidates[candidateIndex], candidateIndex, template.templateIR),
+    /visual slot no longer intersects the template canvas/u,
+    'a persisted candidate wholly outside the canvas remains fail-closed');
+  assert.throws(() => applyVariantCompositionAssignment(slide, assignment, template.templateIR),
+    /visual slot no longer intersects the template canvas/u,
+    'a wholly off-canvas slot remains fail-closed instead of being silently discarded');
 });
 
 test('native layout fallback is withheld when inherited master text could carry sample content into exports', async (t) => {
@@ -1813,6 +1980,158 @@ test('native layout fallback is withheld when inherited master text could carry 
   const assessment = assessVariantCompositionDistinctnessRaw(tracks, template.templateIR, 'office-kit');
   assert.equal(assessment.distinct, false);
   assert.equal(assessment.assignments.length, 0, 'no inherited sample-text composition is selected for export');
+});
+
+test('generic inferred-region fallback is the last resort and produces distinct editable A/B/C previews', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-derived-fallback-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await inferredRegionTemplateFixture(root);
+  const sourceHash = createHash('sha256').update(await readFile(template.templatePath)).digest('hex');
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiledTracks = VARIANT_POLICIES.map((policy) => compilePresentation(deckPlan, contentIR, template.templateIR, policy));
+  const tracks = compiledTracks.map((presentation) => {
+    const slide = presentation.slides[0];
+    assert.ok(slide);
+    slide.title = 'Цель задаёт план';
+    slide.body = ['Уточнить цель.', 'Проверить условия.', 'Определить следующий шаг.'];
+    slide.generatedBodyPoints = slide.body.map((text) => ({ text, origin: 'generated-from-brief', evidenceRefs: [] }));
+    return slide;
+  });
+  const adjacent = tracks[0]?.layoutCandidates[0];
+  assert.ok(adjacent?.titleBox && adjacent.bodyBox);
+  const roundingOverlap = {
+    ...adjacent,
+    titleBox: { ...adjacent.titleBox, height: adjacent.bodyBox.y - adjacent.titleBox.y + 1 },
+  };
+  const adjustedTitle = deriveTemplateTitleBox(roundingOverlap);
+  assert.equal(adjustedTitle?.y + adjustedTitle.height, roundingOverlap.bodyBox.y,
+    'exact placeholder intersection is removed from generated title geometry');
+  assert.equal(templateDerivedCompositionSupported({ ...tracks[0], layoutCandidates: [roundingOverlap] }, template.templateIR, roundingOverlap), true,
+    'a one-EMU rounding overlap is repaired from measured boundaries and still goes through rendered-preview validation');
+  const assessment = assessVariantCompositionDistinctnessRaw(tracks, template.templateIR, 'office-kit');
+  assert.equal(assessment.hasSafeAssignments, true);
+  assert.equal(assessment.distinct, true, JSON.stringify({
+    message: 'strategy-derived signatures distinguish complete one-slide A/B/C tracks',
+    counts: assessment.candidateCounts, evidence: assessment.evidence,
+    candidates: tracks[0]?.layoutCandidates.map((candidate) => ({ unknownReasons: candidate.unknownReasons,
+      title: candidate.slotEvidence.title, body: candidate.slotEvidence.body, titleBox: candidate.titleBox, bodyBox: candidate.bodyBox })),
+  }));
+  const deckAssignments = assignDeckVariantCompositions([assessment.safeOptionsByVariant]);
+  assert.ok(deckAssignments, 'tier 3 rescues the safe but composition-identical donor when needed for distinct complete tracks');
+  const chosen = ['A', 'B', 'C'].map((variant) => deckAssignments[variant][0]);
+  assert.equal(new Set(chosen.map((item) => item.projectedCompositionSignature)).size, 3);
+  assert.ok(chosen.some((item) => item.compositionKind === 'exemplar-backed'),
+    'the safe semantic donor remains preferred for one track');
+  assert.ok(chosen.some((item) => item.compositionKind === 'template-derived-fallback'),
+    'generic compositions are used only where the higher-tier donor cannot provide deck-level distinction');
+
+  for (const [index, compiled] of compiledTracks.entries()) {
+    const assignment = chosen.find((item) => item.variantId === tracks[index]?.variantId);
+    assert.ok(assignment);
+    const assigned = applyVariantCompositionAssignment(tracks[index], assignment, template.templateIR);
+    if (assignment.compositionKind === 'template-derived-fallback') {
+      assert.equal(assigned.templateDerivedCompositionStrategy, { A: 'balanced', B: 'visual-first', C: 'structured-dense' }[assigned.variantId]);
+    }
+    const outputPath = path.join(root, 'output', `template-derived-${assigned.variantId}.pptx`);
+    await mkdir(path.dirname(outputPath), { recursive: true });
+    const rendered = await new OfficeKitPptxRenderer().render({
+      compiledPresentation: { ...compiled, slides: [assigned] },
+      contentIR, templateIR: template.templateIR, templatePath: template.templatePath, outputPath,
+    });
+    assert.equal(rendered.validationStatus, 'passed');
+    assert.equal(rendered.reopenStatus, 'passed');
+    assert.equal(rendered.projectedCompositions[0]?.projectedCompositionSignature, assignment.projectedCompositionSignature);
+    const preview = await new OfficeKitPreviewAdapter().preview(await readFile(outputPath), 0);
+    assert.equal(preview.status, 'passed', JSON.stringify({ variant: assigned.variantId, text: preview.textLayoutIssues, geometry: preview.geometryIssues }));
+    assert.equal(preview.textLayoutIssues.length, 0);
+    assert.equal(preview.geometryIssues.length, 0);
+    const reopened = await inspectPptx(outputPath);
+    const visible = reopened.inspection.slides[0]?.elements.map((element) => element.text).join('\n') ?? '';
+    assert.match(visible, /Цель задаёт план/u);
+    assert.match(visible, /Определить следующий шаг/u);
+    assert.doesNotMatch(visible, /Example (?:title|body) region/u, 'source exemplar copy is not retained');
+    assert.ok(reopened.inspection.slides[0]?.elements.filter((element) => element.text.trim()).length >= 2,
+      'the generated slide contains editable native title/body text');
+  }
+  assert.equal(createHash('sha256').update(await readFile(template.templatePath)).digest('hex'), sourceHash,
+    'the unknown template source remains immutable');
+});
+
+test('generic fallback derives readable text color from a dark template background', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-derived-dark-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await inferredRegionTemplateFixture(root, { darkTheme: true, darkBodyBlack: true });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiledTracks = VARIANT_POLICIES.map((policy) => compilePresentation(deckPlan, contentIR, template.templateIR, policy));
+  const tracks = compiledTracks.map((presentation) => {
+    const slide = presentation.slides[0];
+    assert.ok(slide);
+    slide.title = 'Цель задаёт план';
+    slide.body = ['Уточнить цель.', 'Проверить условия.', 'Определить следующий шаг.'];
+    slide.generatedBodyPoints = slide.body.map((text) => ({ text, origin: 'generated-from-brief', evidenceRefs: [] }));
+    return slide;
+  });
+  const assessment = assessVariantCompositionDistinctnessRaw(tracks, template.templateIR, 'office-kit');
+  const assignments = assignDeckVariantCompositions([assessment.safeOptionsByVariant]);
+  assert.ok(assignments);
+  const fallback = ['A', 'B', 'C'].map((variant) => assignments[variant][0]).find((item) => item.compositionKind === 'template-derived-fallback');
+  assert.ok(fallback, 'the regression exercises the generic last-resort renderer path');
+  const index = VARIANT_POLICIES.findIndex((policy) => policy.id === fallback.variantId);
+  const selectedTrack = tracks[index];
+  const compiledTrack = compiledTracks[index];
+  assert.ok(selectedTrack);
+  assert.ok(compiledTrack);
+  const assigned = applyVariantCompositionAssignment(selectedTrack, fallback, template.templateIR);
+  const outputPath = path.join(root, 'output', 'dark-template-derived.pptx');
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const rendered = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: { ...compiledTrack, slides: [assigned] },
+    contentIR, templateIR: template.templateIR, templatePath: template.templatePath, outputPath,
+  });
+  assert.equal(rendered.validationStatus, 'passed');
+  const preview = await new OfficeKitPreviewAdapter().preview(await readFile(outputPath), 0);
+  assert.equal(preview.status, 'passed');
+  const reopened = await loadPresentation(await readFile(outputPath));
+  const reopenedSlide = getSlides(reopened)[0];
+  assert.ok(reopenedSlide);
+  const body = getSlideShapes(reopenedSlide).find((shape) => getShapeText(shape).includes('Проверить условия.'));
+  assert.ok(body);
+  const foreground = getShapeRunFormatEffective(reopened, body, 0, 0).color?.toUpperCase();
+  assert.ok(foreground);
+  assert.notEqual(foreground, '#172B4D', 'dark source body typography is not carried onto a dark template background');
+  assert.ok([`#${template.templateIR.theme?.colors.lt1}`, '#F9FAFB'].some((color) => color.toUpperCase() === foreground),
+    `foreground remains a template-derived light token for the measured dark backdrop, received ${foreground}`);
+});
+
+test('generic inferred-region fallback remains fail-closed around master text, preserved visuals, and missing role evidence', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-derived-fallback-safety-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const tracksFor = (template) => VARIANT_POLICIES.map((policy) => compilePresentation(deckPlan, contentIR, template.templateIR, policy).slides[0]);
+
+  const textMaster = await inferredRegionTemplateFixture(root, { masterStaticText: 'Inherited organizer instructions' });
+  const textAssessment = assessVariantCompositionDistinctnessRaw(tracksFor(textMaster), textMaster.templateIR, 'office-kit');
+  assert.equal(textAssessment.assignments.length, 0, 'inherited master copy is never overlapped or silently retained');
+
+  const logoMaster = await inferredRegionTemplateFixture(root, { masterLogo: true });
+  const logoTracks = tracksFor(logoMaster);
+  const logoCandidate = logoTracks[0]?.layoutCandidates[logoTracks[0].selectedCandidateIndex];
+  assert.ok(logoCandidate);
+  assert.equal(templateDerivedCompositionSupported(logoTracks[0], logoMaster.templateIR, logoCandidate), false,
+    'a measured body region colliding with preserved master artwork is rejected');
+
+  const plainTemplate = await inferredRegionTemplateFixture(root);
+  const missingEvidence = tracksFor(plainTemplate);
+  for (const slide of missingEvidence) slide.layoutCandidates = slide.layoutCandidates.map((candidate) => ({
+    ...candidate,
+    slotEvidence: {
+      ...candidate.slotEvidence,
+      title: candidate.slotEvidence.title ? { ...candidate.slotEvidence.title, confidence: 0 } : null,
+      body: candidate.slotEvidence.body ? { ...candidate.slotEvidence.body, confidence: 0 } : null,
+    },
+  }));
+  const missingAssessment = assessVariantCompositionDistinctnessRaw(missingEvidence, plainTemplate.templateIR, 'office-kit');
+  assert.equal(missingAssessment.assignments.length, 0, 'without title/body region evidence, generic shapes are not fabricated');
 });
 
 test('exemplar projection is withheld when static sample text is inherited from its layout/master', async (t) => {
@@ -2454,22 +2773,26 @@ test('deck-level composition assignment fails closed when no safe choice or no d
   ]), null, 'identical complete safe sequences remain blocked');
 });
 
-test('offline matrix withholds every output when fewer than three safe compositions are available', async (t) => {
+test('offline matrix uses generic native compositions when donor families collapse to one', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-matrix-withheld-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { brief, contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
   const single = singleSlidePlan(deckPlan, contentIR, brief);
   const exemplar = await exemplarFixture(root, 'duplicate-projection-matrix-template.pptx', { create: createDuplicateProjectionExemplarTemplate });
   const outputRoot = path.join(root, 'matrix');
-  await assert.rejects(runOfflinePresentationMatrix({
+  const matrix = await runOfflinePresentationMatrix({
     deckPlan: single.deckPlan,
     contentIR,
     templates: [{ ...exemplar, pptxPath: exemplar.templatePath }],
     outputRoot,
     backend: 'office-kit',
-  }), /complete A\/B\/C decks do not have pairwise distinct/);
-  await assert.rejects(stat(path.join(outputRoot, 'template-1')), { code: 'ENOENT' },
-    'the runner checks distinctness before it writes any A/B/C PPTX output');
+  });
+  const qualification = matrix.templateQualifications[0];
+  assert.equal(qualification?.status, 'passed');
+  assert.equal(qualification?.deckCompositionDistinctness?.distinct, true);
+  assert.ok(qualification?.slides[0]?.variants.some((variant) => variant.compositionKind === 'template-derived-fallback'));
+  assert.equal(matrix.outputCount, 3, 'the last-resort layer produces all three native editable tracks');
+  assert.ok((await stat(path.join(outputRoot, 'template-1'))).isDirectory());
 });
 
 test('local qualification continues across blocked templates and records selector candidate evidence without rendering them', async (t) => {
