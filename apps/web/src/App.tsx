@@ -475,6 +475,7 @@ function PresentationHome({ onOpen }: { onOpen: (projectId: string) => void }) {
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<UiFailure | null>(null);
+  const createNameInputRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -521,50 +522,121 @@ function PresentationHome({ onOpen }: { onOpen: (projectId: string) => void }) {
     }
   };
 
+  const focusCreateName = () => createNameInputRef.current?.focus();
+
   return (
-    <main className="home-shell">
-      <header className="home-header">
-        <div>
-          <div className="eyebrow">{ru.home.eyebrow}</div>
-          <h1>{ru.home.title}</h1>
-          <p className="lede">{ru.home.lede}</p>
+    <main className="home-app-shell">
+      <header className="workspace-topbar home-topbar">
+        <span className="home-product-mark" aria-hidden="true">L</span>
+        <div className="home-product-title">
+          <strong>LCT</strong>
+          <span>{ru.home.productName}</span>
         </div>
+        <span className="home-topbar-context">{ru.home.projects}</span>
       </header>
 
-      <section className="create-panel" aria-label={ru.home.createLabel}>
-        <input
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-          onKeyDown={(event) => { if (event.key === 'Enter' && !creating) void create(); }}
-          placeholder={ru.home.createPlaceholder}
-          aria-label={ru.home.createLabel}
-        />
-        <button className="primary" disabled={creating} onClick={() => void create()}>
-          {creating ? ru.home.creating : ru.home.create}
-        </button>
-      </section>
+      <nav className="workspace-rail home-rail" aria-label={ru.home.navigationLabel}>
+        <a className="rail-button active" href="/" aria-current="page" aria-label={ru.home.projects} title={ru.home.projects}>
+          <FigmaIcon name="clock" />
+        </a>
+      </nav>
 
-      <ErrorNotice failure={error} className="error-banner" />
+      <div className="workspace-content home-content">
+        <div className="home-overview">
+          <div className="home-dashboard-heading">
+            <span className="eyebrow">{ru.home.eyebrow}</span>
+            <h1>{ru.home.title}</h1>
+            <p>{ru.home.lede}</p>
+          </div>
 
-      <section className="projects-section">
-        <div className="section-heading">
-          <h2>{ru.home.projects}</h2>
-          <button className="quiet" onClick={() => void load()} disabled={loading}>{ru.home.refresh}</button>
-        </div>
-        {loading ? <div className="empty-state" role="status">{ru.home.loading}</div> : null}
-        {!loading && projects.length === 0 ? (
-          <div className="empty-state">{ru.home.empty}</div>
-        ) : null}
-        <div className="project-grid">
-          {projects.map((project) => (
-            <button key={project.id} className="project-card" onClick={() => onOpen(project.id)}>
-              <span className="project-card-kind">{ru.home.projectKind}</span>
-              <strong>{project.name || ru.home.genericProject}</strong>
-              <span className="project-card-meta">{project.updatedAt ? ru.home.updated(formatUiDateTime(new Date(project.updatedAt))) : project.id}</span>
+          <form className="home-create-panel" aria-label={ru.home.createLabel} onSubmit={(event) => { event.preventDefault(); if (!creating) void create(); }}>
+            <input
+              ref={createNameInputRef}
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder={ru.home.createPlaceholder}
+              aria-label={ru.home.createLabel}
+            />
+            <button className="primary" type="submit" disabled={creating}>
+              {creating ? ru.home.creating : ru.home.create}
             </button>
-          ))}
+          </form>
         </div>
-      </section>
+
+        <ErrorNotice failure={error} className="error-banner home-error" onRetry={() => void load()} />
+
+        <section className="home-projects" aria-labelledby="home-projects-title" aria-busy={loading}>
+          <div className="home-section-heading">
+            <div className="home-projects-label">
+              <h2 id="home-projects-title">{ru.home.recentProjects}</h2>
+              {!loading && (!error || projects.length > 0) ? <span className="home-project-count">{ru.home.projectCount(projects.length)}</span> : null}
+            </div>
+            <button className="quiet" onClick={() => void load()} disabled={loading}>{ru.home.refresh}</button>
+          </div>
+
+          {loading ? (
+            <>
+              <span className="visually-hidden" role="status">{ru.home.loading}</span>
+              <div className="home-project-grid home-loading-grid" aria-hidden="true">
+                {Array.from({ length: 4 }, (_, index) => <div className="home-project-skeleton" key={index} />)}
+              </div>
+            </>
+          ) : projects.length === 0 && error ? (
+            <div className="home-empty-state" role="status">
+              <span className="home-empty-icon" aria-hidden="true"><FigmaIcon name="folder" /></span>
+              <div>
+                <strong>{ru.home.loadFailedTitle}</strong>
+                <p>{ru.home.loadFailed}</p>
+              </div>
+            </div>
+          ) : projects.length === 0 ? (
+            <div className="home-empty-state">
+              <span className="home-empty-icon" aria-hidden="true"><FigmaIcon name="folder" /></span>
+              <div>
+                <strong>{ru.home.emptyTitle}</strong>
+                <p>{ru.home.empty}</p>
+              </div>
+              <button className="quiet home-empty-action" onClick={focusCreateName}>{ru.home.focusCreate}</button>
+            </div>
+          ) : (
+            <div className="home-project-grid" data-count={projects.length}>
+              {projects.map((project) => {
+                const title = project.name || ru.home.genericProject;
+                const updatedAt = project.updatedAt ? new Date(project.updatedAt) : null;
+                const hasUpdatedAt = updatedAt && Number.isFinite(updatedAt.getTime());
+                return (
+                  <button key={project.id} className="home-project-card" aria-label={ru.home.openProject(title)} onClick={() => onOpen(project.id)}>
+                    <span className="home-project-icon" aria-hidden="true"><FigmaIcon name="folder" /></span>
+                    <span className="home-project-main">
+                      <span className="project-card-kind">{ru.home.projectKind}</span>
+                      <strong title={title}>{title}</strong>
+                      {hasUpdatedAt ? <time className="project-card-meta" dateTime={project.updatedAt}>{ru.home.updated(formatUiDateTime(updatedAt))}</time> : null}
+                    </span>
+                    <span className="home-project-open" aria-hidden="true"><FigmaIcon name="arrow-right" /></span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {!loading && projects.length > 0 && projects.length <= 2 ? (
+          <section className="home-start-guide" aria-labelledby="home-start-guide-title">
+            <div className="home-start-guide-heading">
+              <span className="eyebrow">{ru.home.guideEyebrow}</span>
+              <h2 id="home-start-guide-title">{ru.home.guideTitle}</h2>
+            </div>
+            <ol className="home-guide-steps">
+              {ru.home.guideSteps.map((step, index) => (
+                <li key={step.title}>
+                  <span className="home-guide-index" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
+                  <span><strong>{step.title}</strong><small>{step.description}</small></span>
+                </li>
+              ))}
+            </ol>
+          </section>
+        ) : null}
+      </div>
     </main>
   );
 }
