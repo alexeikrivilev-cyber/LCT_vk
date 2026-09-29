@@ -483,7 +483,8 @@ async function requestJson(baseUrl, route, options = {}, expectedStatus = 200) {
   let body;
   try { body = text ? JSON.parse(text) : null; }
   catch { throw errorWithCode('PRODUCT_API_INVALID_JSON', 'Product API returned a non-JSON response.'); }
-  if (response.status !== expectedStatus) {
+  const acceptedStatuses = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+  if (!acceptedStatuses.includes(response.status)) {
     const apiCode = body?.error?.code ?? body?.failure?.code ?? body?.semanticProfile?.failureCode;
     throw errorWithCode(typeof apiCode === 'string' && /^[A-Z0-9_]{1,64}$/.test(apiCode) ? apiCode : 'PRODUCT_API_HTTP_ERROR', `Unexpected HTTP ${response.status} from product API.`);
   }
@@ -526,6 +527,19 @@ async function waitForWorkflow(baseUrl, projectId, timeoutMs, onSnapshot) {
     await sleep(100);
   }
   throw errorWithCode('PRODUCT_WORKFLOW_TIMEOUT', `Product workflow did not finish at stage ${last?.stage ?? 'unknown'}.`);
+}
+
+async function waitForTemplatePreparation(baseUrl, projectId, timeoutMs = 240_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await requestJson(baseUrl, `/api/projects/${encodeURIComponent(projectId)}/template`);
+    const profileStatus = last.semanticProfile?.status;
+    if (['ready', 'degraded-ready', 'failed', 'disabled'].includes(profileStatus)) return last;
+    if (last.status === 'failed') return last;
+    await sleep(100);
+  }
+  throw errorWithCode('TEMPLATE_PROFILE_TIMEOUT', `Template preparation did not finish; last status was ${last?.semanticProfile?.status ?? 'unknown'}.`);
 }
 
 function artifactSummary(bytes, extra = {}) {
@@ -631,23 +645,24 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     const templateStructure = await inspectOfficeKitPackage(input.templateBytes);
     manifest.template.slideCount = templateStructure.slideCount;
     const preparationStarted = performance.now();
-    const prepared = await requestJson(startedServer.url, `/api/projects/${encodeURIComponent(projectId)}/template/compile`, {
+    const preparationAccepted = await requestJson(startedServer.url, `/api/projects/${encodeURIComponent(projectId)}/template/compile`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: templateFilePath }),
-    });
-    if (prepared.status !== 'ready') {
+    }, [200, 202]);
+    if (preparationAccepted.status !== 'ready') {
       throw errorWithCode('TEMPLATE_STRUCTURAL_ANALYSIS_NOT_READY', 'Structural template analysis did not reach READY.');
     }
-    if (options.enableTemplateProfiler && prepared.semanticProfile?.status !== 'ready') {
-      const failureCode = prepared.semanticProfile?.failureCode;
+    const preparedStatus = await waitForTemplatePreparation(startedServer.url, projectId);
+    if (preparedStatus.status !== 'ready') {
+      throw errorWithCode('TEMPLATE_STRUCTURAL_ANALYSIS_NOT_READY', 'Structural template analysis did not reach READY.');
+    }
+    const terminalProfileStatus = preparedStatus.semanticProfile?.status;
+    if (options.enableTemplateProfiler && !['ready', 'degraded-ready'].includes(terminalProfileStatus)) {
+      const failureCode = preparedStatus.semanticProfile?.failureCode;
       throw errorWithCode(typeof failureCode === 'string' ? failureCode : 'TEMPLATE_PROFILE_NOT_READY',
         'Template semantic profile preparation did not reach READY.');
     }
     const templatePreparationMs = Math.max(0, Math.round(performance.now() - preparationStarted));
-    const preparedStatus = await requestJson(startedServer.url, `/api/projects/${encodeURIComponent(projectId)}/template`);
-    const expectedProfileStatus = 'ready';
-    if (preparedStatus.status !== 'ready' || prepared.semanticProfile?.status !== 'ready'
-        || preparedStatus.semanticProfile?.status !== expectedProfileStatus
-        || preparedStatus.semanticProfile?.cached !== true
+    if (preparedStatus.semanticProfile?.cached !== true
         || Object.hasOwn(preparedStatus, 'semanticProfileData')) {
       throw errorWithCode('TEMPLATE_STATUS_INVALID', 'Structural or semantic template preparation status was not safely read back.');
     }
@@ -658,16 +673,17 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     }
     manifest.workflow.templatePreparation = {
       structuralStatus: 'ready',
-      semanticProfileStatus: prepared.semanticProfile?.status ?? 'missing',
+      semanticProfileStatus: terminalProfileStatus ?? 'missing',
+      ...(preparedStatus.semanticProfile?.degradationCode ? { degradationCode: preparedStatus.semanticProfile.degradationCode } : {}),
       cachedStatusRead: true,
       profileRequests: profilerCountBeforeGenerate,
-      templateStructuralMs: prepared.templateStructuralMs ?? templatePreparationMs,
-      templateSemanticProfileMs: prepared.semanticProfile?.templateSemanticProfileMs ?? null,
+      templateStructuralMs: preparedStatus.semanticProfile?.templateStructuralMs ?? preparationAccepted.templateStructuralMs ?? templatePreparationMs,
+      templateSemanticProfileMs: preparedStatus.semanticProfile?.templateSemanticProfileMs ?? null,
       templatePreparationMs,
     };
-    manifest.timing.templateStructuralMs = prepared.templateStructuralMs ?? templatePreparationMs;
+    manifest.timing.templateStructuralMs = preparedStatus.semanticProfile?.templateStructuralMs ?? preparationAccepted.templateStructuralMs ?? templatePreparationMs;
     manifest.timing.templateAnalysisMs = manifest.timing.templateStructuralMs;
-    manifest.timing.templateSemanticProfileMs = prepared.semanticProfile?.templateSemanticProfileMs ?? null;
+    manifest.timing.templateSemanticProfileMs = preparedStatus.semanticProfile?.templateSemanticProfileMs ?? null;
     manifest.timing.templatePreparationMs = templatePreparationMs;
     const brief = {
       audience: 'Аудитория из задачи',

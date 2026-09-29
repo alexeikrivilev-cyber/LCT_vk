@@ -49,9 +49,11 @@ import { SemanticInferenceError, type SemanticInferenceAdapter } from './present
 import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
 import { ProductWorkflowError, ProductWorkflowService } from './presentation/application/product-workflow-service.js';
 import {
+  createDeterministicTemplateSemanticProfile,
   projectTemplateSemanticProfileCache,
   projectTemplateSemanticProfilePreparationStore,
   TemplateSemanticProfiler,
+  type TemplateSemanticProfile,
   type TemplateSemanticProfilePreparationRecord,
 } from './presentation/application/template-semantic-profiler.js';
 import {
@@ -246,6 +248,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     }
     return store;
   };
+  const profileHasDeterministicFallback = (profile: TemplateSemanticProfile) => profile.slides.some((slide) =>
+    slide.reasonCodes.includes('deterministic_fallback'));
   const readPreparedTemplateProfile = async (projectId: string, snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>) => {
     if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
       return null;
@@ -268,18 +272,29 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       const profileCacheKey = await profiler.profileCacheKey(snapshot.templateIR);
       const key = `${projectId}:${profileCacheKey}`;
       const record = await preparationStoreForProject(projectId).read(profileCacheKey);
+      if (record?.templateIRHash === snapshot.templateIR.hash && record.status === 'processing') {
+        return { status: 'processing', cached: false,
+          ...(record.templateStructuralMs === undefined ? {} : { templateStructuralMs: record.templateStructuralMs }) };
+      }
       const profile = await profiler.getPreparedTemplateProfile(snapshot.templateIR, snapshot.presentationDesignSystem);
-      if (profile) return { status: 'ready', cached: true, ...(record?.templateIRHash === snapshot.templateIR.hash ? {
+      if (profile) {
+        const degraded = profileHasDeterministicFallback(profile) || record?.profileOrigin === 'deterministic-fallback'
+          || record?.status === 'degraded-ready';
+        return { status: degraded ? 'degraded-ready' : 'ready', cached: true,
+          ...(degraded ? { degradationCode: record?.degradationCode ?? 'SEMANTIC_PROFILE_DEGRADED' } : {}), ...(record?.templateIRHash === snapshot.templateIR.hash ? {
         templatePreparationMs: record.templatePreparationMs ?? null,
         templateStructuralMs: record.templateStructuralMs ?? null,
         templateSemanticProfileMs: record.templateSemanticProfileMs ?? null,
       } : {}) };
+      }
       if (activeTemplatePreparations.has(key)) return { status: 'processing', cached: false,
         ...(record?.templateIRHash === snapshot.templateIR.hash && record.templateStructuralMs !== undefined
           ? { templateStructuralMs: record.templateStructuralMs } : {}) };
       if (record?.templateIRHash === snapshot.templateIR.hash) {
         if (record.status === 'failed') return { status: 'failed', cached: false, failureCode: record.failureCode ?? 'TEMPLATE_PROFILE_FAILED' };
-        if (record.status === 'processing') return { status: 'failed', cached: false, failureCode: 'TEMPLATE_PROFILE_INTERRUPTED' };
+        if (record.status === 'processing') return { status: 'processing', cached: false,
+          ...(record.templateStructuralMs !== undefined ? { templateStructuralMs: record.templateStructuralMs } : {}) };
+        if (record.status === 'degraded-ready') return { status: 'failed', cached: false, failureCode: 'TEMPLATE_PROFILE_CACHE_MISSING' };
       }
       return { status: 'missing', cached: false };
     } catch (error) {
@@ -292,7 +307,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     projectId: string,
     snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>,
     timing: { templateStructuralMs: number },
-  ): Promise<{ cached: boolean; templateSemanticProfileMs: number }> => {
+    recovery: { recoveryCount?: number; fallbackOnly?: boolean } = {},
+  ): Promise<{ status: 'processing' | 'ready' | 'degraded-ready'; cached: boolean; templateSemanticProfileMs?: number }> => {
     if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
       throw new TypeError('A structurally ready TemplateIR and presentation design system are required for semantic profiling.');
     }
@@ -302,34 +318,101 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     const store = preparationStoreForProject(projectId);
     const alreadyPrepared = await profiler.getPreparedTemplateProfile(snapshot.templateIR, snapshot.presentationDesignSystem);
     if (alreadyPrepared) {
+      const degraded = profileHasDeterministicFallback(alreadyPrepared);
       await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR.hash, profileCacheKey,
-        status: 'ready', updatedAt: new Date().toISOString(), ...timing, templateSemanticProfileMs: 0 });
-      return { cached: true, templateSemanticProfileMs: 0 };
+        status: degraded ? 'degraded-ready' : 'ready', profileOrigin: degraded ? 'deterministic-fallback' : 'semantic',
+        ...(degraded ? { degradationCode: 'SEMANTIC_PROFILE_DEGRADED' } : {}), updatedAt: new Date().toISOString(),
+        ...timing, templateSemanticProfileMs: 0 });
+      return { status: degraded ? 'degraded-ready' : 'ready', cached: true, templateSemanticProfileMs: 0 };
     }
     const existing = activeTemplatePreparations.get(key);
-    if (existing) return existing as Promise<{ cached: boolean; templateSemanticProfileMs: number }>;
-    const task = (async () => {
-      await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR!.hash, profileCacheKey,
-        status: 'processing', updatedAt: new Date().toISOString(), templateStructuralMs: timing.templateStructuralMs });
+    if (existing) return { status: 'processing', cached: false };
+    // Reserve the key before the first asynchronous write so concurrent compile requests dedupe.
+    activeTemplatePreparations.set(key, Promise.resolve());
+    try {
+      await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR.hash, profileCacheKey,
+        status: 'processing', updatedAt: new Date().toISOString(), templateStructuralMs: timing.templateStructuralMs,
+        recoveryCount: recovery.recoveryCount ?? 0 });
+    } catch (error) {
+      activeTemplatePreparations.delete(key);
+      throw error;
+    }
+    const preparationQueuedAt = performance.now();
+    let task!: Promise<void>;
+    task = Promise.resolve().then(async () => {
       const startedAt = performance.now();
       try {
-        await profilerForProject(projectId).prepareTemplateProfile(snapshot.templateIR!, snapshot.presentationDesignSystem!);
+        let profile: TemplateSemanticProfile;
+        let profileOrigin: 'semantic' | 'deterministic-fallback' = 'semantic';
+        let degradationCode: string | undefined;
+        try {
+          if (recovery.fallbackOnly) throw new SemanticInferenceError('SERVICE_UNAVAILABLE', 'Interrupted profile preparation was bounded to one automatic resume.');
+          profile = await profilerForProject(projectId).prepareTemplateProfile(snapshot.templateIR!, snapshot.presentationDesignSystem!);
+        } catch (error) {
+          const failureCode = error instanceof SemanticInferenceError ? error.code : 'TEMPLATE_PROFILE_FAILED';
+          const reason = error instanceof SemanticInferenceError ? `semantic_${error.code.toLowerCase()}` : 'semantic_profile_failed';
+          profile = createDeterministicTemplateSemanticProfile(snapshot.templateIR!, snapshot.presentationDesignSystem!, reason);
+          await projectTemplateSemanticProfileCache(projectsRoot, projectId).write(profile, profileCacheKey);
+          profileOrigin = 'deterministic-fallback';
+          degradationCode = /^[A-Z0-9_]{1,64}$/.test(failureCode) ? failureCode : 'TEMPLATE_PROFILE_FAILED';
+        }
         const templateSemanticProfileMs = Math.max(0, Math.round(performance.now() - startedAt));
+        const degraded = profileOrigin === 'deterministic-fallback' || profileHasDeterministicFallback(profile);
+        const terminalStatus = degraded ? 'degraded-ready' : 'ready';
         await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR!.hash, profileCacheKey,
-          status: 'ready', updatedAt: new Date().toISOString(), ...timing, templateSemanticProfileMs });
-        return { cached: false, templateSemanticProfileMs };
+          status: terminalStatus, profileOrigin: degraded ? 'deterministic-fallback' : 'semantic',
+          ...(degraded ? { degradationCode: degradationCode ?? 'SEMANTIC_PROFILE_DEGRADED' } : {}),
+          updatedAt: new Date().toISOString(), ...timing,
+          templatePreparationMs: Math.max(0, Math.round(performance.now() - preparationQueuedAt)), templateSemanticProfileMs,
+          recoveryCount: recovery.recoveryCount ?? 0 });
       } catch (error) {
         const failureCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
           && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : 'TEMPLATE_PROFILE_FAILED';
         await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR!.hash, profileCacheKey,
-          status: 'failed', updatedAt: new Date().toISOString(), failureCode, ...timing,
-          templateSemanticProfileMs: Math.max(0, Math.round(performance.now() - startedAt)) });
-        throw error;
+          status: 'failed', failureCode, updatedAt: new Date().toISOString(), ...timing,
+          templateSemanticProfileMs: Math.max(0, Math.round(performance.now() - startedAt)), recoveryCount: recovery.recoveryCount ?? 0 });
+        console.error(JSON.stringify({ event: 'template.profile-preparation', projectId, status: 'failed', errorCode: failureCode }));
+      } finally {
+        if (activeTemplatePreparations.get(key) === task) activeTemplatePreparations.delete(key);
       }
-    })();
+    });
     activeTemplatePreparations.set(key, task);
-    try { return await task; }
-    finally { if (activeTemplatePreparations.get(key) === task) activeTemplatePreparations.delete(key); }
+    void task.catch((error) => {
+      const failureCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+        && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : 'TEMPLATE_PROFILE_STATE_PERSIST_FAILED';
+      console.error(JSON.stringify({ event: 'template.profile-preparation-task', projectId, status: 'failed', errorCode: failureCode }));
+    });
+    return { status: 'processing', cached: false };
+  };
+  const resumeInterruptedTemplatePreparations = async () => {
+    if (!semanticProfilingEnabled) return;
+    for (const project of listPresentationProjects(db)) {
+      try {
+        const snapshot = await getTemplateCompilation(projectsRoot, project.id);
+        if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) continue;
+        const profiler = profilerForProject(project.id);
+        const profileCacheKey = await profiler.profileCacheKey(snapshot.templateIR);
+        const store = preparationStoreForProject(project.id);
+        const record = await store.read(profileCacheKey);
+        if (!record || record.templateIRHash !== snapshot.templateIR.hash || record.status !== 'processing') continue;
+        const cached = await profiler.getPreparedTemplateProfile(snapshot.templateIR, snapshot.presentationDesignSystem);
+        if (cached) {
+          const degraded = profileHasDeterministicFallback(cached);
+          await store.write({ ...record, status: degraded ? 'degraded-ready' : 'ready',
+            profileOrigin: degraded ? 'deterministic-fallback' : 'semantic',
+            ...(degraded ? { degradationCode: record.degradationCode ?? 'SEMANTIC_PROFILE_DEGRADED' } : {}),
+            updatedAt: new Date().toISOString() });
+          continue;
+        }
+        await prepareTemplateProfile(project.id, snapshot,
+          { templateStructuralMs: record.templateStructuralMs ?? 0 },
+          { recoveryCount: Math.min(1, (record.recoveryCount ?? 0) + 1), fallbackOnly: (record.recoveryCount ?? 0) >= 1 });
+      } catch (error) {
+        const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+          && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : 'TEMPLATE_PROFILE_RECOVERY_FAILED';
+        console.error(JSON.stringify({ event: 'template.profile-recovery', projectId: project.id, status: 'failed', errorCode: code }));
+      }
+    }
   };
   const planningService = new PlanningService({
     projectRoot,
@@ -615,34 +698,14 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       }
       const profile = await prepareTemplateProfile(req.params.id, compiled, { templateStructuralMs });
       const templatePreparationMs = Math.max(0, Math.round(performance.now() - preparationStartedAt));
-      const profiler = profilerForProject(req.params.id);
-      const compiledIR = compiled.templateIR;
-      if (!compiledIR) throw new TypeError('Structural template compilation did not return a TemplateIR.');
-      const profileCacheKey = await profiler.profileCacheKey(compiledIR);
-      await preparationStoreForProject(req.params.id).write({
-        schemaVersion: 1,
-        templateIRHash: compiledIR.hash,
-        profileCacheKey,
-        status: 'ready',
-        updatedAt: new Date().toISOString(),
-        templatePreparationMs,
+      res.status(profile.status === 'processing' ? 202 : 200).json({ ...compiled, semanticProfile: {
+        status: profile.status,
+        cached: profile.cached,
+        ...(profile.status === 'processing' ? {} : { templatePreparationMs }),
         templateStructuralMs,
-        templateSemanticProfileMs: profile.templateSemanticProfileMs,
-      });
-      res.json({ ...compiled, semanticProfile: {
-        status: 'ready', cached: profile.cached, templatePreparationMs,
-        templateStructuralMs, templateSemanticProfileMs: profile.templateSemanticProfileMs,
+        ...(profile.templateSemanticProfileMs === undefined ? {} : { templateSemanticProfileMs: profile.templateSemanticProfileMs }),
       } });
     } catch (error) {
-      if (error instanceof SemanticInferenceError) {
-        res.locals.errorCode = error.code;
-        const snapshot = await getTemplateCompilation(projectsRoot, req.params.id);
-        return res.status(200).json({
-          ...snapshot,
-          semanticProfile: { status: 'failed', cached: false, failureCode: error.code },
-          semanticProfileNotice: { code: error.code, message: 'Не удалось завершить анализ оформления шаблона. Повторите подготовку перед созданием презентации.' },
-        });
-      }
       if (error instanceof TemplateCompilerError) {
         return res.status(error.status).json({ status: 'failed', failure: { code: error.code, message: error.message } });
       }
@@ -1012,6 +1075,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   const boundPort = address && typeof address === 'object' ? address.port : port;
   const urlHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
   const url = `http://${urlHost}:${boundPort}`;
+  void resumeInterruptedTemplatePreparations().catch(() => {
+    console.error(JSON.stringify({ event: 'template.profile-recovery', status: 'failed', errorCode: 'TEMPLATE_PROFILE_RECOVERY_FAILED' }));
+  });
 
   const shutdown = async () => {
     productWorkflowService.requestShutdown();

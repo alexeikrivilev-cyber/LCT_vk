@@ -2,6 +2,7 @@ import {
   validatePresentationDesignSystem,
   validateTemplateIR,
   type PresentationDesignSystem,
+  type TemplateElement,
   type TemplateIR,
 } from '../domain/template-ir.js';
 import { createHash, randomBytes } from 'node:crypto';
@@ -67,7 +68,7 @@ export interface TemplateSemanticProfileCache {
   invalidate?(cacheKey: string): Promise<void>;
 }
 
-export type TemplateSemanticProfilePreparationStatus = 'processing' | 'ready' | 'failed';
+export type TemplateSemanticProfilePreparationStatus = 'processing' | 'ready' | 'degraded-ready' | 'failed';
 
 export interface TemplateSemanticProfilePreparationRecord {
   schemaVersion: 1;
@@ -76,6 +77,9 @@ export interface TemplateSemanticProfilePreparationRecord {
   status: TemplateSemanticProfilePreparationStatus;
   updatedAt: string;
   failureCode?: string;
+  profileOrigin?: 'semantic' | 'deterministic-fallback';
+  degradationCode?: string;
+  recoveryCount?: number;
   templatePreparationMs?: number;
   templateStructuralMs?: number;
   templateSemanticProfileMs?: number;
@@ -141,9 +145,12 @@ export function projectTemplateSemanticProfilePreparationStore(projectsRoot: str
         const value = JSON.parse(raw) as Partial<TemplateSemanticProfilePreparationRecord>;
         if (value.schemaVersion !== 1 || value.profileCacheKey !== profileCacheKey
             || typeof value.templateIRHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.templateIRHash)
-            || !['processing', 'ready', 'failed'].includes(String(value.status))
+            || !['processing', 'ready', 'degraded-ready', 'failed'].includes(String(value.status))
             || typeof value.updatedAt !== 'string' || !Number.isFinite(Date.parse(value.updatedAt))
             || (value.failureCode !== undefined && (typeof value.failureCode !== 'string' || !/^[A-Z0-9_]{1,64}$/.test(value.failureCode)))
+            || (value.profileOrigin !== undefined && !['semantic', 'deterministic-fallback'].includes(value.profileOrigin))
+            || (value.degradationCode !== undefined && (typeof value.degradationCode !== 'string' || !/^[A-Z0-9_]{1,64}$/.test(value.degradationCode)))
+            || (value.recoveryCount !== undefined && (!Number.isSafeInteger(value.recoveryCount) || value.recoveryCount < 0 || value.recoveryCount > 1))
             || ['templatePreparationMs', 'templateStructuralMs', 'templateSemanticProfileMs'].some((key) => {
               const duration = (value as Record<string, unknown>)[key];
               return duration !== undefined && (!Number.isSafeInteger(duration) || Number(duration) < 0);
@@ -330,8 +337,112 @@ export function validateTemplateSemanticProfile(value: unknown, templateIR: Temp
       ...structuredClone(slide),
       preservedElementIds: [...(slide.preservedElementIds ?? [])],
       replaceableTextElementIds: [...(slide.replaceableTextElementIds ?? [])],
-    })),
+  })),
   };
+}
+
+/** Build a low-confidence profile from generic, same-slide structural evidence only. */
+export function createDeterministicTemplateSemanticProfile(
+  templateIRInput: TemplateIR,
+  designSystemInput: PresentationDesignSystem,
+  degradationReason = 'semantic_unavailable',
+): TemplateSemanticProfile {
+  const templateIR = validateTemplateIR(templateIRInput);
+  validatePresentationDesignSystem(designSystemInput, templateIR);
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(degradationReason)) throw new TypeError('Template profile degradation reason is invalid.');
+
+  const canvasArea = Math.max(1, templateIR.slideSize.width * templateIR.slideSize.height);
+  const layoutById = new Map(templateIR.layouts.map((layout) => [layout.id, layout]));
+  const maxFontSize = (element: TemplateElement): number => Math.max(0,
+    ...(element.effectiveFontSizesPt ?? []), ...(element.directStyles.fontSizesPt ?? []));
+  const geometry = (element: TemplateElement) => element.geometry.resolved ?? element.geometry.direct;
+  const isText = (element: TemplateElement) => Boolean(element.text?.trim());
+  const placeholder = (element: TemplateElement) => `${element.placeholder?.type ?? ''} ${element.placeholder?.role ?? ''}`
+    .toLowerCase().replace(/[^a-z]/g, '');
+  const isTitlePlaceholder = (element: TemplateElement) => /title|ctrtitle/.test(placeholder(element));
+  const isBodyPlaceholder = (element: TemplateElement) => /body|obj|content|subtitle/.test(placeholder(element))
+    && !isTitlePlaceholder(element);
+  const isFurniture = (element: TemplateElement) => /date|footer|header|slidenumber|slidenum|sldnum/.test(placeholder(element));
+  const area = (element: TemplateElement) => {
+    const box = geometry(element);
+    return box ? Math.max(0, box.width) * Math.max(0, box.height) : 0;
+  };
+  const isLargeTextRegion = (element: TemplateElement) => {
+    const box = geometry(element);
+    return Boolean(box && box.width >= templateIR.slideSize.width * 0.2
+      && box.height >= templateIR.slideSize.height * 0.025 && area(element) / canvasArea >= 0.008);
+  };
+  const compareTextRegions = (left: TemplateElement, right: TemplateElement) =>
+    maxFontSize(right) - maxFontSize(left)
+      || area(right) - area(left)
+      || (geometry(left)?.y ?? Number.MAX_SAFE_INTEGER) - (geometry(right)?.y ?? Number.MAX_SAFE_INTEGER)
+      || left.order - right.order;
+  const isMedia = (element: TemplateElement) => /picture|image|chart|table|graphicframe|media/i.test(element.kind);
+
+  const slides = templateIR.slides.map((slide) => {
+    const textElements = slide.elements.filter(isText).slice(0, PROFILE_MAX_ELEMENTS_PER_SLIDE);
+    const selectedIds = new Set<string>();
+    const explicitTitles = textElements.filter(isTitlePlaceholder).sort(compareTextRegions);
+    let title: TemplateElement | undefined = explicitTitles[0];
+    if (!title) {
+      const plausibleTitles = textElements.filter((element) => {
+        const box = geometry(element);
+        return !isFurniture(element) && isLargeTextRegion(element) && box !== null
+          && box.y <= templateIR.slideSize.height * 0.45;
+      }).sort(compareTextRegions);
+      const candidate = plausibleTitles[0];
+      const otherSizes = textElements.filter((element) => element !== candidate).map(maxFontSize).filter((size) => size > 0);
+      const candidateSize = candidate ? maxFontSize(candidate) : 0;
+      if (candidate && (otherSizes.length === 0 || candidateSize > Math.max(...otherSizes))) title = candidate;
+    }
+    if (title) selectedIds.add(title.id);
+
+    const explicitBody = textElements.filter((element) => isBodyPlaceholder(element) && !isFurniture(element))
+      .sort((left, right) => area(right) - area(left) || left.order - right.order);
+    const geometricBody = textElements.filter((element) => {
+      const box = geometry(element);
+      if (selectedIds.has(element.id) || isFurniture(element) || !isLargeTextRegion(element) || !box) return false;
+      return maxFontSize(element) === 0 || !title || maxFontSize(element) <= maxFontSize(title);
+    }).sort((left, right) => area(right) - area(left) || left.order - right.order);
+    const bodyCandidates = explicitBody.length > 0 ? explicitBody : geometricBody;
+    const body: string[] = [];
+    for (const element of bodyCandidates) {
+      if (selectedIds.has(element.id) || body.length >= 4) continue;
+      selectedIds.add(element.id);
+      body.push(element.id);
+    }
+
+    const visual: string[] = [];
+    for (const element of slide.elements) {
+      if (element.text?.trim() || !isMedia(element) || selectedIds.has(element.id)) continue;
+      if (visual.length >= PROFILE_MAX_ELEMENTS_PER_SLIDE) break;
+      selectedIds.add(element.id);
+      visual.push(element.id);
+    }
+    const preserved = textElements.filter((element) => !selectedIds.has(element.id)).map((element) => element.id);
+    const layoutType = (slide.layoutId ? layoutById.get(slide.layoutId)?.declaredType : null)?.toLowerCase().replace(/[^a-z]/g, '') ?? '';
+    const archetype = /^title$/.test(layoutType) ? 'cover'
+      : /sectionheader|sectiondivider|section/.test(layoutType) ? 'section-divider' : 'content';
+    const kinds = slide.elements.filter((element) => visual.includes(element.id)).map((element) => element.kind.toLowerCase());
+    const supportedContentModes: TemplateContentMode[] = ['text'];
+    if (kinds.some((kind) => /picture|image/.test(kind))) supportedContentModes.push('image');
+    if (kinds.some((kind) => /chart/.test(kind))) supportedContentModes.push('chart', 'metrics');
+    if (kinds.some((kind) => /table/.test(kind))) supportedContentModes.push('table');
+    if (visual.length > 0 && (body.length > 0 || title)) supportedContentModes.push('mixed');
+    return {
+      sourceSlideIndex: slide.index,
+      archetype: archetype as TemplateSlideArchetype,
+      supportedContentModes: [...new Set(supportedContentModes)],
+      titleElementId: title?.id ?? null,
+      bodyElementIds: body,
+      visualElementIds: visual,
+      preservedElementIds: preserved,
+      replaceableTextElementIds: [],
+      confidence: 0.1,
+      reasonCodes: ['deterministic_fallback', degradationReason],
+    } satisfies TemplateSemanticSlideProfile;
+  });
+  return validateTemplateSemanticProfile({ templateIRHash: templateIR.hash, slides }, templateIR);
 }
 
 /** Prioritize readable text, then the largest/media-like non-text objects inside the bounded profile evidence. */
@@ -716,6 +827,52 @@ function requestFor(
   };
 }
 
+function measuredProfileBatchForSlides(
+  templateIR: TemplateIR,
+  systemPrompt: string,
+  slides: readonly TemplateIR['slides'][number][],
+  parent: TemplateSemanticProfileBatchPlan,
+): TemplateSemanticProfileBatchPlan {
+  const measured = boundedBatchEvidence(templateIR, [...slides], systemPrompt);
+  if (!measured) throw new InferenceError('REQUEST_TOO_LARGE', 'A recovered template profiler request exceeded its safe evidence or request-size limit.');
+  return {
+    batchNumber: parent.batchNumber,
+    totalBatches: parent.totalBatches,
+    sourceSlideIndexes: slides.map((slide) => slide.index),
+    evidence: measured.evidenceJson,
+    evidenceBytes: measured.evidenceBytes,
+    schema: measured.schema,
+    schemaBytes: measured.schemaBytes,
+    systemPromptBytes: measured.systemPromptBytes,
+    envelopeOverheadBytes: measured.envelopeOverheadBytes,
+    outputTokenReserveBytes: measured.outputTokenReserveBytes,
+    estimatedTotalRequestBytes: measured.estimatedTotalRequestBytes,
+    maxOutputTokens: measured.maxOutputTokens,
+  };
+}
+
+function profileBatchWithOutputBudget(
+  batch: TemplateSemanticProfileBatchPlan,
+  maxOutputTokens: number,
+): TemplateSemanticProfileBatchPlan | null {
+  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= batch.maxOutputTokens
+      || maxOutputTokens > TEMPLATE_PROFILE_WORKFLOW.maxOutputTokens) return null;
+  const outputTokenReserveBytes = maxOutputTokens * PROFILE_OUTPUT_TOKEN_BYTE_RESERVE;
+  const estimatedTotalRequestBytes = batch.systemPromptBytes + batch.evidenceBytes + batch.schemaBytes
+    + batch.envelopeOverheadBytes + outputTokenReserveBytes;
+  if (estimatedTotalRequestBytes > PROFILE_REQUEST_BYTE_LIMIT) return null;
+  return { ...batch, maxOutputTokens, outputTokenReserveBytes, estimatedTotalRequestBytes };
+}
+
+function isLengthTruncation(error: unknown): error is InferenceError {
+  return error instanceof InferenceError && error.code === 'INVALID_STRUCTURED_OUTPUT'
+    && error.telemetry?.finishReason === 'length';
+}
+
+function isRecoverablePairFailure(error: unknown): error is InferenceError {
+  return isLengthTruncation(error) || error instanceof InferenceError && error.code === 'SERVICE_UNAVAILABLE';
+}
+
 /**
  * Replaceable semantic evidence adapter for templates. Cached per TemplateIR hash;
  * deterministic selector and safety checks remain responsible for final choices.
@@ -818,12 +975,70 @@ export class TemplateSemanticProfiler {
         }
       }
       const plan = planTemplateSemanticProfileBatches(templateIR, prompt.content);
-      const batchResults: Array<TemplateSemanticSlideProfile[] | undefined> = new Array(plan.batches.length);
+      const batchResults = new Map<number, TemplateSemanticSlideProfile>();
       const controller = new AbortController();
       const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
       const concurrency = Math.min(this.options.concurrency ?? 1, plan.batches.length);
       let nextBatch = 0;
       let firstFailure: unknown;
+      let pendingInitialBatches = plan.batches.length;
+      let providerCalls = 0;
+      let reservedRecoveryCalls = 0;
+      const reserveRecoveryCalls = (count: number): boolean => {
+        if (providerCalls + reservedRecoveryCalls + pendingInitialBatches + count > PROFILE_BATCH_COUNT_LIMIT) return false;
+        reservedRecoveryCalls += count;
+        return true;
+      };
+      const dispatch = async (
+        batch: TemplateSemanticProfileBatchPlan,
+        slides: readonly TemplateIR['slides'][number][],
+        credit: 'initial' | 'reserved',
+      ) => {
+        if (credit === 'initial') pendingInitialBatches = Math.max(0, pendingInitialBatches - 1);
+        else {
+          if (reservedRecoveryCalls < 1) throw new InferenceError('REQUEST_TOO_LARGE', 'Template profiler recovery exceeded its request budget.');
+          reservedRecoveryCalls -= 1;
+        }
+        providerCalls += 1;
+        return this.inference.infer({ ...requestFor(templateIR, prompt.content, batch, slides), signal: requestSignal });
+      };
+      const inferSingleSlide = async (
+        batch: TemplateSemanticProfileBatchPlan,
+        slide: TemplateIR['slides'][number],
+        credit: 'initial' | 'reserved',
+      ) => {
+        try {
+          return await dispatch(batch, [slide], credit);
+        } catch (error) {
+          if (!isLengthTruncation(error) || requestSignal.aborted) throw error;
+          const larger = profileBatchWithOutputBudget(batch, TEMPLATE_PROFILE_WORKFLOW.maxOutputTokens);
+          if (!larger || !reserveRecoveryCalls(1)) throw error;
+          return dispatch(larger, [slide], 'reserved');
+        }
+      };
+      const inferBatchWithRecovery = async (
+        batch: TemplateSemanticProfileBatchPlan,
+        batchSlides: readonly TemplateIR['slides'][number][],
+      ) => {
+        if (batchSlides.length === 1) {
+          const response = await inferSingleSlide(batch, batchSlides[0]!, 'initial');
+          return response.value.slides;
+        }
+        try {
+          const response = await dispatch(batch, batchSlides, 'initial');
+          return response.value.slides;
+        } catch (error) {
+          if (!isRecoverablePairFailure(error) || requestSignal.aborted) throw error;
+          if (!reserveRecoveryCalls(batchSlides.length)) throw error;
+          const recovered: TemplateSemanticSlideProfile[] = [];
+          for (const slide of batchSlides) {
+            const singleBatch = measuredProfileBatchForSlides(templateIR, prompt.content, [slide], batch);
+            const response = await inferSingleSlide(singleBatch, slide, 'reserved');
+            recovered.push(...response.value.slides);
+          }
+          return recovered;
+        }
+      };
       const workers = Array.from({ length: concurrency }, async () => {
         while (!firstFailure) {
           if (signal?.aborted) {
@@ -837,10 +1052,8 @@ export class TemplateSemanticProfiler {
           const batchIndexes = new Set(batch.sourceSlideIndexes);
           const batchSlides = templateIR.slides.filter((slide) => batchIndexes.has(slide.index));
           try {
-            const response = await this.inference.infer({
-              ...requestFor(templateIR, prompt.content, batch, batchSlides), signal: requestSignal,
-            });
-            batchResults[batchIndex] = response.value.slides;
+            const slides = await inferBatchWithRecovery(batch, batchSlides);
+            for (const slide of slides) batchResults.set(slide.sourceSlideIndex, slide);
           } catch (error) {
             if (!firstFailure) firstFailure = error;
             controller.abort(firstFailure);
@@ -850,7 +1063,7 @@ export class TemplateSemanticProfiler {
       });
       await Promise.all(workers);
       if (firstFailure) throw firstFailure;
-      const mergedSlides: TemplateSemanticSlideProfile[] = batchResults.flatMap((slides) => slides ?? []);
+      const mergedSlides: TemplateSemanticSlideProfile[] = [...batchResults.values()];
       const expectedIndexOrder = new Map(templateIR.slides.map((slide, index) => [slide.index, index]));
       mergedSlides.sort((left, right) => (expectedIndexOrder.get(left.sourceSlideIndex) ?? Number.MAX_SAFE_INTEGER)
         - (expectedIndexOrder.get(right.sourceSlideIndex) ?? Number.MAX_SAFE_INTEGER));

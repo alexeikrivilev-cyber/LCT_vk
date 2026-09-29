@@ -159,6 +159,29 @@ async function waitFor(operation, predicate, label, timeoutMs = 45000) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
+async function prepareTemplate(server, projectId, filePath, timeoutMs = 45000) {
+  const acceptedResponse = await fetch(`${server.url}/api/projects/${projectId}/template/compile`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ filePath }),
+  });
+  if (acceptedResponse.status === 503) {
+    const body = await json(acceptedResponse);
+    if (body.failure?.code === 'INSPECTOR_UNAVAILABLE') return false;
+  }
+  assert.ok([200, 202].includes(acceptedResponse.status), await acceptedResponse.clone().text());
+  const accepted = await json(acceptedResponse);
+  assert.ok(['processing', 'ready', 'degraded-ready', 'disabled'].includes(accepted.semanticProfile?.status),
+    `template preparation was not accepted: ${JSON.stringify(accepted.semanticProfile)}`);
+  const state = await waitFor(async () => json(await fetch(`${server.url}/api/projects/${projectId}/template`)),
+    (value) => ['ready', 'degraded-ready', 'failed', 'disabled'].includes(value.semanticProfile?.status),
+    `template semantic profile for ${projectId}`, timeoutMs);
+  assert.equal(state.status, 'ready', `template structure failed: ${JSON.stringify(state.failure)}`);
+  assert.ok(['ready', 'degraded-ready', 'disabled'].includes(state.semanticProfile?.status),
+    `template semantic profile failed: ${JSON.stringify(state.semanticProfile)}`);
+  if (state.semanticProfile.status !== 'disabled') assert.equal(state.semanticProfile.cached, true);
+  return state;
+}
+
 async function createProject(server, projectId) {
   const response = await fetch(`${server.url}/api/projects`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -177,16 +200,8 @@ async function upload(server, projectId, name, bytes) {
 async function seedReadyPlanningState(server, dataDir, projectId, sourceText = 'Evidence points to a retention constraint for sustained growth.', includeChartSource = false) {
   const pptx = await makeValidSyntheticPptx(path.join(dataDir, 'fixture'));
   await upload(server, projectId, 'template.pptx', pptx);
-  const compiled = await fetch(`${server.url}/api/projects/${projectId}/template/compile`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ filePath: 'template.pptx' }),
-  });
-  if (compiled.status === 503) {
-    const body = await json(compiled);
-    if (body.failure?.code === 'INSPECTOR_UNAVAILABLE') return false;
-  }
-  assert.equal(compiled.status, 200, await compiled.clone().text());
-  const template = await json(compiled);
+  const template = await prepareTemplate(server, projectId, 'template.pptx');
+  if (!template) return false;
   const sourceFile = includeChartSource ? 'metrics.csv' : 'source.md';
   const sourceBytes = includeChartSource
     ? Buffer.from('Quarter,Retention\nQ1,10\nQ2,12\nQ3,13\n', 'utf8')
@@ -916,12 +931,8 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(imageModels.configured, false);
     const pptx = await makeValidSyntheticPptx(path.join(temp, 'template'));
     await upload(started, projectId, 'synthetic-template.pptx', pptx);
-    const preparedResponse = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ filePath: 'synthetic-template.pptx' }),
-    });
-    assert.equal(preparedResponse.status, 200, await preparedResponse.clone().text());
-    const prepared = await json(preparedResponse);
+    const prepared = await prepareTemplate(started, projectId, 'synthetic-template.pptx');
+    assert.ok(prepared);
     assert.equal(prepared.status, 'ready');
     assert.equal(prepared.semanticProfile.status, 'ready');
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, 1);
@@ -1093,10 +1104,8 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     await createProject(started, sourceProjectId);
     await upload(started, sourceProjectId, 'source-template.pptx', pptx);
     await upload(started, sourceProjectId, 'market-context.md', Buffer.from('# Current position\nThe product serves three customer segments.\n\n# Next step\nThe team will validate the smallest pilot first.', 'utf8'));
-    const sourceTemplatePrepared = await fetch(`${started.url}/api/projects/${sourceProjectId}/template/compile`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: 'source-template.pptx' }),
-    });
-    assert.equal(sourceTemplatePrepared.status, 200, await sourceTemplatePrepared.clone().text());
+    const sourceTemplatePrepared = await prepareTemplate(started, sourceProjectId, 'source-template.pptx');
+    assert.ok(sourceTemplatePrepared);
     const withSourceInput = {
       ...input,
       templateFilePath: 'source-template.pptx',
@@ -1123,10 +1132,8 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     started = await closeAndRestartWithRenderer(started, recoveryDataDir, repoRoot, recoveryRendererGate.renderer);
     await createProject(started, recoveryProjectId);
     await upload(started, recoveryProjectId, 'recovery-template.pptx', recoveryTemplate);
-    const recoveryTemplatePrepared = await fetch(`${started.url}/api/projects/${recoveryProjectId}/template/compile`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: 'recovery-template.pptx' }),
-    });
-    assert.equal(recoveryTemplatePrepared.status, 200, await recoveryTemplatePrepared.clone().text());
+    const recoveryTemplatePrepared = await prepareTemplate(started, recoveryProjectId, 'recovery-template.pptx');
+    assert.ok(recoveryTemplatePrepared);
     const beforeRecoveryCalls = endpoint.state.inference.length;
     const recoveryInput = {
       templateFilePath: 'recovery-template.pptx', contentFiles: [],

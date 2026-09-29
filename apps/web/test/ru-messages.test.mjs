@@ -104,8 +104,8 @@ test('normal user flow requires only a template and task; optional fields stay c
   const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
   assert.match(appSource, /fetch\(`\/api\/projects\/\$\{encodeURIComponent\(projectId\)\}\/workflow\/generate`/u);
   assert.match(appSource, /<button className="primary" onClick=\{\(\) => void generatePresentation\(\)\} disabled=\{!templateFile \|\| !templatePreparationReady \|\| !briefPurpose\.trim\(\) \|\| busy \|\| templatePreparationPending \|\| productWorkflowRunning\}>/u, 'one-click generation waits for a complete prepared profile');
-  assert.match(appSource, /templatePreparationReady = matchingScan && templateScan\?\.status === 'ready' && templateProfileStatus === 'ready'/u,
-    'generation remains disabled until the persisted semantic profile validates');
+  assert.match(appSource, /templatePreparationReady = matchingScan && templateScan\?\.status === 'ready'[\s\S]*?isUsableTemplateProfileState\(templateProfileStatus\)/u,
+    'generation waits for a validated semantic profile, including an explicitly degraded profile');
   assert.match(appSource, /<button className=\{templateFile \? 'quiet' : 'primary'\} onClick=\{\(\) => uploadRef\.current\?\.click\(\)\}/u);
   assert.match(appSource, /<label className="planning-required-field">[\s\S]*<textarea id="presentation-purpose" required/u);
   const optionalStart = appSource.indexOf('<details className="advanced-tools optional-settings">');

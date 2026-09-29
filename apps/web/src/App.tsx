@@ -17,6 +17,7 @@ import {
 import { clearWorkspaceDraft, readWorkspaceDraft, writeWorkspaceDraft } from './workspace-draft';
 import { refreshPersistedWorkflowSnapshots } from './workflow-terminal-refresh';
 import { includeUploadedContentFiles } from './uploaded-content-selection';
+import { isPersistedTemplatePreparationState, isUsableTemplateProfileState } from './template-preparation-state';
 
 type Project = {
   id: string;
@@ -54,7 +55,7 @@ class ApplicationUiError extends Error {
 }
 
 type TemplateCompileStatus = 'uncompiled' | 'ready' | 'stale' | 'failed';
-type TemplateSemanticProfileStatus = 'disabled' | 'missing' | 'processing' | 'ready' | 'failed';
+type TemplateSemanticProfileStatus = 'disabled' | 'missing' | 'processing' | 'ready' | 'degraded-ready' | 'failed';
 type TemplateCompileResponse = {
   status: TemplateCompileStatus;
   source?: unknown;
@@ -66,6 +67,7 @@ type TemplateCompileResponse = {
     status: TemplateSemanticProfileStatus;
     cached: boolean;
     failureCode?: string;
+    degradationCode?: string;
     templatePreparationMs?: number | null;
     templateStructuralMs?: number | null;
     templateSemanticProfileMs?: number | null;
@@ -696,7 +698,8 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const templateProfileStatus = rawTemplateProfileStatus === 'disabled' ? 'missing' : rawTemplateProfileStatus;
   const templatePreparationPending = templateAnalyzing || Boolean(matchingScan && templateScan?.status === 'ready'
     && templateProfileStatus === 'processing');
-  const templatePreparationReady = matchingScan && templateScan?.status === 'ready' && templateProfileStatus === 'ready';
+  const templatePreparationReady = matchingScan && templateScan?.status === 'ready'
+    && isUsableTemplateProfileState(templateProfileStatus);
   const visibleTemplateStatus: TemplateCompileStatus | null = scanSelectionMismatch
     ? 'stale'
     : templateScan?.status === 'ready' && !templatePreparationReady && templateProfileStatus !== 'processing'
@@ -706,7 +709,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const templateBadgeLabel = templatePreparationPending
     ? templateProfileStatus === 'processing' ? ru.template.profileAnalyzing : ru.template.structureAnalyzing
     : templateFetching ? ru.template.fetching
-      : templatePreparationReady ? ru.template.ready
+      : templatePreparationReady ? templateProfileStatus === 'degraded-ready' ? ru.template.profileDegradedBadge : ru.template.ready
         : templateProfileStatus === 'failed' ? ru.template.profileFailed
         : templateScan?.status === 'ready' ? ru.template.profileRequired
         : visibleTemplateStatus === 'ready' ? ru.template.ready
@@ -910,8 +913,18 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       }
     } catch (err) {
       if (requestId === templatePreparationRequestRef.current && selectedTemplateRef.current === filePath) {
-        setTemplateError(uiFailure(err, ru.errors.template));
-        await Promise.all([loadTemplateScan({ quiet: true }), loadPlanning()]);
+        const [recoveredScan] = await Promise.all([loadTemplateScan({ quiet: true }), loadPlanning()]);
+        const recoveredPath = sourcePathOf(recoveredScan);
+        const recoveredProfileStatus = recoveredScan?.semanticProfile?.status;
+        const backendHasTruthfulPreparationState = isPersistedTemplatePreparationState(
+          recoveredScan?.status, recoveredProfileStatus, recoveredPath, filePath,
+        );
+        if (backendHasTruthfulPreparationState) {
+          setTemplateScan(recoveredScan);
+          setTemplateError(null);
+        } else {
+          setTemplateError(uiFailure(err, ru.errors.template));
+        }
       }
     } finally {
       if (requestId === templatePreparationRequestRef.current) setTemplateAnalyzing(false);
@@ -1288,6 +1301,17 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         {templateProfileStatus === 'failed' && templateScan?.status === 'ready' ? (
           <ErrorNotice failure={{ message: ru.template.profileFailed, ...(templateScan.semanticProfile?.failureCode ? { code: templateScan.semanticProfile.failureCode } : {}) }}
             className="template-message template-message-warning" role="status" onRetry={() => void analyzeTemplate(templateFile)} />
+        ) : null}
+        {templateProfileStatus === 'degraded-ready' && templateScan?.status === 'ready' ? (
+          <div className="template-message template-message-warning" role="status">
+            <span>{ru.template.profileDegraded}</span>
+            {templateScan.semanticProfile?.degradationCode ? (
+              <details className="diagnostic-details">
+                <summary>{ru.template.diagnosticLabel}</summary>
+                <code>{templateScan.semanticProfile.degradationCode}</code>
+              </details>
+            ) : null}
+          </div>
         ) : null}
         {!templateFetching && !templateAnalyzing && !templateScan && templateError ? (
           <div className="template-message template-message-warning">{ru.template.scanUnavailable}</div>

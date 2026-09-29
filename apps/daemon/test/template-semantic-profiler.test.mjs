@@ -7,9 +7,10 @@ import test from 'node:test';
 import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 import { inspectPptx } from '../src/presentation/adapters/python-inspector.ts';
 import { OpenAICompatibleSemanticInferenceAdapter } from '../src/presentation/adapters/openai-compatible-semantic-inference.ts';
-import { planTemplateSemanticProfileBatches, projectTemplateSemanticProfileCache, templateSemanticProfileCacheKey, templateSemanticProfileJsonSchema, TemplateSemanticProfiler } from '../src/presentation/application/template-semantic-profiler.ts';
+import { createDeterministicTemplateSemanticProfile, planTemplateSemanticProfileBatches, projectTemplateSemanticProfileCache, templateSemanticProfileCacheKey, templateSemanticProfileJsonSchema, TemplateSemanticProfiler, validateTemplateSemanticProfile } from '../src/presentation/application/template-semantic-profiler.ts';
 import { createTemplateIR, derivePresentationDesignSystem } from '../src/presentation/application/template-mapper.ts';
 import { sha256Json, templateIRHashPayload } from '../src/presentation/domain/template-ir.ts';
+import { SemanticInferenceError } from '../src/presentation/application/semantic-inference-port.ts';
 import { startFakeSemanticEndpoint, deterministicPlanningResponse } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
 
 const model = 'offline-fake-planner';
@@ -43,6 +44,27 @@ function completion(value) {
     choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: JSON.stringify(value) } }],
     usage: { prompt_tokens: 17, completion_tokens: 23 },
   };
+}
+
+function strictFakeProfileResponse(request) {
+  const response = deterministicPlanningResponse({
+    model,
+    messages: request.messages,
+    response_format: { json_schema: { name: request.output.name } },
+  });
+  const value = JSON.parse(response.choices[0].message.content);
+  assert.equal(request.output.validate(value), true, 'the same runtime profile contract validates every fake response');
+  return { value, telemetry: {} };
+}
+
+function profileFailure(code, finishReason) {
+  return new SemanticInferenceError(code, 'synthetic profiler failure', {
+    telemetry: {
+      role: 'worker', operation: 'template-semantic-profile', model, requestId: 'test-request',
+      startedAt: new Date(0).toISOString(), finishedAt: new Date(1).toISOString(), wallTimeMs: 1,
+      ...(finishReason ? { httpStatus: 200, finishReason } : {}), status: 'error', errorCode: code,
+    },
+  });
 }
 
 test('semantic template profile loads its versioned prompt, validates references, and caches by TemplateIR plus prompt fingerprint', async (t) => {
@@ -570,6 +592,107 @@ test('profile preparation bounds concurrent batches, merges deterministically, a
     async read() { return null; }, async write() { throw new Error('read-only lookup must not write'); },
   });
   assert.equal(await emptyCacheProfiler.getPreparedTemplateProfile(templateIR, presentationDesignSystem), null);
+});
+
+test('two-slide finish_reason=length recovers as ordered, strictly validated single-slide requests', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-length-split-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 2 });
+  const requests = [];
+  let writes = 0;
+  const profiler = new TemplateSemanticProfiler({
+    async infer(request) {
+      const indexes = request.metadata.templateProfilerBatch.sourceSlideIndexes;
+      requests.push({ indexes: [...indexes], maxOutputTokens: request.maxOutputTokens, schema: request.output.schema });
+      if (requests.length === 1) throw profileFailure('INVALID_STRUCTURED_OUTPUT', 'length');
+      return strictFakeProfileResponse(request);
+    },
+  }, { async read() { return null; }, async write() { writes += 1; } });
+
+  const profile = await profiler.prepareTemplateProfile(templateIR, presentationDesignSystem);
+  assert.deepEqual(requests.map((request) => request.indexes), [[1, 2], [1], [2]]);
+  assert.ok(requests.slice(1).every((request) => request.maxOutputTokens === 2048));
+  assert.equal(profile.slides.length, 2);
+  assert.deepEqual(profile.slides.map((slide) => slide.sourceSlideIndex), [1, 2]);
+  assert.equal(writes, 1, 'only the complete profile is cached after both recovered slides validate');
+});
+
+test('two-slide transport failure splits once into strict single-slide requests', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-transport-split-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 2 });
+  const requests = [];
+  const profiler = new TemplateSemanticProfiler({
+    async infer(request) {
+      const indexes = request.metadata.templateProfilerBatch.sourceSlideIndexes;
+      requests.push([...indexes]);
+      if (requests.length === 1) throw profileFailure('SERVICE_UNAVAILABLE');
+      return strictFakeProfileResponse(request);
+    },
+  });
+
+  const profile = await profiler.prepareTemplateProfile(templateIR, presentationDesignSystem);
+  assert.deepEqual(requests, [[1, 2], [1], [2]]);
+  assert.deepEqual(profile.slides.map((slide) => slide.sourceSlideIndex), [1, 2]);
+});
+
+test('single-slide finish_reason=length gets at most one larger retry within the request budget', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-single-retry-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 1 });
+  const requests = [];
+  const profiler = new TemplateSemanticProfiler({
+    async infer(request) {
+      requests.push(request);
+      if (requests.length === 1) throw profileFailure('INVALID_STRUCTURED_OUTPUT', 'length');
+      return strictFakeProfileResponse(request);
+    },
+  });
+
+  const profile = await profiler.prepareTemplateProfile(templateIR, presentationDesignSystem);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].maxOutputTokens, 2048);
+  assert.equal(requests[1].maxOutputTokens, 4096);
+  assert.ok(requests[1].metadata.templateProfilerBatch.estimatedTotalRequestBytes <= 48 * 1024);
+  assert.ok(requests[1].metadata.templateProfilerBatch.outputTokenReserveBytes
+    > requests[0].metadata.templateProfilerBatch.outputTokenReserveBytes);
+  assert.equal(validateTemplateSemanticProfile(profile, templateIR).slides.length, 1);
+});
+
+test('a still-truncated single slide is attempted only twice and never writes a partial profile', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-single-exhausted-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 1 });
+  let calls = 0;
+  let writes = 0;
+  const profiler = new TemplateSemanticProfiler({
+    async infer() { calls += 1; throw profileFailure('INVALID_STRUCTURED_OUTPUT', 'length'); },
+  }, { async read() { return null; }, async write() { writes += 1; } });
+
+  await assert.rejects(profiler.prepareTemplateProfile(templateIR, presentationDesignSystem), (error) => error.code === 'INVALID_STRUCTURED_OUTPUT');
+  assert.equal(calls, 2);
+  assert.equal(writes, 0);
+});
+
+test('deterministic fallback profiles remain low-confidence, same-slide, role-exclusive, and strictly valid', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-fallback-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root, { slideCount: 3 });
+  const profile = createDeterministicTemplateSemanticProfile(templateIR, presentationDesignSystem, 'semantic_unavailable');
+  assert.equal(validateTemplateSemanticProfile(profile, templateIR).slides.length, templateIR.slides.length);
+  assert.ok(profile.slides.every((slide) => slide.confidence < 0.6));
+  for (const slideProfile of profile.slides) {
+    const source = templateIR.slides.find((slide) => slide.index === slideProfile.sourceSlideIndex);
+    const roles = [
+      ...(slideProfile.titleElementId ? [slideProfile.titleElementId] : []),
+      ...slideProfile.bodyElementIds, ...slideProfile.visualElementIds,
+      ...(slideProfile.preservedElementIds ?? []), ...(slideProfile.replaceableTextElementIds ?? []),
+    ];
+    assert.equal(new Set(roles).size, roles.length);
+    assert.ok(roles.every((id) => source.elements.some((element) => element.id === id)));
+    assert.deepEqual(slideProfile.replaceableTextElementIds, [], 'unknown sample copy is never silently cleared');
+    assert.ok(slideProfile.reasonCodes.includes('deterministic_fallback'));
+  }
 });
 
 test('batch response index coverage is exact and partial results are never cached', async (t) => {

@@ -365,28 +365,31 @@ test('profile batches remain bounded and run before all three downstream semanti
   assert.equal(endpoints[0].state.inference.length, 8);
 });
 
-test('fake profile preparation stops after one failure and does not retry', async (t) => {
+test('fake profile preparation degrades safely after one failure and does not retry profiling', async (t) => {
   const scratch = await mkdtemp(path.join(repoRoot, '.lct', 'product-e2e-failure-test-'));
   t.after(() => rm(scratch, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 }));
   const templatePath = path.join(scratch, 'template.pptx');
-  await makeTemplate(templatePath);
+  await makeTemplate(templatePath, { slideCount: 1 });
   const endpoints = [];
   const endpointFactory = async (options) => {
     const endpoint = await startFakeSemanticEndpoint({ ...options, failure: () => 'http-524' });
     endpoints.push(endpoint);
     return endpoint;
   };
-  const manifest = await runProductE2E(workflowOptions(templatePath, path.join(scratch, 'failure'), 3, 'Проверить контролируемый отказ.', true), {
+  const manifest = await runProductE2E(workflowOptions(templatePath, path.join(scratch, 'failure'), 1, 'Проверить контролируемый отказ.', true), {
     startFakeSemanticEndpoint: endpointFactory,
   });
   assert.equal(manifest.result, 'FAIL');
   assert.equal(manifest.failure?.code, 'SERVICE_UNAVAILABLE');
-  assert.equal(manifest.semantic.requestCount, 1);
+  assert.equal(manifest.workflow.templatePreparation.semanticProfileStatus, 'degraded-ready');
+  assert.equal(manifest.semantic.requestCount, 2);
   assert.equal(manifest.semantic.automaticRetries, 0);
   assert.equal(manifest.semantic.requests[0].httpStatus, 524);
   assert.equal(manifest.semantic.requests[0].runtimeSchemaValidation, 'not-run');
   assert.equal(manifest.semantic.requests[0].operation, 'template-semantic-profile');
-  assert.equal(manifest.semantic.rawOperationCounts['deck-plan'], undefined);
-  assert.equal(endpoints[0].state.inference.length, 1);
-  assert.deepEqual(endpoints[0].state.inference.map((call) => call.operation), ['template-semantic-profile']);
+  assert.equal(manifest.semantic.requests[1].operation, 'deck-plan');
+  assert.equal(manifest.semantic.requests[1].httpStatus, 524);
+  assert.equal(manifest.semantic.rawOperationCounts['deck-plan'], 1);
+  assert.equal(endpoints[0].state.inference.length, 2);
+  assert.deepEqual(endpoints[0].state.inference.map((call) => call.operation), ['template-semantic-profile', 'deck-plan']);
 });

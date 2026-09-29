@@ -7,14 +7,15 @@ import test from 'node:test';
 import { register } from 'tsx/esm/api';
 
 import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
-import { createHybridExemplarTemplate } from './exemplar-template-fixtures.mjs';
-import { startFakeSemanticEndpoint } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
+import { createExemplarTemplate, createHybridExemplarTemplate } from './exemplar-template-fixtures.mjs';
+import { deterministicPlanningResponse, startFakeSemanticEndpoint } from '../../../scripts/lib/fake-openai-compatible-endpoint.mjs';
 
 register();
 const { startServer } = await import('../src/server.ts');
 const { SemanticInferenceError } = await import('../src/presentation/application/semantic-inference-port.ts');
 const { OpenAICompatibleSemanticInferenceAdapter } = await import('../src/presentation/adapters/openai-compatible-semantic-inference.ts');
 const { compileTemplate } = await import('../src/presentation/application/template-compiler.ts');
+const { projectTemplateSemanticProfileCache, projectTemplateSemanticProfilePreparationStore, TemplateSemanticProfiler } = await import('../src/presentation/application/template-semantic-profiler.ts');
 
 const repoRoot = path.resolve(import.meta.dirname, '../../..');
 
@@ -25,6 +26,38 @@ async function closeStartedServer(started) {
 
 async function json(response) {
   return response.json();
+}
+
+async function waitForProfileState(started, projectId, terminal = ['ready', 'degraded-ready', 'failed'], timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${started.url}/api/projects/${projectId}/template`);
+    assert.equal(response.status, 200);
+    last = await response.json();
+    if (terminal.includes(last.semanticProfile?.status)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Template semantic profile did not reach a terminal state: ${JSON.stringify(last?.semanticProfile)}`);
+}
+
+async function waitFor(predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return predicate();
+}
+
+function validProfileResponse(request) {
+  const response = deterministicPlanningResponse({
+    model: 'offline-template-profile', messages: request.messages,
+    response_format: { json_schema: { name: request.output.name } },
+  });
+  const value = JSON.parse(response.choices[0].message.content);
+  assert.equal(request.output.validate(value), true);
+  return { value, telemetry: {} };
 }
 
 function objectKeys(value, keys = new Set()) {
@@ -81,15 +114,18 @@ test('Template Compiler API persists understanding, detects source changes, and 
         return;
       }
     }
-    assert.equal(compiled.status, 200, await compiled.clone().text());
-    const compiledBody = await json(compiled);
+    assert.equal(compiled.status, 202, await compiled.clone().text());
+    const acceptedBody = await json(compiled);
+    assert.equal(acceptedBody.semanticProfile.status, 'processing');
+    assert.equal(acceptedBody.semanticProfile.cached, false);
+    const compiledBody = { ...acceptedBody, semanticProfile: (await waitForProfileState(started, projectId)).semanticProfile };
     assert.equal(compiledBody.status, 'ready');
     assert.equal(compiledBody.source.filePath, templateName);
     assert.equal(compiledBody.source.sha256, originalHash);
     assert.equal(compiledBody.templateIR.slides.length, 2);
     assert.equal(compiledBody.presentationDesignSystem.templateIRId, compiledBody.templateIR.id);
     assert.equal(compiledBody.semanticProfile.status, 'ready');
-    assert.equal(compiledBody.semanticProfile.cached, false);
+    assert.equal(compiledBody.semanticProfile.cached, true, 'the later state read reports the persisted profile cache');
     assert.ok(!Object.hasOwn(compiledBody, 'inspection'), 'the private inspection DTO must not be exposed');
     const irKeys = objectKeys(compiledBody.templateIR);
     assert.equal(irKeys.has('protocolVersion'), false);
@@ -163,10 +199,13 @@ test('Template Compiler API persists understanding, detects source changes, and 
     const inheritedUpload = new FormData();
     inheritedUpload.append('files', new Blob([inheritedBytes]), 'inherited-placeholder.pptx');
     assert.equal((await fetch(`${started.url}/api/projects/${inheritedProjectId}/upload`, { method: 'POST', body: inheritedUpload })).status, 200);
-    const inferred = await json(await fetch(`${started.url}/api/projects/${inheritedProjectId}/template/compile`, {
+    const inferredResponse = await fetch(`${started.url}/api/projects/${inheritedProjectId}/template/compile`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ filePath: 'inherited-placeholder.pptx' }),
-    }));
+    });
+    assert.equal(inferredResponse.status, 202);
+    const inferredAccepted = await inferredResponse.json();
+    const inferred = { ...inferredAccepted, semanticProfile: (await waitForProfileState(started, inheritedProjectId)).semanticProfile };
     assert.equal(inferred.status, 'ready');
     const inheritedTitle = inferred.templateIR.slides.flatMap((slide) => slide.elements)
       .find((element) => element.text === 'Native source title sample');
@@ -248,17 +287,23 @@ test('Template Compiler API persists understanding, detects source changes, and 
   }
 });
 
-test('failed semantic preparation blocks Generate with 409 without a profile retry', async (t) => {
+test('semantic provider failure persists a validated degraded profile and allows the planning path to start', async (t) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profiler-error-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
   let inferenceCalls = 0;
+  let profileCalls = 0;
   const started = await startServer({
     host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
     serveWeb: false, returnServer: true,
     enableSemanticProfiling: true,
-    semanticInferenceAdapter: {
-      async infer() { inferenceCalls += 1; throw new SemanticInferenceError('PROVIDER_ERROR', 'unsafe raw provider message'); },
-    },
+    semanticInferenceAdapter: { async infer(request) {
+      inferenceCalls += 1;
+      if (request.operation === 'template-semantic-profile') {
+        profileCalls += 1;
+        throw new SemanticInferenceError('PROVIDER_ERROR', 'unsafe raw provider message');
+      }
+      throw new SemanticInferenceError('SERVICE_UNAVAILABLE', 'offline after preparation');
+    } },
   });
   const projectId = 'semantic-profile-boundary';
   try {
@@ -267,7 +312,9 @@ test('failed semantic preparation blocks Generate with 409 without a profile ret
       body: JSON.stringify({ id: projectId, name: 'Semantic profile boundary test' }),
     });
     assert.equal(created.status, 201);
-    const pptx = await makeSyntheticPptx({ slideCount: 1, layoutCount: 2 });
+    const fallbackTemplatePath = path.join(temp, 'fallback-template.pptx');
+    await createExemplarTemplate(fallbackTemplatePath, { includePicture: false });
+    const pptx = await readFile(fallbackTemplatePath);
     const upload = new FormData();
     upload.append('files', new Blob([pptx]), 'Шаблон.pptx');
     assert.equal((await fetch(`${started.url}/api/projects/${projectId}/upload`, { method: 'POST', body: upload })).status, 200);
@@ -276,22 +323,22 @@ test('failed semantic preparation blocks Generate with 409 without a profile ret
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ filePath: 'Шаблон.pptx' }),
     });
-    assert.equal(response.status, 200);
-    const failure = await response.json();
-    assert.equal(failure.status, 'ready');
-    assert.equal(failure.semanticProfile.status, 'failed');
-    assert.equal(failure.semanticProfile.failureCode, 'PROVIDER_ERROR');
-    assert.doesNotMatch(failure.semanticProfileNotice.message, /можно продолжить/u);
-    assert.doesNotMatch(JSON.stringify(failure), /unsafe raw provider message|C:\\\\|node_modules/u);
+    assert.equal(response.status, 202);
+    const accepted = await response.json();
+    assert.equal(accepted.semanticProfile.status, 'processing');
+    assert.equal(accepted.semanticProfile.cached, false);
+    assert.doesNotMatch(JSON.stringify(accepted), /unsafe raw provider message|C:\\\\|node_modules/u);
 
-    const saved = await fetch(`${started.url}/api/projects/${projectId}/template`);
-    assert.equal(saved.status, 200);
-    const savedBody = await saved.json();
+    const savedBody = await waitForProfileState(started, projectId, ['degraded-ready']);
     assert.equal(savedBody.status, 'ready', 'structural readiness remains separately observable after profile failure');
-    assert.equal(savedBody.semanticProfile.status, 'failed');
+    assert.equal(savedBody.semanticProfile.status, 'degraded-ready');
+    assert.equal(savedBody.semanticProfile.degradationCode, 'PROVIDER_ERROR', JSON.stringify(savedBody.semanticProfile));
+    assert.equal(profileCalls, 1, 'the exhausted semantic preparation is not retried by polling');
 
-    const callsBeforeGenerate = inferenceCalls;
-    assert.ok(callsBeforeGenerate > 0, 'template preparation attempted semantic profiling');
+    const cached = await json(await fetch(`${started.url}/api/projects/${projectId}/template`));
+    assert.equal(cached.semanticProfile.status, 'degraded-ready');
+    assert.equal(cached.semanticProfile.cached, true);
+    assert.equal(profileCalls, 1, 'the deterministic fallback is persisted in the normal validated profile cache');
     const blocked = await fetch(`${started.url}/api/projects/${projectId}/workflow/generate`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ templateFilePath: 'Шаблон.pptx', contentFiles: [], brief: {
@@ -299,9 +346,15 @@ test('failed semantic preparation blocks Generate with 409 without a profile ret
         expectedOutcome: 'Согласовать следующий шаг.', preferences: [], requestedSlideCount: 1,
       } }),
     });
-    assert.equal(blocked.status, 409);
-    assert.equal((await blocked.json()).error.code, 'TEMPLATE_PROFILE_NOT_READY');
-    assert.equal(inferenceCalls, callsBeforeGenerate, 'Generate must not retry profile inference on a cache miss');
+    assert.equal(blocked.status, 202, 'the prepared degraded profile lets the ordinary planning path start');
+    await waitForProfileState(started, projectId, ['degraded-ready']);
+    const planningStarted = await waitFor(() => inferenceCalls > profileCalls);
+    const workflowState = await json(await fetch(`${started.url}/api/projects/${projectId}/workflow`));
+    assert.equal(planningStarted, true, `the detached planning workflow reaches its separate inference request; state=${JSON.stringify(workflowState.operation && {
+      status: workflowState.operation.status, stage: workflowState.operation.stage, failure: workflowState.operation.failure,
+    })}`);
+    assert.equal(profileCalls, 1, 'planning never starts template profiling again');
+    assert.ok(inferenceCalls > profileCalls, 'the workflow can make its normal, separate planning request');
   } finally {
     await new Promise((resolve, reject) => started.server.close((error) => error ? reject(error) : resolve()));
     await started.shutdown();
@@ -376,11 +429,13 @@ test('template preparation profiles before Generate and exposes read-only cache 
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ filePath: 'structural-template.pptx' }),
     });
-    assert.equal(response.status, 200, await response.clone().text());
-    const compiled = await response.json();
+    assert.equal(response.status, 202, await response.clone().text());
+    const accepted = await response.json();
+    assert.equal(accepted.semanticProfile.status, 'processing');
+    const compiled = { ...accepted, semanticProfile: (await waitForProfileState(started, projectId)).semanticProfile };
     assert.equal(compiled.status, 'ready');
     assert.equal(compiled.semanticProfile.status, 'ready');
-    assert.equal(compiled.semanticProfile.cached, false);
+    assert.equal(compiled.semanticProfile.cached, true, 'the terminal state reports the persisted profile cache');
     assert.ok(compiled.templateIR?.hash);
     assert.ok(compiled.presentationDesignSystem);
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, 1);
@@ -391,5 +446,152 @@ test('template preparation profiles before Generate and exposes read-only cache 
     assert.equal(endpoint.state.inference.length, callsAfterPrepare, 'GET validates the profile cache without inference');
   } finally {
     await closeStartedServer(started);
+  }
+});
+
+test('template preparation returns PROCESSING before inference, survives client abort, and deduplicates concurrent compile requests', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-async-api-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let enteredResolve;
+  const entered = new Promise((resolve) => { enteredResolve = resolve; });
+  let inferenceCalls = 0;
+  const started = await startServer({
+    host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
+    serveWeb: false, returnServer: true, enableSemanticProfiling: true,
+    semanticInferenceAdapter: { async infer(request) {
+      inferenceCalls += 1;
+      enteredResolve();
+      await gate;
+      return validProfileResponse(request);
+    } },
+  });
+  const projectId = 'async-template-preparation';
+  try {
+    assert.equal((await fetch(`${started.url}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: projectId, name: 'Async template preparation' }),
+    })).status, 201);
+    const upload = new FormData();
+    upload.append('files', new Blob([await makeSyntheticPptx({ slideCount: 1, layoutCount: 2 })]), 'unknown template.pptx');
+    assert.equal((await fetch(`${started.url}/api/projects/${projectId}/upload`, { method: 'POST', body: upload })).status, 200);
+
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const acceptedResponse = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
+      method: 'POST', signal: controller.signal,
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: 'unknown template.pptx' }),
+    });
+    assert.equal(acceptedResponse.status, 202);
+    const accepted = await acceptedResponse.json();
+    controller.abort();
+    assert.equal(accepted.semanticProfile.status, 'processing');
+    assert.ok(Date.now() - startedAt < 10000, 'the accepted response does not await the delayed semantic provider');
+    await entered;
+
+    const processing = await json(await fetch(`${started.url}/api/projects/${projectId}/template`));
+    assert.equal(processing.semanticProfile.status, 'processing');
+    const duplicate = await fetch(`${started.url}/api/projects/${projectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'unknown template.pptx' }),
+    });
+    assert.equal(duplicate.status, 202);
+    assert.equal((await duplicate.json()).semanticProfile.status, 'processing');
+    assert.equal(inferenceCalls, 1, 'same project and profile key has exactly one active job');
+
+    release();
+    const ready = await waitForProfileState(started, projectId);
+    assert.equal(ready.semanticProfile.status, 'ready');
+    assert.equal(inferenceCalls, 1);
+    const reloaded = await json(await fetch(`${started.url}/api/projects/${projectId}/template`));
+    assert.equal(reloaded.semanticProfile.status, 'ready');
+    assert.equal(reloaded.semanticProfile.cached, true);
+  } finally {
+    release();
+    await closeStartedServer(started);
+  }
+});
+
+test('daemon restart resumes persisted processing and bounds repeated restart recovery with deterministic fallback', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-restart-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const dataDir = path.join(temp, 'data');
+  const projectsRoot = path.join(dataDir, 'projects');
+  const projectId = 'interrupted-template-preparation';
+  const secondProjectId = 'repeatedly-interrupted-template-preparation';
+  const startStructuralServer = () => startServer({
+    host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
+    serveWeb: false, returnServer: true, enableSemanticProfiling: false,
+  });
+  let activeServer = await startStructuralServer();
+  try {
+    assert.equal((await fetch(`${activeServer.url}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: projectId, name: 'Interrupted preparation' }),
+    })).status, 201);
+    const upload = new FormData();
+    upload.append('files', new Blob([await makeSyntheticPptx({ slideCount: 2, layoutCount: 2 })]), 'restart template.pptx');
+    assert.equal((await fetch(`${activeServer.url}/api/projects/${projectId}/upload`, { method: 'POST', body: upload })).status, 200);
+    const compiled = await fetch(`${activeServer.url}/api/projects/${projectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'restart template.pptx' }),
+    });
+    assert.equal(compiled.status, 200);
+    const structural = await compiled.json();
+    const profiler = new TemplateSemanticProfiler({ async infer() { throw new Error('cache key lookup must not infer'); } });
+    const profileCacheKey = await profiler.profileCacheKey(structural.templateIR);
+    const preparationStore = projectTemplateSemanticProfilePreparationStore(projectsRoot, projectId);
+    const processingRecord = {
+      schemaVersion: 1, templateIRHash: structural.templateIR.hash, profileCacheKey,
+      status: 'processing', updatedAt: new Date().toISOString(), templateStructuralMs: 12, recoveryCount: 0,
+    };
+    await preparationStore.write(processingRecord);
+
+    assert.equal((await fetch(`${activeServer.url}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: secondProjectId, name: 'Repeatedly interrupted preparation' }),
+    })).status, 201);
+    const secondUpload = new FormData();
+    secondUpload.append('files', new Blob([await makeSyntheticPptx({ slideCount: 1, layoutCount: 2 })]), 'second restart template.pptx');
+    assert.equal((await fetch(`${activeServer.url}/api/projects/${secondProjectId}/upload`, { method: 'POST', body: secondUpload })).status, 200);
+    const secondCompile = await fetch(`${activeServer.url}/api/projects/${secondProjectId}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'second restart template.pptx' }),
+    });
+    assert.equal(secondCompile.status, 200, 'structural-only mode compiles without semantic work');
+    const secondStructural = await secondCompile.json();
+    const secondKey = await profiler.profileCacheKey(secondStructural.templateIR);
+    await projectTemplateSemanticProfilePreparationStore(projectsRoot, secondProjectId).write({
+      schemaVersion: 1, templateIRHash: secondStructural.templateIR.hash, profileCacheKey: secondKey,
+      status: 'processing', updatedAt: new Date().toISOString(), templateStructuralMs: 8, recoveryCount: 1,
+    });
+
+    await closeStartedServer(activeServer);
+    activeServer = null;
+
+    let inferenceCalls = 0;
+    const resumed = await startServer({
+      host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
+      serveWeb: false, returnServer: true, enableSemanticProfiling: true,
+      semanticInferenceAdapter: { async infer(request) { inferenceCalls += 1; return validProfileResponse(request); } },
+    });
+    activeServer = resumed;
+    const ready = await waitForProfileState(resumed, projectId);
+    assert.equal(ready.semanticProfile.status, 'ready');
+    assert.ok(inferenceCalls > 0, 'a valid persisted PROCESSING record is resumed once after restart');
+    const recoveredRecord = await preparationStore.read(profileCacheKey);
+    assert.equal(recoveredRecord.status, 'ready');
+    assert.equal(recoveredRecord.recoveryCount, 1);
+
+    const callsAfterFirstResume = inferenceCalls;
+    const degraded = await waitForProfileState(resumed, secondProjectId);
+    assert.equal(degraded.semanticProfile.status, 'degraded-ready');
+    assert.equal(inferenceCalls, callsAfterFirstResume, 'a repeated interrupted preparation falls back without another model run');
+    const fallbackRecord = await projectTemplateSemanticProfilePreparationStore(projectsRoot, secondProjectId).read(secondKey);
+    assert.equal(fallbackRecord.status, 'degraded-ready');
+    assert.equal(fallbackRecord.recoveryCount, 1);
+  } finally {
+    if (activeServer) await closeStartedServer(activeServer);
   }
 });
