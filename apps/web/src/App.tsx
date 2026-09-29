@@ -607,6 +607,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const [generationComplete, setGenerationComplete] = useState(false);
   const [generationExported, setGenerationExported] = useState(false);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('upload');
+  const [developerToolsOpen, setDeveloperToolsOpen] = useState(false);
   const [auditRefreshError, setAuditRefreshError] = useState<UiFailure | null>(null);
   const workspaceViewTouchedRef = useRef(false);
   const workspaceViewInitializedRef = useRef(false);
@@ -1361,7 +1362,8 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
           aria-label={ru.workspace.templateStage} title={ru.workspace.templateStage} onClick={() => chooseWorkspaceView('upload')}><FigmaIcon name="folder" /></button>
         <button className="rail-button" aria-label={ru.home.projects} title={ru.home.projects} onClick={onBack}><FigmaIcon name="clock" /></button>
         <button className="rail-button rail-settings" aria-label={ru.workspace.technicalTools} title={ru.workspace.technicalTools}
-          onClick={() => { document.querySelector('.developer-tools')?.toggleAttribute('open'); }}><FigmaIcon name="settings" /></button>
+          aria-expanded={developerToolsOpen} aria-controls="developer-tools-panel"
+          onClick={() => setDeveloperToolsOpen((open) => !open)}><FigmaIcon name="settings" /></button>
       </nav>
 
       <div className="workspace-content" data-view={workspaceView}>
@@ -1461,7 +1463,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         {workspaceView === 'upload' ? <div className="workspace-flow-actions upload-flow-actions">
           <span>{templatePreparationReady ? ru.template.ready : templateBadgeLabel}</span>
           <button className="primary icon-next" aria-label={ru.workspace.continueToTemplate} title={ru.workspace.continueToTemplate}
-            disabled={!templatePreparationReady} onClick={() => chooseWorkspaceView('template')}><FigmaIcon name="arrow-right" /></button>
+            disabled={!templatePreparationReady} onClick={() => chooseWorkspaceView('template')}><span>{ru.workspace.continueToTemplate}</span><FigmaIcon name="arrow-right" /></button>
         </div> : null}
 
         {workspaceView === 'template' && matchingScan && templateIR ? <section className="template-design-summary" aria-label={ru.template.designSystemSummary}>
@@ -1638,16 +1640,16 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
           <button className="quiet" onClick={() => chooseWorkspaceView('upload')}>{ru.workspace.back}</button>
           <span>{templateBadgeLabel}</span>
           <button className="primary icon-next" aria-label={ru.workspace.continueToBrief} title={ru.workspace.continueToBrief}
-            disabled={!templatePreparationReady} onClick={() => chooseWorkspaceView('brief')}><FigmaIcon name="arrow-right" /></button>
+            disabled={!templatePreparationReady} onClick={() => chooseWorkspaceView('brief')}><span>{ru.workspace.continueToBrief}</span><FigmaIcon name="arrow-right" /></button>
         </div> : null}
       </section>
 
       <section className="planning-panel" id="planning-panel" aria-labelledby="planning-panel-title">
         <div className="planning-panel-head">
           <div>
-            <span className="eyebrow">{ru.planning.eyebrow}</span>
+            <span className="eyebrow">{workspaceView === 'outline' ? ru.planning.outlineEyebrow : ru.planning.eyebrow}</span>
             <h2 id="planning-panel-title">{workspaceView === 'outline' ? ru.planning.outlineTitle : ru.planning.briefTitle}</h2>
-            <p>{ru.planning.description}</p>
+            <p>{workspaceView === 'outline' ? ru.planning.outlineDescription : ru.planning.description}</p>
           </div>
           <div className="planning-head-actions">
             <span className={`planning-status planning-status-${planningGenerating ? 'generating' : planningDraftDirty ? 'stale' : planning?.status ?? 'loading'}`} role="status">
@@ -1758,12 +1760,18 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                 <span className="eyebrow">{ru.planning.generated}</span>
                 <h3 id="planning-result-title">{stringValue(planningDeckPlan.workingTitle, ru.planning.generatedTitle)}</h3>
                 <p>{stringValue(planningDeckPlan.narrativeSummary)}</p>
+                {planningSelectedPaths.length ? null : <span className="planning-provenance">{ru.planning.noSource}</span>}
               </div>
               {planning?.updatedAt ? <span className="planning-updated">{ru.planning.planUpdated(formatUiDateTime(new Date(planning.updatedAt)))}</span> : null}
             </div>
             <div className="planning-slide-grid">
               {planningSlides.map((slide, index) => {
                 const item = record(slide);
+                const narrativeRole = stringValue(firstValue(item, ['narrativeRole']));
+                const visualType = stringValue(firstValue(item, ['semanticVisualType']), 'unknown');
+                const density = stringValue(firstValue(item, ['targetDensity']), 'unknown');
+                const hasNarrativeRole = narrativeRole && !['slide', 'unknown', 'none', 'unspecified'].includes(narrativeRole);
+                const hasVisualType = !['unknown', 'none', 'unspecified'].includes(visualType);
                 const refs = arrayValue(item, ['contentRefs']).filter((ref): ref is string => typeof ref === 'string');
                 const paths = [...new Set(refs.map((ref) => unitSourceById.get(ref)).filter((sourceId): sourceId is string => Boolean(sourceId))
                   .map((sourceId) => sourcePathById.get(sourceId)).filter((path): path is string => Boolean(path)))];
@@ -1771,18 +1779,17 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                   <article className="planning-slide-card" key={stringValue(firstValue(item, ['id']), `slide-${index + 1}`)}>
                     <div className="planning-slide-card-head">
                       <strong>{stringValue(firstValue(item, ['order']), String(index + 1)).padStart(2, '0')}</strong>
-                      <span>{ru.planning.narrativeRole(stringValue(firstValue(item, ['narrativeRole']), 'slide'))}</span>
+                      {hasNarrativeRole ? <span>{ru.planning.narrativeRole(narrativeRole)}</span> : null}
                     </div>
                     <h4>{stringValue(firstValue(item, ['purpose']), ru.planning.purposeUnknown)}</h4>
                     <p className="planning-takeaway">{stringValue(firstValue(item, ['takeaway']), ru.planning.takeawayUnknown)}</p>
-                    <div className="planning-slide-meta">
-                      <span>{ru.planning.visualType(stringValue(firstValue(item, ['semanticVisualType']), 'unknown'))}</span>
-                      <span>{ru.planning.density(stringValue(firstValue(item, ['targetDensity']), 'unknown'))}</span>
-                    </div>
-                    <div className="planning-source-paths">
-                      <strong>{ru.planning.sources}</strong>
-                      {paths.length ? paths.map((path) => <span key={path} title={path}>{path}</span>) : <span>{ru.planning.noSource}</span>}
-                    </div>
+                    {hasVisualType || density !== 'unknown' ? <div className="planning-slide-meta">
+                      {hasVisualType ? <span>{ru.planning.visualType(visualType)}</span> : null}
+                      {density !== 'unknown' ? <span>{ru.planning.density(density)}</span> : null}
+                    </div> : null}
+                    {paths.length ? <div className="planning-source-paths" data-has-sources="true">
+                      <strong>{ru.planning.sources}</strong>{paths.map((path) => <span key={path} title={path}>{path}</span>)}
+                    </div> : null}
                   </article>
                 );
               })}
@@ -1814,14 +1821,13 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         </details> : null}
 
         {workspaceView === 'brief' ? <div className="workspace-flow-actions brief-flow-actions">
-          <button className="quiet" onClick={() => chooseWorkspaceView('template')}>{ru.workspace.back}</button>
-          <span>{ru.planning.requiredTaskNote}</span>
+          <button className="quiet" onClick={() => chooseWorkspaceView('template')}>{ru.workspace.backToTemplate}</button>
         </div> : null}
         {workspaceView === 'outline' ? <div className="workspace-flow-actions outline-flow-actions">
           <button className="quiet" onClick={() => chooseWorkspaceView('brief')}>{ru.planning.editBrief}</button>
           <span>{planningSlides.length ? ru.planning.slideCountLabel(planningSlides.length) : ru.planning.generatedTitle}</span>
           <button className="primary icon-next" aria-label={ru.workflow.action} title={ru.workflow.action}
-            disabled={!savedPlanReady || planningDraftDirty || productWorkflowRunning} onClick={() => void generatePresentation()}><FigmaIcon name="arrow-right" /></button>
+            disabled={!savedPlanReady || planningDraftDirty || productWorkflowRunning} onClick={() => void generatePresentation()}><span>{ru.workflow.action}</span><FigmaIcon name="arrow-right" /></button>
         </div> : null}
       </section>
 
@@ -1843,7 +1849,8 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         onStateChange={reportGenerationState}
       />
 
-      <details className="advanced-tools developer-tools">
+      <details className="advanced-tools developer-tools" id="developer-tools-panel" open={developerToolsOpen}
+        onToggle={(event) => setDeveloperToolsOpen(event.currentTarget.open)}>
         <summary>{ru.workspace.technicalTools}</summary>
       <div className="workspace-grid">
         <aside className="workspace-sidebar">

@@ -30,6 +30,7 @@ export const ru = {
     briefOnUpload: 'Краткий бриф и цель презентации',
     briefOnUploadPlaceholder: 'Подготовить отчёт по итогам квартала',
     continueToBrief: 'Перейти к описанию задачи',
+    backToTemplate: '← К шаблону',
     recent: 'Недавние проекты',
     advancedMode: 'Расширенный режим',
     technicalTools: 'Технические инструменты',
@@ -155,10 +156,12 @@ export const ru = {
   },
   planning: {
     eyebrow: 'ЗАДАЧА ПРЕЗЕНТАЦИИ',
+    outlineEyebrow: 'ПЛАН ПРЕЗЕНТАЦИИ',
     title: 'Опишите задачу',
     briefTitle: 'Опишите задачу',
-    outlineTitle: 'План презентации',
+    outlineTitle: 'Проверьте структуру',
     description: 'Расскажите, для кого и зачем нужна презентация. Структура, варианты слайдов и проверка подготовятся автоматически.',
+    outlineDescription: 'Проверьте составленный план и число слайдов перед началом генерации.',
     loading: 'Загружаем сохранённый план…',
     understanding: 'Готовим план…',
     unavailable: 'Состояние плана недоступно',
@@ -196,9 +199,15 @@ export const ru = {
     optionalSettings: 'Дополнительные настройки',
     addSources: 'Добавить материалы',
     requiredTaskNote: 'Укажите шаблон и задачу. Остальное можно настроить по желанию.',
-    planDetails: 'План и технические подробности',
+    planDetails: 'Содержание и проверка плана',
     editBrief: 'Изменить задачу',
-    slideCountLabel: (count: number) => count + ' слайдов в плане',
+    slideCountLabel: (count: number) => {
+      const lastTwo = count % 100;
+      const last = count % 10;
+      const noun = last === 1 && lastTwo !== 11 ? 'слайд'
+        : last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14) ? 'слайда' : 'слайдов';
+      return `${count} ${noun} в плане`;
+    },
     generate: 'Создать план',
     generating: 'Составляем план…',
     sourceWarnings: 'Предупреждения по материалам',
@@ -209,7 +218,7 @@ export const ru = {
     visualUnknown: 'Тип визуализации не указан',
     densityUnknown: 'Плотность не указана',
     sources: 'Источники',
-    noSource: 'Источник не указан',
+    noSource: 'Тезисы составлены по брифу · материалы не добавлены',
     review: 'Проверка плана',
     outcomeUnknown: 'Результат не указан',
     findingUnknown: 'Описание проблемы отсутствует.',
@@ -219,9 +228,9 @@ export const ru = {
     noFindings: 'Проблем нет.',
     reviewOutcome: (value: string) => value === 'pass' ? 'План прошёл проверку' : value === 'revise' ? 'Нужны изменения' : 'Результат проверки не указан',
     findingSeverity: (value: string) => value === 'error' ? 'Ошибка' : value === 'warning' ? 'Предупреждение' : value === 'info' ? 'Информация' : 'Замечание',
-    narrativeRole: (value: string) => ({ cover: 'Обложка', setup: 'Контекст', problem: 'Проблема', evidence: 'Данные', solution: 'Решение', architecture: 'Устройство решения', value: 'Результат', closing: 'Заключение', slide: 'Слайд', unknown: 'Роль не указана' } as Record<string, string>)[value] ?? 'Роль не указана',
-    visualType: (value: string) => ({ comparison: 'сравнение', table: 'таблица', chart: 'диаграмма', diagram: 'схема', process: 'процесс', image: 'изображение', icon: 'значок', text: 'текст', unknown: 'Тип визуализации не указан' } as Record<string, string>)[value] ?? 'Тип визуализации не указан',
-    density: (value: string) => ({ sparse: 'свободная', balanced: 'сбалансированная', dense: 'плотная', unknown: 'Плотность не указана' } as Record<string, string>)[value] ?? 'Плотность не указана',
+    narrativeRole: (value: string) => ({ cover: 'Обложка', opening: 'Введение', agenda: 'Повестка', 'section-divider': 'Раздел', setup: 'Контекст', problem: 'Проблема', evidence: 'Данные', content: 'Основная часть', solution: 'Решение', architecture: 'Устройство решения', value: 'Результат', closing: 'Заключение', slide: 'Слайд', unknown: 'Роль не указана' } as Record<string, string>)[value] ?? 'Роль не указана',
+    visualType: (value: string) => ({ comparison: 'сравнение', table: 'таблица', chart: 'диаграмма', diagram: 'схема', timeline: 'временная шкала', process: 'процесс', image: 'изображение', kpi: 'ключевые показатели', icon: 'значок', text: 'текст', unknown: 'Тип визуализации не указан' } as Record<string, string>)[value] ?? 'Тип визуализации не указан',
+    density: (value: string) => ({ compact: 'компактная', sparse: 'свободная', balanced: 'сбалансированная', detailed: 'подробная', dense: 'плотная', unknown: 'Плотность не указана' } as Record<string, string>)[value] ?? 'Плотность не указана',
     targetType: (value: string) => ({ deck: 'презентация', slide: 'слайд', 'visual-slot': 'визуальный блок', block: 'элемент' } as Record<string, string>)[value] ?? 'элемент',
     reviewLabel: 'Проверка плана',
     noPlanFindings: 'Проблем с планом нет.',
