@@ -47,7 +47,7 @@ import {
 } from './presentation/adapters/openai-compatible-semantic-inference.js';
 import { derivePlanningContentBudgets } from './presentation/adapters/office-kit-planning-content-budgets.js';
 import { SemanticInferenceError, type SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
-import { PlanningService, PlanningServiceError } from './presentation/application/planning-service.js';
+import { PlanningService, PlanningServiceError, planningDeadlineFromEnvironment } from './presentation/application/planning-service.js';
 import { ProductWorkflowError, ProductWorkflowService } from './presentation/application/product-workflow-service.js';
 import {
   createDeterministicTemplateSemanticProfile,
@@ -93,6 +93,8 @@ export interface StartServerOptions {
   enableSemanticProfiling?: boolean;
   /** Replaceable bounded concurrency for template preparation; defaults to LCT_TEMPLATE_PROFILE_CONCURRENCY or 1. */
   templateProfileConcurrency?: number;
+  /** Replaceable planning deadline seam for bounded application tests. */
+  planningTimeoutMs?: number;
   /** Replaceable renderer seam used by offline application tests. */
   presentationRenderer?: PptxRendererPort;
   /** Replaceable preview seam used by offline application tests. */
@@ -211,6 +213,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   const envPort = parseDaemonPort(process.env.LCT_PORT, DEFAULT_DAEMON_PORT);
   const port = options.port === undefined ? envPort : Number(options.port);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new TypeError('LCT_PORT must be an integer between 1 and 65535.');
+  const planningTimeoutMs = options.planningTimeoutMs === undefined
+    ? planningDeadlineFromEnvironment(process.env.LCT_PLANNING_TIMEOUT_MS)
+    : planningDeadlineFromEnvironment(String(options.planningTimeoutMs));
   const configuredProfileConcurrency = process.env.LCT_TEMPLATE_PROFILE_CONCURRENCY;
   const profileConcurrency = options.templateProfileConcurrency
     ?? (configuredProfileConcurrency === undefined || configuredProfileConcurrency.trim() === '' ? 1 : Number(configuredProfileConcurrency));
@@ -489,6 +494,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     projectRoot,
     projectsRoot,
     getInferenceAdapter: getSemanticAdapter,
+    planningDeadlineMs: planningTimeoutMs,
     ...(semanticProfilingEnabled ? {
       getPreparedTemplateProfile: readPreparedTemplateProfile,
       getPlanningContentBudgets: (input) => derivePlanningContentBudgets({ projectsRoot, ...input }),

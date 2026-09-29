@@ -15,6 +15,7 @@ import {
   validateDeckPlanDraft,
   type DeckPlan,
   type DeckPlanDraft,
+  type DeckPlanDraftSlide,
 } from '../domain/deck-plan.js';
 import { validateContentIR, type ContentIR } from '../domain/content-ir.js';
 import {
@@ -51,10 +52,24 @@ const MAX_SELECTED_FILES = 12;
 const MAX_EVIDENCE_CHARS = 256 * 1024;
 const MAX_FINDINGS = 12;
 const MAX_REPAIR_OPERATIONS = 8;
-const PLANNING_DEADLINE_MS = 300_000;
+export const DEFAULT_PLANNING_DEADLINE_MS = 300_000;
+export const MAX_PLANNING_DEADLINE_MS = 900_000;
 const ROLE_VALUES = ['opening', 'agenda', 'section-divider', 'content', 'closing'] as const;
 const VISUAL_VALUES = ['none', 'image', 'chart', 'table', 'diagram', 'timeline', 'process', 'comparison', 'kpi'] as const;
 const DENSITY_VALUES = ['compact', 'balanced', 'detailed'] as const;
+
+export function planningDeadlineFromEnvironment(value: string | undefined): number {
+  if (value === undefined || value.trim() === '') return DEFAULT_PLANNING_DEADLINE_MS;
+  const normalized = value.trim();
+  if (!/^\d+$/.test(normalized)) {
+    throw new TypeError(`LCT_PLANNING_TIMEOUT_MS must be an integer between 1 and ${MAX_PLANNING_DEADLINE_MS}`);
+  }
+  const timeoutMs = Number(normalized);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_PLANNING_DEADLINE_MS) {
+    throw new TypeError(`LCT_PLANNING_TIMEOUT_MS must be an integer between 1 and ${MAX_PLANNING_DEADLINE_MS}`);
+  }
+  return timeoutMs;
+}
 
 export type PlanningStatus =
   | 'unconfigured'
@@ -170,6 +185,7 @@ export interface PlanningServiceOptions {
   projectRoot: string;
   projectsRoot: string;
   getInferenceAdapter: () => SemanticInferenceAdapter;
+  planningDeadlineMs?: number;
   getPreparedTemplateProfile?: (projectId: string, template: TemplateCompilationResponse) => Promise<TemplateSemanticProfile | null>;
   getPlanningContentBudgets?: (input: {
     projectId: string;
@@ -859,6 +875,28 @@ function asDraft(value: unknown, contentIR: ContentIR, brief: Brief): DeckPlanDr
   return validateDeckPlanDraft(value, allowedPlanningContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR), true);
 }
 
+function draftFromPlan(plan: DeckPlan): DeckPlanDraft {
+  return {
+    workingTitle: plan.workingTitle,
+    narrativeSummary: plan.narrativeSummary,
+    slides: plan.slides.map(({ id: _id, order: _order, ...slide }) => slide),
+  };
+}
+
+function plannedCopyBudgetFailure(
+  slides: readonly DeckPlanDraftSlide[],
+  budgets: PlanningContentBudgets | null,
+): string | null {
+  if (!budgets) return null;
+  try {
+    validateDraftAgainstContentBudgets(slides, budgets);
+    return null;
+  } catch (error) {
+    if (error instanceof RangeError && error.message.includes('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET')) return error.message;
+    throw error;
+  }
+}
+
 function stableValue(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableValue).join(',')}]`;
   if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableValue(value[key])}`).join(',')}}`;
@@ -939,10 +977,16 @@ export class PlanningService {
   private readonly activeProjects = new Map<string, { controller: AbortController; done: Promise<void>; resolveDone: () => void }>();
   private readonly now: () => Date;
   private readonly createId: () => string;
+  private readonly planningDeadlineMs: number;
 
   constructor(private readonly options: PlanningServiceOptions) {
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? randomUUID;
+    this.planningDeadlineMs = options.planningDeadlineMs ?? DEFAULT_PLANNING_DEADLINE_MS;
+    if (!Number.isSafeInteger(this.planningDeadlineMs) || this.planningDeadlineMs < 1
+        || this.planningDeadlineMs > MAX_PLANNING_DEADLINE_MS) {
+      throw new TypeError(`planningDeadlineMs must be an integer between 1 and ${MAX_PLANNING_DEADLINE_MS}`);
+    }
   }
 
   async get(projectId: string): Promise<PlanningResponse> {
@@ -1101,7 +1145,7 @@ export class PlanningService {
       await writeStoredState(this.options.projectsRoot, projectId, state);
 
       const adapter = this.options.getInferenceAdapter();
-      const deadlineAtEpochMs = Date.now() + PLANNING_DEADLINE_MS;
+      const deadlineAtEpochMs = Date.now() + this.planningDeadlineMs;
       const designSystem = scopedDesignSystem(template.presentationDesignSystem);
       const workerEvidence = {
         brief,
@@ -1134,43 +1178,8 @@ export class PlanningService {
         metadata: { projectId, generationId: this.createId() },
       };
       const workerResponse = await inferPlanningRequestWithRetry(adapter, workerRequest, ensureActive);
-      let workerDraft = asDraft(workerResponse.value, contentIR, brief);
+      const workerDraft = asDraft(workerResponse.value, contentIR, brief);
       let revisionWorkerSummary: TelemetrySummary | undefined;
-      let revisionUsed = false;
-      if (contentBudgets) {
-        try {
-          validateDraftAgainstContentBudgets(workerDraft.slides, contentBudgets);
-        } catch (error) {
-          if (!(error instanceof RangeError) || !error.message.includes('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET')) throw error;
-          const repairRequest: SemanticInferenceRequest<DeckPlanDraft> = {
-            ...workerRequest,
-            operation: 'deck-plan-revision',
-            messages: [
-              { role: 'system', content: `${promptAssets.worker}\n\nFIT REPAIR: The previous draft failed the supplied measured template text budgets. Return a revised draft with shorter, complete presentation wording that fits at least one role-compatible candidate family for every slide. Keep the same slide order, narrative roles, purpose, contentRefs, mediaRefs, visual types, density, and all evidenceRefs. Do not add, remove, or alter source-backed claims; only compress their wording. Do not shrink fonts or change the template. This is the only fit-repair attempt.` },
-              { role: 'user', content: JSON.stringify({
-                brief,
-                currentDraft: workerDraft,
-                contentIR: compactContentIR(contentIR),
-                presentationDesignSystem: designSystem,
-                contentBudgets,
-                requestedSlideCount: brief.requestedSlideCount ?? null,
-              }) },
-            ],
-            metadata: { projectId, generationId: this.createId() },
-          };
-          const repairResponse = await inferPlanningRequestWithRetry(adapter, repairRequest, ensureActive);
-          const repairedDraft = asDraft(repairResponse.value, contentIR, brief);
-          assertBudgetRevisionPreservesPlan(workerDraft, repairedDraft);
-          try {
-            validateDraftAgainstContentBudgets(repairedDraft.slides, contentBudgets);
-          } catch (repairError) {
-            throw new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'The bounded fit repair still exceeds the qualified template text budgets.', 422, { cause: repairError });
-          }
-          workerDraft = repairedDraft;
-          revisionWorkerSummary = telemetrySummary(repairResponse.telemetry);
-          revisionUsed = true;
-        }
-      }
       const planId = `dp_${this.createId().replaceAll('-', '')}`;
       const checkpoint = canonicalizeDeckPlan(workerDraft, {
         id: planId,
@@ -1221,14 +1230,15 @@ export class PlanningService {
       let deckPlan = checkpoint;
       if (review.outcome === 'repair') {
         deckPlan = applyPlanRepair(checkpoint, review, contentIR, brief, fingerprint);
-      } else if (review.outcome === 'local-replan') {
-        if (revisionUsed) {
-          throw new PlanningServiceError('PLAN_REVISION_BUDGET_EXHAUSTED', 'The plan already used its single bounded revision to fit the template.', 422);
-        }
+      }
+      const budgetFailure = plannedCopyBudgetFailure(deckPlan.slides, contentBudgets);
+      if (review.outcome === 'local-replan' || budgetFailure !== null) {
+        const revisionBase = draftFromPlan(deckPlan);
         const revisionEvidenceText = JSON.stringify({
           brief,
-          currentPlan: checkpoint,
-          findings: review.findings,
+          currentPlan: revisionBase,
+          review,
+          fitBudgetFailure: budgetFailure,
           contentIR: compactContentIR(contentIR),
           presentationDesignSystem: designSystem,
           contentBudgets,
@@ -1237,11 +1247,25 @@ export class PlanningService {
         if (revisionEvidenceText.length > MAX_EVIDENCE_CHARS) {
           throw new PlanningServiceError('PLANNING_CONTEXT_TOO_LARGE', 'Worker revision evidence exceeds the planning context limit. Select fewer or shorter source files.', 413);
         }
+        const revisionInstructions = [
+          promptAssets.worker,
+          'BOUNDED REVISION: Supervisor review has already run. This is the only deck-plan-revision for this planning attempt. Address the supplied review findings and any fit constraint together in one complete revised draft.',
+          ...(review.outcome === 'local-replan'
+            ? ['Apply the Supervisor findings while preserving the supported narrative and source-backed evidence.']
+            : ['Keep the current plan meaning and structure; the Supervisor has not requested a local re-plan.']),
+          ...(review.outcome === 'repair'
+            ? ['The Supervisor repair operations are already reflected in currentPlan. Preserve those corrections.']
+            : []),
+          ...(budgetFailure !== null
+            ? [`FIT CONSTRAINT: currentPlan exceeds measured template text budgets (${budgetFailure}). Make complete, concise wording that fits the supplied role-compatible region budgets. Preserve every source claim and evidence reference; do not add or remove facts, change fonts, or change the template.`]
+            : []),
+          'Return one full DeckPlan draft. Do not request another review or another revision.',
+        ].join('\n\n');
         const revisionRequest: SemanticInferenceRequest<DeckPlanDraft> = {
           ...workerRequest,
           operation: 'deck-plan-revision',
           messages: [
-            { role: 'system', content: promptAssets.worker },
+            { role: 'system', content: revisionInstructions },
             { role: 'user', content: revisionEvidenceText },
           ],
           signal: operation.controller.signal,
@@ -1249,11 +1273,15 @@ export class PlanningService {
         };
         const revisionResponse = await inferPlanningRequestWithRetry(adapter, revisionRequest, ensureActive);
         const revisedDraft = asDraft(revisionResponse.value, contentIR, brief);
-        if (contentBudgets) {
-          try { validateDraftAgainstContentBudgets(revisedDraft.slides, contentBudgets); }
-          catch (error) { throw new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'Revised slide copy exceeds all qualified template text regions. Generate a shorter plan and retry.', 422, { cause: error }); }
+        if (budgetFailure !== null && review.outcome !== 'local-replan') {
+          assertBudgetRevisionPreservesPlan(revisionBase, revisedDraft);
         }
-        revisionUsed = true;
+        if (contentBudgets) {
+          const revisedBudgetFailure = plannedCopyBudgetFailure(revisedDraft.slides, contentBudgets);
+          if (revisedBudgetFailure !== null) {
+            throw new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'The single bounded plan revision still exceeds the qualified template text budgets.', 422);
+          }
+        }
         deckPlan = canonicalizeDeckPlan(revisedDraft, {
           id: checkpoint.id,
           version: checkpoint.version + 1,

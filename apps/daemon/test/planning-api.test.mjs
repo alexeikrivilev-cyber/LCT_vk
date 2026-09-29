@@ -10,7 +10,8 @@ import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 register();
 const { startServer } = await import('../src/server.ts');
 const { SemanticInferenceError } = await import('../src/presentation/application/semantic-inference-port.ts');
-const { assertBudgetRevisionPreservesPlan, inferPlanningRequestWithRetry, PlanningServiceError, planningInputFingerprint } = await import('../src/presentation/application/planning-service.ts');
+const { assertBudgetRevisionPreservesPlan, inferPlanningRequestWithRetry, PlanningService, PlanningServiceError, planningDeadlineFromEnvironment, planningInputFingerprint } = await import('../src/presentation/application/planning-service.ts');
+const { planningContentProfileFingerprint } = await import('../src/presentation/application/planning-content-budgets.ts');
 const { deckPlanHash } = await import('../src/presentation/domain/deck-plan.ts');
 const { AGENT_WORKFLOW_CONTRACT_SHA256, AGENT_WORKFLOW_VERSIONS } = await import('../src/presentation/application/workflow-versions.ts');
 
@@ -61,6 +62,14 @@ test('bounded text-fit revision may shorten wording but cannot change narrative 
   const changedStructure = structuredClone(concise);
   changedStructure.slides[1].contentRefs = [];
   assert.throws(() => assertBudgetRevisionPreservesPlan(original, changedStructure), (error) => error.code === 'BUDGET_REPAIR_CHANGED_PLAN_STRUCTURE');
+});
+
+test('planning deadline config is bounded and keeps the five-minute default', () => {
+  assert.equal(planningDeadlineFromEnvironment(undefined), 300_000);
+  assert.equal(planningDeadlineFromEnvironment(' 900000 '), 900_000);
+  for (const invalid of ['0', '-1', '900001', '1.5', 'NaN']) {
+    assert.throws(() => planningDeadlineFromEnvironment(invalid), /LCT_PLANNING_TIMEOUT_MS/);
+  }
 });
 
 test('deck-plan, plan-review, and the single plan revision retry invalid structured output once with the exact request', async () => {
@@ -161,6 +170,7 @@ function makeFakeAdapter(control) {
     async infer(request) {
       requestNumber += 1;
       control.calls?.push({ role: request.role, operation: request.operation });
+      control.deadlines?.push(request.deadlineAtEpochMs);
       control.schemas?.push({ operation: request.operation, name: request.output.name, schema: request.output.schema });
       const text = request.messages.at(-1).content;
       const evidence = JSON.parse(text);
@@ -177,6 +187,7 @@ function makeFakeAdapter(control) {
             ? { slides: planDraft(contentId).slides.map((slide) => ({ ...slide, semanticVisualType: 'arbitrary-layout' })) }
             : {};
         value = planDraft(contentId, override);
+        if (control.workerOutput) value = control.workerOutput(request, evidence, value);
       } else {
         const checkpointVersion = evidence.checkpointVersion;
         const mode = control.reviewMode ?? 'pass';
@@ -402,13 +413,81 @@ test('Planning API runs a bounded Worker/Supervisor flow, persists, reloads, and
   }
 });
 
+test('fit failure and Supervisor local re-plan share exactly one bounded Worker revision', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-planning-combined-revision-'));
+  const dataDir = path.join(temp, 'data');
+  const control = { reviewMode: 'local-replan', calls: [], workerEvidence: [], schemas: [], workerOutput: null };
+  const adapter = makeFakeAdapter(control);
+  const options = {
+    host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+    semanticInferenceAdapter: adapter, enableSemanticProfiling: false,
+  };
+  const started = await startServer(options);
+  const projectId = 'planning-combined-fit-replan';
+  t.after(async () => {
+    await closeStartedServer(started);
+    await rm(temp, { recursive: true, force: true });
+  });
+
+  await createProject(started, projectId);
+  if (!await compileTemplate(started, projectId, await makeSyntheticPptx({ slideCount: 2, layoutCount: 2 }))) {
+    t.skip('Python 3.12 unavailable: local template fixture cannot be compiled');
+    return;
+  }
+  await upload(started, projectId, 'source.md', Buffer.from('# Retention\n\nRetention is the limiting factor for sustained growth.', 'utf8'));
+
+  control.workerOutput = (request, _evidence, draft) => request.operation === 'deck-plan-revision'
+    ? {
+      ...draft,
+      slides: draft.slides.map((slide, index) => ({
+        ...slide,
+        takeaway: index === 0 ? 'Решение' : 'Фокус',
+        bodyPoints: slide.bodyPoints.map((point) => ({ ...point, text: index === 0 ? 'Обозначить решение и главный тезис.' : point.text })),
+      })),
+    }
+    : draft;
+  const profile = { slides: [] };
+  const budgets = {
+    version: 'fit-aware-copy-budget.v1',
+    profileSha256: planningContentProfileFingerprint(profile),
+    candidateFamilies: [{
+      familyKey: 'family-1', archetype: 'content', supportedContentModes: ['mixed'],
+      titleRegion: { maxCharacters: 10, maxLines: 1, maxCharactersPerLine: 10 },
+      bodyRegions: [{ maxCharacters: 180, maxLines: 4, maxCharactersPerLine: 45 }],
+      body: { maxCharacters: 360, maxPoints: 4, maxCharactersPerPoint: 180 },
+    }],
+    slides: [1, 2].map((order) => ({ order, candidateFamilyKeys: ['family-1'] })),
+  };
+  const planning = new PlanningService({
+    projectRoot: repoRoot,
+    projectsRoot: path.join(dataDir, 'projects'),
+    getInferenceAdapter: () => adapter,
+    getPreparedTemplateProfile: async () => profile,
+    getPlanningContentBudgets: async () => budgets,
+  });
+  const result = await planning.generate(projectId, {
+    contentFiles: ['source.md'],
+    brief: { audience: 'Executive team', purpose: 'Choose a growth priority', expectedOutcome: 'Align on retention investment', requestedSlideCount: 2, preferences: ['Use supplied evidence'] },
+  });
+
+  assert.equal(result.status, 'ready');
+  assert.equal(result.review.outcome, 'local-replan');
+  assert.deepEqual(result.deckPlan.slides.map((slide) => slide.takeaway), ['Решение', 'Фокус']);
+  assert.deepEqual(control.calls, [
+    { role: 'worker', operation: 'deck-plan' },
+    { role: 'supervisor', operation: 'plan-review' },
+    { role: 'worker', operation: 'deck-plan-revision' },
+  ]);
+  assert.equal(result.telemetry.revisionWorker.model, 'fake-planner-v1');
+});
+
 test('Planning API accepts a task and optional context with zero uploaded source files', async (t) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-planning-task-only-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
-  const control = { reviewMode: 'pass', badWorker: null, workerFailure: false, calls: [], workerEvidence: [] };
+  const control = { reviewMode: 'pass', badWorker: null, workerFailure: false, calls: [], workerEvidence: [], deadlines: [] };
   const options = {
     host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
-    serveWeb: false, returnServer: true, semanticInferenceAdapter: makeFakeAdapter(control),
+    serveWeb: false, returnServer: true, semanticInferenceAdapter: makeFakeAdapter(control), planningTimeoutMs: 600_000,
   };
   let started = await startServer(options);
   const projectId = 'planning-task-only';
@@ -433,6 +512,10 @@ test('Planning API accepts a task and optional context with zero uploaded source
       && slide.bodyPoints.every((point) => point.origin === 'generated-from-brief')));
     assert.ok(!JSON.stringify(planned.deckPlan).includes(brief.purpose));
     assert.deepEqual(control.calls.map(({ role }) => role), ['worker', 'supervisor']);
+    assert.equal(control.deadlines.length, 2);
+    assert.equal(control.deadlines[0], control.deadlines[1], 'all semantic planning calls share one absolute deadline');
+    assert.ok(control.deadlines[0] >= Date.now() + 598_000 && control.deadlines[0] <= Date.now() + 600_000,
+      'all semantic planning calls share the configured absolute deadline');
 
     await closeStartedServer(started);
     started = await startServer(options);

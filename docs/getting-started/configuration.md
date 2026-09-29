@@ -27,6 +27,7 @@
 | `LCT_SEMANTIC_API_KEY` | Нет/условно | отсутствует в fake-only конфигурации | daemon; **секрет** | Bearer credential endpoint. Требует HTTPS, кроме loopback |
 | `LCT_SEMANTIC_ENABLE_THINKING` | Нет | не задано; допустимы `true`/`false` | daemon; нет | Опциональная request-level chat-template setting. Unset сохраняет provider default |
 | `LCT_SEMANTIC_REQUEST_TIMEOUT_MS` | Нет | `300000`; диапазон `1`–`300000` | daemon; нет | Максимальное ожидание semantic inference. Planning дополнительно ограничен общим deadline и cancellation |
+| `LCT_PLANNING_TIMEOUT_MS` | Нет | `300000`; диапазон `1`–`900000` | daemon; нет | Общий wall-clock deadline последовательности планирования: Worker, Supervisor и не более одной revision. Не меняет лимит отдельного inference-запроса |
 | `LCT_SEMANTIC_READINESS_TIMEOUT_MS` | Нет | `30000`; диапазон `1`–`120000` | daemon; нет | Таймаут отдельной проверки доступности `/models`; при его истечении endpoint получает временный статус `warming`, а локальная readiness остаётся успешной |
 
 Настройки readiness и inference независимы. Ошибки конфигурации и явные ответы HTTP 401/403 остаются ошибками readiness.
@@ -103,7 +104,7 @@
 | Multipart upload | 2 файла в запросе, до 64 MiB каждый; не более 2 одновременных upload-запросов |
 | JSON API body | до 32 MiB; небольшие generation/control-запросы имеют отдельные меньшие bounds |
 | ContentIR | до 12 выбранных источников, 16 MiB на источник, 32 MiB суммарно, 256 KiB извлечённого текста и 4096 units |
-| Semantic planning | 256 KiB serialized evidence; Worker 150 s, Supervisor 90 s, общий planning deadline 240 s; максимум 2 одновременных planning jobs |
+| Semantic planning | 256 KiB serialized evidence; до 3 последовательных semantic calls (Worker, Supervisor, не более одной revision); общий deadline по умолчанию 300 s, настраивается `LCT_PLANNING_TIMEOUT_MS` до 900 s; максимум 2 одновременных planning jobs |
 | DeckPlan / generation | 1–30 слайдов; до 2 одновременных generation jobs |
 | Repair / export | максимум 2 одновременных repair jobs и 2 export jobs |
 | PPTX inspection | до 64 MiB входного архива, 4096 ZIP members и 256 MiB expanded archive/XML reads; inspector timeout 30 s |
