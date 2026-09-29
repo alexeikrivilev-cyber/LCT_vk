@@ -43,7 +43,7 @@ export async function createExemplarTemplate(filePath, { masterName = 'Unnamed d
 }
 
 /** Three repeated but structurally distinct vector compositions for selector/render tests. */
-export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unlabelled composition families', mixedStyleBody = false, hyperlinkBody = false, varyingFooter = false, masterStaticText = null } = {}) {
+export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unlabelled composition families', mixedStyleBody = false, hyperlinkBody = false, varyingFooter = false, masterStaticText = null, includeFullCanvasBackground = false } = {}) {
   const deck = new pptxgen();
   deck.layout = 'LAYOUT_WIDE';
   const familyMasters = Array.from({ length: 3 }, (_, family) => `${masterName} ${family + 1}`);
@@ -53,6 +53,7 @@ export async function createFamilyExemplarTemplate(filePath, { masterName = 'Unl
   for (let index = 0; index < 12; index += 1) {
     const family = Math.floor(index / 4);
     const slide = deck.addSlide({ masterName: familyMasters[family] });
+    if (includeFullCanvasBackground) slide.addImage({ data: `image/png;base64,${fixtureImage}`, x: 0, y: 0, w: 13.333333, h: 7.5 });
     slide.addText(`Original source headline ${index + 1}`, {
       x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
     });

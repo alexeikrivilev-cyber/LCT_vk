@@ -207,9 +207,9 @@ function templateRoleSourceShapes(
   return result;
 }
 
-function estimatedWrappedLines(text: string, widthEmu: number, fontPt: number): number {
-  const charsPerLine = Math.max(1, widthEmu / 12_700 / Math.max(1, fontPt * 0.56));
-  return Math.max(1, ...text.split(/\r?\n/u).map((line) => Math.max(1, Math.ceil(Array.from(line).length / charsPerLine))));
+function estimatedWrappedLines(text: string, widthEmu: number, fontPt: number, averageGlyphWidthEm = 0.56): number {
+  const charsPerLine = Math.max(1, widthEmu / 12_700 / Math.max(1, fontPt * averageGlyphWidthEm));
+  return text.split(/\r?\n/u).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charsPerLine)), 0);
 }
 
 function partitionTextRegions(
@@ -445,6 +445,37 @@ function applyResolvedRoleTextStyle(
   });
 }
 
+function fitExemplarTitleToDonorBox(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
+  title: ReturnType<typeof getSlideShapes>[number],
+  text: string,
+  sourceSlideIndex: number,
+  warnings: string[],
+): void {
+  const bounds = getShapeBoundsResolved(presentation, title);
+  if (!bounds) return;
+  let format: ReturnType<typeof getShapeRunFormatEffective>;
+  try { format = getShapeRunFormatEffective(presentation, title, 0, 0); } catch { return; }
+  const fontSizePt = format.size;
+  if (fontSizePt === undefined || !Number.isFinite(fontSizePt) || fontSizePt <= 0) return;
+  const availableHeightPt = bounds.h / 12_700;
+  // PowerPoint line leading and paragraph metrics exceed the nominal font box.
+  // Reserve 1.28 em per line; preview audit remains the hard validation gate.
+  const minimumFontPt = Math.min(8, fontSizePt);
+  let lowerFit = minimumFontPt;
+  let upperFit = fontSizePt;
+  for (let iteration = 0; iteration < 16; iteration += 1) {
+    const candidateSizePt = (lowerFit + upperFit) / 2;
+    const lineCount = estimatedWrappedLines(text, bounds.w, candidateSizePt, 0.68);
+    if (candidateSizePt * lineCount * 1.28 <= availableHeightPt) lowerFit = candidateSizePt;
+    else upperFit = candidateSizePt;
+  }
+  if (lowerFit >= fontSizePt - 0.05) return;
+  const roundedSizePt = Math.min(fontSizePt, Math.max(minimumFontPt, Math.floor(lowerFit * 10) / 10));
+  setShapeTextFormat(title, { size: roundedSizePt });
+  warnings.push(`Exemplar slide ${sourceSlideIndex} title font was reduced from ${fontSizePt}pt to ${roundedSizePt}pt to fit its measured donor box.`);
+}
+
 function requiredTemplateColor(color: string) {
   const resolved = asColor(color);
   if (!resolved) throw new PptxBackendError('TEMPLATE_TEXT_STYLE_UNRESOLVED', 'Could not derive a connector color from the template body text role.');
@@ -532,6 +563,7 @@ function connectProcessNodes(
 }
 
 function projectExemplarText(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
   slide: ReturnType<typeof getSlides>[number],
   compiled: CompiledSlide,
   selection: ExemplarSlideSelection,
@@ -579,6 +611,7 @@ function projectExemplarText(
     setShapeText(shape, '');
   }
   setShapeText(title, compiled.title);
+  fitExemplarTitleToDonorBox(presentation, title, compiled.title, selection.sourceSlideIndex, textStyleWarnings);
   for (let index = 0; index < bodyShapes.length; index += 1) {
     setShapeText(bodyShapes[index]!, selection.bodyContentSegments[index]!);
   }
@@ -964,7 +997,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       const selection = exemplarSelections.get(compiled.id);
       let slide = outputSlidesById.get(compiled.id);
       if (selection && slide) {
-        projectExemplarText(slide, compiled, selection, textStyleWarnings);
+        projectExemplarText(presentation, slide, compiled, selection, textStyleWarnings);
         if (compiled.visualization.type === 'kpi' && !compiled.visualization.kpi) {
           // A qualitative KPI request has no source-backed value to render. If
           // the selected donor has a source-free visual shape, remove it and

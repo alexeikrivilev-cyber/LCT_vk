@@ -147,6 +147,8 @@ export interface TemplateAsset {
   part: string;
   relationshipIds: string[];
   contentType: string | null;
+  /** Optional 16x9 sRGB sample for media-role comparison; omitted by older persisted IR. */
+  visualFingerprint?: string;
   kind: 'media';
 }
 
@@ -407,9 +409,13 @@ function isTheme(value: unknown): value is PartialTemplateTheme {
 }
 
 function isAsset(value: unknown): value is TemplateAsset {
-  if (!isRecord(value) || !exactKeys(value, ['id', 'part', 'relationshipIds', 'contentType', 'kind'])) return false;
+  const requiredKeys = ['id', 'part', 'relationshipIds', 'contentType', 'kind'];
+  if (!isRecord(value) || !(exactKeys(value, requiredKeys) || exactKeys(value, [...requiredKeys, 'visualFingerprint']))) return false;
   return isString(value.id) && isPart(value.part) && Array.isArray(value.relationshipIds)
-    && value.relationshipIds.every(isString) && isNullableString(value.contentType) && value.kind === 'media'
+    && value.relationshipIds.every(isString) && isNullableString(value.contentType)
+    && (!Object.hasOwn(value, 'visualFingerprint') || (isString(value.visualFingerprint)
+      && /^rgb16x9-v1:[A-Za-z0-9+/]{576}$/.test(value.visualFingerprint)))
+    && value.kind === 'media'
     ;
 }
 

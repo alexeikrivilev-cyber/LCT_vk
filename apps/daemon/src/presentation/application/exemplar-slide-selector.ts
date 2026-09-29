@@ -263,6 +263,70 @@ function normalizedText(element: TemplateElement): string {
   return (element.text ?? '').trim().replace(/\s+/g, ' ');
 }
 
+function isFullCanvasImage(element: TemplateElement, template: TemplateIR): boolean {
+  const box = geometryOf(element);
+  if (!box || Math.abs(box.rotation) > 0.01) return false;
+  const width = template.slideSize.width;
+  const height = template.slideSize.height;
+  const toleranceX = width * 0.005;
+  const toleranceY = height * 0.005;
+  return Math.abs(box.x) <= toleranceX && Math.abs(box.y) <= toleranceY
+    && Math.abs(box.width - width) <= toleranceX
+    && Math.abs(box.height - height) <= toleranceY;
+}
+
+function hasEditableTextAbove(element: TemplateElement, slide: TemplateSlide): boolean {
+  const editableTextAbove = slide.elements.filter((candidate) => candidate.kind.toLowerCase() === 'shape'
+    && candidate.parentId === null
+    && candidate.nativeId !== null
+    && candidate.order > element.order
+    && normalizedText(candidate).length > 0
+    && geometryOf(candidate) !== null);
+  return editableTextAbove.length >= 3;
+}
+
+function fullCanvasMediaFingerprint(element: TemplateElement, slide: TemplateSlide, template: TemplateIR): string | null {
+  const imageRelationships = slide.relationships.filter((relationship) => element.relationshipIds.includes(relationship.id)
+    && relationship.mode === 'internal' && relationship.targetPart !== null);
+  if (imageRelationships.length !== 1) return null;
+  return template.assets.find((asset) => asset.part === imageRelationships[0]!.targetPart)?.visualFingerprint ?? null;
+}
+
+function similarMediaFingerprint(left: string, right: string): boolean {
+  const prefix = 'rgb16x9-v1:';
+  if (!left.startsWith(prefix) || !right.startsWith(prefix)) return false;
+  const a = Buffer.from(left.slice(prefix.length), 'base64');
+  const b = Buffer.from(right.slice(prefix.length), 'base64');
+  if (a.length !== 16 * 9 * 3 || b.length !== a.length) return false;
+  let difference = 0;
+  for (let index = 0; index < a.length; index += 1) difference += Math.abs(a[index]! - b[index]!);
+  return difference / a.length <= 8;
+}
+
+function isFullCanvasBackgroundShell(
+  element: TemplateElement,
+  slide: TemplateSlide,
+  family: readonly TemplateSlide[],
+  template: TemplateIR,
+): boolean {
+  const fullCanvasImages = slide.elements.filter((other) => ['picture', 'image'].includes(other.kind.toLowerCase())
+    && isFullCanvasImage(other, template));
+  const fingerprint = fullCanvasMediaFingerprint(element, slide, template);
+  if (!slide.layoutId || fullCanvasImages.length !== 1 || !fullCanvasImages.includes(element)
+      || !hasEditableTextAbove(element, slide) || !fingerprint) return false;
+  const minimum = Math.max(2, Math.ceil(family.length * 0.8));
+  const similarMediaRoleCount = family.filter((candidate) => {
+    const images = candidate.elements.filter((other) => ['picture', 'image'].includes(other.kind.toLowerCase())
+      && isFullCanvasImage(other, template));
+    if (images.length !== 1 || !hasEditableTextAbove(images[0]!, candidate)) return false;
+    const candidateFingerprint = fullCanvasMediaFingerprint(images[0]!, candidate, template);
+    return candidateFingerprint !== null && similarMediaFingerprint(fingerprint, candidateFingerprint);
+  }).length;
+  // Repetition of both near-full-canvas geometry and sampled image appearance
+  // is required so a one-off customer photo cannot inherit the shell role.
+  return family.length >= 2 && similarMediaRoleCount >= minimum;
+}
+
 function inheritedStaticText(template: TemplateIR, layoutId: string | null | undefined, masterId?: string | null): TemplateElement[] {
   const layout = layoutId ? template.layouts.find((item) => item.id === layoutId) : null;
   const master = template.masters.find((item) => item.id === (layout?.masterId ?? masterId));
@@ -363,8 +427,8 @@ function projectedTitleFit(text: string, title: TemplateElement, body: TemplateE
     // Approximate title width conservatively: the previous 0.52-em average
     // marked some long source-template titles as fitting when PowerPoint clipped them.
     fit: estimatedLineFit(text, title, hasMeasuredTitleSize ? 8 : inheritedSizeEstimate, 0.68),
-    // Direct and Office Kit resolved placeholder sizes use the ordinary fit
-    // threshold. Only genuinely unknown inheritance needs extra headroom.
+    // Unknown inheritance needs extra headroom because its effective font size
+    // is estimated; measured donor typography is adjusted to its box in render.
     minimum: hasMeasuredTitleSize ? 0.72 : 0.9,
   };
 }
@@ -579,6 +643,9 @@ function visualClassification(
     }
     if (kind === 'picture' || kind === 'image') {
       if (!box || !relationships) return { elementId: element.id, kind: 'opaque-unsafe', reason: 'picture geometry or package relationship is unresolved' };
+      if (isFullCanvasBackgroundShell(element, slide, family, template)) {
+        return { elementId: element.id, kind: 'template-decoration', reason: 'full-canvas image role recurs across the layout family behind independent editable text objects' };
+      }
       const smallPicture = area(box) / canvasArea <= 0.04;
       const repeated = occurrences(element);
       const minimum = Math.max(2, Math.ceil(family.length * 0.8));
@@ -656,7 +723,10 @@ function classifyStructuralArchetype(
   const bodyIds = new Set(bodies.map((body) => body.id));
   const secondaryMajor = majorText.filter((element) => element.id !== title.id && !bodyIds.has(element.id)
     && !preservedChromeIds.has(element.id));
-  const specialVisuals = visualKinds(slide);
+  const family = template.slides.filter((candidate) => candidate.layoutId === slide.layoutId);
+  const backgroundShellIds = new Set(slide.elements.filter((element) => ['picture', 'image'].includes(element.kind.toLowerCase())
+    && isFullCanvasBackgroundShell(element, slide, family, template)).map((element) => element.id));
+  const specialVisuals = visualKinds(slide).filter((element) => !backgroundShellIds.has(element.id));
   const unlabelledShapes = slide.elements.filter((element) => element.parentId === null
     && ['shape', 'connector'].includes(element.kind.toLowerCase()) && !normalizedText(element));
   const visualAreaShare = Math.min(1, [...specialVisuals, ...unlabelledShapes]
@@ -1033,13 +1103,14 @@ function candidateFor(
   const startedAt = performance.now();
   diagnostics?.increment('composition.candidateBuildCount');
   const trustedProfile = profileSlide && profileSlide.confidence >= 0.6 ? profileSlide : null;
+  const structurallyReusedProfile = trustedProfile?.reasonCodes.includes('structural_family_reuse') ?? false;
   const preservedChromeIds = chromeIds(template, slide.layoutId ?? '');
   const visualClasses = cachedVisualClassification(slide, template, trustedProfile?.visualElementIds ?? [], visualClassificationCache, diagnostics);
   const visualElementIds = trustedProfile?.visualElementIds ?? visualClasses.map((item) => item.elementId);
   const diagnostic: CandidateDiagnostic = {
     sourceSlideIndex: slide.index,
     structuralArchetype: null,
-    semanticArchetype: trustedProfile?.archetype ?? null,
+    semanticArchetype: trustedProfile && !structurallyReusedProfile ? trustedProfile.archetype : null,
     semanticConfidence: profileSlide?.confidence ?? null,
     titleElementId: trustedProfile?.titleElementId ?? null,
     bodyElementIds: trustedProfile?.bodyElementIds ?? [],
@@ -1056,11 +1127,18 @@ function candidateFor(
     projectionSafe: null, contentSafe: null, roleCompatible: false,
     titleGeometryNormalized: null, bodyGeometryNormalized: null, titleBodyFontHierarchy: null, designFeatures: null, evidence: [],
   };
+  for (const classification of visualClasses) {
+    if (classification.kind === 'template-decoration'
+        && classification.reason.includes('full-canvas image role recurs across the layout family')
+        && trustedProfile?.visualElementIds.includes(classification.elementId)) {
+      diagnostic.evidence.push(`semantic profile lists ${classification.elementId} as a visual element; recurring full-canvas geometry is treated as background shell evidence`);
+    }
+  }
   const reject = (gate: string, reason: string): CandidateBuild => {
     diagnostics?.recordDuration('composition.candidateBuild', performance.now() - startedAt);
     diagnostic.gate = gate;
     diagnostic.rejectReason = reason;
-    diagnostic.evidence = [reason];
+    diagnostic.evidence = [reason, ...diagnostic.evidence];
     return { candidate: null, diagnostic };
   };
   if (!slide.sourcePart) return reject('source-part', 'source slide part is missing');
@@ -1152,8 +1230,9 @@ function candidateFor(
   if (confidence < MIN_EXEMPLAR_CONFIDENCE) return reject('confidence', `candidate confidence ${confidence}<${MIN_EXEMPLAR_CONFIDENCE}`);
 
   const archetype = classifyStructuralArchetype(slide, template, title, bodies, preservedChromeIds);
-  const chosenArchetype = trustedProfile ? trustedProfile.archetype as ExemplarArchetype : archetype.archetype;
-  const semanticConflict = Boolean(trustedProfile && trustedProfile.archetype !== archetype.archetype);
+  const chosenArchetype = trustedProfile && !structurallyReusedProfile
+    ? trustedProfile.archetype as ExemplarArchetype : archetype.archetype;
+  const semanticConflict = Boolean(trustedProfile && !structurallyReusedProfile && trustedProfile.archetype !== archetype.archetype);
   const titleAreaShare = archetype.titleAreaShare;
   const canvasArea = Math.max(1, template.slideSize.width * template.slideSize.height);
   const bodyAreaShare = Math.min(1, bodies.reduce((sum, element) => sum + area(geometryOf(element)), 0) / canvasArea);
@@ -1300,6 +1379,10 @@ function candidateFor(
     `approximate text-height fit title=${titleFit} body=${bodyFit}; visual preview remains required`,
     ...archetype.evidence,
     ...(semanticConflict ? [`semantic/structural conflict: profile=${trustedProfile!.archetype}, structural=${archetype.archetype}; structural safety remains authoritative`] : []),
+    ...visualClasses.filter((item) => item.kind === 'template-decoration'
+      && item.reason.includes('full-canvas image role recurs across the layout family')
+      && trustedProfile?.visualElementIds.includes(item.elementId))
+      .map((item) => `semantic profile lists ${item.elementId} as a visual element; recurring full-canvas geometry is treated as background shell evidence`),
     `projected body density estimate ${textDensity.toFixed(3)}`,
     `projected body region arrangement score ${bodyArrangement.toFixed(3)}`,
     `strategy preference=${strategyScore.toFixed(3)}, profile preference=${profileStrategyScore.toFixed(3)}, no-visual-content penalty=${noVisualContentPenalty.toFixed(3)}, unused-body penalty=${unusedBodyPenalty.toFixed(3)}, unused-visual-slot area=${unusedVisualSlotAreaShare.toFixed(4)} penalty=${unusedVisualSlotPenalty.toFixed(3)}`,
@@ -1366,7 +1449,7 @@ function candidateFor(
         : ['The structural selector can project one compatible body region; ambiguous unmapped text blocks donor reuse.'],
     };
   diagnostic.structuralArchetype = archetype.archetype;
-  diagnostic.semanticArchetype = trustedProfile?.archetype ?? archetype.archetype;
+  diagnostic.semanticArchetype = trustedProfile && !structurallyReusedProfile ? trustedProfile.archetype : archetype.archetype;
   diagnostic.titleElementId = title.id;
   diagnostic.bodyElementIds = trustedProfile?.bodyElementIds ?? bodies.map((element) => element.id);
   diagnostic.gate = 'passed';
