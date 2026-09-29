@@ -143,7 +143,7 @@ Latest adaptive-request-budget run: after targeted profiler/adapter/qualificatio
 
 ## Deterministic duplicate-role normalization and latest WorkSpace run
 
-The narrowly-scoped normalizer runs only when the batch validator diagnoses `DUPLICATE_ELEMENT_ROLE`. It removes cross-role repeats by precedence `title > body > visual > preserved > replaceable`, then invokes the existing validator. Same-role duplicates, unknown IDs, foreign-slide IDs and invalid replaceable IDs remain failures. Safe profiler telemetry adds only `roleConflictResolved` and a count.
+The narrowly-scoped normalizer runs only when the batch validator diagnoses `DUPLICATE_ELEMENT_ROLE`. It removes repeated assignments by keeping the first occurrence within a role and resolving cross-role repeats by precedence `title > body > visual > preserved > replaceable`, then invokes the existing validator. Unknown IDs, foreign-slide IDs and invalid replaceable IDs remain failures. Safe profiler telemetry adds only `roleConflictResolved` and a count of distinct IDs whose duplicate assignments were removed.
 
 Targeted gates passed before live use: profiler 21/21, adapter 17/17, daemon typecheck, `docs:check` and `git diff --check`.
 
