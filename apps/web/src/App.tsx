@@ -18,6 +18,7 @@ import { clearWorkspaceDraft, readWorkspaceDraft, writeWorkspaceDraft } from './
 import { refreshPersistedWorkflowSnapshots } from './workflow-terminal-refresh';
 import { includeUploadedContentFiles } from './uploaded-content-selection';
 import { isPersistedTemplatePreparationState, isUsableTemplateProfileState } from './template-preparation-state';
+import { persistedWorkspaceView, visibleGenerationOperationError, visiblePersistedFailure, visibleRequestFailure } from './workflow-visible-state';
 
 type Project = {
   id: string;
@@ -43,6 +44,7 @@ type DesignSystem = {
 };
 
 type Route = { kind: 'home' } | { kind: 'project'; projectId: string };
+type WorkspaceView = 'upload' | 'template' | 'brief' | 'outline' | 'progress' | 'editor' | 'audit';
 
 type ApiError = { error?: string | { code?: string; message?: string }; message?: string; code?: string };
 type UiFailure = { message: string; code?: string; status?: number };
@@ -270,7 +272,7 @@ function uiFailure(error: unknown, fallback: string = ru.errors.generic): UiFail
 function ErrorNotice({ failure, className, role = 'alert', onRetry }: { failure: UiFailure | string | null; className?: string; role?: 'alert' | 'status'; onRetry?: () => void }) {
   if (!failure) return null;
   const value = typeof failure === 'string' ? { message: failure } : failure;
-  const showDiagnostics = process.env.NODE_ENV !== 'production' && (value.code || value.status);
+  const showDiagnostics = Boolean(value.code || value.status);
   return <div className={className} role={role}>
     <span>{value.message}</span>
     {onRetry ? <button className="quiet compact ui-error-retry" onClick={onRetry}>{ru.errors.retry}</button> : null}
@@ -280,6 +282,12 @@ function ErrorNotice({ failure, className, role = 'alert', onRetry }: { failure:
       {value.status ? <code>{ru.errors.status(value.status)}</code> : null}
     </details> : null}
   </div>;
+}
+
+type FigmaIconName = 'menu' | 'folder' | 'clock' | 'settings' | 'arrow-right' | 'upload' | 'paperclip' | 'download' | 'chevron-down';
+
+function FigmaIcon({ name }: { name: FigmaIconName }) {
+  return <img className="figma-icon" src={`/figma-icons/${name}.svg`} alt="" aria-hidden="true" />;
 }
 
 function pickPreviewFile(files: ProjectFile[], selected?: string | null): string | null {
@@ -548,6 +556,10 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const draftHydratedRef = useRef(false);
   const [generationComplete, setGenerationComplete] = useState(false);
   const [generationExported, setGenerationExported] = useState(false);
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('upload');
+  const [auditRefreshError, setAuditRefreshError] = useState<UiFailure | null>(null);
+  const workspaceViewTouchedRef = useRef(false);
+  const workspaceViewInitializedRef = useRef(false);
   const filesRef = useRef(files);
   const templateScanRef = useRef(templateScan);
   const selectedTemplateRef = useRef(templateFile);
@@ -654,9 +666,11 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/workflow`, { cache: 'no-store' });
     if (!response.ok) throw await errorMessage(response, 'generation');
     const body = await response.json() as { operation?: ProductWorkflowOperation | null };
-    setProductOperation(body.operation ?? null);
-    if (body.operation?.status === 'ready') setProductWorkflowError(null);
-    return body.operation ?? null;
+    const operation = body.operation ?? null;
+    setProductOperation(operation);
+    if (operation?.status === 'ready') setProductWorkflowError(null);
+    if (operation?.contextualAudit?.status === 'ready' && !operation.contextualAudit.stale) setAuditRefreshError(null);
+    return operation;
   }, [projectId]);
 
   const reload = useCallback(async () => {
@@ -709,7 +723,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       : templateScan?.status ?? null;
   const templateBadgeStatus = templatePreparationPending ? 'processing' : visibleTemplateStatus ?? (templateFetching ? 'loading' : templateError ? 'unavailable' : 'uncompiled');
   const templateBadgeLabel = templatePreparationPending
-    ? templateProfileStatus === 'processing' ? ru.template.profileAnalyzing : ru.template.structureAnalyzing
+    ? ru.template.analyzing
     : templateFetching ? ru.template.fetching
       : templatePreparationReady ? templateProfileStatus === 'degraded-ready' ? ru.template.profileDegradedBadge : ru.template.ready
         : templateProfileStatus === 'failed' ? ru.template.profileFailed
@@ -815,6 +829,33 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
   const planningFindings = arrayValue(planningReview, ['findings']);
   const planningWarnings = arrayValue(planning, ['warnings']);
   const planningFailure = record(planning?.failure);
+  const visibleTemplateError = visibleRequestFailure(templateError,
+    templatePreparationReady ? 'ready' : visibleTemplateStatus === 'failed' ? 'failed' : null, ['ready', 'failed']);
+  const visiblePlanningError = visibleRequestFailure(planningError,
+    savedPlanReady ? 'ready' : planning?.status === 'failed' ? 'failed' : null, ['ready', 'failed']);
+  const productReadyWithAuditFailure = Boolean(productOperation?.status === 'failed'
+    && productOperation.failure?.stage === 'contextual_audit' && productOperation.generationId);
+  const visibleProductWorkflowError = visibleRequestFailure(productWorkflowError,
+    productReadyWithAuditFailure ? 'ready' : productOperation?.status === 'failed' && productOperation.failure ? 'failed' : productOperation?.status, ['ready', 'failed']);
+  const visiblePlanningFailure = visiblePersistedFailure(planningFailure, planning?.status);
+
+  useEffect(() => {
+    if (!draftHydrated || workspaceViewInitializedRef.current) return;
+    workspaceViewInitializedRef.current = true;
+    const initialView = persistedWorkspaceView({
+      operationStatus: productOperation?.status,
+      operationFailureStage: productOperation?.failure?.stage,
+      operationGenerationId: productOperation?.generationId,
+      savedPlanReady,
+      templateReady: templatePreparationReady,
+    });
+    if (initialView) setWorkspaceView(initialView);
+  }, [draftHydrated, productOperation?.failure?.stage, productOperation?.generationId, productOperation?.status, savedPlanReady, templatePreparationReady]);
+
+  const chooseWorkspaceView = (view: WorkspaceView) => {
+    workspaceViewTouchedRef.current = true;
+    setWorkspaceView(view);
+  };
 
   const togglePlanningFile = (path: string, checked: boolean) => {
     setPlanningError(null);
@@ -870,6 +911,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       const body = await response.json() as PlanningResponse;
       setPlanning(body);
       setSelectedContentFiles(Array.isArray(body.contentFiles) ? body.contentFiles.slice(0, 12) : planningSelectedPaths);
+      if (body.status === 'ready') chooseWorkspaceView('outline');
       try { if (typeof window !== 'undefined') clearWorkspaceDraft(window.sessionStorage, projectId); }
       catch { /* Saved planning state is on the server even if browser storage is unavailable. */ }
     } catch (err) {
@@ -935,6 +977,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
 
   const generatePresentation = async () => {
     setProductWorkflowError(null);
+    setAuditRefreshError(null);
     if (!templateFile) {
       setProductWorkflowError({ message: ru.template.uploadFirst });
       return;
@@ -958,6 +1001,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       return;
     }
     setProductWorkflowBusy(true);
+    chooseWorkspaceView('progress');
     try {
       const brief = {
         audience: briefAudience.trim(),
@@ -977,19 +1021,33 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       if (body.operation) setProductOperation(body.operation);
       if (body.operation?.status === 'ready') {
         await Promise.all([loadTemplateScan(), loadPlanning()]);
-        document.getElementById('generation-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        chooseWorkspaceView('editor');
+      } else if (body.operation?.status === 'failed' && body.operation.failure?.stage === 'contextual_audit' && body.operation.generationId) {
+        await Promise.all([loadTemplateScan(), loadPlanning()]);
+        chooseWorkspaceView('audit');
       }
       try { if (typeof window !== 'undefined') clearWorkspaceDraft(window.sessionStorage, projectId); }
       catch { /* Server-owned operation and plan remain available after reload. */ }
     } catch (err) {
-      setProductWorkflowError(uiFailure(err, ru.workflow.error));
+      const latest = await loadProductOperation().catch(() => null);
+      if (latest?.status === 'ready') {
+        await Promise.all([loadTemplateScan(), loadPlanning()]);
+        chooseWorkspaceView('editor');
+      } else if (latest?.status === 'failed' && latest.failure?.stage === 'contextual_audit' && latest.generationId) {
+        await Promise.all([loadTemplateScan(), loadPlanning()]);
+        setProductOperation(latest);
+        chooseWorkspaceView('audit');
+      } else {
+        setProductWorkflowError(uiFailure(err, ru.workflow.error));
+        if (latest?.status === 'failed') setProductOperation(latest);
+      }
     } finally {
       setProductWorkflowBusy(false);
     }
   };
 
   const repeatContextualAudit = async () => {
-    setProductWorkflowError(null);
+    setAuditRefreshError(null);
     setProductWorkflowBusy(true);
     try {
       const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/workflow/contextual-audit`, {
@@ -999,7 +1057,10 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
       const body = await response.json() as { operation?: ProductWorkflowOperation };
       if (body.operation) setProductOperation(body.operation);
     } catch (err) {
-      setProductWorkflowError(uiFailure(err, ru.workflow.error));
+      const latest = await loadProductOperation().catch(() => null);
+      if (latest?.contextualAudit?.status !== 'ready' || latest.contextualAudit.stale) {
+        setAuditRefreshError(uiFailure(err, ru.workflow.auditTransportUnavailable));
+      }
     } finally {
       setProductWorkflowBusy(false);
     }
@@ -1019,7 +1080,9 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             planning: loadPlanning,
           });
           if (refreshed && next.status === 'ready') {
-            document.getElementById('generation-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            chooseWorkspaceView('editor');
+          } else if (next.status === 'failed') {
+            chooseWorkspaceView(next.failure?.stage === 'contextual_audit' && next.generationId ? 'audit' : 'progress');
           }
         }
       } catch (err) {
@@ -1220,42 +1283,47 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     }
   };
 
-  const reportGenerationState = useCallback((complete: boolean, exported: boolean) => {
+  const reportGenerationState = useCallback((complete: boolean, exported: boolean, status?: string | null) => {
     setGenerationComplete(complete);
     setGenerationExported(exported);
+    if (workspaceViewTouchedRef.current) return;
+    if (status === 'preparing' || status === 'generating') setWorkspaceView('progress');
+    else if (complete) setWorkspaceView('editor');
   }, []);
 
   if (!project && !error) return <div className="boot-state" role="status">{ru.workspace.boot}</div>;
 
   return (
-    <main className="workspace-shell">
+    <main className="workspace-shell" data-view={workspaceView}>
       <header className="workspace-topbar">
-        <button className="quiet" onClick={onBack}>{ru.workspace.back}</button>
+        <button className="workspace-menu" aria-label={ru.workspace.back} title={ru.workspace.back} onClick={onBack}><FigmaIcon name="menu" /></button>
         <div className="project-title-block">
-          <span className="eyebrow">{ru.workspace.eyebrow}</span>
           <strong>{project?.name ?? projectId}</strong>
+          <FigmaIcon name="chevron-down" />
         </div>
         <div className="topbar-actions">
           <button className="quiet" onClick={() => void reload()}>{ru.workspace.reload}</button>
         </div>
       </header>
 
-      <ErrorNotice failure={error} className="error-banner workspace-error" />
-      {uploading ? <p className="workspace-operation-status" role="status" aria-live="polite">{ru.workspace.uploading}</p> : null}
-
-      <nav className="workspace-stages" aria-label={ru.workspace.stagesLabel}>
-        <a href="#template-panel" data-complete={templatePreparationReady}>{ru.workspace.templateStage}</a>
-        <a href="#planning-panel" data-complete={planningSourceFiles.length > 0}>{ru.workspace.contentStage}</a>
-        <a href="#planning-panel" data-complete={savedPlanReady}>{ru.workspace.planStage}</a>
-        <a href="#generation-panel" data-complete={generationComplete}>{ru.workspace.generateStage}</a>
-        <a href="#generation-review" data-complete={generationExported}>{ru.workspace.reviewStage}</a>
+      <nav className="workspace-rail" aria-label={ru.workspace.stagesLabel}>
+        <button className={workspaceView === 'upload' || workspaceView === 'template' || workspaceView === 'brief' || workspaceView === 'outline' ? 'rail-button active' : 'rail-button'}
+          aria-label={ru.workspace.templateStage} title={ru.workspace.templateStage} onClick={() => chooseWorkspaceView('upload')}><FigmaIcon name="folder" /></button>
+        <button className="rail-button" aria-label={ru.home.projects} title={ru.home.projects} onClick={onBack}><FigmaIcon name="clock" /></button>
+        <button className="rail-button rail-settings" aria-label={ru.workspace.technicalTools} title={ru.workspace.technicalTools}
+          onClick={() => { document.querySelector('.developer-tools')?.toggleAttribute('open'); }}><FigmaIcon name="settings" /></button>
       </nav>
+
+      <div className="workspace-content" data-view={workspaceView}>
+        <ErrorNotice failure={error} className="error-banner workspace-error" />
+        <ErrorNotice failure={visibleProductWorkflowError} className="product-workflow-error" onRetry={() => void generatePresentation()} />
+        {uploading ? <p className="workspace-operation-status" role="status" aria-live="polite">{ru.workspace.uploading}</p> : null}
 
       <section className="template-panel" id="template-panel" aria-labelledby="template-panel-title">
         <div className="template-panel-head">
           <div>
           <span className="eyebrow">{ru.template.eyebrow}</span>
-            <h2 id="template-panel-title">{ru.template.title}</h2>
+            <h2 id="template-panel-title">{workspaceView === 'upload' && !templateFile ? ru.workspace.emptyPresentation : ru.template.title}</h2>
             <p>{ru.template.description}</p>
           </div>
           <span className={`template-status status-${templateBadgeStatus}`} role="status">
@@ -1285,7 +1353,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         </div>
 
         <p className="template-scope-note">{ru.template.scope}</p>
-        <ErrorNotice failure={templateError} className="error-banner template-error" />
+        <ErrorNotice failure={visibleTemplateError} className="error-banner template-error" />
 
         {visibleTemplateStatus === 'uncompiled' && templateFiles.length > 0 ? (
           <div className="template-message">{ru.template.chooseAndAnalyze}</div>
@@ -1315,9 +1383,82 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             ) : null}
           </div>
         ) : null}
-        {!templateFetching && !templateAnalyzing && !templateScan && templateError ? (
+        {!templateFetching && !templateAnalyzing && !templateScan && visibleTemplateError ? (
           <div className="template-message template-message-warning">{ru.template.scanUnavailable}</div>
         ) : null}
+
+        {workspaceView === 'upload' ? <div className="upload-materials-row">
+          <div><span className="eyebrow">{ru.planning.sourceFiles}</span>
+            <strong>{ru.planning.materialsSummary(planningSelectedPaths.length, planningSourceFiles.length)}</strong>
+            <span className="upload-materials-note">{planningSourceFiles.length ? ru.planning.materialsOptional : ru.planning.uploadSources}</span>
+          </div>
+          <button className="quiet" onClick={() => sourceUploadRef.current?.click()} disabled={busy || planningGenerating || productWorkflowRunning}>
+            <FigmaIcon name="paperclip" />{ru.planning.addSources}
+          </button>
+        </div> : null}
+
+        {workspaceView === 'upload' ? <label className="upload-brief-field" htmlFor="upload-presentation-purpose">
+          <span>{ru.workspace.briefOnUpload}</span>
+          <textarea id="upload-presentation-purpose" value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)}
+            placeholder={ru.workspace.briefOnUploadPlaceholder} disabled={productWorkflowRunning || planningGenerating} />
+        </label> : null}
+
+        {templatePreparationPending ? <div className="template-progress" role="status" aria-live="polite">
+          <span>{ru.template.analyzing}</span>
+          <div className="template-progress-track"><i /></div>
+        </div> : null}
+
+        {workspaceView === 'upload' ? <div className="workspace-flow-actions upload-flow-actions">
+          <span>{templatePreparationReady ? ru.template.ready : templateBadgeLabel}</span>
+          <button className="primary icon-next" aria-label={ru.workspace.continueToTemplate} title={ru.workspace.continueToTemplate}
+            disabled={!templatePreparationReady} onClick={() => chooseWorkspaceView('template')}><FigmaIcon name="arrow-right" /></button>
+        </div> : null}
+
+        {workspaceView === 'template' && matchingScan && templateIR ? <section className="template-design-summary" aria-label={ru.template.designSystemSummary}>
+          <div className="template-summary-heading"><h3>{ru.template.designSystemSummary}</h3><span className="template-status status-ready">{templateBadgeLabel}</span></div>
+          <div className="template-metrics template-summary-metrics">
+            <div className="template-metric"><span>{ru.template.slides}</span><strong>{countLabel(templateIR, ['slides'], ['slideCount', 'summary.slideCount'])}</strong></div>
+            <div className="template-metric"><span>{ru.template.layouts}</span><strong>{ru.template.layoutCount(layouts.length)}</strong></div>
+            <div className="template-metric"><span>{ru.template.palette}</span><strong>{directColors.length || themeColors.length || '—'}</strong></div>
+            <div className="template-metric"><span>{ru.template.fonts}</span><strong>{fonts.length || '—'}</strong></div>
+          </div>
+          <div className="template-summary-grid">
+            <section className="template-summary-column">
+              <h4>{ru.template.palette}</h4>
+              {directColors.length || themeColors.length ? <div className="template-summary-palette">
+                {(directColors.length ? directColors : themeColors).slice(0, 12).map((color, index) => (
+                  <span className="template-summary-color" key={`${color.label}-${index}`} title={`${color.label}: ${color.value}`}>
+                    <i aria-hidden="true" style={safeColor(color.value) ? { backgroundColor: safeColor(color.value) as string } : undefined} />
+                    <small>{color.label}</small>
+                  </span>
+                ))}
+              </div> : <p className="template-muted">{ru.template.noPalette}</p>}
+              <h4>{ru.template.fonts}</h4>
+              <div className="template-summary-fonts">
+                {fonts.length ? fonts.map((font) => <span key={font}>{font}</span>) : <span>{ru.template.noFonts}</span>}
+                {fontSizes.map((size) => <span key={size}>{size} pt</span>)}
+              </div>
+            </section>
+            <section className="template-summary-column">
+              <h4>{ru.template.layouts}</h4>
+              <p>{ru.template.layoutCount(layouts.length)}</p>
+              {layouts.length ? <div className="template-summary-layouts">
+                {layouts.slice(0, 6).map((entry, index) => {
+                  const layout = record(entry);
+                  if (!layout) return null;
+                  const title = stringValue(firstValue(layout, ['matchingName', 'declaredName', 'name', 'title']), ru.template.layoutUnknown(index + 1));
+                  const usageCount = firstValue(layout, ['usageCount', 'slideUsageCount']);
+                  const roles = uniqueStrings(arrayValue(layout, ['placeholderRoles', 'structure.placeholderRoles']));
+                  return <article className="template-summary-layout" key={`${title}-${index}`}>
+                    <strong>{title}</strong>
+                    <span>{typeof usageCount === 'number' ? ru.template.usage(usageCount) : ru.template.usageUnknown}</span>
+                    {roles.length ? <small>{roles.slice(0, 3).join(' · ')}</small> : null}
+                  </article>;
+                })}
+              </div> : <p className="template-muted">{ru.template.noLayoutDetails}</p>}
+            </section>
+          </div>
+        </section> : null}
 
         {matchingScan && templateIR ? (
           <details className="advanced-tools template-report-disclosure">
@@ -1442,13 +1583,20 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
           </div>
           </details>
         ) : null}
+
+        {workspaceView === 'template' ? <div className="workspace-flow-actions">
+          <button className="quiet" onClick={() => chooseWorkspaceView('upload')}>{ru.workspace.back}</button>
+          <span>{templateBadgeLabel}</span>
+          <button className="primary icon-next" aria-label={ru.workspace.continueToBrief} title={ru.workspace.continueToBrief}
+            disabled={!templatePreparationReady} onClick={() => chooseWorkspaceView('brief')}><FigmaIcon name="arrow-right" /></button>
+        </div> : null}
       </section>
 
       <section className="planning-panel" id="planning-panel" aria-labelledby="planning-panel-title">
         <div className="planning-panel-head">
           <div>
             <span className="eyebrow">{ru.planning.eyebrow}</span>
-            <h2 id="planning-panel-title">{ru.planning.title}</h2>
+            <h2 id="planning-panel-title">{workspaceView === 'outline' ? ru.planning.outlineTitle : ru.planning.briefTitle}</h2>
             <p>{ru.planning.description}</p>
           </div>
           <div className="planning-head-actions">
@@ -1464,46 +1612,12 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
           </div>
         ) : null}
         {planningLoading && !planning ? <div className="planning-notice" role="status">{ru.planning.loading}</div> : null}
-        <ErrorNotice failure={planningError} className="error-banner planning-error" />
-        {productOperation || productWorkflowError ? <section className="product-workflow-card" aria-label={ru.workflow.action}>
-          <div className="product-workflow-controls">
-            {productOperation ? <span className={`product-workflow-status status-${productOperation.status}`} role="status" aria-live="polite">
-              {productOperation.status === 'running' ? productWorkflowStageLabel(productOperation.stage, productOperation.readySlides, productOperation.totalSlides)
-                : productWorkflowBusy ? ru.workflow.working
-                  : productOperation.status === 'ready' ? ru.workflow.stages.ready : ru.workflow.stages.failed}
-            </span> : null}
-          </div>
-          <ErrorNotice failure={productOperation?.status === 'ready' ? null : productWorkflowError} className="error-banner product-workflow-error" onRetry={() => void generatePresentation()} />
-          {productOperation?.status === 'failed' && productOperation.failure ? <ErrorNotice role="status" className="product-workflow-failure" failure={{
-            message: friendlyErrorMessage(productOperation.failure.code, 500, 'generation'),
-            code: productOperation.failure.code,
-          }} onRetry={() => void generatePresentation()} /> : null}
-          {productOperation?.contextualAudit ? <div className="product-contextual-audit" data-audit-source="contextual" role="status">
-            <strong>{ru.workflow.contextualAudit}: {productOperation.contextualAudit.status === 'ready'
-              ? ru.workflow.auditFindings(productOperation.contextualAudit.findings?.filter((finding) => finding.severity !== 'info').length ?? 0)
-              : ru.workflow.auditFailed}</strong>
-            {productOperation.contextualAudit.stale ? <p>{ru.workflow.auditStale}</p> : null}
-            {productOperation.contextualAudit.status === 'failed' ? <p>{friendlyErrorMessage(productOperation.contextualAudit.failureCode ?? undefined, 500, 'generic')}</p> : null}
-            <p>{ru.workflow.suggestionsOnly}</p>
-            {productOperation.contextualAudit.findings?.length ? <details>
-              <summary>{ru.planning.reviewLabel}</summary>
-              <ul>{productOperation.contextualAudit.findings.filter((finding) => finding.severity !== 'info').map((finding) => <li key={`${finding.ruleId}-${finding.slideId ?? 'deck'}`}>
-                <span>{ru.workflow.messages[finding.messageCode]}</span>
-                {finding.suggestedActionCode ? <small>{ru.workflow.actionMessages[finding.suggestedActionCode as keyof typeof ru.workflow.actionMessages]}</small> : null}
-                <small>{finding.slideId ? ru.workflow.slideLabel(planningSlides.findIndex((slide) => stringValue(record(slide)?.id) === finding.slideId) + 1) : ru.workflow.deckLabel}</small>
-              </li>)}</ul>
-            </details> : productOperation.contextualAudit.status === 'ready' ? <p>{ru.workflow.auditClean}</p> : null}
-            {productOperation.contextualAudit.status === 'failed' && productOperation.contextualAudit.telemetry?.validationFailureCode
-              ? <details><summary>{ru.errors.diagnostics}</summary><code>{ru.errors.code(productOperation.contextualAudit.telemetry.validationFailureCode)}</code></details> : null}
-            {productOperation.contextualAudit.stale || productOperation.contextualAudit.status === 'failed'
-              ? <button className="quiet" onClick={() => void repeatContextualAudit()} disabled={productWorkflowRunning}>{ru.workflow.auditRerun}</button> : null}
-          </div> : null}
-        </section> : null}
+        <ErrorNotice failure={visiblePlanningError} className="error-banner planning-error" />
         {planning?.status === 'stale' ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.stale}</div> : null}
         {planningDraftDirty ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.draftChanged}</div> : null}
-        {planningFailure?.message ? <ErrorNotice role="status" className="planning-notice planning-notice-warning" failure={{
-          message: friendlyErrorMessage(stringValue(planningFailure.code), 422, 'planning'),
-          ...(planningFailure.code ? { code: stringValue(planningFailure.code) } : {}),
+        {visiblePlanningFailure?.message ? <ErrorNotice role="status" className="planning-notice planning-notice-warning" failure={{
+          message: friendlyErrorMessage(stringValue(visiblePlanningFailure.code), 422, 'planning'),
+          ...(visiblePlanningFailure.code ? { code: stringValue(visiblePlanningFailure.code) } : {}),
         }} /> : null}
 
         <details className="advanced-tools planning-advanced">
@@ -1526,7 +1640,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
             <label className="planning-required-field">{ru.planning.purpose} <span aria-hidden="true">*</span>
               <textarea id="presentation-purpose" required maxLength={1000} value={briefPurpose} onChange={(event) => setBriefPurpose(event.target.value)} disabled={planningGenerating || productWorkflowRunning} rows={3} placeholder={ru.planning.purposePlaceholder} />
             </label>
-            <details className="advanced-tools optional-settings">
+          <details className="advanced-tools optional-settings">
               <summary>{ru.planning.optionalSettings}</summary>
               <div className="advanced-tools-content">
             <label>{ru.planning.audience}
@@ -1580,7 +1694,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
           </div>
         </div>
 
-        {planningWarnings.length || planningDeckPlan || planningReview ? <details className="advanced-tools planning-review-advanced">
+        {planningWarnings.length || planningDeckPlan || planningReview ? <details className="advanced-tools planning-review-advanced" open={workspaceView === 'outline'}>
           <summary>{ru.planning.planDetails}</summary>
           <div className="advanced-tools-content">
         {planningWarnings.length ? (
@@ -1648,6 +1762,17 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         ) : null}
           </div>
         </details> : null}
+
+        {workspaceView === 'brief' ? <div className="workspace-flow-actions brief-flow-actions">
+          <button className="quiet" onClick={() => chooseWorkspaceView('template')}>{ru.workspace.back}</button>
+          <span>{ru.planning.requiredTaskNote}</span>
+        </div> : null}
+        {workspaceView === 'outline' ? <div className="workspace-flow-actions outline-flow-actions">
+          <button className="quiet" onClick={() => chooseWorkspaceView('brief')}>{ru.planning.editBrief}</button>
+          <span>{planningSlides.length ? ru.planning.slideCountLabel(planningSlides.length) : ru.planning.generatedTitle}</span>
+          <button className="primary icon-next" aria-label={ru.workflow.action} title={ru.workflow.action}
+            disabled={!savedPlanReady || planningDraftDirty || productWorkflowRunning} onClick={() => void generatePresentation()}><FigmaIcon name="arrow-right" /></button>
+        </div> : null}
       </section>
 
       <PresentationGenerationPanel
@@ -1658,6 +1783,13 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         planHash={stringValue(firstValue(planningDeckPlan, ['hash']))}
         contentIRHash={stringValue(firstValue(contentIR, ['hash']))}
         templateIRHash={stringValue(firstValue(templateIR, ['hash']))}
+        view={workspaceView}
+        productOperation={productOperation}
+        auditRefreshError={auditRefreshError}
+        auditBusy={productWorkflowBusy}
+        onRepeatContextualAudit={() => void repeatContextualAudit()}
+        onRetryWorkflow={() => void generatePresentation()}
+        onViewChange={chooseWorkspaceView}
         onStateChange={reportGenerationState}
       />
 
@@ -1740,23 +1872,33 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
         </section>
       </div>
       </details>
+      </div>
     </main>
   );
 }
 
-function PresentationGenerationPanel({ projectId, planningReady, inputFingerprint, planHash, contentIRHash, templateIRHash, onStateChange }: {
+function PresentationGenerationPanel({ projectId, planningReady, inputFingerprint, planHash, contentIRHash, templateIRHash, view, productOperation, auditRefreshError, auditBusy, onRepeatContextualAudit, onRetryWorkflow, onViewChange, onStateChange }: {
   projectId: string;
   planningReady: boolean;
   inputFingerprint: string | null;
   planHash: string;
   contentIRHash: string;
   templateIRHash: string;
-  onStateChange: (complete: boolean, exported: boolean) => void;
+  view: WorkspaceView;
+  productOperation: ProductWorkflowOperation | null;
+  auditRefreshError: UiFailure | null;
+  auditBusy: boolean;
+  onRepeatContextualAudit: () => void;
+  onRetryWorkflow: () => void;
+  onViewChange: (view: WorkspaceView) => void;
+  onStateChange: (complete: boolean, exported: boolean, status?: string | null) => void;
 }) {
   const [generation, setGeneration] = useState<GenerationState | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<UiFailure | null>(null);
+  const [errorOrigin, setErrorOrigin] = useState<'start' | 'action' | null>(null);
+  const [activeSlideId, setActiveSlideId] = useState<string | null>(null);
   const generationRef = useRef<GenerationState | null>(null);
   const idempotencyRef = useRef<string | null>(null);
   const activeRef = useRef(false);
@@ -1770,7 +1912,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
 
   useEffect(() => {
     const isCurrent = matchesCurrentInputs(generation);
-    onStateChange(Boolean(isCurrent && generation?.status === 'completed'), Boolean(isCurrent && generation?.exports.length));
+    onStateChange(Boolean(isCurrent && generation?.status === 'completed'), Boolean(isCurrent && generation?.exports.length), generation?.status);
   }, [contentIRHash, generation?.exports.length, generation?.generationId, generation?.status, inputFingerprint, onStateChange, planHash, templateIRHash]);
 
   const apply = useCallback((next: GenerationState | null) => {
@@ -1796,7 +1938,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
     }
   }, [apply, projectId]);
 
-  useEffect(() => { void load(); }, [load, projectId]);
+  useEffect(() => { void load(); }, [load, projectId, productOperation?.generationId]);
 
   useEffect(() => {
     if (!generation || !activeRef.current) return;
@@ -1825,8 +1967,12 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
   const withBusy = async (key: string, operation: () => Promise<void>) => {
     setBusy(key);
     setError(null);
+    setErrorOrigin(null);
     try { await operation(); }
-    catch (err) { setError(uiFailure(err, ru.errors.render)); }
+    catch (err) {
+      setError(uiFailure(err, ru.errors.render));
+      setErrorOrigin(key === 'start' ? 'start' : 'action');
+    }
     finally { setBusy(null); }
   };
 
@@ -1899,151 +2045,284 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
 
   const isActive = generation?.status === 'preparing' || generation?.status === 'generating';
   const currentGeneration = matchesCurrentInputs(generation);
+  const auditOnlyWorkflowFailure = productOperation?.status === 'failed'
+    && productOperation.failure?.stage === 'contextual_audit' && Boolean(productOperation.generationId);
+  const generationStatusClass = auditOnlyWorkflowFailure && currentGeneration && generation?.status === 'completed'
+    ? 'completed' : productOperation?.status ?? generation?.status ?? 'idle';
   const canExport = currentGeneration && generation?.status === 'completed' && generation.readySlides === generation.totalSlides;
   const canChooseTrack = Boolean(generation?.slides.length) && generation!.slides.every((pack) => pack.status === 'ready'
     && ['A', 'B', 'C'].every((variant) => pack.variants[variant as GenerationVariantId]?.status === 'ready'));
+  const visibleGenerationError = visibleGenerationOperationError(error, errorOrigin,
+    currentGeneration && generation?.status === 'completed' ? 'completed'
+      : currentGeneration && generation?.status === 'failed' && generation.failure ? 'failed' : null);
+  const visibleGenerationFailure = visiblePersistedFailure(generation?.failure, generation?.status);
+  const activePack = generation?.slides.find((pack) => pack.slideId === activeSlideId)
+    ?? generation?.slides.find((pack) => pack.slideId === generation?.currentSlideId)
+    ?? generation?.slides[0]
+    ?? null;
+  const activeVariant = activePack?.variants[activePack.selectedVariant] ?? null;
+  const showAuditTransportFailure = Boolean(auditRefreshError || productOperation?.contextualAudit?.status === 'failed');
+  const currentWorkflowLabel = productOperation?.status === 'running'
+    ? productWorkflowStageLabel(productOperation.stage, productOperation.readySlides, productOperation.totalSlides)
+    : currentGeneration && generation?.status === 'completed'
+      ? ru.workflow.stages.ready
+      : generation?.status === 'generating' || generation?.status === 'preparing'
+        ? productWorkflowStageLabel('generating', generation.readySlides, generation.totalSlides)
+        : productOperation?.status === 'failed' && !(productOperation.failure?.stage === 'contextual_audit' && productOperation.generationId)
+          ? ru.workflow.stages.failed
+          : generation?.status === 'failed' ? generationStatusLabel(generation.status)
+            : loading ? ru.generation.loading : planningReady ? ru.planning.readyToGenerate : ru.planning.waiting;
+  const realProgress = productOperation?.status === 'running' && productOperation.stage === 'generating'
+      && productOperation.totalSlides && productOperation.totalSlides > 0
+      ? Math.max(0, Math.min(100, productOperation.readySlides / productOperation.totalSlides * 100))
+      : currentGeneration && generation && generation.totalSlides > 0
+        ? Math.max(0, Math.min(100, generation.readySlides / generation.totalSlides * 100))
+        : null;
+
+  const workflowFailure = productOperation?.status === 'failed' && !auditOnlyWorkflowFailure ? productOperation.failure : null;
+  const canEditVariants = currentGeneration && canChooseTrack;
+  const activePreviewUrl = activeVariant?.previewUrl ? activeVariant.previewUrl + '?v=' + activeVariant.version : null;
+  const contextualFindings = productOperation?.contextualAudit?.findings ?? [];
+  const contextualAudit = productOperation?.contextualAudit ?? null;
+  const viewTitle = view === 'progress' ? currentWorkflowLabel : view === 'audit' ? ru.workflow.reviewTitle : ru.workflow.editSlides;
 
   return (
-    <section className="generation-panel" id="generation-panel" aria-labelledby="generation-panel-title">
+    <section className="generation-panel" id="generation-panel" data-view={view} aria-labelledby="generation-panel-title">
       <div className="generation-panel-head">
         <div>
-      <span className="eyebrow">{ru.generation.eyebrow}</span>
-          <h2 id="generation-panel-title">{canExport ? ru.generation.resultReady : ru.generation.title}</h2>
-          <p>{canExport ? ru.generation.resultSummary(generation?.totalSlides ?? 0) : ru.generation.description}</p>
+          <span className="eyebrow">{view === 'audit' ? ru.workflow.audit : ru.generation.eyebrow}</span>
+          <h2 id="generation-panel-title">{view === 'audit' ? viewTitle : view === 'editor' && canExport ? ru.generation.resultReady : viewTitle}</h2>
+          <p>{view === 'progress' ? ru.workflow.working : view === 'audit' ? ru.workflow.suggestionsOnly
+            : canExport ? ru.generation.resultSummary(generation?.totalSlides ?? 0) : ru.generation.description}</p>
         </div>
         <div className="generation-actions">
-          {isActive ? <button className="quiet" onClick={() => void cancel()} disabled={Boolean(busy)}>{ru.generation.cancel}</button>
-            : <details className="advanced-tools generation-advanced">
-              <summary>{ru.workspace.advancedMode}</summary>
-              <button className="primary" onClick={() => void start()} disabled={!planningReady || loading || Boolean(busy) || currentGeneration && (generation?.status === 'completed' || generation?.status === 'cancelled')}>
-                {currentGeneration && generation?.status === 'failed' ? ru.generation.resume : currentGeneration && generation?.status === 'completed' ? ru.generation.generated : ru.generation.generate}
-              </button>
-            </details>}
-          <span className={`generation-status generation-status-${generation?.status ?? 'idle'}`} role="status">
-            {loading ? ru.generation.loading : generation?.status === 'completed' && !currentGeneration ? ru.planning.planChanged : generation ? generationStatusLabel(generation.status) : planningReady ? ru.planning.readyToGenerate : ru.planning.waiting}
+          <span className={'generation-status generation-status-' + generationStatusClass} role="status">
+            {loading ? ru.generation.loading : currentWorkflowLabel}
           </span>
+          {isActive ? <button className="quiet" onClick={() => void cancel()} disabled={Boolean(busy)}>{ru.generation.cancel}</button> : null}
+          {view === 'progress' && productOperation?.status === 'failed' && !auditOnlyWorkflowFailure
+            ? <button className="primary" onClick={onRetryWorkflow} disabled={Boolean(busy)}>{ru.errors.retry}</button> : null}
+          {view === 'progress' && generation?.status === 'completed' && currentGeneration
+            ? <button className="primary" onClick={() => onViewChange('editor')}>{ru.workflow.openResult}</button> : null}
+          {view === 'editor' ? <button className="quiet" onClick={() => onViewChange('audit')}>{ru.workflow.openAudit}</button> : null}
+          {view === 'audit' ? <button className="quiet" onClick={() => onViewChange('editor')}>{ru.workflow.openEditor}</button> : null}
+          {view === 'progress' && !isActive && productOperation?.status !== 'failed'
+            ? <button className="quiet" onClick={() => onViewChange('outline')}>{ru.planning.editBrief}</button> : null}
         </div>
       </div>
 
-      <ErrorNotice failure={error} className="generation-error" />
-      {generation?.failure ? <ErrorNotice role="status" className="generation-notice" failure={{
-        message: friendlyErrorMessage(generation.failure.code, 500, 'generation'), code: generation.failure.code,
-      }} onRetry={generation.failure.code === 'VARIANTS_NOT_DISTINCT' ? undefined : () => void start()} /> : null}
+      {workflowFailure ? <ErrorNotice role="status" className="generation-notice" failure={{
+        message: ru.workflow.workflowFailed, ...(workflowFailure.code ? { code: workflowFailure.code } : {}),
+      }} onRetry={workflowFailure.retryable ? onRetryWorkflow : undefined} /> : null}
+      <ErrorNotice failure={visibleGenerationError} className="generation-error" />
+      {visibleGenerationFailure ? <ErrorNotice role="status" className="generation-notice" failure={{
+        message: friendlyErrorMessage(visibleGenerationFailure.code, 500, 'generation'),
+        ...(visibleGenerationFailure.code ? { code: visibleGenerationFailure.code } : {}),
+      }} onRetry={visibleGenerationFailure.code === 'VARIANTS_NOT_DISTINCT' ? undefined : () => void start()} /> : null}
+      {view === 'progress' && showAuditTransportFailure && productOperation?.contextualAudit?.status === 'failed'
+        ? <div className="audit-transport-note" role="status">{ru.workflow.contextualFailed}</div> : null}
+      {generation && !currentGeneration ? <div className="planning-notice planning-notice-warning" role="status">{ru.workflow.previousGeneration}</div> : null}
 
-      {generation ? <>
-        <div className="generation-progress-row" role="status" aria-live="polite">
-          <strong>{ru.generation.slideProgress(generation.readySlides, generation.totalSlides)}</strong>
-          <span>{generation.currentSlideId ? ru.generation.workingOnSlide(generation.slides.find((pack) => pack.slideId === generation.currentSlideId)?.index) : generationStatusLabel(generation.status)}</span>
+      {view === 'progress' ? (
+        <div className="workflow-progress-shell" role="status" aria-live="polite" aria-busy={isActive || productOperation?.status === 'running'}>
+          <div className="workflow-progress-copy">
+            <strong>{currentWorkflowLabel}</strong>
+            {productOperation?.status === 'running' && productOperation.stage === 'generating'
+              && productOperation.totalSlides && productOperation.totalSlides > 0
+              ? <span>{ru.generation.slideProgress(productOperation.readySlides, productOperation.totalSlides)}</span>
+              : currentGeneration && generation && generation.totalSlides > 0 && productOperation?.status !== 'running'
+                ? <span>{ru.generation.slideProgress(generation.readySlides, generation.totalSlides)}</span>
+                : <span>{productOperation?.status === 'failed' ? ru.workflow.workflowFailed : ru.workflow.working}</span>}
+          </div>
+          <div className="workflow-progress-track" role="progressbar" aria-label={currentWorkflowLabel}
+            aria-valuemin={0} aria-valuemax={100} aria-valuenow={realProgress ?? undefined} data-indeterminate={realProgress === null}>
+            <i style={realProgress === null ? undefined : { width: realProgress + '%' }} />
+          </div>
+          {generation?.slides.length && (productOperation?.status !== 'running' || productOperation.generationId === generation.generationId) ? <ol className="workflow-slide-status-list">
+            {generation.slides.map((pack) => <li key={pack.slideId}>
+              <span className="workflow-slide-index">{String(pack.index).padStart(2, '0')}</span>
+              <span className="workflow-slide-title">{pack.title}</span>
+              <span className={'workflow-slide-state pack-status-' + pack.status}>{slidePackStatusLabel(pack.status, pack.failure?.code)}</span>
+            </li>)}
+          </ol> : null}
+          {!generation && !productOperation ? <p className="generation-empty-hint">{ru.generation.noGeneration}</p> : null}
         </div>
-        <div className="generation-track-picker" role="group" aria-label={ru.generation.defaultTrack}>
-          <span>{ru.generation.defaultTrack}</span>
-          {(['A', 'B', 'C'] as const).map((variant) => <button key={variant} className={generation.defaultTrack === variant ? 'active' : ''}
-            aria-pressed={generation.defaultTrack === variant} disabled={!canChooseTrack || Boolean(busy)} onClick={() => chooseTrack(variant)}>
-            {ru.generation.track(variant, variant === 'A')}
-          </button>)}
-        </div>
-        <div className="generation-slide-list">
-          {generation.slides.map((pack) => <article className="generation-slide-card" key={pack.slideId} aria-labelledby={`generation-slide-${pack.index}`}>
-            <div className="generation-slide-heading">
-              <div><span>{ru.generation.slide(String(pack.index).padStart(2, '0'))}</span><h3 id={`generation-slide-${pack.index}`}>{pack.title}</h3></div>
-              <div className={`generation-pack-status pack-status-${pack.status}`} role="status">{slidePackStatusLabel(pack.status, pack.failure?.code)}</div>
+      ) : null}
+
+      {(view === 'editor' || view === 'audit') ? generation?.slides.length ? (
+        <div className={'presentation-editor' + (view === 'audit' ? ' presentation-audit-editor' : '')}>
+          <nav className="editor-slide-rail" aria-label={ru.workflow.chooseSlide}>
+            {generation.slides.map((pack) => {
+              const selected = pack.variants[pack.selectedVariant];
+              const preview = selected?.previewUrl ? selected.previewUrl + '?v=' + selected.version : null;
+              return <button type="button" key={pack.slideId}
+                className={'editor-slide-thumb' + (activePack?.slideId === pack.slideId ? ' active' : '')}
+                aria-current={activePack?.slideId === pack.slideId ? 'true' : undefined}
+                onClick={() => setActiveSlideId(pack.slideId)}>
+                <span>{String(pack.index).padStart(2, '0')}</span>
+                {preview ? <img src={preview} alt="" /> : <span className="editor-thumb-empty">{ru.workflow.slidePreviewUnavailable}</span>}
+                <strong>{pack.title}</strong>
+              </button>;
+            })}
+          </nav>
+          <div className="editor-canvas-column">
+            <div className="editor-canvas">
+              {activePreviewUrl ? <img src={activePreviewUrl} alt={ru.generation.previewAlt(activePack?.index ?? 0, activePack?.selectedVariant ?? 'A')} />
+                : <div className="editor-preview-empty" role="status">{ru.workflow.slidePreviewUnavailable}</div>}
             </div>
-            {pack.failure?.code === 'VARIANTS_NOT_DISTINCT' ? <p className="generation-notice" role="status">{ru.generation.withheldReason}</p> : null}
-            <div className="generation-variants">
+            {view === 'audit' && activePack ? <div className="audited-slide-caption">
+              <span>{ru.workflow.slideLabel(activePack.index)}</span><strong>{activePack.title}</strong>
+            </div> : null}
+            {view === 'editor' && activePack ? <div className="editor-variant-grid" role="group" aria-label={ru.generation.defaultTrack}>
               {(['A', 'B', 'C'] as const).map((variant) => {
-                const item = pack.variants[variant];
-                const audit = item.audit?.findings ?? [];
-                const unavailablePack = pack.failure?.code === 'VARIANTS_NOT_DISTINCT';
-                const visibleVariantStatus = unavailablePack ? 'withheld' : item.status;
-                const variantReady = pack.status === 'ready' && item.status === 'ready';
-                return <section className={`generation-variant ${pack.selectedVariant === variant ? 'selected' : ''}`} key={variant} aria-label={ru.generation.slideVariantLabel(pack.index, variant)}>
-                  <div className="generation-variant-heading">
-                    <strong>{ru.generation.variant(variant)}</strong>
-                    {pack.recommendedVariant === variant ? <span className="recommended-mark">{ru.generation.recommended}</span> : null}
-                    {pack.lockedVariant === variant ? <span className="locked-mark">{ru.generation.locked(variant)}</span> : null}
-                    <span className="variant-status" data-status={visibleVariantStatus}>{variantStatusLabel(visibleVariantStatus)}</span>
-                  </div>
-                  {item.previewUrl ? <img className="generation-preview" src={`${item.previewUrl}?v=${item.version}`} alt={ru.generation.previewAlt(pack.index, variant)} />
-                    : <div className="generation-preview-empty" role="status">{unavailablePack ? ru.generation.withheldReason : pack.status === 'rendering' ? ru.generation.preparingPreview : item.status === 'failed' ? ru.generation.noPreview : variantStatusLabel(item.status)}</div>}
-                  <div className="generation-variant-meta">
-                    <span>{item.visualSlotStatus === 'not-applicable' ? ru.generation.textSlide : ru.generation.visual(ru.status[item.visualSlotStatus as keyof typeof ru.status] ?? ru.status.unknown)}</span>
-                    <LayoutEvidenceNotes item={item} />
-                    <span>{ru.generation.auditCounts(audit.length)}</span>
-                  </div>
-                  <button className={pack.selectedVariant === variant ? 'primary generation-select' : 'quiet generation-select'}
-                    aria-pressed={pack.selectedVariant === variant} disabled={!variantReady || Boolean(busy)}
-                    onClick={() => chooseSlide(pack, variant)}>
-                    {pack.selectedVariant === variant ? ru.generation.selected(variant) : ru.generation.choose(variant)}
+                const item = activePack.variants[variant];
+                const available = activePack.status === 'ready' && item.status === 'ready' && Boolean(item.previewUrl);
+                return <article className={'editor-variant-card' + (activePack.selectedVariant === variant ? ' selected' : '')} key={variant}>
+                  <button type="button" className="editor-variant-preview" disabled={!item.previewUrl}
+                    onClick={() => setActiveSlideId(activePack.slideId)} aria-label={ru.generation.slideVariantLabel(activePack.index, variant)}>
+                    {item.previewUrl ? <img src={item.previewUrl + '?v=' + item.version} alt={ru.generation.previewAlt(activePack.index, variant)} />
+                      : <span>{ru.workflow.slidePreviewUnavailable}</span>}
                   </button>
-                </section>;
+                  <div className="editor-variant-card-footer">
+                    <strong>{ru.generation.variant(variant)}</strong>
+                    {activePack.recommendedVariant === variant ? <span className="recommended-mark">{ru.generation.recommended}</span> : null}
+                    <button type="button" className={activePack.selectedVariant === variant ? 'primary' : 'quiet'}
+                      disabled={!available || !canEditVariants || Boolean(busy)} aria-pressed={activePack.selectedVariant === variant}
+                      onClick={() => chooseSlide(activePack, variant)}>
+                      {activePack.selectedVariant === variant ? ru.generation.selected(variant) : ru.generation.choose(variant)}
+                    </button>
+                  </div>
+                </article>;
               })}
-            </div>
-            <div className="generation-slide-footer">
-              <span className="generation-audit-badge" data-errors={pack.auditSummary.errors > 0} aria-label={ru.generation.audit}>
-                {ru.generation.auditSummary(pack.auditSummary.errors, pack.auditSummary.warnings)}
-              </span>
-              <button className="quiet" disabled={pack.status !== 'ready' || Boolean(busy)} onClick={() => toggleLock(pack)}>
-                {pack.lockedVariant ? ru.generation.unlock(pack.lockedVariant) : ru.generation.lock(pack.selectedVariant)}
-              </button>
-              <details className="generation-audit" data-audit-source="deterministic" id={pack.index === 1 ? 'generation-review' : undefined}>
-                <summary>{ru.generation.deterministicAudit}</summary>
-                {pack.variants[pack.selectedVariant].audit?.findings?.length ? <ul>
-                  {pack.variants[pack.selectedVariant].audit?.findings?.map((findingValue, index) => {
-                    const finding = record(findingValue);
+            </div> : null}
+          </div>
+          <aside className={'editor-inspector' + (view === 'audit' ? ' audit-inspector' : '')}>
+            {view === 'audit' ? <>
+              <section data-audit-source="contextual" aria-labelledby="contextual-audit-title">
+                <div className="audit-panel-heading">
+                  <div><span className="eyebrow">{ru.workflow.audit}</span><h3 id="contextual-audit-title">{ru.workflow.reviewTitle}</h3></div>
+                  <button type="button" className="quiet compact" disabled={auditBusy || Boolean(busy) || productOperation?.status === 'running'}
+                    onClick={onRepeatContextualAudit}>{ru.workflow.retryAudit}</button>
+                </div>
+                {auditRefreshError ? <ErrorNotice failure={auditRefreshError} className="generation-error" /> : null}
+                {contextualAudit?.status === 'failed' ? <div className="audit-transport-note" role="status">
+                  {ru.workflow.auditTransportUnavailable}
+                  {contextualAudit.failureCode ? <details className="diagnostic-details"><summary>{ru.template.diagnosticLabel}</summary><code>{contextualAudit.failureCode}</code></details> : null}
+                </div> : contextualAudit?.status === 'ready' ? <>
+                  {contextualAudit.stale ? <div className="planning-notice planning-notice-warning">{ru.workflow.auditStale}</div> : null}
+                  {contextualFindings.filter((finding) => !finding.slideId || finding.slideId === activePack?.slideId).length ? <ul className="contextual-audit-list">
+                    {contextualFindings.filter((finding) => !finding.slideId || finding.slideId === activePack?.slideId).map((finding, index) => (
+                      <li key={finding.ruleId + '-' + index} className={'audit-finding severity-' + finding.severity}>
+                        <span className="finding-severity">{ru.planning.findingSeverity(finding.severity)}</span>
+                        <div><strong>{finding.slideId ? ru.workflow.slideLabel(activePack?.index ?? 0) : ru.workflow.deckLabel}</strong>
+                          <p>{ru.workflow.messages[finding.messageCode]}</p>
+                          {finding.evidenceRefs.length ? <details><summary>{ru.workflow.findings}</summary><code>{finding.evidenceRefs.join(' · ')}</code></details> : null}
+                        </div>
+                      </li>
+                    ))}
+                  </ul> : <p className="planning-muted">{ru.workflow.noContextualFindings}</p>}
+                </> : <p className="planning-muted">{ru.workflow.auditResultsUnavailable}</p>}
+              </section>
+              <section className="audit-inspector-deterministic" data-audit-source="deterministic" aria-labelledby="deterministic-audit-title">
+                <div className="audit-panel-heading"><div><span className="eyebrow">{ru.generation.audit}</span><h3 id="deterministic-audit-title">{ru.workflow.deterministicAudit}</h3></div></div>
+                {activePack && activeVariant?.audit?.findings?.length ? <ul className="deterministic-audit-findings">
+                  {activeVariant.audit.findings.map((value, index) => {
+                    const finding = record(value);
                     const findingId = stringValue(firstValue(finding, ['id']));
                     const rule = stringValue(firstValue(finding, ['ruleId']), 'audit');
+                    const rawSeverity = stringValue(firstValue(finding, ['severity', 'level']), 'info');
+                    const severity = rawSeverity === 'error' || rawSeverity === 'warning' || rawSeverity === 'info' ? rawSeverity : 'info';
                     const safeFix = firstValue(finding, ['autofixAvailable']) === true;
-                    return <li key={`${findingId}-${index}`}>
-                      <span>{auditFindingMessage(rule)}</span>
-                      {safeFix ? <button className="quiet compact" disabled={Boolean(busy)} onClick={() => repair(pack, pack.selectedVariant, findingId)}>{ru.generation.applyFix}</button> : <small>{ru.generation.replan}</small>}
+                    return <li className={'audit-finding severity-' + severity} key={findingId + '-' + index}>
+                      <span className="finding-severity">{ru.planning.findingSeverity(severity)}</span>
+                      <div><p>{auditFindingMessage(rule)}</p>
+                        {safeFix ? <button type="button" className="quiet compact" disabled={!currentGeneration || Boolean(busy) || !findingId} onClick={() => repair(activePack, activePack.selectedVariant, findingId)}>{ru.generation.applyFix}</button>
+                          : <small>{ru.workflow.replan}</small>}
+                      </div>
                     </li>;
                   })}
-                </ul> : <p>{ru.generation.noAuditFindings}</p>}
+                </ul> : <div className="audit-pass-note"><strong>{ru.generation.auditSummary(0, 0)}</strong><p>{ru.generation.noAuditFindings}</p></div>}
+              </section>
+            </> : activePack ? <>
+              <span className="eyebrow">{ru.generation.slide(String(activePack.index).padStart(2, '0'))}</span>
+              <h3>{activePack.title}</h3>
+              <span className={'generation-pack-status pack-status-' + activePack.status}>{slidePackStatusLabel(activePack.status, activePack.failure?.code)}</span>
+              <div className="editor-audit-summary"><strong>{ru.workflow.deterministicAudit}</strong>
+                <span className="generation-audit-badge" data-errors={activePack.auditSummary.errors > 0}>
+                  {ru.generation.auditSummary(activePack.auditSummary.errors, activePack.auditSummary.warnings)}
+                </span>
+              </div>
+              <button type="button" className="quiet editor-lock-button" disabled={!canEditVariants || activePack.status !== 'ready' || Boolean(busy)}
+                onClick={() => toggleLock(activePack)}>
+                {activePack.lockedVariant ? ru.generation.unlock(activePack.lockedVariant) : ru.generation.lock(activePack.selectedVariant)}
+              </button>
+              <details className="advanced-tools editor-audit-details">
+                <summary>{ru.workflow.deterministicAudit}</summary>
+                {activeVariant?.audit?.findings?.length ? <ul>{activeVariant.audit.findings.map((value, index) => {
+                  const finding = record(value);
+                  const findingId = stringValue(firstValue(finding, ['id']));
+                  const rule = stringValue(firstValue(finding, ['ruleId']), 'audit');
+                  const safeFix = firstValue(finding, ['autofixAvailable']) === true;
+                  return <li key={findingId + '-' + index}>
+                    <span>{auditFindingMessage(rule)}</span>
+                    {safeFix ? <button type="button" className="quiet compact" disabled={!currentGeneration || Boolean(busy) || !findingId} onClick={() => repair(activePack, activePack.selectedVariant, findingId)}>{ru.generation.applyFix}</button>
+                      : <small>{ru.workflow.replan}</small>}
+                  </li>;
+                })}</ul> : <p>{ru.generation.noAuditFindings}</p>}
               </details>
-            </div>
-            {pack.failure && pack.failure.code !== 'VARIANTS_NOT_DISTINCT' ? <ErrorNotice role="status" className="generation-notice" failure={{
-              message: friendlyErrorMessage(pack.failure.code, 422, 'generation'), code: pack.failure.code,
-            }} /> : null}
-          </article>)}
+            </> : <p className="generation-empty-hint">{ru.workflow.chooseSlide}</p>}
+          </aside>
         </div>
+      ) : <p className="generation-empty-hint">{ru.generation.noGeneration}</p> : null}
 
-        <section className="generation-export" aria-labelledby="generation-export-title">
-          <div><span className="eyebrow">{ru.generation.exportTitle}</span><h3 id="generation-export-title">{ru.generation.exportHeading}</h3>
+      {(view === 'editor' || view === 'audit') && generation ? (
+        <section className="generation-export generation-export-compact" aria-label={ru.generation.exportTitle}>
+          <div><span className="eyebrow">{ru.generation.exportTitle}</span><h3>{ru.generation.exportHeading}</h3>
             <p>{ru.generation.exportDescription}</p></div>
+          <div className="generation-export-actions">
+            <button type="button" className="primary" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'pptx')}>
+              {busy === 'export-selected-pptx' ? ru.generation.assembling : ru.generation.downloadPptx}
+            </button>
+            <button type="button" className="quiet" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'pdf')}>{ru.generation.downloadPdf}</button>
+            <button type="button" className="quiet" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'html')}>{ru.generation.downloadHtml}</button>
+          </div>
+          {generation.exports.length ? <ul className="generation-export-list">{generation.exports.map((artifact) => <li key={artifact.id}>
+            <a href={artifact.downloadUrl} download>{ru.generation.exportAction(artifact.mode, artifact.format ?? 'pptx')}</a>
+            <span>{ru.generation.validated}</span>
+          </li>)}</ul> : null}
+        </section>
+      ) : null}
+      {(view === 'editor' || view === 'progress') && generation ? (
+        <details className="advanced-tools generation-advanced"><summary>{ru.workspace.advancedMode}</summary>
+          <div className="advanced-tools-content"><div className="generation-track-picker" role="group" aria-label={ru.generation.defaultTrack}>
+            <span>{ru.generation.defaultTrack}</span>
+            {(['A', 'B', 'C'] as const).map((variant) => <button type="button" key={variant} className={generation.defaultTrack === variant ? 'active' : ''}
+              aria-pressed={generation.defaultTrack === variant} disabled={!canEditVariants || Boolean(busy)} onClick={() => chooseTrack(variant)}>
+              {ru.generation.track(variant, variant === 'A')}
+            </button>)}
+          </div>
           <div className="selected-export">
             <span className="selected-export-label">{ru.generation.editablePowerPoint}</span>
-            <div className="generation-export-actions">
-              <button className="primary" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'pptx')}>
-                {busy === 'export-selected-pptx' ? ru.generation.assembling : ru.generation.downloadPptx}
-              </button>
-              <button className="quiet" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'pdf')}>{ru.generation.downloadPdf}</button>
-              <button className="quiet" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck('selected', 'html')}>{ru.generation.downloadHtml}</button>
-            </div>
+            <button className="quiet" onClick={() => void start()}
+              disabled={!planningReady || loading || Boolean(busy) || currentGeneration && (generation?.status === 'completed' || generation?.status === 'cancelled')}>
+              {currentGeneration && generation?.status === 'failed' ? ru.generation.resume : ru.generation.generate}
+            </button>
           </div>
           <details className="advanced-tools variant-exports">
             <summary>{ru.generation.otherVariants}</summary>
             <div className="advanced-tools-content">
               {(['A', 'B', 'C'] as const).map((mode) => <div className="variant-export-row" key={mode}>
                 <strong>{ru.generation.variant(mode)}</strong>
-                {(['pptx', 'pdf', 'html'] as const).map((format) => <button key={format} className="quiet" disabled={!canExport || Boolean(busy)} onClick={() => exportDeck(mode, format)}>
-                  {busy === `export-${mode}-${format}` ? ru.generation.assembling : ru.generation.exportAction(mode, format)}
+                {(['pptx', 'pdf', 'html'] as const).map((format) => <button key={format} className="quiet"
+                  disabled={!canExport || Boolean(busy)} onClick={() => exportDeck(mode, format)}>
+                  {busy === 'export-' + mode + '-' + format ? ru.generation.assembling : ru.generation.exportAction(mode, format)}
                 </button>)}
               </div>)}
-              {generation.exports.some((artifact) => artifact.mode !== 'selected') ? <>
-                <strong className="previous-downloads-heading">{ru.generation.previousDownloads}</strong>
-                <ul className="generation-export-list">{generation.exports.filter((artifact) => artifact.mode !== 'selected').map((artifact) => <li key={artifact.id}>
-                  <a href={artifact.downloadUrl} download>{ru.generation.exportAction(artifact.mode, artifact.format ?? 'pptx')}</a>
-                  <span>{ru.generation.validated}</span>
-                </li>)}</ul>
-              </> : null}
             </div>
           </details>
-          {generation.exports.some((artifact) => artifact.mode === 'selected') ? <ul className="generation-export-list">{generation.exports.filter((artifact) => artifact.mode === 'selected').map((artifact) => <li key={artifact.id}>
-            <a href={artifact.downloadUrl} download>{artifact.format === 'pdf' ? ru.generation.downloadPdf : artifact.format === 'html' ? ru.generation.downloadHtml : ru.generation.downloadPptx}</a>
-            <span>{ru.generation.validated}</span>
-          </li>)}</ul> : null}
-        </section>
-      </> : <p className="generation-empty-hint">{ru.generation.noGeneration}</p>}
+          </div>
+        </details>
+      ) : null}
     </section>
   );
 }
