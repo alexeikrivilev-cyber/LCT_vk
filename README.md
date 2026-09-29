@@ -16,4 +16,4 @@
 
 ## Публикация GitHub Pages
 
-Для этой ветки достаточно выбрать GitHub Pages deployment из `gh-pages` и корневую папку `/`. Подробные шаги приведены в задаче публикации.
+В настройках репозитория откройте **Settings → Pages → Build and deployment**. Выберите **Deploy from a branch**, ветку `gh-pages`, папку `/ (root)` и нажмите **Save**. После публикации прототип будет доступен по адресу `https://alexeikrivilev-cyber.github.io/LCT_vk/`.
