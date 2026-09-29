@@ -24,6 +24,7 @@
 - [Варианты deployment](./deployment/overview.md)
 - [Inference boundary](../INFERENCE.md), [self-hosted runtime](../services/inference/README.md)
 - [RunPod startup runbook](./RUNPOD_STARTUP_RUNBOOK.md) — только для необязательного self-hosted варианта
+- [Финальный demo runbook](./runbooks/FINAL_DEMO_RUNBOOK.md) — local fake path и ограниченный live-запуск
 - [Операционный runbook](./operations/runbook.md), [наблюдаемость](./operations/observability.md), [восстановление](./operations/failure-recovery.md)
 - [Безопасность](../SECURITY.md), [лицензии и модели](./compliance/licenses-and-models.md)
 
