@@ -184,6 +184,28 @@ test('visible dates use Russian locale formatting', () => {
   assert.match(formatUiDateTime(new Date('2026-09-26T09:05:00.000Z')), /\d{2}\.\d{2}\.\d{4}/u);
 });
 
+test('home dashboard labels project counts and opens projects using available metadata', () => {
+  assert.equal(ru.home.projectCount(0), '0 проектов');
+  assert.equal(ru.home.projectCount(1), '1 проект');
+  assert.equal(ru.home.projectCount(2), '2 проекта');
+  assert.equal(ru.home.projectCount(4), '4 проекта');
+  assert.equal(ru.home.projectCount(11), '11 проектов');
+  assert.equal(ru.home.projectCount(21), '21 проект');
+  assert.equal(ru.home.openProject('Итоги квартала'), 'Открыть проект «Итоги квартала»');
+  assert.match(ru.home.loadFailed, /Повторите попытку/u);
+
+  const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  assert.match(appSource, /data-count=\{projects\.length\}/u);
+  assert.match(appSource, /onClick=\{\(\) => onOpen\(project\.id\)\}/u);
+  assert.match(appSource, /dateTime=\{project\.updatedAt\}/u);
+  assert.match(appSource, /!loading && projects\.length > 0 && projects\.length <= 2/u,
+    'the compact getting-started guide only appears for sparse project lists');
+  assert.match(appSource, /projects\.length === 0 && error/u,
+    'a failed initial load is not presented as a real empty project list');
+  assert.match(appSource, /onRetry=\{\(\) => void load\(\)\}/u,
+    'a failed project refresh remains recoverable');
+});
+
 test('known design-system names use Russian display labels while preserving their identifiers', () => {
   assert.equal(ru.workspace.designSystemLabel('Corporate'), 'Корпоративный стиль');
   assert.equal(ru.workspace.designSystemLabel('Neutral Modern'), 'Современный нейтральный стиль');
