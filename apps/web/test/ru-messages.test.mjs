@@ -102,11 +102,17 @@ test('deterministic and contextual audit sources are visibly distinct and repair
 
 test('normal user flow requires only a template and task; optional fields stay collapsed', () => {
   const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  assert.match(appSource, /workspaceView === 'template' && matchingScan && templateIR/u,
+    'the design-system summary belongs to the template inspector, not the upload screen');
   assert.match(appSource, /fetch\(`\/api\/projects\/\$\{encodeURIComponent\(projectId\)\}\/workflow\/generate`/u);
   assert.match(appSource, /<button className="primary" onClick=\{\(\) => void generatePresentation\(\)\} disabled=\{!templateFile \|\| !templatePreparationReady \|\| !briefPurpose\.trim\(\) \|\| busy \|\| templatePreparationPending \|\| productWorkflowRunning\}>/u, 'one-click generation waits for a complete prepared profile');
   assert.match(appSource, /templatePreparationReady = matchingScan && templateScan\?\.status === 'ready'[\s\S]*?isUsableTemplateProfileState\(templateProfileStatus\)/u,
     'generation waits for a validated semantic profile, including an explicitly degraded profile');
   assert.match(appSource, /<button className=\{templateFile \? 'quiet' : 'primary'\} onClick=\{\(\) => uploadRef\.current\?\.click\(\)\}/u);
+  assert.match(appSource, /templatePreparationPending\s*\?\s*ru\.template\.analyzing/u,
+    'template processing states use the customer-facing analyzing label');
+  assert.match(appSource, /<span>\{ru\.template\.analyzing\}<\/span>/u,
+    'the visible template progress status does not leak internal pipeline stages');
   assert.match(appSource, /<label className="planning-required-field">[\s\S]*<textarea id="presentation-purpose" required/u);
   const optionalStart = appSource.indexOf('<details className="advanced-tools optional-settings">');
   const optionalEnd = appSource.indexOf('</details>', optionalStart);
@@ -118,7 +124,12 @@ test('normal user flow requires only a template and task; optional fields stay c
   assert.match(appSource, /<details className="advanced-tools planning-advanced">[\s\S]*?onClick=\{\(\) => void analyzeTemplate\(\)\}[\s\S]*?onClick=\{\(\) => void generatePlan\(\)\}/u);
   assert.match(appSource, /<details className="advanced-tools generation-advanced">[\s\S]*?onClick=\{\(\) => void start\(\)\}/u);
   assert.match(appSource, /<details className="advanced-tools developer-tools">[\s\S]*?<div className="workspace-grid">/u);
-  assert.match(appSource, /<details className="advanced-tools template-report-disclosure">/u);
+  assert.match(appSource, /className="template-design-summary" aria-label=\{ru\.template\.designSystemSummary\}/u,
+    'the template inspector exposes a compact design-system summary from persisted profile data');
+  assert.match(appSource, /<details className="advanced-tools template-report-disclosure">/u,
+    'verbose structural diagnostics remain collapsed in the normal template-inspector view');
+  assert.match(appSource, /useEffect\(\(\) => \{ void load\(\); \}, \[load, projectId, productOperation\?\.generationId\]\)/u,
+    'generation snapshots are refreshed when the persisted workflow starts a generation');
   assert.equal(ru.template.upload, 'Загрузить PPTX');
   assert.equal(ru.planning.optionalSettings, 'Дополнительные настройки');
   assert.equal(ru.workspace.advancedMode, 'Расширенный режим');
@@ -146,13 +157,13 @@ test('workflow failures offer a safe retry and technical codes stay in details',
   assert.match(appSource, /<button className="quiet compact ui-error-retry" onClick=\{onRetry\}>\{ru\.errors\.retry\}/u);
   assert.match(appSource, /<details className="ui-error-details">[\s\S]*?ru\.errors\.code\(value\.code\)/u);
   assert.doesNotMatch(appSource, /failure\.code\s*\|\|\s*failure\.message/u);
-  assert.match(appSource, /if \(body\.operation\?\.status === 'ready'\) setProductWorkflowError\(null\)/u,
+  assert.match(appSource, /if \(operation\?\.status === 'ready'\) setProductWorkflowError\(null\)/u,
     'a persisted successful backend state clears a stale transient UI failure');
-  assert.match(appSource, /productOperation\.contextualAudit\.status === 'ready'[\s\S]*?ru\.workflow\.auditFindings/u,
-    'only a completed audit can report a finding count');
-  assert.match(appSource, /productOperation\.contextualAudit\.status === 'ready' \? <p>\{ru\.workflow\.auditClean\}/u,
-    'a failed audit must never be displayed as clean');
-  assert.match(appSource, /productOperation\.contextualAudit\.stale \|\| productOperation\.contextualAudit\.status === 'failed'[\s\S]*?repeatContextualAudit\(\)/u,
+  assert.match(appSource, /contextualAudit\?\.status === 'ready'[\s\S]*?contextualFindings/u,
+    'contextual findings render only from a completed audit');
+  assert.match(appSource, /contextualAudit\?\.status === 'failed'[\s\S]*?ru\.workflow\.auditTransportUnavailable[\s\S]*?contextualAudit\?\.status === 'ready'/u,
+    'a failed audit is shown as unavailable, never as a clean result');
+  assert.match(appSource, /onRepeatContextualAudit\}\s*>\{ru\.workflow\.retryAudit\}/u,
     'a failed contextual audit can be retried without restarting planning or generation');
 });
 
