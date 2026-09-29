@@ -1565,6 +1565,42 @@ test('validated semantic archetypes change donor ranking and structural conflict
   'conflicting semantic and structural classifications are retained as diagnostic evidence');
 });
 
+test('donor ranking measures wrapped copy density and recurring source shell', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-density-shell-ranking-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await familyExemplarFixture(root, 'density-shell-template.pptx');
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[1];
+  assert.ok(compiled);
+  const semanticProfile = semanticProfileFor(template.templateIR, () => 'content', () => 0.99);
+  const shortCopy = {
+    ...compiled,
+    body: ['Короткий тезис.', 'Ещё один тезис.'],
+    targetDensity: 'detailed',
+    visualization: { ...compiled.visualization, type: 'none', status: 'none', tableData: null, tableCellRefs: null, chartData: null, processSteps: [], kpi: null },
+    imageRefs: [],
+  };
+  const longCopy = {
+    ...shortCopy,
+    body: [
+      'Первый развернутый вывод занимает несколько строк и показывает, как согласовать роли команды с этапами работы над единым пользовательским сценарием.',
+      'Второй развернутый вывод объясняет, какие контрольные точки помогают обнаруживать ошибки, сохранять ответственность и поддерживать качество результата.',
+    ],
+  };
+  const shortAssessment = assessExemplarSelection(shortCopy, template.templateIR, semanticProfile);
+  const longAssessment = assessExemplarSelection(longCopy, template.templateIR, semanticProfile);
+  assert.ok(shortAssessment.selection && longAssessment.selection);
+  assert.ok(longAssessment.selection.designFeatures.textDensity > shortAssessment.selection.designFeatures.textDensity,
+    `wrapped copy should occupy more measured capacity: short=${shortAssessment.selection.designFeatures.textDensity}, long=${longAssessment.selection.designFeatures.textDensity}`);
+
+  const firstFamily = shortAssessment.safeSelections.find((selection) => selection.sourceSlideIndex === 1);
+  const richestFamily = shortAssessment.safeSelections.find((selection) => selection.sourceSlideIndex === 9);
+  assert.ok(firstFamily && richestFamily);
+  assert.ok((richestFamily.designFeatures.shellRichnessScore ?? 0) > (firstFamily.designFeatures.shellRichnessScore ?? 0),
+    'the safe-shell score should recognize more recurring template decoration without inspecting template names');
+  assert.ok(richestFamily.evidence.some((item) => item.includes('safe recurring shell richness=')));
+});
+
 test('semantic role hints cannot bypass source-specific projection safety', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-semantic-safety-'));
   t.after(() => rm(root, { recursive: true, force: true }));

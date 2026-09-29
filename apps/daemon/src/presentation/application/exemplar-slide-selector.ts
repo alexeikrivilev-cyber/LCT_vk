@@ -89,6 +89,8 @@ export interface ExemplarSlideSelection {
     bodyAreaShare: number;
     bodyArrangementScore: number;
     textDensity: number;
+    /** Bounded score for recurring, safe template shell objects retained in the projection. */
+    shellRichnessScore?: number;
     connectorCount: number;
   };
   selectionReason: string;
@@ -145,6 +147,7 @@ export interface ExemplarSelectionAssessment {
       bodyAreaShare: number;
       bodyArrangementScore: number;
       textDensity: number;
+      shellRichnessScore?: number;
       connectorCount: number;
     } | null;
     evidence: string[];
@@ -418,6 +421,24 @@ function estimatedLineFit(text: string, element: TemplateElement, minimumFontSiz
   const requiredLines = Math.max(1, text.split(/\r?\n/).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charactersPerLine)), 0));
   const availableLines = Math.max(0.25, heightPt / lineHeightPt);
   return Number(Math.min(1, availableLines / requiredLines).toFixed(4));
+}
+
+function estimatedWrappedLineCount(text: string, element: TemplateElement): number {
+  const box = geometryOf(element);
+  if (!box) return 0;
+  const fontSizePt = Math.max(8, maxFont(element));
+  const charactersPerLine = Math.max(6, (box.width / 12700) / (fontSizePt * 0.52));
+  return text.split(/\r?\n/u).reduce((sum, line) => sum + Math.max(1,
+    Math.ceil(Array.from(line).length / charactersPerLine)), 0);
+}
+
+function estimatedBodyLineCapacity(element: TemplateElement): number {
+  const box = geometryOf(element);
+  if (!box) return 0;
+  const fontSizePt = Math.max(8, maxFont(element));
+  const charactersPerLine = Math.max(6, (box.width / 12700) / (fontSizePt * 0.52));
+  const linesPerRegion = (box.height / 12700) / (fontSizePt * 1.2);
+  return Math.max(0.25, charactersPerLine * linesPerRegion);
 }
 
 function projectedTitleFit(text: string, title: TemplateElement, body: TemplateElement): { fit: number; minimum: number } {
@@ -1033,17 +1054,8 @@ function bodySlotsFor(
     visit(0);
     for (const selected of combinations) {
       const blocks = boundedFragments;
-      const capacities = selected.map((element) => {
-        const box = geometryOf(element)!;
-        const font = Math.max(8, maxFont(element));
-        return Math.max(0.25, (box.width / 12700) / (font * 0.52) * (box.height / 12700) / (font * 1.2));
-      });
-      const demandFor = (text: string, element: TemplateElement) => {
-        const box = geometryOf(element)!;
-        const font = Math.max(8, maxFont(element));
-        const charsPerLine = Math.max(6, (box.width / 12700) / (font * 0.52));
-        return Math.max(1, text.split(/\r?\n/).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charsPerLine)), 0));
-      };
+      const capacities = selected.map(estimatedBodyLineCapacity);
+      const demandFor = estimatedWrappedLineCount;
       type Partition = { cost: number; ranges: Array<{ start: number; end: number }>; fits: number[] };
       const dp: Array<Array<Partition | null>> = Array.from({ length: count + 1 }, () => Array(blocks.length + 1).fill(null));
       dp[0]![0] = { cost: 0, ranges: [], fits: [] };
@@ -1282,12 +1294,9 @@ function candidateFor(
   diagnostic.removedTextElementIds = [...removableUnusedBodies, ...removableUnusedReplaceableText].map((element) => element.id);
   diagnostic.removedPanelElementIds = removableUnusedPanels.map((element) => element.id);
   diagnostic.blockedTextElementIds = blockedText.map((element) => element.id);
-  const bodyLineCapacity = Math.max(0.25, bodies.reduce((sum, item) => {
-    const box = geometryOf(item)!;
-    return sum + (box.width / 12700) / (Math.max(8, maxFont(item)) * 0.52)
-      * (box.height / 12700) / (Math.max(8, maxFont(item)) * 1.2);
-  }, 0));
-  const projectedLines = Math.max(1, compiled.body.length);
+  const bodyLineCapacity = Math.max(0.25, bodies.reduce((sum, item) => sum + estimatedBodyLineCapacity(item), 0));
+  const projectedLines = bodyChoice.segments.reduce((sum, text, index) => sum
+    + estimatedWrappedLineCount(text, bodies[index]!), 0);
   const textDensity = Number(Math.min(1, projectedLines / bodyLineCapacity).toFixed(4));
   const contentGateReasons: string[] = [];
   if (titleHeightShare > 0.22) contentGateReasons.push('title consumes too much vertical space for a content slide');
@@ -1336,13 +1345,29 @@ function candidateFor(
     : targetDensity === 'compact'
       ? (['cover', 'hero', 'visual-led', 'content'].includes(strategyArchetype) ? 0.05 : 0)
       : (['content', 'content-split'].includes(strategyArchetype) ? 0.04 : 0);
+  const densityTarget = compiled.body.length === 0 ? 0
+    : ['title', 'section', 'summary'].includes(compiled.intent)
+      ? (targetDensity === 'detailed' ? 0.34 : targetDensity === 'compact' ? 0.18 : 0.26)
+      : (targetDensity === 'detailed' ? 0.62 : targetDensity === 'compact' ? 0.32 : 0.44);
+  // Favor a donor whose measured body capacity suits the planned copy amount.
+  // This changes layout choice only; it never adds copy or relaxes text-fit gates.
+  const densityFitPreference = -Math.min(0.2, Math.max(0, densityTarget - textDensity) * 0.35);
   const bodyPointCount = compiled.body.length;
   const bodyRegionMatch = Math.max(-0.12, 0.06 - Math.abs(bodies.length - bodyPointCount) * 0.04);
   const unusedBodyPenalty = Math.min(0.3, removableUnusedBodies.length * 0.025);
   const unusedVisualSlotAreaShare = Number((removableUnusedVisuals.reduce((sum, element) => sum + area(geometryOf(element)), 0) / canvasArea).toFixed(4));
   const unusedVisualSlotPenalty = Math.min(0.24, unusedVisualSlotAreaShare * 0.8);
   const bodyArrangementPreference = (bodyArrangement - 0.5) * 0.3;
+  const safeShellVisuals = visualClasses.filter((item) => item.kind === 'template-decoration')
+    .map((item) => slide.elements.find((element) => element.id === item.elementId))
+    .filter((element): element is TemplateElement => Boolean(element));
+  const safeShellAreaShare = safeShellVisuals.reduce((sum, element) => sum + area(geometryOf(element)), 0) / canvasArea;
+  const shellRichnessScore = Number(Math.min(1,
+    Math.min(0.5, safeShellAreaShare) + Math.min(0.3, safeShellVisuals.length * 0.08)
+      + Math.min(0.2, preservedText.length * 0.06)).toFixed(4));
+  const shellRichnessPreference = shellRichnessScore * 0.1;
   const semanticBoost = roleScore + strategyScore + profileStrategyScore + visualIntentScore + densityPreference
+    + densityFitPreference + shellRichnessPreference
     + bodyRegionMatch + bodyArrangementPreference - unusedBodyPenalty - unusedVisualSlotPenalty - semanticConflictPenalty
     - unsupportedDataArchetypePenalty - noVisualContentPenalty;
   const segmentedRegionBoost = bodies.length > 1 && bodyChoice.segmentation.method !== 'existing-blocks' ? 0.08 : 0;
@@ -1384,6 +1409,8 @@ function candidateFor(
       && trustedProfile?.visualElementIds.includes(item.elementId))
       .map((item) => `semantic profile lists ${item.elementId} as a visual element; recurring full-canvas geometry is treated as background shell evidence`),
     `projected body density estimate ${textDensity.toFixed(3)}`,
+    `planned body utilization target=${densityTarget.toFixed(2)}; fit preference=${densityFitPreference.toFixed(3)}`,
+    `safe recurring shell richness=${shellRichnessScore.toFixed(3)} from ${safeShellVisuals.length} decorative visual(s), ${preservedText.length} chrome text region(s)`,
     `projected body region arrangement score ${bodyArrangement.toFixed(3)}`,
     `strategy preference=${strategyScore.toFixed(3)}, profile preference=${profileStrategyScore.toFixed(3)}, no-visual-content penalty=${noVisualContentPenalty.toFixed(3)}, unused-body penalty=${unusedBodyPenalty.toFixed(3)}, unused-visual-slot area=${unusedVisualSlotAreaShare.toFixed(4)} penalty=${unusedVisualSlotPenalty.toFixed(3)}`,
     ...contentGateReasons.map((reason) => `content-sanity gate: ${reason}`),
@@ -1441,6 +1468,7 @@ function candidateFor(
         bodyAreaShare: Number(bodyAreaShare.toFixed(4)),
         bodyArrangementScore: bodyArrangement,
         textDensity,
+        shellRichnessScore,
         connectorCount,
       },
       selectionReason: '',
