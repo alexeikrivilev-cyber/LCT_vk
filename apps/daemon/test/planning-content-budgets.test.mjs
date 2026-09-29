@@ -48,6 +48,13 @@ test('approximate font metrics receive a larger reserve than measured font metri
   assert.ok(approximate.maxCharacters <= measured.maxCharacters);
 });
 
+test('TemplateIR fallback typography remains measurable without an exact font family', () => {
+  const approximateFont = (text, spec) => ({ widthPx: Array.from(text).length * spec.sizePx * 0.5, approximate: true });
+  const budget = deriveTextRegionBudget(metrics({ fontFamily: '', fontSizePt: 18 }), 'body', approximateFont);
+  assert.ok(budget, 'valid region geometry and a measured fallback font size are sufficient');
+  assert.ok(budget.maxCharacters > 0);
+});
+
 test('runtime accepts copy only when one role-compatible candidate family can fit every region', () => {
   const budgets = {
     version: 'fit-aware-copy-budget.v1',

@@ -33,6 +33,44 @@ function positive(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 
+function elementFontSizePt(element: TemplateIR['slides'][number]['elements'][number]): number | undefined {
+  const sizes = [...(element.effectiveFontSizesPt ?? []), ...(element.directStyles.fontSizesPt ?? [])].filter(positive);
+  return sizes.length ? Math.max(...sizes) : undefined;
+}
+
+function placeholderTokens(element: TemplateIR['slides'][number]['elements'][number]): string {
+  return `${element.placeholder?.type ?? ''} ${element.placeholder?.role ?? ''}`.toLowerCase().replace(/[^a-z]/gu, '');
+}
+
+function isPlaceholderTitle(element: TemplateIR['slides'][number]['elements'][number]): boolean {
+  return /title|ctrtitle|subtitle/u.test(placeholderTokens(element));
+}
+
+function isPlaceholderBody(element: TemplateIR['slides'][number]['elements'][number]): boolean {
+  return /body|obj|content/u.test(placeholderTokens(element)) && !isPlaceholderTitle(element);
+}
+
+function isTemplateTextRegion(element: TemplateIR['slides'][number]['elements'][number]): boolean {
+  if (!element.nativeId || !(element.geometry.resolved ?? element.geometry.direct)) return false;
+  if (/picture|image|chart|table|graphicframe|connector|group/iu.test(element.kind)) return false;
+  return Boolean(element.text?.trim()) || isPlaceholderTitle(element) || isPlaceholderBody(element);
+}
+
+function regionArea(element: TemplateIR['slides'][number]['elements'][number]): number {
+  const geometry = element.geometry.resolved ?? element.geometry.direct;
+  return geometry ? Math.max(0, geometry.width) * Math.max(0, geometry.height) : 0;
+}
+
+function compareTitleCandidates(
+  left: TemplateIR['slides'][number]['elements'][number],
+  right: TemplateIR['slides'][number]['elements'][number],
+): number {
+  return (elementFontSizePt(right) ?? 0) - (elementFontSizePt(left) ?? 0)
+    || (left.geometry.resolved ?? left.geometry.direct)!.y - (right.geometry.resolved ?? right.geometry.direct)!.y
+    || regionArea(right) - regionArea(left)
+    || left.order - right.order;
+}
+
 function regionMetricsForShape(
   presentation: Awaited<ReturnType<typeof loadPresentation>>,
   shape: ReturnType<typeof getSlideShapes>[number],
@@ -46,7 +84,6 @@ function regionMetricsForShape(
   let fontSizePt = fallbackFontPt ?? 0;
   let bold = false;
   let italic = false;
-  let foundRun = false;
   const paragraphProperties: RegionMetrics['paragraphProperties'] = [];
 
   for (let paragraph = 0; paragraph < Math.max(0, getShapeParagraphCount(shape)); paragraph += 1) {
@@ -73,17 +110,25 @@ function regionMetricsForShape(
         if (positive(format.size)) fontSizePt = Math.max(fontSizePt, format.size);
         bold ||= format.bold === true;
         italic ||= format.italic === true;
-        foundRun = true;
       } catch {
         // Unresolved typography is excluded instead of inventing a font size.
       }
     }
   }
-  if (!widthEmu || !heightEmu || !fontSizePt || !foundRun) return null;
+  // Empty placeholders often inherit a trustworthy font from their layout or master.
+  // TemplateIR typography is a valid measurement fallback even when the shape has no runs.
+  if (!positive(widthEmu) || !positive(heightEmu) || !positive(fontSizePt)) return null;
 
   let bodyPr: ReturnType<typeof getShapeBodyPrEffective>;
   try { bodyPr = getShapeBodyPrEffective(presentation, shape); }
-  catch { return null; }
+  catch {
+    bodyPr = { margins: {
+      left: DEFAULT_TEXT_MARGIN_HORIZONTAL_EMU,
+      right: DEFAULT_TEXT_MARGIN_HORIZONTAL_EMU,
+      top: DEFAULT_TEXT_MARGIN_VERTICAL_EMU,
+      bottom: DEFAULT_TEXT_MARGIN_VERTICAL_EMU,
+    } } as ReturnType<typeof getShapeBodyPrEffective>;
+  }
   const { left, right, top, bottom } = bodyPr.margins;
   return {
     widthEmu,
@@ -125,26 +170,54 @@ export async function derivePlanningContentBudgets(input: {
   for (const profileSlide of profile.slides) {
     const sourceSlide = nativeSlides[profileSlide.sourceSlideIndex - 1];
     const templateSlide = input.template.slides.find((slide) => slide.index === profileSlide.sourceSlideIndex);
-    if (!sourceSlide || !templateSlide || !profileSlide.titleElementId || profileSlide.bodyElementIds.length === 0) continue;
+    if (!sourceSlide || !templateSlide) continue;
     const elements = new Map(templateSlide.elements.map((element) => [element.id, element]));
     const shapes = new Map(getSlideShapes(sourceSlide).map((shape) => [String(getShapeId(shape)), shape]));
-    const titleElement = elements.get(profileSlide.titleElementId);
-    const titleShape = titleElement?.nativeId ? shapes.get(titleElement.nativeId) : undefined;
-    if (!titleElement || !titleShape) continue;
-    const titleMetrics = regionMetricsForShape(presentation, titleShape,
-      Math.max(0, ...(titleElement.effectiveFontSizesPt ?? titleElement.directStyles.fontSizesPt ?? [])) || undefined,
-      titleElement.directStyles.fonts?.[0]);
-    const titleRegion = titleMetrics ? deriveTextRegionBudget(titleMetrics, 'title', measureText) : null;
-    if (!titleRegion) continue;
+    const semanticTitle = elements.get(profileSlide.titleElementId ?? '');
+    const structuralText = templateSlide.elements.filter(isTemplateTextRegion);
+    const titleCandidates = [
+      ...(semanticTitle && structuralText.some((element) => element.id === semanticTitle.id) ? [semanticTitle] : []),
+      ...structuralText.filter(isPlaceholderTitle),
+      ...structuralText.slice().sort(compareTitleCandidates),
+    ].filter((element, index, all) => all.findIndex((candidate) => candidate.id === element.id) === index);
+    let titleRegion: ReturnType<typeof deriveTextRegionBudget> = null;
+    let titleElementId: string | null = null;
+    for (const element of titleCandidates) {
+      const shape = element.nativeId ? shapes.get(element.nativeId) : undefined;
+      if (!shape) continue;
+      const metrics = regionMetricsForShape(presentation, shape, elementFontSizePt(element), element.directStyles.fonts?.[0]);
+      const budget = metrics ? deriveTextRegionBudget(metrics, 'title', measureText) : null;
+      if (!budget) continue;
+      titleRegion = budget;
+      titleElementId = element.id;
+      break;
+    }
+    if (!titleRegion || !titleElementId) continue;
 
+    const semanticBodies = profileSlide.bodyElementIds.flatMap((id) => {
+      const element = elements.get(id);
+      return element && element.id !== titleElementId && structuralText.some((candidate) => candidate.id === element.id)
+        ? [element] : [];
+    });
+    const bodyCandidates = [
+      ...semanticBodies,
+      ...structuralText.filter((element) => isPlaceholderBody(element) && element.id !== titleElementId),
+      ...structuralText.filter((element) => element.id !== titleElementId
+        && !isPlaceholderTitle(element) && !isPlaceholderBody(element)),
+    ].filter((element, index, all) => all.findIndex((candidate) => candidate.id === element.id) === index)
+      .sort((left, right) => {
+        const leftIndex = semanticBodies.findIndex((element) => element.id === left.id);
+        const rightIndex = semanticBodies.findIndex((element) => element.id === right.id);
+        const leftRole = leftIndex >= 0 ? 0 : isPlaceholderBody(left) ? 1 : 2;
+        const rightRole = rightIndex >= 0 ? 0 : isPlaceholderBody(right) ? 1 : 2;
+        return leftRole - rightRole || regionArea(right) - regionArea(left) || left.order - right.order;
+      });
     const bodyRegions = [];
-    for (const elementId of profileSlide.bodyElementIds) {
-      const element = elements.get(elementId);
-      const shape = element?.nativeId ? shapes.get(element.nativeId) : undefined;
-      if (!element || !shape) continue;
-      const metrics = regionMetricsForShape(presentation, shape,
-        Math.max(0, ...(element.effectiveFontSizesPt ?? element.directStyles.fontSizesPt ?? [])) || undefined,
-        element.directStyles.fonts?.[0]);
+    for (const element of bodyCandidates) {
+      if (bodyRegions.length >= 4) break;
+      const shape = element.nativeId ? shapes.get(element.nativeId) : undefined;
+      if (!shape) continue;
+      const metrics = regionMetricsForShape(presentation, shape, elementFontSizePt(element), element.directStyles.fonts?.[0]);
       const budget = metrics ? deriveTextRegionBudget(metrics, 'body', measureText) : null;
       if (budget) bodyRegions.push(budget);
     }
