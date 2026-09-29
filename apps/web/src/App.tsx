@@ -19,6 +19,7 @@ import { refreshPersistedWorkflowSnapshots } from './workflow-terminal-refresh';
 import { includeUploadedContentFiles } from './uploaded-content-selection';
 import { isPersistedTemplatePreparationState, isUsableTemplateProfileState } from './template-preparation-state';
 import { persistedWorkspaceView, visibleGenerationOperationError, visiblePersistedFailure, visibleRequestFailure } from './workflow-visible-state';
+import { hasCompleteSavedVariants, selectSavedDeckVariant, selectSavedSlideVariant } from './saved-generation-selection';
 
 type Project = {
   id: string;
@@ -2124,6 +2125,10 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
 
   const chooseTrack = (variant: GenerationVariantId) => {
     if (!generation) return;
+    if (!matchesCurrentInputs(generation)) {
+      if (hasCompleteSavedVariants(generation)) apply(selectSavedDeckVariant(generation, variant));
+      return;
+    }
     void withBusy(`track-${variant}`, async () => {
       const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/selection`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -2134,6 +2139,10 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
   };
 
   const chooseSlide = (pack: GenerationPack, variant: GenerationVariantId) => {
+    if (generation && !matchesCurrentInputs(generation)) {
+      if (hasCompleteSavedVariants(generation)) apply(selectSavedSlideVariant(generation, pack.slideId, variant));
+      return;
+    }
     void withBusy(`slide-${pack.slideId}-${variant}`, async () => {
       const body = await request(`/api/projects/${encodeURIComponent(projectId)}/generation/selection`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -2174,6 +2183,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
 
   const isActive = generation?.status === 'preparing' || generation?.status === 'generating';
   const currentGeneration = matchesCurrentInputs(generation);
+  const canBrowseSavedResult = hasCompleteSavedVariants(generation);
   const auditOnlyWorkflowFailure = productOperation?.status === 'failed'
     && productOperation.failure?.stage === 'contextual_audit' && Boolean(productOperation.generationId);
   const generationStatusClass = auditOnlyWorkflowFailure && currentGeneration && generation?.status === 'completed'
@@ -2209,7 +2219,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
         : null;
 
   const workflowFailure = productOperation?.status === 'failed' && !auditOnlyWorkflowFailure ? productOperation.failure : null;
-  const canEditVariants = currentGeneration && canChooseTrack;
+  const canSelectVariants = generation?.status === 'completed' && (currentGeneration ? canChooseTrack : canBrowseSavedResult);
   const activePreviewUrl = activeVariant?.previewUrl ? activeVariant.previewUrl + '?v=' + activeVariant.version : null;
   const contextualFindings = productOperation?.contextualAudit?.findings ?? [];
   const contextualAudit = productOperation?.contextualAudit ?? null;
@@ -2231,8 +2241,8 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
           {isActive ? <button className="quiet" onClick={() => void cancel()} disabled={Boolean(busy)}>{ru.generation.cancel}</button> : null}
           {view === 'progress' && productOperation?.status === 'failed' && !auditOnlyWorkflowFailure
             ? <button className="primary" onClick={onRetryWorkflow} disabled={Boolean(busy)}>{ru.errors.retry}</button> : null}
-          {view === 'progress' && generation?.status === 'completed' && currentGeneration
-            ? <button className="primary" onClick={() => onViewChange('editor')}>{ru.workflow.openResult}</button> : null}
+          {view === 'progress' && ((generation?.status === 'completed' && currentGeneration) || canBrowseSavedResult)
+            ? <button className="primary" onClick={() => onViewChange('editor')}>{currentGeneration ? ru.workflow.openResult : ru.workflow.openSavedResult}</button> : null}
           {view === 'editor' ? <button className="quiet" onClick={() => onViewChange('audit')}>{ru.workflow.openAudit}</button> : null}
           {view === 'audit' ? <button className="quiet" onClick={() => onViewChange('editor')}>{ru.workflow.openEditor}</button> : null}
           {view === 'progress' && !isActive && productOperation?.status !== 'failed'
@@ -2316,7 +2326,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
                     <strong>{ru.generation.variant(variant)}</strong>
                     {activePack.recommendedVariant === variant ? <span className="recommended-mark">{ru.generation.recommended}</span> : null}
                     <button type="button" className={activePack.selectedVariant === variant ? 'primary' : 'quiet'}
-                      disabled={!available || !canEditVariants || Boolean(busy)} aria-pressed={activePack.selectedVariant === variant}
+                      disabled={!available || !canSelectVariants || Boolean(busy)} aria-pressed={activePack.selectedVariant === variant}
                       onClick={() => chooseSlide(activePack, variant)}>
                       {activePack.selectedVariant === variant ? ru.generation.selected(variant) : ru.generation.choose(variant)}
                     </button>
@@ -2330,7 +2340,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
               <section data-audit-source="contextual" aria-labelledby="contextual-audit-title">
                 <div className="audit-panel-heading">
                   <div><span className="eyebrow">{ru.workflow.audit}</span><h3 id="contextual-audit-title">{ru.workflow.reviewTitle}</h3></div>
-                  <button type="button" className="quiet compact" disabled={auditBusy || Boolean(busy) || productOperation?.status === 'running'}
+                  <button type="button" className="quiet compact" disabled={!currentGeneration || auditBusy || Boolean(busy) || productOperation?.status === 'running'}
                     onClick={onRepeatContextualAudit}>{ru.workflow.retryAudit}</button>
                 </div>
                 {auditRefreshError ? <ErrorNotice failure={auditRefreshError} className="generation-error" /> : null}
@@ -2381,7 +2391,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
                   {ru.generation.auditSummary(activePack.auditSummary.errors, activePack.auditSummary.warnings)}
                 </span>
               </div>
-              <button type="button" className="quiet editor-lock-button" disabled={!canEditVariants || activePack.status !== 'ready' || Boolean(busy)}
+              <button type="button" className="quiet editor-lock-button" disabled={!currentGeneration || !canSelectVariants || activePack.status !== 'ready' || Boolean(busy)}
                 onClick={() => toggleLock(activePack)}>
                 {activePack.lockedVariant ? ru.generation.unlock(activePack.lockedVariant) : ru.generation.lock(activePack.selectedVariant)}
               </button>
@@ -2426,7 +2436,7 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
           <div className="advanced-tools-content"><div className="generation-track-picker" role="group" aria-label={ru.generation.defaultTrack}>
             <span>{ru.generation.defaultTrack}</span>
             {(['A', 'B', 'C'] as const).map((variant) => <button type="button" key={variant} className={generation.defaultTrack === variant ? 'active' : ''}
-              aria-pressed={generation.defaultTrack === variant} disabled={!canEditVariants || Boolean(busy)} onClick={() => chooseTrack(variant)}>
+              aria-pressed={generation.defaultTrack === variant} disabled={!canSelectVariants || Boolean(busy)} onClick={() => chooseTrack(variant)}>
               {ru.generation.track(variant, variant === 'A')}
             </button>)}
           </div>
