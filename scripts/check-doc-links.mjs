@@ -95,7 +95,7 @@ if (profilerContract.maxBatches !== liveQualificationContract.maxProfilerRequest
     || profilerContract.maxSlidesPerBatch !== 2 || profilerContract.maxBatchEvidenceBytes !== 24 * 1024
     || profilerContract.maxEstimatedRequestBytes !== 48 * 1024
     || profilerContract.requestEnvelopeOverheadBytes !== 2048 || profilerContract.outputTokenByteReserve !== 4
-    || profilerContract.maxOutputTokens !== 4096 || profilerContract.timeoutMs !== 180000) {
+    || profilerContract.maxOutputTokens !== 4096 || profilerContract.timeoutMs !== 300000) {
   failures.push('template profiler batch limits differ from the hard request budget contract');
 }
 const liveQualificationGuide = await readFile(path.join(root, 'LIVE_QUALIFICATION.md'), 'utf8');

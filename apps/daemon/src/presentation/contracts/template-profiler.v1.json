@@ -23,5 +23,5 @@
   "maxOutputTokens": 4096,
   "outputTokensPerSlide": 1024,
   "temperature": 0,
-  "timeoutMs": 180000
+  "timeoutMs": 300000
 }

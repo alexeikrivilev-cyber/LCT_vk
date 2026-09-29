@@ -51,7 +51,7 @@ const MAX_SELECTED_FILES = 12;
 const MAX_EVIDENCE_CHARS = 256 * 1024;
 const MAX_FINDINGS = 12;
 const MAX_REPAIR_OPERATIONS = 8;
-const PLANNING_DEADLINE_MS = 240_000;
+const PLANNING_DEADLINE_MS = 300_000;
 const ROLE_VALUES = ['opening', 'agenda', 'section-divider', 'content', 'closing'] as const;
 const VISUAL_VALUES = ['none', 'image', 'chart', 'table', 'diagram', 'timeline', 'process', 'comparison', 'kpi'] as const;
 const DENSITY_VALUES = ['compact', 'balanced', 'detailed'] as const;
@@ -1129,7 +1129,6 @@ export class PlanningService {
         output: workerContract,
         maxOutputTokens: 4096,
         temperature: 0.2,
-        timeoutMs: 150_000,
         deadlineAtEpochMs,
         signal: operation.controller.signal,
         metadata: { projectId, generationId: this.createId() },
@@ -1213,7 +1212,6 @@ export class PlanningService {
         output: reviewContract,
         maxOutputTokens: 2048,
         temperature: 0,
-        timeoutMs: 90_000,
         deadlineAtEpochMs,
         signal: operation.controller.signal,
         metadata: { projectId, checkpointId: checkpoint.id },

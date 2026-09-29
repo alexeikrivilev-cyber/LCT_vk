@@ -109,6 +109,44 @@ test('configured semantic readiness probes only the local models endpoint and va
   }
 });
 
+test('semantic readiness reports warming as non-fatal while hard failures remain unready', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-daemon-warming-ready-'));
+  const oldBase = process.env.LCT_SEMANTIC_BASE_URL;
+  const oldModel = process.env.LCT_SEMANTIC_MODEL;
+  const oldTimeout = process.env.LCT_SEMANTIC_READINESS_TIMEOUT_MS;
+  process.env.LCT_SEMANTIC_BASE_URL = 'https://provider.example.test/v1';
+  process.env.LCT_SEMANTIC_MODEL = 'local-test-model';
+  process.env.LCT_SEMANTIC_READINESS_TIMEOUT_MS = '35000';
+  let probeStatus = 'warming';
+  let observedTimeout;
+  const started = await startServer({
+    host: '127.0.0.1', port: 0, dataDir: temp, projectRoot: repoRoot, serveWeb: false, returnServer: true,
+    semanticReadinessProbe: async (timeoutMs) => {
+      observedTimeout = timeoutMs;
+      return probeStatus;
+    },
+  });
+  t.after(async () => {
+    await closeHttpServer(started.server);
+    await started.shutdown();
+    await rm(temp, { recursive: true, force: true });
+    if (oldBase === undefined) delete process.env.LCT_SEMANTIC_BASE_URL; else process.env.LCT_SEMANTIC_BASE_URL = oldBase;
+    if (oldModel === undefined) delete process.env.LCT_SEMANTIC_MODEL; else process.env.LCT_SEMANTIC_MODEL = oldModel;
+    if (oldTimeout === undefined) delete process.env.LCT_SEMANTIC_READINESS_TIMEOUT_MS;
+    else process.env.LCT_SEMANTIC_READINESS_TIMEOUT_MS = oldTimeout;
+  });
+
+  const warming = await fetch(`${started.url}/readiness`);
+  assert.equal(warming.status, 200);
+  assert.deepEqual((await warming.json()).checks.semantic, { required: true, status: 'warming' });
+  assert.equal(observedTimeout, 35_000);
+
+  probeStatus = 'unreachable';
+  const unreachable = await fetch(`${started.url}/readiness`);
+  assert.equal(unreachable.status, 503);
+  assert.deepEqual((await unreachable.json()).checks.semantic, { required: true, status: 'unreachable' });
+});
+
 test('server API bounds uploads, hides parser stacks, and logs only safe structured diagnostics', async (t) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-daemon-security-'));
   const started = await startServer({ host: '127.0.0.1', port: 0, dataDir: temp, projectRoot: repoRoot, serveWeb: false, returnServer: true });

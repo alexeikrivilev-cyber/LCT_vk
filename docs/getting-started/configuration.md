@@ -26,9 +26,10 @@
 | `LCT_SEMANTIC_MODEL` | Нет | `Qwen/Qwen3.8-27B` | daemon; нет | Model alias, передаваемый endpoint |
 | `LCT_SEMANTIC_API_KEY` | Нет/условно | отсутствует в fake-only конфигурации | daemon; **секрет** | Bearer credential endpoint. Требует HTTPS, кроме loopback |
 | `LCT_SEMANTIC_ENABLE_THINKING` | Нет | не задано; допустимы `true`/`false` | daemon; нет | Опциональная request-level chat-template setting. Unset сохраняет provider default |
-| `LCT_SEMANTIC_READINESS_TIMEOUT_MS` | Нет | `30000`; диапазон `1`–`120000` | daemon; нет | Таймаут отдельной проверки доступности `/models`; допускает холодный старт удалённого endpoint и не меняет inference timeout |
+| `LCT_SEMANTIC_REQUEST_TIMEOUT_MS` | Нет | `300000`; диапазон `1`–`300000` | daemon; нет | Максимальное ожидание semantic inference. Planning дополнительно ограничен общим deadline и cancellation |
+| `LCT_SEMANTIC_READINESS_TIMEOUT_MS` | Нет | `30000`; диапазон `1`–`120000` | daemon; нет | Таймаут отдельной проверки доступности `/models`; при его истечении endpoint получает временный статус `warming`, а локальная readiness остаётся успешной |
 
-Таймаут самих semantic inference запросов остаётся фиксированным в коде: 120 секунд. Настройка readiness на него не влияет.
+Настройки readiness и inference независимы. Ошибки конфигурации и явные ответы HTTP 401/403 остаются ошибками readiness.
 
 ## Необязательная генерация изображений
 

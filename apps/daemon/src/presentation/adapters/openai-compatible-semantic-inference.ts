@@ -14,7 +14,7 @@ import {
 } from '../application/semantic-inference-port.js';
 
 const DEFAULT_MODEL = 'Qwen/Qwen3.8-27B';
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_TIMEOUT_MS = 300_000;
 const DEFAULT_READINESS_TIMEOUT_MS = 30_000;
 const MAX_READINESS_TIMEOUT_MS = 120_000;
@@ -57,11 +57,12 @@ export interface SemanticInferenceConfig {
 }
 
 export type SemanticFetch = typeof fetch;
+export type SemanticEndpointProbeStatus = 'reachable' | 'warming' | 'unreachable';
 
-export async function probeSemanticEndpoint(
+export async function probeSemanticEndpointStatus(
   config: Pick<SemanticInferenceConfig, 'baseUrl' | 'model' | 'apiKey' | 'readinessTimeoutMs'>,
   fetcher: SemanticFetch = globalThis.fetch,
-): Promise<boolean> {
+): Promise<SemanticEndpointProbeStatus> {
   const baseUrl = normalizeBaseUrl(config.baseUrl, config.apiKey);
   const timeoutMs = config.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
   if (!isFiniteInteger(timeoutMs, 1, MAX_READINESS_TIMEOUT_MS)) {
@@ -77,17 +78,24 @@ export async function probeSemanticEndpoint(
     });
     if (!response.ok) {
       await response.body?.cancel().catch(() => undefined);
-      return false;
+      return 'unreachable';
     }
     const text = await readBoundedText(response, controller.signal);
     const payload: unknown = JSON.parse(text);
-    if (!isRecord(payload) || !Array.isArray(payload.data) || payload.data.length > 512) return false;
-    return payload.data.some((item) => isRecord(item) && item.id === config.model);
+    if (!isRecord(payload) || !Array.isArray(payload.data) || payload.data.length > 512) return 'unreachable';
+    return payload.data.some((item) => isRecord(item) && item.id === config.model) ? 'reachable' : 'unreachable';
   } catch {
-    return false;
+    return controller.signal.aborted ? 'warming' : 'unreachable';
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function probeSemanticEndpoint(
+  config: Pick<SemanticInferenceConfig, 'baseUrl' | 'model' | 'apiKey' | 'readinessTimeoutMs'>,
+  fetcher: SemanticFetch = globalThis.fetch,
+): Promise<boolean> {
+  return (await probeSemanticEndpointStatus(config, fetcher)) === 'reachable';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -107,6 +115,19 @@ function readinessTimeoutFromEnvironment(value: string | undefined): number {
   const timeoutMs = Number(normalized);
   if (!isFiniteInteger(timeoutMs, 1, MAX_READINESS_TIMEOUT_MS)) {
     throw configError(`LCT_SEMANTIC_READINESS_TIMEOUT_MS must be an integer between 1 and ${MAX_READINESS_TIMEOUT_MS}`);
+  }
+  return timeoutMs;
+}
+
+function requestTimeoutFromEnvironment(value: string | undefined): number {
+  if (value === undefined || value.trim() === '') return DEFAULT_TIMEOUT_MS;
+  const normalized = value.trim();
+  if (!/^\d+$/.test(normalized)) {
+    throw configError(`LCT_SEMANTIC_REQUEST_TIMEOUT_MS must be an integer between 1 and ${MAX_TIMEOUT_MS}`);
+  }
+  const timeoutMs = Number(normalized);
+  if (!isFiniteInteger(timeoutMs, 1, MAX_TIMEOUT_MS)) {
+    throw configError(`LCT_SEMANTIC_REQUEST_TIMEOUT_MS must be an integer between 1 and ${MAX_TIMEOUT_MS}`);
   }
   return timeoutMs;
 }
@@ -153,7 +174,7 @@ export function semanticInferenceConfigFromEnvironment(
     model,
     ...(apiKey ? { apiKey } : {}),
     ...(enableThinkingValue ? { enableThinking: enableThinkingValue === 'true' } : {}),
-    requestTimeoutMs: DEFAULT_TIMEOUT_MS,
+    requestTimeoutMs: requestTimeoutFromEnvironment(environment.LCT_SEMANTIC_REQUEST_TIMEOUT_MS),
     readinessTimeoutMs: readinessTimeoutFromEnvironment(environment.LCT_SEMANTIC_READINESS_TIMEOUT_MS),
   };
 }

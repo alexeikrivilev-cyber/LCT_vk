@@ -761,7 +761,6 @@ export class ProductWorkflowService {
       output: contract,
       maxOutputTokens: 3072,
       temperature: 0,
-      timeoutMs: 60_000,
       metadata: { projectId, generationId: generation.generationId },
     } satisfies SemanticInferenceRequest<ContextualDeckAuditResponse>);
     const report = validateContextualDeckAuditResponse(response.value, validationContext);

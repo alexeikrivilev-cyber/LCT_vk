@@ -640,7 +640,7 @@ test('large templates use deterministic slide- and byte-bounded batches and merg
       resolvedConflictCount: 0,
     });
     assert.equal(request.maxOutputTokens, batch.maxOutputTokens);
-    assert.equal(request.timeoutMs, 180000);
+    assert.equal(request.timeoutMs, 300000);
     assert.equal(request.output.schema.properties.slides.minItems, batch.sourceSlideIndexes.length);
     assert.equal(request.output.schema.properties.slides.maxItems, batch.sourceSlideIndexes.length);
     assert.deepEqual(request.output.schema.properties.slides.items.anyOf.map((branch) => branch.properties.sourceSlideIndex.enum[0]), batch.sourceSlideIndexes);
@@ -1103,7 +1103,7 @@ test('profiler config version invalidates profiles produced from the previous ev
   assert.equal(contract.requestEnvelopeOverheadBytes, 2048);
   assert.equal(contract.outputTokenByteReserve, 4);
   assert.equal(contract.maxOutputTokens, 4096);
-  assert.equal(contract.timeoutMs, 180000);
+  assert.equal(contract.timeoutMs, 300000);
   const prompt = (await readFile(path.join(process.cwd(), 'apps/daemon/prompts/template-profiler.v3.md'), 'utf8')).replace(/\s+/g, ' ').trim();
   const promptSha256 = createHash('sha256').update(prompt, 'utf8').digest('hex');
   const oldCacheKey = createHash('sha256').update(JSON.stringify({

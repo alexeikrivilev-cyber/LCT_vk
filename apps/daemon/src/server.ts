@@ -41,8 +41,9 @@ import { generatePresentationImage } from './media/index.js';
 import { presentationImageConfig, presentationImageModels } from './media/models.js';
 import {
   OpenAICompatibleSemanticInferenceAdapter,
-  probeSemanticEndpoint,
+  probeSemanticEndpointStatus,
   semanticInferenceConfigFromEnvironment,
+  type SemanticEndpointProbeStatus,
 } from './presentation/adapters/openai-compatible-semantic-inference.js';
 import { derivePlanningContentBudgets } from './presentation/adapters/office-kit-planning-content-budgets.js';
 import { SemanticInferenceError, type SemanticInferenceAdapter } from './presentation/application/semantic-inference-port.js';
@@ -82,6 +83,8 @@ export interface StartServerOptions {
   returnServer?: boolean;
   semanticInferenceAdapter?: SemanticInferenceAdapter;
   semanticInferenceAdapterFactory?: () => SemanticInferenceAdapter;
+  /** Deterministic readiness seam for timeout-state tests; normal startup probes the configured endpoint. */
+  semanticReadinessProbe?: (timeoutMs: number) => Promise<SemanticEndpointProbeStatus>;
   /** Explicit identity for injected inference adapters before enabling daemon-wide semantic cache reuse. */
   semanticInferenceCacheIdentity?: string;
   /** Offline qualification seam; defaults on when the semantic endpoint has a stable cache identity. */
@@ -573,11 +576,18 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
       await Promise.all(probes.map((probe) => rm(probe, { force: true }).catch(() => undefined)));
     }
     const semanticRequired = semanticProfilingEnabled || Boolean(semanticConfig);
-    const semanticReachable = semanticConfig ? await probeSemanticEndpoint(semanticConfig) : null;
-    const semanticReady = !semanticRequired || (semanticConfig ? semanticReachable === true : hasInjectedSemanticAdapter);
+    const semanticProbeStatus = semanticConfig
+      ? options.semanticReadinessProbe
+        ? await options.semanticReadinessProbe(semanticConfig.readinessTimeoutMs ?? 30_000)
+        : await probeSemanticEndpointStatus(semanticConfig)
+      : null;
+    const semanticReady = !semanticRequired
+      || semanticProbeStatus === 'reachable'
+      || semanticProbeStatus === 'warming'
+      || hasInjectedSemanticAdapter;
     const ready = storeAvailable && requiredDirsWritable && Boolean(renderer)
       && semanticReady;
-    const semanticStatus = semanticConfig ? semanticReachable ? 'reachable' : 'unreachable'
+    const semanticStatus = semanticConfig ? semanticProbeStatus
       : hasInjectedSemanticAdapter ? 'injected-unprobed' : semanticRequired ? 'unconfigured' : 'not-required';
     res.status(ready ? 200 : 503).json({
       ok: ready,
