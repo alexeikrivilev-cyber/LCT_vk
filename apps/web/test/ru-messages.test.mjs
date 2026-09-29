@@ -19,6 +19,15 @@ test('all persisted template, planning, generation, pack, and variant states hav
   ];
   assert.ok(labels.every((label) => /[А-Яа-яЁё]/u.test(label)));
   assert.equal(slidePackStatusLabel('failed', 'VARIANTS_NOT_DISTINCT'), 'Варианты не созданы');
+  for (const role of ['opening', 'agenda', 'section-divider', 'content', 'closing']) {
+    assert.notEqual(ru.planning.narrativeRole(role), 'Роль не указана', `${role} must have a customer-facing label`);
+  }
+  for (const type of ['image', 'chart', 'table', 'diagram', 'timeline', 'process', 'comparison', 'kpi']) {
+    assert.notEqual(ru.planning.visualType(type), 'Тип визуализации не указан', `${type} must have a customer-facing label`);
+  }
+  for (const density of ['compact', 'balanced', 'detailed']) {
+    assert.notEqual(ru.planning.density(density), 'Плотность не указана', `${density} must have a customer-facing label`);
+  }
 });
 
 test('all major failures have safe Russian copy and retryable outcomes stay actionable', () => {
@@ -123,7 +132,11 @@ test('normal user flow requires only a template and task; optional fields stay c
   }
   assert.match(appSource, /<details className="advanced-tools planning-advanced">[\s\S]*?onClick=\{\(\) => void analyzeTemplate\(\)\}[\s\S]*?onClick=\{\(\) => void generatePlan\(\)\}/u);
   assert.match(appSource, /<details className="advanced-tools generation-advanced">[\s\S]*?onClick=\{\(\) => void start\(\)\}/u);
-  assert.match(appSource, /<details className="advanced-tools developer-tools">[\s\S]*?<div className="workspace-grid">/u);
+  assert.match(appSource, /aria-expanded=\{developerToolsOpen\} aria-controls="developer-tools-panel"/u,
+    'the technical-tools toggle exposes its disclosure state');
+  assert.match(appSource, /<details className="advanced-tools developer-tools" id="developer-tools-panel" open=\{developerToolsOpen\}[\s\S]*?<div className="workspace-grid">/u);
+  assert.match(appSource, /onToggle=\{\(event\) => setDeveloperToolsOpen\(event\.currentTarget\.open\)\}/u,
+    'native details toggles stay synchronized with the technical-tools control');
   assert.match(appSource, /className="template-design-summary" aria-label=\{ru\.template\.designSystemSummary\}/u,
     'the template inspector exposes a compact design-system summary from persisted profile data');
   assert.match(appSource, /<details className="advanced-tools template-report-disclosure">/u,
