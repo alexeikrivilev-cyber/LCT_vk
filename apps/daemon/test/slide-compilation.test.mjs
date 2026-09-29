@@ -2339,10 +2339,16 @@ test('generic fallback derives readable text color from a dark template backgrou
   const reopened = await loadPresentation(await readFile(outputPath));
   const reopenedSlide = getSlides(reopened)[0];
   assert.ok(reopenedSlide);
+  const title = getSlideShapes(reopenedSlide).find((shape) => getShapeText(shape) === selectedTrack.title);
   const body = getSlideShapes(reopenedSlide).find((shape) => getShapeText(shape).includes('Проверить условия.'));
+  assert.ok(title, 'the title remains a native editable shape');
   assert.ok(body);
+  const titleForeground = getShapeRunFormatEffective(reopened, title, 0, 0).color?.toUpperCase();
   const foreground = getShapeRunFormatEffective(reopened, body, 0, 0).color?.toUpperCase();
+  assert.ok(titleForeground);
   assert.ok(foreground);
+  assert.equal(titleForeground, foreground,
+    'the title uses the contrast-checked theme foreground for its own measured dark region');
   assert.notEqual(foreground, '#172B4D', 'dark source body typography is not carried onto a dark template background');
   assert.ok([`#${template.templateIR.theme?.colors.lt1}`, '#F9FAFB'].some((color) => color.toUpperCase() === foreground),
     `foreground remains a template-derived light token for the measured dark backdrop, received ${foreground}`);

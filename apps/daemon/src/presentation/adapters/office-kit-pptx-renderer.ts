@@ -401,15 +401,16 @@ function chooseTemplateTextColor(background: string, template: TemplateIRValue, 
   return best.color;
 }
 
-function templateDerivedThemeForeground(compiled: CompiledSlide, template: TemplateIRValue): string | null {
+function templateDerivedThemeForeground(compiled: CompiledSlide, template: TemplateIRValue, role: 'title' | 'body'): string | null {
   const candidate = compiled.layoutCandidates[compiled.selectedCandidateIndex];
+  const roleBox = role === 'title' ? candidate?.titleBox : candidate?.bodyBox;
   const layout = template.layouts.find((item) => item.sourcePart === compiled.layoutSourcePart);
   const master = template.masters.find((item) => item.id === layout?.masterId);
   const parts = [layout, master].filter((item): item is NonNullable<typeof item> => Boolean(item));
   const panel = parts.flatMap((part) => part.elements).find((element) => {
     const fill = normalizedHexColor(element.directStyles.fillColor);
     const box = element.geometry.resolved ?? element.geometry.direct;
-    return Boolean(fill && box && candidate?.bodyBox && boxContains(box, candidate.bodyBox));
+    return Boolean(fill && box && roleBox && boxContains(box, roleBox));
   });
   const panelColor = normalizedHexColor(panel?.directStyles.fillColor);
   const background = layout?.background ?? master?.background ?? null;
@@ -1075,7 +1076,8 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         }
         const titleSources = templateRoleSourceShapes(compiled, input.templateIR, sourceSlidesByPart, 'title');
         const bodySources = templateRoleSourceShapes(compiled, input.templateIR, sourceSlidesByPart, 'body');
-        const themeForeground = templateDerivedThemeForeground(compiled, input.templateIR);
+        const titleThemeForeground = templateDerivedThemeForeground(compiled, input.templateIR, 'title');
+        const bodyThemeForeground = templateDerivedThemeForeground(compiled, input.templateIR, 'body');
         const titlePlaceholder = ['title', 'ctrTitle', 'subTitle'].map((type) => findSlidePlaceholder(slide!, type as 'title' | 'ctrTitle' | 'subTitle'))
           .find((shape) => Boolean(shape));
         const bodyPlaceholder = ['body', 'obj', 'subTitle'].map((type) => findSlidePlaceholder(slide!, type as 'body' | 'obj' | 'subTitle'))
@@ -1086,8 +1088,8 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         // tier-3 editable boxes. No sample or temporary text reaches the output.
         if (titlePlaceholder) setShapeText(titlePlaceholder, compiled.title);
         if (bodyPlaceholder) setShapeText(bodyPlaceholder, compiled.body.join('\n'));
-        const titleStyleBase = roleTextStyle(presentation, slide, 'title', titleSources, themeForeground);
-        const bodyStyleBase = roleTextStyle(presentation, slide, 'body', bodySources, themeForeground);
+        const titleStyleBase = roleTextStyle(presentation, slide, 'title', titleSources, titleThemeForeground);
+        const bodyStyleBase = roleTextStyle(presentation, slide, 'body', bodySources, bodyThemeForeground);
         if (titlePlaceholder) setShapeText(titlePlaceholder, '');
         if (bodyPlaceholder) setShapeText(bodyPlaceholder, '');
         const roleStyle = (base: ReturnType<typeof roleTextStyle>, role: 'title' | 'body') => {
@@ -1099,7 +1101,13 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
             font: base.font ?? (role === 'title' ? input.templateIR.theme?.fonts.major : input.templateIR.theme?.fonts.minor) ?? undefined,
           };
         };
-        const titleStyle = roleStyle(titleStyleBase, 'title');
+        const titleStyleResolved = roleStyle(titleStyleBase, 'title');
+        // Role placeholders can carry a stale dark run color even when the
+        // measured title region sits on a dark inherited background. The
+        // region-derived foreground takes precedence when it has contrast proof.
+        const titleStyle = titleThemeForeground
+          ? { ...titleStyleResolved, color: titleThemeForeground }
+          : titleStyleResolved;
         const bodyStyleBaseResolved = roleStyle(bodyStyleBase, 'body');
         const bodyColor = templateDerivedBodyColor(compiled, input.templateIR, titleStyle.color, bodyStyleBaseResolved.color);
         const bodyStyle = bodyColor ? { ...bodyStyleBaseResolved, color: bodyColor } : bodyStyleBaseResolved;
