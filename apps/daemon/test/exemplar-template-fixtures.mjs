@@ -115,6 +115,43 @@ export async function createSixRegionGridExemplarTemplate(filePath, { masterName
   await deck.writeFile({ fileName: filePath });
 }
 
+/** Three native body families with two, four, and six editable regions for completeness ranking. */
+export async function createBodyCapacityExemplarTemplate(filePath, { masterName = 'Body capacity families' } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  const familyMasters = Array.from({ length: 3 }, (_, family) => `${masterName} ${family + 1}`);
+  familyMasters.forEach((title) => deck.defineSlideMaster({ title, objects: [] }));
+  const counts = [2, 4, 6];
+  for (let family = 0; family < counts.length; family += 1) {
+    const count = counts[family];
+    for (let slideIndex = 0; slideIndex < 3; slideIndex += 1) {
+      const slide = deck.addSlide({ masterName: familyMasters[family] });
+      slide.addText(`Source headline ${family}-${slideIndex}`, {
+        x: 0.58, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
+      });
+      const columns = count === 2 ? 2 : count === 4 ? 2 : 3;
+      const rows = Math.ceil(count / columns);
+      const gapX = 0.28;
+      const gapY = 0.32;
+      const width = (12.1 - (columns - 1) * gapX) / columns;
+      const height = count === 2 ? 2.05 : count === 4 ? 1.48 : 1.35;
+      for (let region = 0; region < count; region += 1) {
+        const row = Math.floor(region / columns);
+        const column = region % columns;
+        slide.addText(`Source region ${family}-${slideIndex}-${region}`, {
+          x: 0.62 + column * (width + gapX), y: 1.55 + row * (height + gapY), w: width, h: height,
+          fontFace: 'Aptos', fontSize: 18, margin: 0.12, valign: 'top',
+          fill: { color: 'E9EEF3' }, line: { color: 'D1D9E0', width: 0.8 },
+        });
+      }
+      slide.addText('REPEATED CAPACITY BRAND', {
+        x: 0.58, y: 7.08, w: 3.2, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+      });
+    }
+  }
+  await deck.writeFile({ fileName: filePath });
+}
+
 /** Structural role fixtures; titles and bodies share geometry so only measured typography/topology distinguishes them. */
 export async function createRoleExemplarTemplate(filePath, { masterName = 'Structural role fixtures' } = {}) {
   const deck = new pptxgen();
@@ -166,6 +203,33 @@ export async function createTwoRegionExemplarTemplate(filePath, { masterName = '
   await deck.writeFile({ fileName: filePath });
 }
 
+/** Repeated editable four-row body with a separate native square marker per row. */
+export async function createFourRowBulletExemplarTemplate(filePath, { masterName = 'Four-row bullet layout' } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({ title: masterName, objects: [] });
+  for (let slideIndex = 0; slideIndex < 4; slideIndex += 1) {
+    const slide = deck.addSlide({ masterName });
+    slide.addText(`Source headline ${slideIndex + 1}`, {
+      x: 0.62, y: 0.32, w: 11.9, h: 0.72, fontFace: 'Aptos Display', fontSize: 30, bold: true, margin: 0,
+    });
+    for (let row = 0; row < 4; row += 1) {
+      const y = 1.55 + row * 0.95;
+      slide.addShape('rect', {
+        x: 0.68, y: y + 0.14, w: 0.18, h: 0.18,
+        line: { color: '274C77', transparency: 100 }, fill: { color: '1687C9' },
+      });
+      slide.addText(`Source bullet ${slideIndex + 1}-${row + 1}`, {
+        x: 1.05, y, w: 11.5, h: 0.55, fontFace: 'Aptos', fontSize: 19, margin: 0,
+      });
+    }
+    slide.addText('REPEATED FOUR-ROW BRAND', {
+      x: 0.62, y: 7.08, w: 3.4, h: 0.18, fontFace: 'Aptos', fontSize: 9, margin: 0,
+    });
+  }
+  await deck.writeFile({ fileName: filePath });
+}
+
 /** Two repeated exemplar families plus a third, separately styled native-placeholder layout. */
 export async function createHybridExemplarTemplate(filePath, { masterName = 'Hybrid qualification' } = {}) {
   const deck = new pptxgen();
@@ -205,6 +269,33 @@ export async function createHybridExemplarTemplate(filePath, { masterName = 'Hyb
   const nativeSlide = deck.addSlide({ masterName: nativeMaster });
   nativeSlide.addText('Native source title sample', { placeholder: 'Hybrid native title' });
   nativeSlide.addText('Native source body sample', { placeholder: 'Hybrid native body' });
+  await deck.writeFile({ fileName: filePath });
+}
+
+/** Geometry-only ending composition: hero title, two paired lower identities, and an isolated square callout. */
+export async function createClosingRoleExemplarTemplate(filePath, { masterName = 'Closing role layout' } = {}) {
+  const deck = new pptxgen();
+  deck.layout = 'LAYOUT_WIDE';
+  deck.defineSlideMaster({ title: masterName, objects: [] });
+  for (let slideIndex = 0; slideIndex < 4; slideIndex += 1) {
+    const slide = deck.addSlide({ masterName });
+    slide.addText(`Original closing headline ${slideIndex + 1}`, {
+      x: 1.1, y: 2.2, w: 8.3, h: 1.45, fontFace: 'Aptos Display', fontSize: 54, bold: true, margin: 0,
+    });
+    slide.addText(`Source callout ${slideIndex + 1}`, {
+      x: 10.25, y: 0.65, w: 1.95, h: 1.95, fontFace: 'Aptos', fontSize: 22, margin: 0.08,
+    });
+    for (let person = 0; person < 2; person += 1) {
+      const x = person === 0 ? 3.0 : 7.0;
+      slide.addShape('ellipse', {
+        x, y: 5.05, w: 0.84, h: 0.84,
+        line: { color: '1687C9', width: 1 }, fill: { color: 'DCEAF4' },
+      });
+      slide.addText(`Source role ${slideIndex + 1}-${person + 1}`, {
+        x: x + 0.98, y: 5.05, w: 2.25, h: 0.84, fontFace: 'Aptos', fontSize: 16, margin: 0,
+      });
+    }
+  }
   await deck.writeFile({ fileName: filePath });
 }
 

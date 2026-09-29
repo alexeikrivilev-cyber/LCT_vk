@@ -47,6 +47,9 @@ import { createHardTemplateCorpus } from './hard-template-corpus.mjs';
 import { createOfflineReplayManifest, runOfflineMatrixFromState } from '../../../scripts/run-offline-presentation-matrix.mjs';
 import { runPptxCompatibilityHarness } from '../../../scripts/compare-pptx-backends.mjs';
 import {
+  createFourRowBulletExemplarTemplate,
+  createBodyCapacityExemplarTemplate,
+  createClosingRoleExemplarTemplate,
   createDuplicateProjectionExemplarTemplate,
   createCrossLayoutFooterTemplate,
   createExemplarTemplate,
@@ -1108,6 +1111,38 @@ test('sparse copy selects an aligned compact subset from a larger body grid', as
   assert.deepEqual(rendered.unresolvedVisualTypes, []);
 });
 
+test('body-region completeness favors native capacity that matches short planned copy', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-body-completeness-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'body-capacity-families.pptx', { create: createBodyCapacityExemplarTemplate });
+  const bodyIdsBySlide = Object.fromEntries(template.templateIR.slides.map((slide) => [slide.index,
+    slide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+      && element.text?.startsWith('Source region')).map((element) => element.id)]));
+  const profile = semanticProfileForMultiRegion(template.templateIR,
+    template.templateIR.slides.map((slide) => slide.index), bodyIdsBySlide);
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]).slides[1];
+  assert.ok(compiled);
+  const sparseCopy = {
+    ...compiled,
+    body: ['Короткий первый вывод.', 'Короткий второй вывод.'],
+    targetDensity: 'balanced',
+    visualization: { ...compiled.visualization, type: 'none', status: 'none', tableData: null, tableCellRefs: null, chartData: null, processSteps: [], kpi: null },
+    imageRefs: [],
+  };
+  const assessment = assessExemplarSelection(sparseCopy, template.templateIR, profile);
+  assert.ok(assessment.selection, JSON.stringify(assessment.candidateDiagnostics.filter((candidate) => candidate.projectionSafe === true)));
+  assert.ok(assessment.safeSelections.length >= 3, '2-, 4-, and 6-zone safe composition families remain candidates');
+  const winner = assessment.safeSelections[0];
+  assert.ok(winner.sourceSlideIndex <= 3, `two-zone composition wins over sparse grids; selected source slide ${winner.sourceSlideIndex}`);
+  assert.equal(winner.designFeatures.availableBodyRegionCount, 2);
+  assert.equal(winner.designFeatures.bodyRegionCompleteness, 1);
+  const larger = assessment.safeSelections.find((candidate) => candidate.sourceSlideIndex >= 4);
+  assert.ok(larger);
+  assert.ok(larger.designFeatures.bodyRegionCompleteness < winner.designFeatures.bodyRegionCompleteness);
+  assert.ok(larger.evidence.some((item) => item.includes('unused safe body area=')));
+});
+
 test('Office Kit renderer preserves distinct projected A/B/C composition signatures', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-rendered-variant-signatures-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1601,6 +1636,39 @@ test('donor ranking measures wrapped copy density and recurring source shell', a
   assert.ok(richestFamily.evidence.some((item) => item.includes('safe recurring shell richness=')));
 });
 
+test('closing topology overrides a conflicting profile and is reserved for summary intent', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-closing-topology-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'closing-role-layout.pptx', { create: createClosingRoleExemplarTemplate });
+  const donor = template.templateIR.slides[0];
+  assert.ok(donor);
+  const title = donor.elements.find((element) => element.text?.startsWith('Original closing headline'));
+  const body = donor.elements.find((element) => element.text?.startsWith('Source callout'));
+  assert.ok(title && body);
+  assert.equal(classifyExemplarArchetype(donor, template.templateIR, title.id, body.id).archetype, 'closing');
+  const profile = semanticProfileFor(template.templateIR, () => 'content', () => 0.95);
+  for (const profileSlide of profile.slides) {
+    const source = template.templateIR.slides.find((slide) => slide.index === profileSlide.sourceSlideIndex);
+    const bodyIds = source.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+      && (element.text?.startsWith('Source callout') || element.text?.startsWith('Source role'))).map((element) => element.id);
+    profileSlide.bodyElementIds = bodyIds;
+    profileSlide.replaceableTextElementIds = profileSlide.replaceableTextElementIds.filter((id) => !bodyIds.includes(id));
+  }
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compileTemplate = await exemplarFixture(root, 'compile-skeleton.pptx');
+  const compiled = compilePresentation(deckPlan, contentIR, compileTemplate.templateIR, VARIANT_POLICIES[0]).slides[1];
+  assert.ok(compiled);
+  const shortTitle = { ...compiled, title: 'Ключевой вывод', body: ['Первый подтверждённый тезис.', 'Второй подтверждённый тезис.'] };
+  const narrative = assessExemplarSelection({ ...shortTitle, intent: 'narrative' }, template.templateIR, profile);
+  assert.equal(narrative.selection, null, 'a composition with dedicated ending structure cannot replace a narrative donor');
+  assert.ok(narrative.candidateDiagnostics.some((candidate) => candidate.sourceSlideIndex === donor.index
+    && candidate.structuralArchetype === 'closing' && candidate.semanticArchetype === 'closing'
+    && candidate.roleCompatible === false), JSON.stringify(narrative.candidateDiagnostics.filter((candidate) => candidate.sourceSlideIndex === donor.index)));
+  const summary = assessExemplarSelection({ ...shortTitle, intent: 'summary' }, template.templateIR, profile);
+  assert.ok(summary.safeSelections.some((selection) => selection.sourceSlideIndex === donor.index
+    && selection.semanticArchetype === 'closing'), 'the native ending composition remains available to summary intent');
+});
+
 test('semantic role hints cannot bypass source-specific projection safety', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-semantic-safety-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1715,6 +1783,79 @@ test('semantic projection assigns complete body blocks across two native regions
   }
   assert.ok(!oneBlockReopened.inspection.slides[0]?.elements.some((element) => /Left source region|Right source region/.test(element.text)),
     'unused mapped sample text cannot leak from the source template when the projected content has fewer blocks');
+});
+
+test('unused body markers are removed while markers for projected rows survive a reopened PPTX', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-unused-body-markers-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await exemplarFixture(root, 'four-row-bullets.pptx', { create: createFourRowBulletExemplarTemplate });
+  const bodyIdsBySlide = Object.fromEntries(template.templateIR.slides.map((slide) => [slide.index,
+    slide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+      && element.text?.startsWith('Source bullet')).map((element) => element.id)]));
+  const profile = semanticProfileForMultiRegion(template.templateIR,
+    template.templateIR.slides.map((slide) => slide.index), bodyIdsBySlide);
+  // The real Heldout profiles classify these unlabelled square row markers as
+  // visual affordances. They still need to follow the selected body projection.
+  for (const profileSlide of profile.slides) {
+    const donorSlide = template.templateIR.slides.find((slide) => slide.index === profileSlide.sourceSlideIndex);
+    assert.ok(donorSlide);
+    profileSlide.visualElementIds = donorSlide.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+      && !element.text?.trim() && element.nativeId
+      && (element.geometry.resolved ?? element.geometry.direct)?.width < template.templateIR.slideSize.width * 0.05)
+      .map((element) => element.id);
+  }
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiledDeck = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const sourceSlide = compiledDeck.slides[1];
+  assert.ok(sourceSlide);
+  const sparseCopy = {
+    ...sourceSlide,
+    body: ['Первый короткий тезис.', 'Второй короткий тезис.'],
+    visualization: { ...sourceSlide.visualization, type: 'none', status: 'none', tableData: null, tableCellRefs: null, chartData: null, processSteps: [], kpi: null },
+    imageRefs: [],
+  };
+  const assessment = assessExemplarSelection(sparseCopy, template.templateIR, profile);
+  const selection = assessment.selection;
+  assert.ok(selection, JSON.stringify(assessment.candidateDiagnostics.filter((candidate) => candidate.projectionSafe === true)));
+  const donor = template.templateIR.slides.find((slide) => slide.sourcePart === selection.sourcePart);
+  assert.ok(donor);
+  const selectedBodyIds = new Set(selection.slots.bodySlots.map((slot) => slot.elementId));
+  const bodyElements = donor.elements.filter((element) => bodyIdsBySlide[donor.index]?.includes(element.id));
+  const markerElements = donor.elements.filter((element) => element.kind.toLowerCase() === 'shape'
+    && !element.text?.trim() && element.nativeId && (element.geometry.resolved ?? element.geometry.direct)?.width < template.templateIR.slideSize.width * 0.05);
+  assert.equal(markerElements.length, 4);
+  const markerToBody = new Map(markerElements.map((marker) => {
+    const markerBox = marker.geometry.resolved ?? marker.geometry.direct;
+    const nearest = bodyElements.map((body) => ({ body, box: body.geometry.resolved ?? body.geometry.direct }))
+      .sort((left, right) => Math.abs(left.box.y + left.box.height / 2 - markerBox.y - markerBox.height / 2)
+        - Math.abs(right.box.y + right.box.height / 2 - markerBox.y - markerBox.height / 2))[0];
+    assert.ok(nearest);
+    return [marker, nearest.body];
+  }));
+  for (const [marker, body] of markerToBody) {
+    const removed = selection.removeElementNativeIds.includes(marker.nativeId);
+    assert.equal(removed, !selectedBodyIds.has(body.id), `marker ${marker.nativeId} follows its associated body projection`);
+  }
+
+  const outputPath = path.join(root, 'rendered', 'two-row-bullets.pptx');
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const projectedSlide = {
+    ...sparseCopy,
+    exemplarSelection: selection,
+    exemplarSelectionValidation: { templateIRHash: template.templateIR.hash, signature: selection.projectedCompositionSignature },
+  };
+  const rendered = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: { ...compiledDeck, id: `${compiledDeck.id}_two_row_bullets`, slides: [projectedSlide] },
+    contentIR, templateIR: template.templateIR, semanticProfile: profile,
+    templatePath: template.templatePath, outputPath,
+  });
+  assert.equal(rendered.reopenStatus, 'passed');
+  const reopened = await loadPresentation(await readFile(outputPath));
+  const remainingIds = new Set(getSlideShapes(getSlides(reopened)[0]).map((shape) => String(getShapeId(shape))));
+  for (const [marker, body] of markerToBody) {
+    assert.equal(remainingIds.has(marker.nativeId), selectedBodyIds.has(body.id),
+      `reopened PPTX keeps only the markers beside projected native rows (${marker.nativeId})`);
+  }
 });
 
 test('joint A/B/C assignments preserve the exact qualified composition kind in renderer and matrix', async (t) => {

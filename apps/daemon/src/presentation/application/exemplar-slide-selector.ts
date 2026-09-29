@@ -69,7 +69,7 @@ export interface ExemplarSlideSelection {
     blocked: string[];
   };
   clearElementNativeIds: string[];
-  /** Source body copy and a uniquely geometry-associated panel may be removed when a trusted profile marks the slot unused. */
+  /** Source body copy, a uniquely associated panel, and its unambiguous marker may be removed for an unused trusted slot. */
   removeElementNativeIds: string[];
   preserveChromeNativeIds: string[];
   /** Legacy source morphology key, retained as evidence only. It is not used for A/B/C deduplication. */
@@ -83,6 +83,9 @@ export interface ExemplarSlideSelection {
     structuralArchetype: ExemplarArchetype;
     mappedBodyRegionCount: number;
     projectedBodyRegionCount: number;
+    availableBodyRegionCount: number;
+    bodyRegionCompleteness: number;
+    unusedBodyAreaShare: number;
     unusedMappedBodyRegionCount: number;
     unusedVisualSlotAreaShare: number;
     visualAreaShare: number;
@@ -141,6 +144,9 @@ export interface ExemplarSelectionAssessment {
       structuralArchetype: ExemplarArchetype;
       mappedBodyRegionCount: number;
       projectedBodyRegionCount: number;
+      availableBodyRegionCount: number;
+      bodyRegionCompleteness: number;
+      unusedBodyAreaShare: number;
       unusedMappedBodyRegionCount: number;
       unusedVisualSlotAreaShare: number;
       visualAreaShare: number;
@@ -246,6 +252,31 @@ function area(box: { x: number; y: number; width: number; height: number } | nul
 
 function geometryOf(element: TemplateElement): TemplateGeometry | null {
   return element.geometry.resolved ?? element.geometry.direct;
+}
+
+function bodyLikeAffordance(
+  element: TemplateElement,
+  title: TemplateElement,
+  selectedBodies: readonly TemplateElement[],
+): boolean {
+  const box = geometryOf(element);
+  if (!box || element.parentId !== null || element.kind.toLowerCase() !== 'shape'
+      || !element.nativeId || !normalizedText(element) || !selectedBodies.length) return false;
+  const selectedBoxes = selectedBodies.map(geometryOf).filter((item): item is TemplateGeometry => Boolean(item));
+  if (!selectedBoxes.length) return false;
+  const median = (values: number[]) => {
+    const sorted = values.filter((value) => Number.isFinite(value) && value > 0).sort((left, right) => left - right);
+    return sorted.length ? sorted[Math.floor(sorted.length / 2)]! : 0;
+  };
+  const medianArea = median(selectedBoxes.map(area));
+  const medianWidth = median(selectedBoxes.map((item) => item.width));
+  const medianHeight = median(selectedBoxes.map((item) => item.height));
+  const medianFont = median(selectedBodies.map(maxFont));
+  const font = maxFont(element);
+  return element.id !== title.id && area(box) >= medianArea * 0.3 && area(box) <= medianArea * 2.5
+    && box.width >= medianWidth * 0.45 && box.height >= medianHeight * 0.45
+    && font >= medianFont * 0.5 && font <= medianFont * 1.8
+    && font <= Math.max(1, maxFont(title) * 0.8);
 }
 
 function maxFont(element: TemplateElement): number {
@@ -377,6 +408,36 @@ function associatedUnusedBodyPanels(
   const panelCounts = new Map<string, number>();
   for (const item of associations) if (item.panel) panelCounts.set(item.panel.id, (panelCounts.get(item.panel.id) ?? 0) + 1);
   return associations.flatMap((item) => item.panel && panelCounts.get(item.panel.id) === 1 ? [item.panel] : []);
+}
+
+function associatedUnusedBodyMarkers(
+  slide: TemplateSlide,
+  bodyRegions: readonly TemplateElement[],
+  unusedBodyRegionIds: ReadonlySet<string>,
+  protectedMarkerIds: ReadonlySet<string>,
+  template: TemplateIR,
+): TemplateElement[] {
+  return slide.elements.flatMap((marker) => {
+    if (protectedMarkerIds.has(marker.id) || marker.parentId !== null || !marker.nativeId
+        || marker.kind.toLowerCase() !== 'shape' || normalizedText(marker) || marker.relationshipIds.length) return [];
+    const markerBox = geometryOf(marker);
+    const markerAspect = markerBox ? markerBox.width / Math.max(1, markerBox.height) : 0;
+    if (!markerBox || !inCanvas(markerBox, template) || markerAspect < 0.7 || markerAspect > 1.3
+        || markerBox.width > template.slideSize.width * 0.05 || markerBox.height > template.slideSize.height * 0.05) return [];
+    const relatedRegions = bodyRegions.filter((body) => {
+      const bodyBox = geometryOf(body);
+      if (!bodyBox) return false;
+      const horizontalGap = bodyBox.x - (markerBox.x + markerBox.width);
+      const verticalTolerance = bodyBox.height * 0.04;
+      return horizontalGap >= -markerBox.width * 0.15
+        && horizontalGap <= Math.max(markerBox.width * 1.5, bodyBox.height * 0.35)
+        && markerBox.y >= bodyBox.y - verticalTolerance
+        && markerBox.y + markerBox.height <= bodyBox.y + bodyBox.height + verticalTolerance
+        && markerBox.width <= bodyBox.width * 0.1
+        && markerBox.height <= bodyBox.height * 0.5;
+    });
+    return relatedRegions.length === 1 && unusedBodyRegionIds.has(relatedRegions[0]!.id) ? [marker] : [];
+  });
 }
 
 function unusedSemanticVisualSlots(
@@ -771,7 +832,89 @@ function classifyStructuralArchetype(
     || (titleBodyFontRatio >= 2.5 && titleHeightShare >= 0.14 && bodyAreaShare < 0.15);
   let archetype: ExemplarArchetype = 'content';
 
-  if (hasDataObject) archetype = 'table-data';
+  const visualAnchors = [...visualKinds(slide), ...unlabelledShapes]
+    .filter((element, index, all) => all.findIndex((candidate) => candidate.id === element.id) === index)
+    .filter((element) => {
+      const box = geometryOf(element);
+      if (!box) return false;
+      const share = area(box) / canvasArea;
+      const ratio = box.width / Math.max(1, box.height);
+      return share >= 0.002 && share <= 0.035 && ratio >= 0.65 && ratio <= 1.45;
+    });
+  const lowerAnchorGroups = visualAnchors.filter((anchor) => {
+    const box = geometryOf(anchor)!;
+    const centerY = (box.y + box.height / 2) / template.slideSize.height;
+    if (centerY < 0.62) return false;
+    const paired = visualAnchors.filter((other) => {
+      if (other.id === anchor.id) return true;
+      const otherBox = geometryOf(other)!;
+      return Math.abs((otherBox.y + otherBox.height / 2) - (box.y + box.height / 2))
+          <= Math.max(box.height, otherBox.height) * 0.3
+        && Math.abs(otherBox.width - box.width) <= Math.max(box.width, otherBox.width) * 0.18
+        && Math.abs(otherBox.height - box.height) <= Math.max(box.height, otherBox.height) * 0.18;
+    });
+    return paired.length >= 2;
+  });
+  const closingTopology = lowerAnchorGroups.some((anchor) => {
+    const anchorBox = geometryOf(anchor)!;
+    const alignedAnchors = visualAnchors.filter((other) => {
+      const otherBox = geometryOf(other)!;
+      return Math.abs((otherBox.y + otherBox.height / 2) - (anchorBox.y + anchorBox.height / 2))
+          <= Math.max(anchorBox.height, otherBox.height) * 0.3
+        && Math.abs(otherBox.width - anchorBox.width) <= Math.max(anchorBox.width, otherBox.width) * 0.18
+        && Math.abs(otherBox.height - anchorBox.height) <= Math.max(anchorBox.height, otherBox.height) * 0.18;
+    });
+    const labels = textShapes.filter((element) => element.id !== title.id && !preservedChromeIds.has(element.id)
+      && maxFont(element) >= 9 && maxFont(element) <= maxFont(title) * 0.7
+      && area(geometryOf(element)) / canvasArea >= 0.003
+      && alignedAnchors.some((item) => {
+        const box = geometryOf(item)!;
+        const textBox = geometryOf(element);
+        if (!textBox) return false;
+        const verticalOverlap = Math.max(0, Math.min(box.y + box.height, textBox.y + textBox.height) - Math.max(box.y, textBox.y));
+        const horizontalGap = Math.max(0, Math.max(box.x, textBox.x) - Math.min(box.x + box.width, textBox.x + textBox.width));
+        const verticalGap = Math.max(0, Math.max(box.y, textBox.y) - Math.min(box.y + box.height, textBox.y + textBox.height));
+        return verticalOverlap >= Math.min(box.height, textBox.height) * 0.45
+            && horizontalGap <= template.slideSize.width * 0.035
+          || verticalGap <= Math.max(box.height, textBox.height) * 0.25
+            && horizontalGap <= Math.max(box.width, textBox.width) * 0.25;
+      }));
+    const pairedLabels = labels.filter((label) => {
+      const textBox = geometryOf(label)!;
+      return alignedAnchors.some((item) => {
+        const box = geometryOf(item)!;
+        const verticalOverlap = Math.max(0, Math.min(box.y + box.height, textBox.y + textBox.height) - Math.max(box.y, textBox.y));
+        const horizontalGap = Math.max(0, Math.max(box.x, textBox.x) - Math.min(box.x + box.width, textBox.x + textBox.width));
+        const verticalGap = Math.max(0, Math.max(box.y, textBox.y) - Math.min(box.y + box.height, textBox.y + textBox.height));
+        return verticalOverlap >= Math.min(box.height, textBox.height) * 0.45
+            && horizontalGap <= template.slideSize.width * 0.035
+          || verticalGap <= Math.max(box.height, textBox.height) * 0.25
+            && horizontalGap <= Math.max(box.width, textBox.width) * 0.25;
+      });
+    });
+    const titleBox = geometryOf(title)!;
+    const titleCenterY = (titleBox.y + titleBox.height / 2) / template.slideSize.height;
+    const isolatedSquareCallout = textShapes.some((element) => {
+      if (element.id === title.id || labels.includes(element) || preservedChromeIds.has(element.id)) return false;
+      const box = geometryOf(element);
+      if (!box || (box.y + box.height) / template.slideSize.height > 0.78) return false;
+      const aspect = box.width / Math.max(1, box.height);
+      if (aspect < 0.65 || aspect > 1.45 || area(box) / canvasArea < 0.035) return false;
+      const titleOverlap = box.x < titleBox.x + titleBox.width && box.x + box.width > titleBox.x
+        && box.y < titleBox.y + titleBox.height && box.y + box.height > titleBox.y;
+      const anchorOverlap = alignedAnchors.some((item) => {
+        const anchorBox = geometryOf(item)!;
+        return box.x < anchorBox.x + anchorBox.width && box.x + box.width > anchorBox.x
+          && box.y < anchorBox.y + anchorBox.height && box.y + box.height > anchorBox.y;
+      });
+      return !titleOverlap && !anchorOverlap;
+    });
+    return pairedLabels.length >= 2 && isolatedSquareCallout && titleCenterY >= 0.25 && titleCenterY <= 0.62
+      && titleBodyFontRatio >= 2.1;
+  });
+
+  if (closingTopology) archetype = 'closing';
+  else if (hasDataObject) archetype = 'table-data';
   else if (pictureArea >= 0.16 || visualAreaShare >= 0.34) archetype = 'visual-led';
   else if (sideBySideMajor || (pictureArea >= 0.1 && mappedBodyCenterX / template.slideSize.width < 0.55)) archetype = 'content-split';
   else if (largeMetricCount >= 3 && majorText.length >= 5) archetype = 'metric-evidence';
@@ -1242,7 +1385,8 @@ function candidateFor(
   if (confidence < MIN_EXEMPLAR_CONFIDENCE) return reject('confidence', `candidate confidence ${confidence}<${MIN_EXEMPLAR_CONFIDENCE}`);
 
   const archetype = classifyStructuralArchetype(slide, template, title, bodies, preservedChromeIds);
-  const chosenArchetype = trustedProfile && !structurallyReusedProfile
+  const structurallyClosing = archetype.archetype === 'closing';
+  const chosenArchetype = trustedProfile && !structurallyReusedProfile && !structurallyClosing
     ? trustedProfile.archetype as ExemplarArchetype : archetype.archetype;
   const semanticConflict = Boolean(trustedProfile && !structurallyReusedProfile && trustedProfile.archetype !== archetype.archetype);
   const titleAreaShare = archetype.titleAreaShare;
@@ -1268,6 +1412,20 @@ function candidateFor(
     && !replacedTextIds.includes(element.id));
   const unprojectedReplaceableText = textShapes.filter((element) => semanticReplaceableIds.has(element.id)
     && !replacedTextIds.includes(element.id) && !preservedText.includes(element));
+  const bodyAffordanceIds = new Set(trustedProfile
+    ? [...trustedProfile.bodyElementIds, ...(trustedProfile.replaceableTextElementIds ?? [])]
+    : bodies.map((element) => element.id));
+  const bodyAffordanceRegions = [...new Map([...bodies, ...unprojectedMappedBodies, ...unprojectedReplaceableText]
+    .filter((element) => bodyAffordanceIds.has(element.id)
+      && !preservedChromeIds.has(element.id) && !semanticPreservedIds.has(element.id)
+      && bodyLikeAffordance(element, title, bodies))
+    .map((element) => [element.id, element])).values()];
+  const bodyAffordanceRegionIds = new Set(bodyAffordanceRegions.map((element) => element.id));
+  const unusedBodyAffordanceRegions = bodyAffordanceRegions.filter((element) => !selectedBodyIds.has(element.id));
+  const availableBodyRegionCount = Math.max(bodies.length, bodyAffordanceRegions.length);
+  const bodyRegionCompleteness = Number((bodies.length / Math.max(1, availableBodyRegionCount)).toFixed(4));
+  const unusedBodyAreaShare = Number((unusedBodyAffordanceRegions.reduce((sum, element) => sum + area(geometryOf(element)), 0)
+    / canvasArea).toFixed(4));
   const removableUnusedReplaceableText = unprojectedReplaceableText.filter((element) => element.parentId === null
     && Boolean(element.nativeId) && element.kind.toLowerCase() === 'shape' && element.relationshipIds.length === 0);
   const removableUnusedReplaceableIds = new Set(removableUnusedReplaceableText.map((element) => element.id));
@@ -1278,6 +1436,15 @@ function candidateFor(
   const removableUnusedBodies = unprojectedMappedBodies.filter((element) => removableUnusedBodyIds.has(element.id));
   const removableUnusedPanels = associatedUnusedBodyPanels(slide, [...removableUnusedBodies, ...removableUnusedReplaceableText],
     new Set([...preservedChromeIds, ...visualElementIds, ...preservedText.map((element) => element.id), title.id, ...bodies.map((element) => element.id)]), template);
+  const unusedBodyMarkerRegionIds = new Set([...removableUnusedBodies, ...removableUnusedReplaceableText]
+    .filter((element) => bodyAffordanceRegionIds.has(element.id)).map((element) => element.id));
+  const removableUnusedBodyMarkers = associatedUnusedBodyMarkers(slide,
+    [...bodies, ...unprojectedMappedBodies, ...unprojectedReplaceableText], unusedBodyMarkerRegionIds,
+    // A visual profile can include small row markers as visual affordances. Their
+    // unique geometry association to a body row is stronger evidence here: keep
+    // markers beside selected rows and remove only those beside projected-away
+    // rows. Preserve explicit chrome and semantic-preservation declarations.
+    new Set([...preservedChromeIds, ...semanticPreservedIds]), template);
   const renderableVisual = hasRenderableVisual(compiled);
   const removableUnusedVisuals = renderableVisual ? [] : unusedSemanticVisualSlots(slide, visualElementIds,
     new Set([...preservedChromeIds, ...preservedText.map((element) => element.id), title.id, ...bodies.map((element) => element.id)]), template);
@@ -1354,7 +1521,8 @@ function candidateFor(
   const densityFitPreference = -Math.min(0.2, Math.max(0, densityTarget - textDensity) * 0.35);
   const bodyPointCount = compiled.body.length;
   const bodyRegionMatch = Math.max(-0.12, 0.06 - Math.abs(bodies.length - bodyPointCount) * 0.04);
-  const unusedBodyPenalty = Math.min(0.3, removableUnusedBodies.length * 0.025);
+  const unusedBodyPenalty = Math.min(0.42,
+    (1 - bodyRegionCompleteness) * 0.32 + Math.min(0.1, unusedBodyAreaShare * 0.6));
   const unusedVisualSlotAreaShare = Number((removableUnusedVisuals.reduce((sum, element) => sum + area(geometryOf(element)), 0) / canvasArea).toFixed(4));
   const unusedVisualSlotPenalty = Math.min(0.24, unusedVisualSlotAreaShare * 0.8);
   const bodyArrangementPreference = (bodyArrangement - 0.5) * 0.3;
@@ -1374,7 +1542,8 @@ function candidateFor(
   const score = confidenceScore + semanticBoost + segmentedRegionBoost - Math.min(0.25, contentGateReasons.length * 0.1)
     - (textDensity < 0.08 && bodyAreaShare > 0.3 ? 0.12 : 0);
   const clearElementNativeIds = [...new Set(explicitlyReplaceableText)].map((element) => element.nativeId!);
-  const removeElementNativeIds = [...new Set([...removableUnusedBodies, ...removableUnusedReplaceableText, ...removableUnusedPanels, ...removableUnusedVisuals])].map((element) => element.nativeId!);
+  const removeElementNativeIds = [...new Set([...removableUnusedBodies, ...removableUnusedReplaceableText,
+    ...removableUnusedPanels, ...removableUnusedBodyMarkers, ...removableUnusedVisuals])].map((element) => element.nativeId!);
   const visualSlots = renderableVisual ? visualClasses.filter((item) => item.kind === 'content-slot'
     && (visualElementIds.includes(item.elementId) || /picture|image|chart|table|graphic/i.test(
       `${slide.elements.find((element) => element.id === item.elementId)?.placeholder?.type ?? ''} ${slide.elements.find((element) => element.id === item.elementId)?.placeholder?.role ?? ''}`)))
@@ -1412,9 +1581,10 @@ function candidateFor(
     `planned body utilization target=${densityTarget.toFixed(2)}; fit preference=${densityFitPreference.toFixed(3)}`,
     `safe recurring shell richness=${shellRichnessScore.toFixed(3)} from ${safeShellVisuals.length} decorative visual(s), ${preservedText.length} chrome text region(s)`,
     `projected body region arrangement score ${bodyArrangement.toFixed(3)}`,
+    `body region completeness=${bodies.length}/${availableBodyRegionCount} (${bodyRegionCompleteness.toFixed(3)}), unused safe body area=${unusedBodyAreaShare.toFixed(4)}`,
     `strategy preference=${strategyScore.toFixed(3)}, profile preference=${profileStrategyScore.toFixed(3)}, no-visual-content penalty=${noVisualContentPenalty.toFixed(3)}, unused-body penalty=${unusedBodyPenalty.toFixed(3)}, unused-visual-slot area=${unusedVisualSlotAreaShare.toFixed(4)} penalty=${unusedVisualSlotPenalty.toFixed(3)}`,
     ...contentGateReasons.map((reason) => `content-sanity gate: ${reason}`),
-    `${textShapes.length} text shapes classified: ${preservedText.length} preserved, ${replacedTextIds.length} replaced, ${clearElementNativeIds.length} cleared; ${removableUnusedBodies.length} unused body region(s), ${removableUnusedReplaceableText.length} unused replaceable text shape(s), ${removableUnusedPanels.length} associated panel(s), and ${removableUnusedVisuals.length} empty profiled visual slot(s) removed; ${blockedText.length} blocked`,
+    `${textShapes.length} text shapes classified: ${preservedText.length} preserved, ${replacedTextIds.length} replaced, ${clearElementNativeIds.length} cleared; ${removableUnusedBodies.length} unused body region(s), ${removableUnusedReplaceableText.length} unused replaceable text shape(s), ${removableUnusedPanels.length} associated panel(s), ${removableUnusedBodyMarkers.length} unused body marker(s), and ${removableUnusedVisuals.length} empty profiled visual slot(s) removed; ${blockedText.length} blocked`,
     `${visualClasses.length} visual object(s) classified as ${Object.entries(visualClassCounts).map(([kind, count]) => `${kind}=${count}`).join(', ') || 'none'}`,
     `${slide.elements.filter((element) => element.kind.toLowerCase() === 'connector').length} native connectors and ${slide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && !normalizedText(element)).length} unlabelled shapes retained`,
     `${titleSupport} title evidence records and ${bodySupport} body evidence records refer to this source slide`,
@@ -1452,7 +1622,8 @@ function candidateFor(
       preserveChromeNativeIds,
       familyKey: familyKey(slide, title, body, template),
       projectedCompositionSignature: projectedCompositionSignature(slide, title, bodies,
-        new Set([...removableUnusedBodyIds, ...removableUnusedReplaceableIds, ...removableUnusedPanels.map((element) => element.id), ...removableUnusedVisuals.map((element) => element.id)]),
+        new Set([...removableUnusedBodyIds, ...removableUnusedReplaceableIds, ...removableUnusedPanels.map((element) => element.id),
+          ...removableUnusedBodyMarkers.map((element) => element.id), ...removableUnusedVisuals.map((element) => element.id)]),
         compiled.body.some((text) => text.trim()),
         new Set([...preservedChromeIds, ...preservedText.map((element) => element.id)]), template, visualSlot),
       titleGeometryNormalized: titleNormalized,
@@ -1462,6 +1633,9 @@ function candidateFor(
         structuralArchetype: archetype.archetype,
         mappedBodyRegionCount: trustedProfile?.bodyElementIds.length ?? bodies.length,
         projectedBodyRegionCount: bodies.length,
+        availableBodyRegionCount,
+        bodyRegionCompleteness,
+        unusedBodyAreaShare,
         unusedMappedBodyRegionCount: removableUnusedBodies.length,
         unusedVisualSlotAreaShare,
         visualAreaShare: Number(archetype.visualAreaShare.toFixed(4)),
@@ -1477,7 +1651,8 @@ function candidateFor(
         : ['The structural selector can project one compatible body region; ambiguous unmapped text blocks donor reuse.'],
     };
   diagnostic.structuralArchetype = archetype.archetype;
-  diagnostic.semanticArchetype = trustedProfile && !structurallyReusedProfile ? trustedProfile.archetype : archetype.archetype;
+  diagnostic.semanticArchetype = trustedProfile && !structurallyReusedProfile && !structurallyClosing
+    ? trustedProfile.archetype : archetype.archetype;
   diagnostic.titleElementId = title.id;
   diagnostic.bodyElementIds = trustedProfile?.bodyElementIds ?? bodies.map((element) => element.id);
   diagnostic.gate = 'passed';
@@ -1498,10 +1673,11 @@ function candidateFor(
 }
 
 function semanticCandidates(candidates: Candidate[], intent: CompiledSlide['intent']): Candidate[] {
-  // Intent/archetype is a ranking signal only. Projection safety, source residue,
-  // geometry, and per-region fit have already been enforced as hard gates.
-  void intent;
-  return candidates.filter((candidate) => candidate.projectionSafe);
+  // Closing compositions are hard role-specific: their repeated lower identity
+  // row and isolated callout should be reserved for a summary/ending slide.
+  // Other archetype preferences remain ranking signals after safety gates.
+  return candidates.filter((candidate) => candidate.projectionSafe
+    && (candidate.selection.designFeatures.structuralArchetype !== 'closing' || intent === 'summary'));
 }
 
 export function nativePlaceholderFallbackSupported(
