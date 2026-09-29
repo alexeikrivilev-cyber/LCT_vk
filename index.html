@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#090d16">
+    <meta name="description" content="Интерактивный статический прототип конструктора презентаций LCT.">
+    <title>LCT — конструктор презентаций</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="LCT — на главную"><span class="brand-mark">L</span><span>LCT</span></a>
+      <span class="topbar-label">Конструктор презентаций</span>
+      <span class="prototype-badge"><i></i> Интерактивный прототип</span>
+    </header>
+
+    <main id="top">
+      <section class="hero wrap">
+        <div class="hero-copy">
+          <p class="eyebrow">ПРЕЗЕНТАЦИИ В ЯЗЫКЕ ВАШЕГО ШАБЛОНА</p>
+          <h1>От корпоративного PPTX<br><span>до редактируемой презентации</span></h1>
+          <p class="hero-subtitle">Из корпоративного PPTX и исходных материалов — в готовую редактируемую презентацию.</p>
+        </div>
+        <div class="hero-orbit" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="orbit-core">LCT</div><span class="orbit-dot dot-one"></span><span class="orbit-dot dot-two"></span></div>
+      </section>
+
+      <section class="workflow wrap" aria-labelledby="workflow-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">БЫСТРЫЙ СТАРТ</p><h2 id="workflow-title">Подготовьте исходные данные</h2></div>
+          <span class="demo-note">Демо работает локально · файлы не загружаются</span>
+        </div>
+        <div class="setup-grid">
+          <article class="setup-card" id="template-card">
+            <div class="step-heading"><span class="step-number">01</span><div><h3>Шаблон</h3><p>Выберите корпоративный PPTX</p></div></div>
+            <button class="button button-secondary" id="template-button" type="button"><span class="button-icon">＋</span> Загрузить PPTX</button>
+            <div class="setup-state" id="template-state" aria-live="polite"><span class="state-dot"></span><span>Ожидает выбора</span></div>
+            <div class="template-summary" id="template-summary" hidden>
+              <div class="template-preview-mark">W</div>
+              <div class="template-summary-copy"><strong>VK WorkSpace</strong><span>29 слайдов · шаблон готов</span></div>
+              <span class="ready-pill">Готов</span>
+              <div class="template-tags"><span>Текстовые композиции</span><span>Карточки</span><span>Таблицы</span><span>Графики</span><span>Диаграммы</span></div>
+            </div>
+          </article>
+
+          <article class="setup-card" id="source-card">
+            <div class="step-heading"><span class="step-number">02</span><div><h3>Материалы</h3><p>Добавьте факты для презентации</p></div></div>
+            <button class="button button-secondary" id="source-button" type="button"><span class="button-icon">＋</span> Добавить материалы</button>
+            <div class="setup-state" id="source-state" aria-live="polite"><span class="state-dot"></span><span>Не добавлены</span></div>
+            <div class="source-summary" id="source-summary" hidden><span class="file-icon">MD</span><div><strong>lct-demo-source.md</strong><span>Источник добавлен</span></div><span class="check-mark">✓</span></div>
+          </article>
+        </div>
+
+        <article class="brief-card">
+          <div class="brief-head"><span class="step-number">03</span><div><h3>Задача презентации</h3><p>Уточните, что показать аудитории</p></div><span class="brief-hint">Можно изменить</span></div>
+          <label for="brief">Краткий бриф</label>
+          <textarea id="brief" rows="2">Подготовь краткую презентацию о платформе LCT: проблема, решение, архитектура, проверка и результат.</textarea>
+          <div class="brief-footer"><span><span class="sparkle">✳</span> Структура будет построена по задаче и материалам</span><button class="button button-primary" id="generate-button" type="button" disabled>Создать презентацию <span aria-hidden="true">→</span></button></div>
+        </article>
+
+        <section class="generation-state" id="generation-state" aria-live="polite" hidden>
+          <div class="generation-state-head"><div><p class="eyebrow">ЛОКАЛЬНЫЙ ДЕМО-СЦЕНАРИЙ</p><h3 id="generation-title">Готовим демонстрационный результат</h3></div><span class="loading-ring" aria-hidden="true"></span></div>
+          <ol class="generation-steps" id="generation-steps"></ol>
+          <div class="generation-progress"><i id="generation-progress-fill"></i></div>
+        </section>
+      </section>
+
+      <section class="result-section wrap" id="result-section" aria-labelledby="result-title" hidden>
+        <div class="section-heading result-heading">
+          <div><p class="eyebrow">РЕЗУЛЬТАТ</p><h2 id="result-title">Варианты презентации</h2><p>Один смысл — три композиционных подхода.</p></div>
+          <span class="result-ready"><i></i> 5 слайдов готовы</span>
+        </div>
+
+        <div class="result-layout">
+          <nav class="slide-rail" aria-label="Слайды презентации" id="slide-rail"></nav>
+          <section class="preview-column" aria-label="Предпросмотр слайда">
+            <div class="preview-toolbar"><span class="preview-label"><span class="live-dot"></span> ПРЕДПРОСМОТР</span><span id="slide-counter">Слайд 01 из 05</span></div>
+            <div class="slide-frame" id="slide-frame" aria-live="polite"></div>
+            <div class="variant-bar"><span class="variant-label">КОМПОЗИЦИЯ</span><div class="variant-switch" role="group" aria-label="Выберите композицию">
+              <button type="button" class="variant-button active" data-variant="A" aria-pressed="true"><b>A</b><span>Сценарная</span></button>
+              <button type="button" class="variant-button" data-variant="B" aria-pressed="false"><b>B</b><span>Свободная</span></button>
+              <button type="button" class="variant-button" data-variant="C" aria-pressed="false"><b>C</b><span>Карточки</span></button>
+            </div></div>
+          </section>
+
+          <aside class="audit-card" aria-labelledby="audit-title">
+            <div class="audit-card-heading"><div class="audit-icon">✓</div><div><p class="eyebrow">КОНТРОЛЬ КАЧЕСТВА</p><h3 id="audit-title">Проверка презентации</h3></div></div>
+            <ul class="audit-checks"><li><span>✓</span> Структура</li><li><span>✓</span> Переполнение текста</li><li><span>✓</span> Совместимость с шаблоном</li><li><span>✓</span> Редактируемые элементы</li></ul>
+            <div class="audit-result"><span class="audit-check-large">✓</span><div><strong>0 критических ошибок</strong><span>Демонстрационный результат</span></div></div>
+            <div class="export-block"><p class="eyebrow">ЭКСПОРТ</p><div class="export-buttons"><button type="button" class="export-button" data-format="PPTX">PPTX <span>↓</span></button><button type="button" class="export-button" data-format="PDF">PDF <span>↓</span></button><button type="button" class="export-button" data-format="HTML">HTML <span>↓</span></button></div><p class="export-hint" id="export-hint" aria-live="polite">Файлы доступны в рабочей версии.</p></div>
+          </aside>
+        </div>
+
+        <section class="pipeline-section" aria-labelledby="pipeline-title">
+          <div class="section-heading"><div><p class="eyebrow">КАК УСТРОЕН ПРОЦЕСС</p><h2 id="pipeline-title">От шаблона к результату</h2></div><span class="pipeline-tag">Последовательность системы</span></div>
+          <div class="pipeline-inputs"><div class="pipeline-input"><span class="pipeline-icon">P</span><div><strong>PPTX Template</strong><span>Шаблон и его правила</span></div></div><span class="plus-sign">+</span><div class="pipeline-input"><span class="pipeline-icon source-icon">≡</span><div><strong>Source Materials</strong><span>Факты и исходные данные</span></div></div></div>
+          <div class="pipeline-flow" aria-label="Этапы обработки презентации">
+            <div class="pipeline-node"><span>01</span><strong>TemplateIR</strong></div><i></i><div class="pipeline-node"><span>02</span><strong>PresentationDesignSystem</strong></div><i></i><div class="pipeline-node"><span>03</span><strong>ContentIR</strong></div><i></i><div class="pipeline-node"><span>04</span><strong>Worker</strong></div><i></i><div class="pipeline-node"><span>05</span><strong>Supervisor</strong></div><i></i><div class="pipeline-node"><span>06</span><strong>DeckPlan</strong></div>
+          </div>
+          <div class="pipeline-output"><div class="output-variants"><span>A</span><span>B</span><span>C</span></div><strong>Варианты</strong><span class="pipeline-arrow">→</span><strong>Аудит</strong><span class="pipeline-arrow">→</span><div class="output-formats"><span>PPTX</span><span>PDF</span><span>HTML</span></div></div>
+        </section>
+      </section>
+
+      <section class="capabilities wrap" aria-labelledby="capabilities-title">
+        <div class="section-heading"><div><p class="eyebrow">ВОЗМОЖНОСТИ СИСТЕМЫ</p><h2 id="capabilities-title">Что делает LCT</h2></div><p class="capabilities-intro">Рабочий конвейер сохраняет структуру шаблона и проверяет результат перед экспортом.</p></div>
+        <div class="capability-grid">
+          <article class="capability-card"><span class="capability-icon">▧</span><h3>Анализ PPTX</h3><p>Разбираем структуру существующего PowerPoint-шаблона.</p></article>
+          <article class="capability-card"><span class="capability-icon">⌘</span><h3>Template Design System</h3><p>Извлекаем композиции, геометрию, типографику и роли элементов.</p></article>
+          <article class="capability-card"><span class="capability-icon">≋</span><h3>Планирование</h3><p>Worker и Supervisor формируют DeckPlan.</p></article>
+          <article class="capability-card"><span class="capability-icon variant-icon">A/B/C</span><h3>Три варианта</h3><p>Создаются альтернативные композиции для слайдов.</p></article>
+          <article class="capability-card"><span class="capability-icon">✓</span><h3>Проверка</h3><p>Структура и ссылки проходят deterministic/runtime проверки.</p></article>
+          <article class="capability-card"><span class="capability-icon">▤</span><h3>Редактируемый PowerPoint</h3><p>Результат остаётся редактируемым PPTX с нативными объектами.</p></article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer wrap"><a class="brand footer-brand" href="#top"><span class="brand-mark">L</span><span>LCT</span></a><span>Интерактивный прототип · демонстрационные данные</span><a href="#top">Наверх ↑</a></footer>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
