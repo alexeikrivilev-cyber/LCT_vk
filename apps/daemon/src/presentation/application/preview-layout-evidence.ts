@@ -54,13 +54,14 @@ function text(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
-/** Downgrade only an exact geometry match to the selected source template; retain its evidence as a warning. */
+/** Downgrade only a unique exact geometry match to the selected source template; retain it as a warning. */
 export function classifySourceTemplateBleed(
   issue: unknown,
   template: TemplateIR,
   selection: ExemplarSlideSelection | null | undefined,
 ): unknown {
-  if (!selection || !isRecord(issue) || typeof issue.shapeName !== 'string' || !isRecord(issue.bounds)) return issue;
+  if (!selection || !isRecord(issue) || issue.classification !== 'GENERATED_OBJECT_OUT_OF_BOUNDS'
+      || issue.severity !== 'error' || !isRecord(issue.bounds)) return issue;
   const bounds = issue.bounds;
   if (!['x', 'y', 'width', 'height'].every((key) => typeof bounds[key] === 'number')) return issue;
 
@@ -69,7 +70,7 @@ export function classifySourceTemplateBleed(
   const master = layout?.masterId ? template.masters.find((candidate) => candidate.id === layout.masterId) : null;
   const candidates = [...(sourceSlide?.elements ?? []), ...(layout?.elements ?? []), ...(master?.elements ?? [])].filter((element) => {
     const geometry = element.geometry.resolved ?? element.geometry.direct;
-    return element.name === issue.shapeName && geometry
+    return geometry
       && Math.abs(geometry.x - Number(bounds.x)) <= 1 && Math.abs(geometry.y - Number(bounds.y)) <= 1
       && Math.abs(geometry.width - Number(bounds.width)) <= 1 && Math.abs(geometry.height - Number(bounds.height)) <= 1;
   });

@@ -54,6 +54,24 @@ test('only an exact selected source-template geometry match is retained as a vis
   assert.equal(unrelated.classification, 'GENERATED_OBJECT_OUT_OF_BOUNDS');
 });
 
+test('exact inherited geometry remains recognizable when a renderer changes the generated shape name', () => {
+  const { template, selection } = setup();
+  const issue = { severity: 'error', classification: 'GENERATED_OBJECT_OUT_OF_BOUNDS', confidence: 'high',
+    shapeName: 'Google Shape;679;p31', bounds: { x: 0, y: 4748271, width: 12192000, height: 2109730 } };
+  const inherited = classifySourceTemplateBleed(issue, template, selection);
+  assert.equal(inherited.classification, 'SOURCE_TEMPLATE_BLEED');
+  assert.equal(inherited.severity, 'warning');
+});
+
+test('ambiguous duplicate source geometries and unrelated issue classes remain blocking', () => {
+  const { template, selection } = setup();
+  const issue = { severity: 'error', classification: 'GENERATED_OBJECT_OUT_OF_BOUNDS',
+    bounds: { x: 0, y: 4748271, width: 12192000, height: 2109730 } };
+  template.layouts[0].elements.push({ ...template.slides[0].elements[0], id: 'duplicate-source-geometry' });
+  assert.equal(classifySourceTemplateBleed(issue, template, selection).classification, 'GENERATED_OBJECT_OUT_OF_BOUNDS');
+  assert.equal(classifySourceTemplateBleed({ ...issue, classification: 'OTHER_GEOMETRY_WARNING' }, template, selection).classification, 'OTHER_GEOMETRY_WARNING');
+});
+
 test('summary retains inherited bleed and approximate metric as separate nonblocking categories', () => {
   const { template, selection } = setup();
   const summary = summarizePreviewLayoutEvidence({

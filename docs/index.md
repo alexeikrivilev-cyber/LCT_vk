@@ -31,7 +31,7 @@
 ## Требования, решения и статус
 
 - [Трассировка organizer case](./compliance/CASE_REQUIREMENTS.md)
-- [Поддержка браузеров](./compliance/BROWSER_SUPPORT.md), [шаблонная квалификация](./quality/template-qualification.md)
+- [Поддержка браузеров](./compliance/BROWSER_SUPPORT.md), [шаблонная квалификация](./quality/template-qualification.md), [offline visual quality review v2](./quality/visual-quality-v2.md)
 - [ADR index](../decisions/README.md)
 - [Текущий readiness status](./READY_FOR_QWEN.md)
 - [План final pre-live compliance hardening](./plans/active/pre-live-compliance-hardening.md)
