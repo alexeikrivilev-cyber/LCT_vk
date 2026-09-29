@@ -132,9 +132,12 @@ test('contextual auditor agent, skill, prompt hash, schema, and rule set are exp
   assert.notEqual(buildContextualAuditVersionFingerprint({ auditor: { ...CONTEXTUAL_AUDITOR_WORKFLOW, promptVersion: 'contextual-deck-audit.v6' } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
   assert.notEqual(buildContextualAuditVersionFingerprint({ schema: { type: 'object', required: ['newField'] } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-  const prompt = await readFile(path.join(repoRoot, 'apps/daemon/prompts/contextual-deck-audit.v5.md'));
-  assert.equal(createHash('sha256').update(prompt).digest('hex'), CONTEXTUAL_AUDITOR_WORKFLOW.promptSha256);
-  assert.match(prompt.toString('utf8'), /exactly 11 objects[\s\S]*never emit one finding per slide/u);
+  const prompt = await readFile(path.join(repoRoot, 'apps/daemon/prompts/contextual-deck-audit.v5.md'), 'utf8');
+  const canonicalPrompt = prompt.replace(/\r\n?/gu, '\n');
+  assert.equal(createHash('sha256').update(canonicalPrompt).digest('hex'), CONTEXTUAL_AUDITOR_WORKFLOW.promptSha256);
+  assert.equal(createHash('sha256').update(canonicalPrompt.replace(/\n/gu, '\r\n').replace(/\r\n?/gu, '\n')).digest('hex'),
+    CONTEXTUAL_AUDITOR_WORKFLOW.promptSha256, 'CRLF checkouts use the same prompt contract hash');
+  assert.match(canonicalPrompt, /exactly 11 objects[\s\S]*never emit one finding per slide/u);
   await readFile(path.join(repoRoot, 'skills/presentation-contextual-audit/SKILL.md'));
 });
 

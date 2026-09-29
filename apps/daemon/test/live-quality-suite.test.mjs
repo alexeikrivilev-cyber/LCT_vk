@@ -154,12 +154,12 @@ test('suite is sequential, stops at five scenarios, and caps remote calls at Wor
   }
 });
 
-test('strict-schema failures, 524, null content, truncation, and malformed JSON stop without retry', async (t) => {
+test('eligible 524 and truncation failures retry once while fatal semantic failures stop', async (t) => {
   for (const [label, failure, expectedCalls, code] of [
     ['strict-invalid', (_role, operation) => operation === 'smoke.worker' ? 'invalid-schema' : null, 1, 'INVALID_STRUCTURED_OUTPUT'],
-    ['worker-524', (role, operation) => role === 'worker' && operation === 'deck-plan' ? 'http-524' : null, 2, 'HTTP_524'],
+    ['worker-524', (role, operation) => role === 'worker' && operation === 'deck-plan' ? 'http-524' : null, 3, 'HTTP_524'],
     ['worker-null', (role, operation) => role === 'worker' && operation === 'deck-plan' ? 'content-null' : null, 2, 'EMPTY_RESPONSE'],
-    ['worker-length', (role, operation) => role === 'worker' && operation === 'deck-plan' ? 'length' : null, 2, 'INVALID_STRUCTURED_OUTPUT'],
+    ['worker-length', (role, operation) => role === 'worker' && operation === 'deck-plan' ? 'length' : null, 3, 'INVALID_STRUCTURED_OUTPUT'],
     ['worker-malformed', (role, operation) => role === 'worker' && operation === 'deck-plan' ? 'malformed-json' : null, 2, 'INVALID_JSON'],
   ]) {
     await t.test(label, async (subtest) => {
@@ -200,9 +200,9 @@ test('a suite failure stops before later scenarios and never retries a 524', asy
   t.after(async () => { await endpoint.close(); await removeRun(runId); });
   const result = await runAgainst(endpoint, 'suite', runId);
   assert.equal(result.summary.failureCode, 'HTTP_524');
-  assert.equal(endpoint.state.inference.length, 1);
+  assert.equal(endpoint.state.inference.length, 2, 'template profiling runs once before the single non-retried 524');
   assert.equal(result.summary.scenarios.length, 1);
-  assert.equal(result.summary.semanticInferenceCalls, 1);
+  assert.equal(result.summary.semanticInferenceCalls, 2);
 });
 
 test('runtime-invalid DeckPlan output stops after the Worker response', async (t) => {
@@ -211,7 +211,7 @@ test('runtime-invalid DeckPlan output stops after the Worker response', async (t
   t.after(async () => { await endpoint.close(); await removeRun(runId); });
   const result = await runAgainst(endpoint, 'smoke', runId);
   assert.equal(result.summary.failureCode, 'INVALID_STRUCTURED_OUTPUT');
-  assert.equal(endpoint.state.inference.length, 2, 'the Supervisor and every later request must be skipped');
+  assert.equal(endpoint.state.inference.length, 3, 'the bounded Worker retry runs, then the Supervisor and later requests are skipped');
   assert.equal(result.summary.scenarios[0].schema_valid, false);
 });
 

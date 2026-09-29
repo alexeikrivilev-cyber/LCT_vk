@@ -11,11 +11,13 @@ import {
   type TemplateSource,
 } from './template-mapper.js';
 import { inspectPptx } from '../adapters/python-inspector.js';
+import { addTemplateMediaVisualFingerprints } from '../adapters/office-kit-template-media-fingerprint.js';
 import { resolvePresentationFilePath } from '../../presentation-files.js';
+import { recordElapsed, type PerformanceDiagnosticsPort } from '../performance-diagnostics.js';
 
 export type TemplateTypographyResolver = (templateIR: TemplateIR, sourceBytes: Uint8Array) => Promise<void>;
 
-const COMPILER_VERSION = 'lct-template-compiler/1';
+const COMPILER_VERSION = 'lct-template-compiler/2';
 const MAX_TEMPLATE_BYTES = 64 * 1024 * 1024;
 const STATE_RELATIVE_PATH = '.template-compiler/state.json';
 
@@ -199,6 +201,7 @@ export async function compileTemplate(
   projectId: string,
   requestedFilePath: string,
   resolveEffectiveTypography?: TemplateTypographyResolver,
+  diagnostics?: PerformanceDiagnosticsPort,
 ): Promise<TemplateCompilationResponse> {
   const filePath = typeof requestedFilePath === 'string' ? requestedFilePath.trim() : '';
   if (!filePath || path.posix.extname(filePath.replaceAll('\\', '/')).toLowerCase() !== '.pptx') {
@@ -230,23 +233,38 @@ export async function compileTemplate(
       compiledAt,
       compilerVersion: COMPILER_VERSION,
     };
+    const parseStartedAt = performance.now();
     const inspection = await inspectPptx(resolved.absolute);
+    recordElapsed(diagnostics, 'template.structuralParse', parseStartedAt);
+    diagnostics?.increment('templateStructuralParseCount');
     const afterHash = await sourceHash(resolved.absolute);
     if (beforeHash !== afterHash) {
       throw new TemplateCompilerError('SOURCE_CHANGED_DURING_COMPILE', 'The PPTX changed during inspection. Compile it again.', 409);
     }
 
+    const mappingStartedAt = performance.now();
     const mappedTemplateIR = createTemplateIR(inspection, templateSource);
+    diagnostics?.increment('templateIRMappingCount');
+    recordElapsed(diagnostics, 'template.structuralMapping', mappingStartedAt);
+    const fingerprintStartedAt = performance.now();
+    await addTemplateMediaVisualFingerprints(mappedTemplateIR, sourceBytes);
+    recordElapsed(diagnostics, 'template.mediaFingerprint', fingerprintStartedAt);
+    diagnostics?.increment('templateMediaFingerprintCount', mappedTemplateIR.assets.filter((asset) => asset.visualFingerprint).length);
     if (resolveEffectiveTypography) {
       try {
+        const typographyStartedAt = performance.now();
         await resolveEffectiveTypography(mappedTemplateIR, sourceBytes);
+        recordElapsed(diagnostics, 'template.effectiveTypography', typographyStartedAt);
       } catch (error) {
         const code = isRecord(error) && typeof error.code === 'string' ? error.code : 'TEMPLATE_TYPOGRAPHY_RESOLUTION_FAILED';
         console.warn(`Template typography resolution unavailable (${code}); conservative fit gates remain active.`);
       }
     }
     const templateIR = validateTemplateIR(mappedTemplateIR);
+    const designSystemStartedAt = performance.now();
     const presentationDesignSystem = validatePresentationDesignSystem(derivePresentationDesignSystem(templateIR), templateIR);
+    recordElapsed(diagnostics, 'template.designSystemExtraction', designSystemStartedAt);
+    diagnostics?.increment('templateDesignSystemExtractionCount');
     const snapshot: SuccessfulCompilation = { source: templateSource, templateIR, presentationDesignSystem };
     await writeState(projectsRoot, projectId, {
       schemaVersion: 1,

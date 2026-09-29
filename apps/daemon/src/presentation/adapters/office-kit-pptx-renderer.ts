@@ -207,9 +207,9 @@ function templateRoleSourceShapes(
   return result;
 }
 
-function estimatedWrappedLines(text: string, widthEmu: number, fontPt: number): number {
-  const charsPerLine = Math.max(1, widthEmu / 12_700 / Math.max(1, fontPt * 0.56));
-  return Math.max(1, ...text.split(/\r?\n/u).map((line) => Math.max(1, Math.ceil(Array.from(line).length / charsPerLine))));
+function estimatedWrappedLines(text: string, widthEmu: number, fontPt: number, averageGlyphWidthEm = 0.56): number {
+  const charsPerLine = Math.max(1, widthEmu / 12_700 / Math.max(1, fontPt * averageGlyphWidthEm));
+  return text.split(/\r?\n/u).reduce((sum, line) => sum + Math.max(1, Math.ceil(Array.from(line).length / charsPerLine)), 0);
 }
 
 function partitionTextRegions(
@@ -401,15 +401,16 @@ function chooseTemplateTextColor(background: string, template: TemplateIRValue, 
   return best.color;
 }
 
-function templateDerivedThemeForeground(compiled: CompiledSlide, template: TemplateIRValue): string | null {
+function templateDerivedThemeForeground(compiled: CompiledSlide, template: TemplateIRValue, role: 'title' | 'body'): string | null {
   const candidate = compiled.layoutCandidates[compiled.selectedCandidateIndex];
+  const roleBox = role === 'title' ? candidate?.titleBox : candidate?.bodyBox;
   const layout = template.layouts.find((item) => item.sourcePart === compiled.layoutSourcePart);
   const master = template.masters.find((item) => item.id === layout?.masterId);
   const parts = [layout, master].filter((item): item is NonNullable<typeof item> => Boolean(item));
   const panel = parts.flatMap((part) => part.elements).find((element) => {
     const fill = normalizedHexColor(element.directStyles.fillColor);
     const box = element.geometry.resolved ?? element.geometry.direct;
-    return Boolean(fill && box && candidate?.bodyBox && boxContains(box, candidate.bodyBox));
+    return Boolean(fill && box && roleBox && boxContains(box, roleBox));
   });
   const panelColor = normalizedHexColor(panel?.directStyles.fillColor);
   const background = layout?.background ?? master?.background ?? null;
@@ -443,6 +444,37 @@ function applyResolvedRoleTextStyle(
     ...(style.fontEastAsian ? { fontEastAsian: style.fontEastAsian } : {}),
     ...(style.fontComplexScript ? { fontComplexScript: style.fontComplexScript } : {}),
   });
+}
+
+function fitExemplarTitleToDonorBox(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
+  title: ReturnType<typeof getSlideShapes>[number],
+  text: string,
+  sourceSlideIndex: number,
+  warnings: string[],
+): void {
+  const bounds = getShapeBoundsResolved(presentation, title);
+  if (!bounds) return;
+  let format: ReturnType<typeof getShapeRunFormatEffective>;
+  try { format = getShapeRunFormatEffective(presentation, title, 0, 0); } catch { return; }
+  const fontSizePt = format.size;
+  if (fontSizePt === undefined || !Number.isFinite(fontSizePt) || fontSizePt <= 0) return;
+  const availableHeightPt = bounds.h / 12_700;
+  // PowerPoint line leading and paragraph metrics exceed the nominal font box.
+  // Reserve 1.28 em per line; preview audit remains the hard validation gate.
+  const minimumFontPt = Math.min(8, fontSizePt);
+  let lowerFit = minimumFontPt;
+  let upperFit = fontSizePt;
+  for (let iteration = 0; iteration < 16; iteration += 1) {
+    const candidateSizePt = (lowerFit + upperFit) / 2;
+    const lineCount = estimatedWrappedLines(text, bounds.w, candidateSizePt, 0.68);
+    if (candidateSizePt * lineCount * 1.28 <= availableHeightPt) lowerFit = candidateSizePt;
+    else upperFit = candidateSizePt;
+  }
+  if (lowerFit >= fontSizePt - 0.05) return;
+  const roundedSizePt = Math.min(fontSizePt, Math.max(minimumFontPt, Math.floor(lowerFit * 10) / 10));
+  setShapeTextFormat(title, { size: roundedSizePt });
+  warnings.push(`Exemplar slide ${sourceSlideIndex} title font was reduced from ${fontSizePt}pt to ${roundedSizePt}pt to fit its measured donor box.`);
 }
 
 function requiredTemplateColor(color: string) {
@@ -532,6 +564,7 @@ function connectProcessNodes(
 }
 
 function projectExemplarText(
+  presentation: Awaited<ReturnType<typeof loadPresentation>>,
   slide: ReturnType<typeof getSlides>[number],
   compiled: CompiledSlide,
   selection: ExemplarSlideSelection,
@@ -579,6 +612,7 @@ function projectExemplarText(
     setShapeText(shape, '');
   }
   setShapeText(title, compiled.title);
+  fitExemplarTitleToDonorBox(presentation, title, compiled.title, selection.sourceSlideIndex, textStyleWarnings);
   for (let index = 0; index < bodyShapes.length; index += 1) {
     setShapeText(bodyShapes[index]!, selection.bodyContentSegments[index]!);
   }
@@ -964,7 +998,7 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
       const selection = exemplarSelections.get(compiled.id);
       let slide = outputSlidesById.get(compiled.id);
       if (selection && slide) {
-        projectExemplarText(slide, compiled, selection, textStyleWarnings);
+        projectExemplarText(presentation, slide, compiled, selection, textStyleWarnings);
         if (compiled.visualization.type === 'kpi' && !compiled.visualization.kpi) {
           // A qualitative KPI request has no source-backed value to render. If
           // the selected donor has a source-free visual shape, remove it and
@@ -1042,7 +1076,8 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         }
         const titleSources = templateRoleSourceShapes(compiled, input.templateIR, sourceSlidesByPart, 'title');
         const bodySources = templateRoleSourceShapes(compiled, input.templateIR, sourceSlidesByPart, 'body');
-        const themeForeground = templateDerivedThemeForeground(compiled, input.templateIR);
+        const titleThemeForeground = templateDerivedThemeForeground(compiled, input.templateIR, 'title');
+        const bodyThemeForeground = templateDerivedThemeForeground(compiled, input.templateIR, 'body');
         const titlePlaceholder = ['title', 'ctrTitle', 'subTitle'].map((type) => findSlidePlaceholder(slide!, type as 'title' | 'ctrTitle' | 'subTitle'))
           .find((shape) => Boolean(shape));
         const bodyPlaceholder = ['body', 'obj', 'subTitle'].map((type) => findSlidePlaceholder(slide!, type as 'body' | 'obj' | 'subTitle'))
@@ -1053,8 +1088,8 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
         // tier-3 editable boxes. No sample or temporary text reaches the output.
         if (titlePlaceholder) setShapeText(titlePlaceholder, compiled.title);
         if (bodyPlaceholder) setShapeText(bodyPlaceholder, compiled.body.join('\n'));
-        const titleStyleBase = roleTextStyle(presentation, slide, 'title', titleSources, themeForeground);
-        const bodyStyleBase = roleTextStyle(presentation, slide, 'body', bodySources, themeForeground);
+        const titleStyleBase = roleTextStyle(presentation, slide, 'title', titleSources, titleThemeForeground);
+        const bodyStyleBase = roleTextStyle(presentation, slide, 'body', bodySources, bodyThemeForeground);
         if (titlePlaceholder) setShapeText(titlePlaceholder, '');
         if (bodyPlaceholder) setShapeText(bodyPlaceholder, '');
         const roleStyle = (base: ReturnType<typeof roleTextStyle>, role: 'title' | 'body') => {
@@ -1066,7 +1101,13 @@ export class OfficeKitPptxRenderer implements PptxRendererPort {
             font: base.font ?? (role === 'title' ? input.templateIR.theme?.fonts.major : input.templateIR.theme?.fonts.minor) ?? undefined,
           };
         };
-        const titleStyle = roleStyle(titleStyleBase, 'title');
+        const titleStyleResolved = roleStyle(titleStyleBase, 'title');
+        // Role placeholders can carry a stale dark run color even when the
+        // measured title region sits on a dark inherited background. The
+        // region-derived foreground takes precedence when it has contrast proof.
+        const titleStyle = titleThemeForeground
+          ? { ...titleStyleResolved, color: titleThemeForeground }
+          : titleStyleResolved;
         const bodyStyleBaseResolved = roleStyle(bodyStyleBase, 'body');
         const bodyColor = templateDerivedBodyColor(compiled, input.templateIR, titleStyle.color, bodyStyleBaseResolved.color);
         const bodyStyle = bodyColor ? { ...bodyStyleBaseResolved, color: bodyColor } : bodyStyleBaseResolved;

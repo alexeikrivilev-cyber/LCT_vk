@@ -4,10 +4,11 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { createFamilyExemplarTemplate } from './exemplar-template-fixtures.mjs';
 import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 import { inspectPptx } from '../src/presentation/adapters/python-inspector.ts';
 import { OpenAICompatibleSemanticInferenceAdapter } from '../src/presentation/adapters/openai-compatible-semantic-inference.ts';
-import { createDeterministicTemplateSemanticProfile, planTemplateSemanticProfileBatches, projectTemplateSemanticProfileCache, templateSemanticProfileCacheKey, templateSemanticProfileJsonSchema, TemplateSemanticProfiler, validateTemplateSemanticProfile } from '../src/presentation/application/template-semantic-profiler.ts';
+import { createDeterministicTemplateSemanticProfile, layeredTemplateSemanticProfileCache, planTemplateSemanticProfileBatches, projectTemplateSemanticProfileCache, sharedTemplateSemanticProfileCache, templateSemanticProfileCacheKey, templateSemanticProfileJsonSchema, TemplateSemanticProfiler, validateTemplateSemanticProfile } from '../src/presentation/application/template-semantic-profiler.ts';
 import { createTemplateIR, derivePresentationDesignSystem } from '../src/presentation/application/template-mapper.ts';
 import { sha256Json, templateIRHashPayload } from '../src/presentation/domain/template-ir.ts';
 import { SemanticInferenceError } from '../src/presentation/application/semantic-inference-port.ts';
@@ -185,6 +186,147 @@ test('semantic template profile loads its versioned prompt, validates references
   assert.equal(endpoint.state.inference.length, 4, 'a different validated TemplateIR hash gets two requests for its independently profiled batches');
 });
 
+test('validated semantic profiles are reused across projects only under the same explicit inference identity', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-shared-template-profile-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root);
+  const endpoint = await startFakeSemanticEndpoint({ model });
+  t.after(() => endpoint.close());
+  const shared = sharedTemplateSemanticProfileCache(path.join(root, 'daemon-data'));
+  const identity = 'sha256:offline-endpoint/model-v1';
+  const first = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), layeredTemplateSemanticProfileCache(
+    projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-a'), shared), { cacheIdentity: identity });
+  const firstProfile = await first.prepareTemplateProfile(templateIR, presentationDesignSystem);
+  const initialRequestCount = endpoint.state.inference.length;
+  assert.equal(initialRequestCount, 2);
+  assert.ok(initialRequestCount > 0);
+
+  const second = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), layeredTemplateSemanticProfileCache(
+    projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-b'), shared), { cacheIdentity: identity });
+  const reusedProfile = await second.prepareTemplateProfile(templateIR, presentationDesignSystem);
+  assert.deepEqual(reusedProfile, firstProfile);
+  assert.equal(endpoint.state.inference.length, initialRequestCount, 'the second project reads and validates the shared profile without inference');
+
+  const changedModelIdentity = new TemplateSemanticProfiler(adapter(endpoint.baseUrl), layeredTemplateSemanticProfileCache(
+    projectTemplateSemanticProfileCache(path.join(root, 'projects'), 'project-c'), shared), { cacheIdentity: 'sha256:offline-endpoint/model-v2' });
+  await changedModelIdentity.prepareTemplateProfile(templateIR, presentationDesignSystem);
+  assert.equal(endpoint.state.inference.length, initialRequestCount * 2, 'a different model identity cannot reuse the old profile');
+  assert.notEqual(templateSemanticProfileCacheKey(templateIR.hash, 'a'.repeat(64), 'model-v1'),
+    templateSemanticProfileCacheKey(templateIR.hash, 'a'.repeat(64), 'model-v2'));
+  assert.notEqual(templateSemanticProfileCacheKey(templateIR.hash, 'a'.repeat(64), 'model-v1', false),
+    templateSemanticProfileCacheKey(templateIR.hash, 'a'.repeat(64), 'model-v1', true),
+  'profiles produced by different family-reuse modes cannot collide in the shared cache');
+});
+
+test('degraded fallback profiles stay project-local while semantic profiles enter the shared cache', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-shared-template-profile-fallback-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { templateIR, presentationDesignSystem } = await fixture(root);
+  const projectWrites = [];
+  const sharedWrites = [];
+  const cache = layeredTemplateSemanticProfileCache({
+    async read() { return null; }, async write(profile, key) { projectWrites.push({ profile, key }); },
+  }, { async read() { return null; }, async write(profile, key) { sharedWrites.push({ profile, key }); } });
+  const fallback = createDeterministicTemplateSemanticProfile(templateIR, presentationDesignSystem, 'semantic_unavailable');
+  const key = 'a'.repeat(64);
+  await cache.write(fallback, key);
+  assert.equal(projectWrites.length, 1);
+  assert.equal(sharedWrites.length, 0, 'a transient inference outage cannot seed another project’s shared cache');
+  const semantic = structuredClone(fallback);
+  semantic.slides = semantic.slides.map((slide) => ({ ...slide, reasonCodes: ['offline_fake'], confidence: 0.95 }));
+  await cache.write(semantic, 'b'.repeat(64));
+  assert.equal(sharedWrites.length, 1, 'validated semantic profiles remain reusable across projects');
+});
+
+test('structural family profiling maps only exact representatives and profiles ambiguous or low-confidence outliers', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-families-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const filePath = path.join(root, 'repeated-families.pptx');
+  await createFamilyExemplarTemplate(filePath, { varyingFooter: true });
+  const inspection = await inspectPptx(filePath);
+  const bytes = await readFile(filePath);
+  const templateIR = createTemplateIR(inspection, {
+    filePath: path.basename(filePath), originalName: path.basename(filePath),
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    compiledAt: '2026-09-29T00:00:00.000Z', compilerVersion: 'lct-template-compiler/2',
+  });
+  // One slide with a geometry outlier is kept independent even though most of
+  // its composition family remains reusable.
+  const outlier = templateIR.slides.find((slide) => slide.index === 2);
+  const decoration = outlier?.elements.find((element) => element.kind.toLowerCase() === 'shape' && !element.text?.trim());
+  assert.ok(decoration?.geometry.direct, 'the fixture exposes a directly positioned decoration');
+  decoration.geometry.direct.x += 1000;
+  templateIR.hash = sha256Json(templateIRHashPayload(templateIR));
+  const presentationDesignSystem = derivePresentationDesignSystem(templateIR);
+  const requests = [];
+  const counters = new Map();
+  const profiler = new TemplateSemanticProfiler({
+    async infer(request) {
+      const response = strictFakeProfileResponse(request);
+      const value = structuredClone(response.value);
+      requests.push([...request.metadata.templateProfilerBatch.sourceSlideIndexes]);
+      for (const slideProfile of value.slides) {
+        slideProfile.confidence = slideProfile.sourceSlideIndex === 5 ? 0.5 : 0.95;
+      }
+      const ambiguousFamilyRepresentative = value.slides.find((slideProfile) => slideProfile.sourceSlideIndex === 1);
+      if (ambiguousFamilyRepresentative) {
+        const representativeSlide = templateIR.slides.find((slide) => slide.index === 1);
+        const familyMember = templateIR.slides.find((slide) => slide.index === 3);
+        const representativeElements = [...(representativeSlide?.elements ?? [])].sort((left, right) => left.order - right.order);
+        const memberElements = [...(familyMember?.elements ?? [])].sort((left, right) => left.order - right.order);
+        const mappedRoles = new Set([ambiguousFamilyRepresentative.titleElementId,
+          ...ambiguousFamilyRepresentative.bodyElementIds, ...ambiguousFamilyRepresentative.visualElementIds].filter(Boolean));
+        const ambiguousText = representativeElements.findIndex((element, index) => element.nativeId
+          && element.kind.toLowerCase() === 'shape' && element.text?.trim() && element.text !== memberElements[index]?.text
+          && !mappedRoles.has(element.id));
+        assert.ok(ambiguousText >= 0, 'the fixture has non-role sample copy that changes across a family member');
+        const unclassifiedText = representativeElements[ambiguousText].id;
+        ambiguousFamilyRepresentative.replaceableTextElementIds = ambiguousFamilyRepresentative.replaceableTextElementIds
+          .filter((id) => id !== unclassifiedText);
+        ambiguousFamilyRepresentative.preservedElementIds = ambiguousFamilyRepresentative.preservedElementIds
+          .filter((id) => id !== unclassifiedText);
+        ambiguousFamilyRepresentative.preservedElementIds.push(unclassifiedText);
+      }
+      assert.equal(request.output.validate(value), true, 'synthetic confidence changes remain inside the strict profile contract');
+      return { value, telemetry: {} };
+    },
+  }, undefined, { familyReuse: true, diagnostics: {
+    increment(name, amount = 1) { counters.set(name, (counters.get(name) ?? 0) + amount); },
+    recordDuration() {},
+  } });
+
+  const profile = await profiler.prepareTemplateProfile(templateIR, presentationDesignSystem);
+  assert.deepEqual(profile.slides.map((slide) => slide.sourceSlideIndex), templateIR.slides.map((slide) => slide.index));
+  assert.deepEqual(requests.flat().sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    'only family representatives, the geometry outlier, and ambiguous or low-confidence family members are profiled');
+  assert.equal(requests.length, 5, 'representatives and only required outliers use five bounded inference calls');
+  const byIndex = new Map(profile.slides.map((slide) => [slide.sourceSlideIndex, slide]));
+  for (const sourceSlide of templateIR.slides) {
+    const mapped = byIndex.get(sourceSlide.index);
+    assert.ok(mapped, `profile exists for source slide ${sourceSlide.index}`);
+    for (const id of [mapped.titleElementId, ...mapped.bodyElementIds, ...mapped.visualElementIds,
+      ...mapped.preservedElementIds, ...mapped.replaceableTextElementIds].filter(Boolean)) {
+      assert.ok(sourceSlide.elements.some((element) => element.id === id), `slide ${sourceSlide.index} contains mapped element ${id}`);
+    }
+  }
+  assert.ok(!byIndex.get(3).reasonCodes.includes('structural_family_reuse'));
+  assert.ok(!byIndex.get(4).reasonCodes.includes('structural_family_reuse'));
+  assert.ok(byIndex.get(2).reasonCodes.includes('offline_fake'), 'the distinct geometry outlier receives its own semantic result');
+  assert.ok(!byIndex.get(2).reasonCodes.includes('structural_family_reuse'));
+  assert.ok(!byIndex.get(3).reasonCodes.includes('structural_family_reuse'), 'ambiguous changed labels trigger individual profiling');
+  assert.ok(!byIndex.get(6).reasonCodes.includes('structural_family_reuse'), 'low-confidence representative members are profiled individually');
+  assert.ok(byIndex.get(10).reasonCodes.includes('structural_family_reuse'));
+  assert.ok(byIndex.get(12).reasonCodes.includes('structural_family_reuse'));
+  assert.equal(byIndex.get(10).archetype, 'content', 'family reuse does not copy a representative semantic archetype onto new slide copy');
+  assert.deepEqual(byIndex.get(10).supportedContentModes, [], 'reused profiles make no unsupported modality claims');
+  assert.ok(profile.slides.filter((slide) => slide.reasonCodes.includes('structural_family_reuse'))
+    .every((slide) => slide.confidence <= 0.8), 'reused semantic evidence is visibly confidence-capped');
+  assert.equal(counters.get('templateProfileFamilyCount'), 3);
+  assert.equal(counters.get('templateProfileRepresentativeSlideCount'), 4);
+  assert.equal(counters.get('templateProfileReusedSlideCount'), 3);
+  assert.equal(counters.get('templateProfileOutlierCount'), 5);
+});
+
 test('batch schema narrows profile references and runtime validation reports safe invariant codes', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-invalid-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -198,6 +340,8 @@ test('batch schema narrows profile references and runtime validation reports saf
     ['invented-element-id', 'UNKNOWN_ELEMENT_ID', (value) => { value.slides[0].bodyElementIds = ['invented-element-id']; }],
     ['element-from-another-slide', 'ELEMENT_FROM_DIFFERENT_SLIDE', (value) => { value.slides[0].bodyElementIds = [otherSlideTextId]; }],
     ['wrong-hash', 'HASH_MISMATCH', (value) => { value.templateIRHash = '0'.repeat(64); }],
+    ['reserved-family-reuse-provenance', 'INVALID_PROFILE_SHAPE', (value) => { value.slides[0].reasonCodes = ['structural_family_reuse']; }],
+    ['reserved-fallback-provenance', 'INVALID_PROFILE_SHAPE', (value) => { value.slides[0].reasonCodes = ['deterministic_fallback']; }],
     ['duplicate-slide-index', 'DUPLICATE_SLIDE_INDEX', (value) => { value.slides[1].sourceSlideIndex = value.slides[0].sourceSlideIndex; }],
     ['unexpected-slide-index', 'UNEXPECTED_SLIDE_INDEX', (value) => { value.slides[0].sourceSlideIndex = 999999; }],
     ['non-text-title', 'TITLE_NOT_TEXT', (value) => {
@@ -950,7 +1094,7 @@ test('profiler config version invalidates profiles produced from the previous ev
   t.after(() => rm(root, { recursive: true, force: true }));
   const { templateIR, presentationDesignSystem } = await fixture(root);
   const contract = JSON.parse(await readFile(path.join(process.cwd(), 'apps/daemon/src/presentation/contracts/template-profiler.v1.json'), 'utf8'));
-  assert.equal(contract.configVersion, 'template-profiler-config.v8');
+  assert.equal(contract.configVersion, 'template-profiler-config.v10');
   assert.equal(contract.maxSlidesPerBatch, 2);
   assert.equal(contract.maxBatchEvidenceBytes, 24 * 1024);
   assert.equal(contract.maxNonTextEvidenceElementsPerSlide, 20);

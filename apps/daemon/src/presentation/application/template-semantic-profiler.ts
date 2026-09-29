@@ -6,7 +6,7 @@ import {
   type TemplateIR,
 } from '../domain/template-ir.js';
 import { createHash, randomBytes } from 'node:crypto';
-import { readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import templateProfilerWorkflow from '../contracts/template-profiler.v1.json' with { type: 'json' };
@@ -18,6 +18,7 @@ import type {
 } from './semantic-inference-port.js';
 import { SemanticInferenceError as InferenceError } from './semantic-inference-port.js';
 import { resolvePresentationFilePath } from '../../presentation-files.js';
+import type { PerformanceDiagnosticsPort } from '../performance-diagnostics.js';
 
 export const TEMPLATE_SLIDE_ARCHETYPES = [
   'cover', 'section-divider', 'content', 'content-split', 'content-dense',
@@ -126,6 +127,73 @@ export function projectTemplateSemanticProfileCache(projectsRoot: string, projec
   };
 }
 
+/** Content-addressed daemon cache shared by projects in this local data directory. */
+export function sharedTemplateSemanticProfileCache(dataDir: string): TemplateSemanticProfileCache {
+  const cacheRoot = path.join(path.resolve(dataDir), 'shared-semantic-profiles');
+  const profilePath = (cacheKey: string) => {
+    if (!/^[a-f0-9]{64}$/.test(cacheKey)) throw new TypeError('Template semantic profile hash is invalid.');
+    return path.join(cacheRoot, `${cacheKey}.json`);
+  };
+  return {
+    async read(cacheKey) {
+      let raw: string;
+      try { raw = await readFile(profilePath(cacheKey), 'utf8'); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+      try { return JSON.parse(raw) as unknown; }
+      catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        return null;
+      }
+    },
+    async write(profile, cacheKey = profile.templateIRHash) {
+      const target = profilePath(cacheKey);
+      await mkdir(cacheRoot, { recursive: true });
+      const temporary = `${target}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+      try {
+        await writeFile(temporary, `${JSON.stringify(profile, null, 2)}\n`, { flag: 'wx' });
+        await rename(temporary, target);
+      } catch (error) {
+        await rm(temporary, { force: true }).catch(() => undefined);
+        throw error;
+      }
+    },
+    async invalidate(cacheKey) {
+      await rm(profilePath(cacheKey), { force: true });
+    },
+  };
+}
+
+/** Reads project-owned state first and falls back to a validated shared profile. */
+export function layeredTemplateSemanticProfileCache(
+  projectCache: TemplateSemanticProfileCache,
+  sharedCache: TemplateSemanticProfileCache,
+): TemplateSemanticProfileCache {
+  return {
+    async read(cacheKey) {
+      const projectProfile = await projectCache.read(cacheKey);
+      return projectProfile ?? await sharedCache.read(cacheKey);
+    },
+    async write(profile, cacheKey) {
+      await projectCache.write(profile, cacheKey);
+      // A transient inference failure must not become a durable cross-project
+      // result. Keep deterministic degradation local to this project so a
+      // later project can retry semantic preparation.
+      if (!profile.slides.some((slide) => slide.reasonCodes.includes('deterministic_fallback'))) {
+        await sharedCache.write(profile, cacheKey).catch(() => undefined);
+      }
+    },
+    async invalidate(cacheKey) {
+      await Promise.allSettled([
+        projectCache.invalidate?.(cacheKey) ?? Promise.resolve(),
+        sharedCache.invalidate?.(cacheKey) ?? Promise.resolve(),
+      ]);
+    },
+  };
+}
+
 /** Persist only preparation status metadata, separate from the profile cache itself. */
 export function projectTemplateSemanticProfilePreparationStore(projectsRoot: string, projectId: string) {
   const recordPath = async (profileCacheKey: string, createParent = false) => {
@@ -189,16 +257,27 @@ const PROFILE_REQUEST_ENVELOPE_OVERHEAD_BYTES = TEMPLATE_PROFILE_WORKFLOW.reques
 const PROFILE_OUTPUT_TOKEN_BYTE_RESERVE = TEMPLATE_PROFILE_WORKFLOW.outputTokenByteReserve;
 const PROFILE_BATCH_CONCURRENCY_LIMIT = 2;
 
-export function templateSemanticProfileCacheKey(templateIRHash: string, promptSha256: string): string {
+export function templateSemanticProfileCacheKey(
+  templateIRHash: string,
+  promptSha256: string,
+  cacheIdentity?: string,
+  familyReuse = false,
+): string {
   if (!/^[a-f0-9]{64}$/.test(templateIRHash) || !/^[a-f0-9]{64}$/.test(promptSha256)) {
     throw new TypeError('Template semantic profile cache fingerprint is invalid.');
   }
+  if (cacheIdentity !== undefined && (!cacheIdentity.trim() || cacheIdentity.length > 512)) {
+    throw new TypeError('Template semantic profile cache identity is invalid.');
+  }
+  if (typeof familyReuse !== 'boolean') throw new TypeError('Template semantic profile family-reuse setting is invalid.');
   return createHash('sha256').update(JSON.stringify({
     templateIRHash,
     promptVersion: TEMPLATE_PROFILE_VERSION,
     promptSha256,
     schemaCompatibility: TEMPLATE_PROFILE_WORKFLOW.schemaCompatibility,
     configVersion: TEMPLATE_PROFILE_WORKFLOW.configVersion,
+    ...(cacheIdentity === undefined ? {} : { cacheIdentity }),
+    familyReuse,
   })).digest('hex');
 }
 
@@ -276,7 +355,8 @@ export function templateSemanticProfileJsonSchema(
         preservedElementIds: idArray(allIds, definitionsForSlide.all),
         replaceableTextElementIds: idArray(replaceableTextIds, definitionsForSlide.replaceable),
         confidence: { type: 'number', minimum: 0, maximum: 1 },
-        reasonCodes: { type: 'array', maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[a-z0-9][a-z0-9._-]*$' } },
+        reasonCodes: { type: 'array', maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 64,
+          pattern: '^(?!(?:structural_family_reuse|deterministic_fallback)$)[a-z0-9][a-z0-9._-]*$' } },
       },
       required: ['sourceSlideIndex', 'archetype', 'supportedContentModes', 'titleElementId', 'bodyElementIds', 'visualElementIds', 'preservedElementIds', 'replaceableTextElementIds', 'confidence', 'reasonCodes'],
     };
@@ -592,7 +672,11 @@ export interface TemplateSemanticProfileBatchPlan {
 }
 
 /** Plans deterministic profiler requests bounded by slide count, evidence, full request estimate, and output reserve. */
-export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR, systemPrompt: string): {
+export function planTemplateSemanticProfileBatches(
+  templateIRInput: TemplateIR,
+  systemPrompt: string,
+  requestedSlideIndexes?: readonly number[],
+): {
   totalEvidenceBytes: number;
   systemPromptBytes: number;
   batches: TemplateSemanticProfileBatchPlan[];
@@ -602,6 +686,14 @@ export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR, 
   if (typeof systemPrompt !== 'string' || Buffer.byteLength(systemPrompt, 'utf8') > TEMPLATE_PROFILE_WORKFLOW.maxPromptBytes) {
     throw new TypeError(`Template profiler system prompt must be a string within ${TEMPLATE_PROFILE_WORKFLOW.maxPromptBytes} bytes.`);
   }
+  const selectedIndexes = requestedSlideIndexes ?? templateIR.slides.map((slide) => slide.index);
+  if (!Array.isArray(selectedIndexes) || selectedIndexes.length < 1 || selectedIndexes.length > templateIR.slides.length
+      || new Set(selectedIndexes).size !== selectedIndexes.length) {
+    throw new TypeError('Template profiler slide selection must contain unique source slide indexes.');
+  }
+  const selectedIndexSet = new Set(selectedIndexes);
+  const selectedSlides = templateIR.slides.filter((slide) => selectedIndexSet.has(slide.index));
+  if (selectedSlides.length !== selectedIndexes.length) throw new TypeError('Template profiler slide selection includes an unknown source slide index.');
   const systemPromptBytes = Buffer.byteLength(systemPrompt, 'utf8');
   const totalEvidenceBytes = Buffer.byteLength(JSON.stringify(profileEvidence(templateIR, templateIR.slides)), 'utf8');
   type PlannedBatch = {
@@ -622,7 +714,7 @@ export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR, 
   const candidateForRange = (start: number, end: number): PlannedBatch | null => {
     const key = `${start}:${end}`;
     if (candidateCache.has(key)) return candidateCache.get(key)!;
-    const slides = templateIR.slides.slice(start, end + 1);
+    const slides = selectedSlides.slice(start, end + 1);
     const measured = slides.length <= PROFILE_BATCH_SLIDE_LIMIT
       ? boundedBatchEvidence(templateIR, slides, systemPrompt)
       : null;
@@ -641,11 +733,11 @@ export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR, 
     }
     return false;
   };
-  const bestFrom = new Array<Partition | null>(templateIR.slides.length + 1).fill(null);
-  bestFrom[templateIR.slides.length] = { batches: [], totalEstimatedBytes: 0 };
-  for (let start = templateIR.slides.length - 1; start >= 0; start -= 1) {
+  const bestFrom = new Array<Partition | null>(selectedSlides.length + 1).fill(null);
+  bestFrom[selectedSlides.length] = { batches: [], totalEstimatedBytes: 0 };
+  for (let start = selectedSlides.length - 1; start >= 0; start -= 1) {
     let best: Partition | null = null;
-    const maximumEnd = Math.min(templateIR.slides.length - 1, start + PROFILE_BATCH_SLIDE_LIMIT - 1);
+    const maximumEnd = Math.min(selectedSlides.length - 1, start + PROFILE_BATCH_SLIDE_LIMIT - 1);
     for (let end = start; end <= maximumEnd; end += 1) {
       const candidate = candidateForRange(start, end);
       const suffix = bestFrom[end + 1];
@@ -659,8 +751,8 @@ export function planTemplateSemanticProfileBatches(templateIRInput: TemplateIR, 
     bestFrom[start] = best;
   }
   const batches = bestFrom[0]?.batches ?? [];
-  if (!batches.length && templateIR.slides.length > 0) {
-    const oversized = templateIR.slides.find((slide) => !boundedBatchEvidence(templateIR, [slide], systemPrompt));
+  if (!batches.length && selectedSlides.length > 0) {
+    const oversized = selectedSlides.find((slide) => !boundedBatchEvidence(templateIR, [slide], systemPrompt));
     if (oversized) throw new InferenceError('REQUEST_TOO_LARGE', `Template profiler request for source slide ${oversized.index} exceeds the safe evidence or estimated request byte limit.`);
     throw new InferenceError('REQUEST_TOO_LARGE', 'Template profiler batches could not be partitioned within the safe request limits.');
   }
@@ -706,6 +798,11 @@ export function diagnoseTemplateSemanticProfileBatch(
   const seen = new Set<number>();
   for (const candidate of value.slides) {
     if (!isTemplateSemanticSlideProfile(candidate)) return 'INVALID_PROFILE_SHAPE';
+    // This reason code is an internal provenance marker. The provider schema
+    // excludes it; retain a runtime check for adapters that return unvalidated JSON.
+    if (candidate.reasonCodes.some((code) => ['structural_family_reuse', 'deterministic_fallback'].includes(code))) {
+      return 'INVALID_PROFILE_SHAPE';
+    }
     if (seen.has(candidate.sourceSlideIndex)) return 'DUPLICATE_SLIDE_INDEX';
     const sourceSlide = expectedByIndex.get(candidate.sourceSlideIndex);
     if (!sourceSlide) return 'UNEXPECTED_SLIDE_INDEX';
@@ -873,6 +970,139 @@ function isRecoverablePairFailure(error: unknown): error is InferenceError {
   return isLengthTruncation(error) || error instanceof InferenceError && error.code === 'SERVICE_UNAVAILABLE';
 }
 
+interface StructuralProfileFamily {
+  representative: TemplateIR['slides'][number];
+  members: Array<{ slide: TemplateIR['slides'][number]; elementIdMap: Map<string, string> }>;
+}
+
+function structuralProfileElements(slide: TemplateIR['slides'][number], templateIR: TemplateIR): Array<Record<string, unknown>> | null {
+  const assetByPart = new Map(templateIR.assets.map((asset) => [asset.part, asset]));
+  const ordered = [...slide.elements].sort((left, right) => left.order - right.order);
+  if (new Set(ordered.map((element) => element.order)).size !== ordered.length) return null;
+  const parentOrder = new Map(slide.elements.filter((element) => element.nativeId !== null)
+    .map((element) => [element.nativeId!, element.order]));
+  const descriptors: Array<Record<string, unknown>> = [];
+  for (const element of ordered) {
+    const box = element.geometry.resolved ?? element.geometry.direct;
+    let parent: number | null = null;
+    if (element.parentId !== null) {
+      if (element.nativeParentId === null || !parentOrder.has(element.nativeParentId)) return null;
+      parent = parentOrder.get(element.nativeParentId)!;
+    }
+    const related = slide.relationships.filter((relationship) => element.relationshipIds.includes(relationship.id)
+      && !relationship.type.toLowerCase().endsWith('/slidelayout'));
+    const relationshipShape: Array<{ type: string; mediaFingerprint: string }> = [];
+    for (const relationship of related) {
+      if (relationship.mode !== 'internal' || !relationship.targetPart) return null;
+      const asset = assetByPart.get(relationship.targetPart);
+      if (!asset?.visualFingerprint) return null;
+      relationshipShape.push({ type: relationship.type, mediaFingerprint: asset.visualFingerprint });
+    }
+    relationshipShape.sort((left, right) => left.type.localeCompare(right.type)
+      || left.mediaFingerprint.localeCompare(right.mediaFingerprint));
+    descriptors.push({
+      kind: element.kind.toLowerCase(),
+      order: element.order,
+      parent,
+      hasText: Boolean(element.text?.trim()),
+      placeholder: element.placeholder ? {
+        type: element.placeholder.type,
+        role: element.placeholder.role,
+      } : null,
+      geometry: box ? { x: box.x, y: box.y, width: box.width, height: box.height, rotation: box.rotation } : null,
+      directGeometry: element.geometry.direct
+        ? { x: element.geometry.direct.x, y: element.geometry.direct.y, width: element.geometry.direct.width,
+          height: element.geometry.direct.height, rotation: element.geometry.direct.rotation } : null,
+      directStyles: element.directStyles,
+      effectiveFontSizesPt: element.effectiveFontSizesPt ?? null,
+      relationships: relationshipShape,
+    });
+  }
+  return descriptors;
+}
+
+/** Groups only exact same-layout object morphologies with a one-to-one native order mapping. */
+function structuralProfileFamilies(templateIR: TemplateIR): StructuralProfileFamily[] {
+  const buckets = new Map<string, TemplateIR['slides'][number][]>();
+  for (const slide of templateIR.slides) {
+    const elements = structuralProfileElements(slide, templateIR);
+    if (!slide.layoutId || !elements) {
+      buckets.set(`single:${slide.index}`, [slide]);
+      continue;
+    }
+    const signature = createHash('sha256').update(JSON.stringify({ layoutId: slide.layoutId, masterId: slide.masterId, elements })).digest('hex');
+    const family = buckets.get(signature) ?? [];
+    family.push(slide);
+    buckets.set(signature, family);
+  }
+  return [...buckets.values()].flatMap((slides) => {
+    if (slides.length < 3) return slides.map((slide) => ({ representative: slide, members: [] }));
+    const representative = slides[0]!;
+    const representativeElements = [...representative.elements].sort((left, right) => left.order - right.order);
+    return [{
+      representative,
+      members: slides.slice(1).map((slide) => {
+        const targetElements = [...slide.elements].sort((left, right) => left.order - right.order);
+        if (targetElements.length !== representativeElements.length) throw new TypeError('Structural family mapping changed after fingerprinting.');
+        return { slide, elementIdMap: new Map(representativeElements.map((element, index) => [element.id, targetElements[index]!.id])) };
+      }),
+    }];
+  }).sort((left, right) => left.representative.index - right.representative.index);
+}
+
+function projectStructuralFamilyProfile(
+  sourceProfile: TemplateSemanticSlideProfile,
+  targetSlide: TemplateIR['slides'][number],
+  elementIdMap: ReadonlyMap<string, string>,
+  representative: TemplateIR['slides'][number],
+): TemplateSemanticSlideProfile | null {
+  const mapId = (id: string): string => {
+    const mapped = elementIdMap.get(id);
+    if (!mapped) throw new TypeError('Structural profile family omitted a referenced element id.');
+    return mapped;
+  };
+  const titleElementId = sourceProfile.titleElementId ? mapId(sourceProfile.titleElementId) : null;
+  const bodyElementIds = sourceProfile.bodyElementIds.map(mapId);
+  const visualElementIds = sourceProfile.visualElementIds.map(mapId);
+  const preserved = (sourceProfile.preservedElementIds ?? []).map(mapId);
+  const replaceableSourceIds = new Set(sourceProfile.replaceableTextElementIds ?? []);
+  const replaceable = (sourceProfile.replaceableTextElementIds ?? []).map(mapId);
+  const roleIds = new Set([...(titleElementId ? [titleElementId] : []), ...bodyElementIds, ...visualElementIds]);
+  const representativeById = new Map(representative.elements.map((element) => [element.id, element]));
+  const targetById = new Map(targetSlide.elements.map((element) => [element.id, element]));
+  const changedText = [...elementIdMap.entries()].flatMap(([sourceId, targetId]) => {
+    const source = representativeById.get(sourceId);
+    const target = targetById.get(targetId);
+    return source?.nativeId && target?.nativeId && source.kind.toLowerCase() === 'shape'
+      && Boolean(source.text?.trim()) && source.text !== target.text ? [{ sourceId, targetId }] : [];
+  });
+  // A changed title/body/visual role maps directly. Other changed text is safe
+  // to reuse only when the representative semantics already identified it as
+  // replaceable sample copy; ambiguous labels and branding become outliers.
+  if (changedText.some(({ sourceId, targetId }) => !roleIds.has(targetId) && !replaceableSourceIds.has(sourceId))) return null;
+  const changedReplaceableIds = changedText
+    .filter(({ sourceId, targetId }) => !roleIds.has(targetId) && replaceableSourceIds.has(sourceId))
+    .map(({ targetId }) => targetId);
+  return {
+    ...structuredClone(sourceProfile),
+    sourceSlideIndex: targetSlide.index,
+    // Text can change the semantic class even when the object morphology is
+    // identical. Reused profiles therefore carry neutral content semantics;
+    // consumers can still derive archetype from each target slide's structure.
+    archetype: 'content',
+    // Reuse carries no planning modality claim. The planning adapter consumes
+    // the separately profiled family representative instead.
+    supportedContentModes: [],
+    titleElementId,
+    bodyElementIds,
+    visualElementIds,
+    preservedElementIds: preserved,
+    replaceableTextElementIds: [...new Set([...replaceable, ...changedReplaceableIds])],
+    confidence: Math.min(0.8, sourceProfile.confidence),
+    reasonCodes: [...new Set([...sourceProfile.reasonCodes.slice(0, 7), 'structural_family_reuse'])],
+  };
+}
+
 /**
  * Replaceable semantic evidence adapter for templates. Cached per TemplateIR hash;
  * deterministic selector and safety checks remain responsible for final choices.
@@ -885,11 +1115,14 @@ export class TemplateSemanticProfiler {
   constructor(
     private readonly inference: SemanticInferenceAdapter,
     private readonly persistentCache?: TemplateSemanticProfileCache,
-    private readonly options: { promptDirectory?: string; concurrency?: number } = {},
+    private readonly options: { promptDirectory?: string; concurrency?: number; cacheIdentity?: string; familyReuse?: boolean; diagnostics?: PerformanceDiagnosticsPort } = {},
   ) {
     if (options.concurrency !== undefined && (!Number.isSafeInteger(options.concurrency)
         || options.concurrency < 1 || options.concurrency > PROFILE_BATCH_CONCURRENCY_LIMIT)) {
       throw new TypeError(`Template profiler concurrency must be an integer between 1 and ${PROFILE_BATCH_CONCURRENCY_LIMIT}.`);
+    }
+    if (options.cacheIdentity !== undefined && (!options.cacheIdentity.trim() || options.cacheIdentity.length > 512)) {
+      throw new TypeError('Template profiler cache identity is invalid.');
     }
   }
 
@@ -913,14 +1146,14 @@ export class TemplateSemanticProfiler {
     const templateIR = validateTemplateIR(templateIRInput);
     validatePresentationDesignSystem(designSystemInput, templateIR);
     const prompt = await this.loadPromptAsset();
-    const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, prompt.sha256);
+    const cacheKey = templateSemanticProfileCacheKey(templateIR.hash, prompt.sha256, this.options.cacheIdentity, this.options.familyReuse === true);
     return { templateIR, prompt, cacheKey };
   }
 
   async profileCacheKey(templateIRInput: TemplateIR): Promise<string> {
     const templateIR = validateTemplateIR(templateIRInput);
     const prompt = await this.loadPromptAsset();
-    return templateSemanticProfileCacheKey(templateIR.hash, prompt.sha256);
+    return templateSemanticProfileCacheKey(templateIR.hash, prompt.sha256, this.options.cacheIdentity, this.options.familyReuse === true);
   }
 
   private async readPrepared(
@@ -929,14 +1162,22 @@ export class TemplateSemanticProfiler {
     invalidateInvalid: boolean,
   ): Promise<TemplateSemanticProfile | null> {
     const cached = this.cache.get(cacheKey);
-    if (cached) return structuredClone(cached);
+    if (cached) {
+      this.options.diagnostics?.increment('templateProfileCacheHitMemory');
+      return structuredClone(cached);
+    }
     const persisted = await this.persistentCache?.read(cacheKey);
-    if (persisted === null || persisted === undefined) return null;
+    if (persisted === null || persisted === undefined) {
+      this.options.diagnostics?.increment('templateProfileCacheMiss');
+      return null;
+    }
     try {
       const profile = validateTemplateSemanticProfile(persisted, templateIR);
       this.cache.set(cacheKey, profile);
+      this.options.diagnostics?.increment('templateProfileCacheHitPersistent');
       return structuredClone(profile);
     } catch {
+      this.options.diagnostics?.increment('templateProfileCacheInvalid');
       if (invalidateInvalid) await this.persistentCache?.invalidate?.(cacheKey);
       return null;
     }
@@ -959,9 +1200,15 @@ export class TemplateSemanticProfiler {
   ): Promise<TemplateSemanticProfile> {
     const { templateIR, prompt, cacheKey } = await this.fingerprint(templateIRInput, designSystemInput);
     const cached = this.cache.get(cacheKey);
-    if (cached) return structuredClone(cached);
+    if (cached) {
+      this.options.diagnostics?.increment('templateProfileCacheHitMemory');
+      return structuredClone(cached);
+    }
     const pending = this.inFlight.get(cacheKey);
-    if (pending) return structuredClone(await pending);
+    if (pending) {
+      this.options.diagnostics?.increment('templateProfileCacheHitInflight');
+      return structuredClone(await pending);
+    }
 
     const task = (async () => {
       const persisted = await this.persistentCache?.read(cacheKey);
@@ -969,19 +1216,58 @@ export class TemplateSemanticProfiler {
         try {
           const profile = validateTemplateSemanticProfile(persisted, templateIR);
           this.cache.set(cacheKey, profile);
+          this.options.diagnostics?.increment('templateProfileCacheHitPersistent');
           return profile;
         } catch {
+          this.options.diagnostics?.increment('templateProfileCacheInvalid');
           await this.persistentCache?.invalidate?.(cacheKey);
         }
+      } else {
+        this.options.diagnostics?.increment('templateProfileCacheMiss');
       }
-      const plan = planTemplateSemanticProfileBatches(templateIR, prompt.content);
+      let families: StructuralProfileFamily[] = [];
+      let familyReuseEnabled = this.options.familyReuse === true;
+      let plan: ReturnType<typeof planTemplateSemanticProfileBatches>;
+      let maximumOutlierPlan: ReturnType<typeof planTemplateSemanticProfileBatches> | null = null;
+      if (familyReuseEnabled) {
+        families = structuralProfileFamilies(templateIR);
+        const usefulFamilies = families.filter((family) => family.members.length > 0);
+        familyReuseEnabled = usefulFamilies.length > 0;
+        if (familyReuseEnabled) {
+          const representativeIndexes = families.map((family) => family.representative.index);
+          const possibleOutlierIndexes = families.flatMap((family) => family.members.map(({ slide }) => slide.index));
+          try {
+            const representativePlan = planTemplateSemanticProfileBatches(templateIR, prompt.content, representativeIndexes);
+            const outlierPlan = possibleOutlierIndexes.length
+              ? planTemplateSemanticProfileBatches(templateIR, prompt.content, possibleOutlierIndexes)
+              : null;
+            if (representativePlan.batches.length + (outlierPlan?.batches.length ?? 0) <= PROFILE_BATCH_COUNT_LIMIT) {
+              plan = representativePlan;
+              maximumOutlierPlan = outlierPlan;
+            } else {
+              familyReuseEnabled = false;
+              plan = planTemplateSemanticProfileBatches(templateIR, prompt.content);
+            }
+          } catch {
+            // Reuse must never turn a profileable template into a preparation
+            // failure. The full deterministic partition remains authoritative.
+            familyReuseEnabled = false;
+            plan = planTemplateSemanticProfileBatches(templateIR, prompt.content);
+          }
+        } else {
+          plan = planTemplateSemanticProfileBatches(templateIR, prompt.content);
+        }
+      } else {
+        plan = planTemplateSemanticProfileBatches(templateIR, prompt.content);
+      }
+      const reusableFamilyCount = familyReuseEnabled ? families.filter((family) => family.members.length > 0).length : 0;
+      this.options.diagnostics?.increment('templateProfileFamilyCount', reusableFamilyCount);
+      this.options.diagnostics?.increment('templateProfileRepresentativeSlideCount', plan.batches.flatMap((batch) => batch.sourceSlideIndexes).length);
       const batchResults = new Map<number, TemplateSemanticSlideProfile>();
       const controller = new AbortController();
       const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-      const concurrency = Math.min(this.options.concurrency ?? 1, plan.batches.length);
-      let nextBatch = 0;
       let firstFailure: unknown;
-      let pendingInitialBatches = plan.batches.length;
+      let pendingInitialBatches = plan.batches.length + (maximumOutlierPlan?.batches.length ?? 0);
       let providerCalls = 0;
       let reservedRecoveryCalls = 0;
       const reserveRecoveryCalls = (count: number): boolean => {
@@ -1000,7 +1286,19 @@ export class TemplateSemanticProfiler {
           reservedRecoveryCalls -= 1;
         }
         providerCalls += 1;
-        return this.inference.infer({ ...requestFor(templateIR, prompt.content, batch, slides), signal: requestSignal });
+        const providerStartedAt = performance.now();
+        this.options.diagnostics?.increment('templateSemanticInferenceRequestCount');
+        if (credit === 'reserved') this.options.diagnostics?.increment('templateSemanticRecoveryRequestCount');
+        try {
+          const response = await this.inference.infer({ ...requestFor(templateIR, prompt.content, batch, slides), signal: requestSignal });
+          if (response.telemetry.promptTokens !== undefined) this.options.diagnostics?.increment('templateSemanticPromptTokens', response.telemetry.promptTokens);
+          if (response.telemetry.completionTokens !== undefined) this.options.diagnostics?.increment('templateSemanticCompletionTokens', response.telemetry.completionTokens);
+          return response;
+        } finally {
+          const providerMs = performance.now() - providerStartedAt;
+          this.options.diagnostics?.recordDuration('templateSemanticProviderMs', providerMs);
+          if (credit === 'reserved') this.options.diagnostics?.recordDuration('templateSemanticRecoveryMs', providerMs);
+        }
       };
       const inferSingleSlide = async (
         batch: TemplateSemanticProfileBatchPlan,
@@ -1039,30 +1337,68 @@ export class TemplateSemanticProfiler {
           return recovered;
         }
       };
-      const workers = Array.from({ length: concurrency }, async () => {
-        while (!firstFailure) {
-          if (signal?.aborted) {
-            firstFailure ??= new InferenceError('CANCELLED', 'Template profiler was cancelled before the next batch.');
-            controller.abort(firstFailure);
-            return;
+      const runPlan = async (currentPlan: ReturnType<typeof planTemplateSemanticProfileBatches>) => {
+        if (!currentPlan.batches.length) return;
+        const concurrency = Math.min(this.options.concurrency ?? 1, currentPlan.batches.length);
+        let nextBatch = 0;
+        const workers = Array.from({ length: concurrency }, async () => {
+          while (!firstFailure) {
+            if (signal?.aborted) {
+              firstFailure ??= new InferenceError('CANCELLED', 'Template profiler was cancelled before the next batch.');
+              controller.abort(firstFailure);
+              return;
+            }
+            const batchIndex = nextBatch++;
+            if (batchIndex >= currentPlan.batches.length) return;
+            const batch = currentPlan.batches[batchIndex]!;
+            const batchIndexes = new Set(batch.sourceSlideIndexes);
+            const batchSlides = templateIR.slides.filter((slide) => batchIndexes.has(slide.index));
+            try {
+              const slides = await inferBatchWithRecovery(batch, batchSlides);
+              for (const slide of slides) batchResults.set(slide.sourceSlideIndex, slide);
+            } catch (error) {
+              if (!firstFailure) firstFailure = error;
+              controller.abort(firstFailure);
+              return;
+            }
           }
-          const batchIndex = nextBatch++;
-          if (batchIndex >= plan.batches.length) return;
-          const batch = plan.batches[batchIndex]!;
-          const batchIndexes = new Set(batch.sourceSlideIndexes);
-          const batchSlides = templateIR.slides.filter((slide) => batchIndexes.has(slide.index));
-          try {
-            const slides = await inferBatchWithRecovery(batch, batchSlides);
-            for (const slide of slides) batchResults.set(slide.sourceSlideIndex, slide);
-          } catch (error) {
-            if (!firstFailure) firstFailure = error;
-            controller.abort(firstFailure);
-            return;
+        });
+        await Promise.all(workers);
+      };
+      await runPlan(plan);
+      if (firstFailure) throw firstFailure;
+      if (familyReuseEnabled) {
+        const outlierIndexes: number[] = [];
+        let reusedSlideCount = 0;
+        for (const family of families) {
+          if (!family.members.length) continue;
+          const representativeProfile = batchResults.get(family.representative.index);
+          if (!representativeProfile || representativeProfile.confidence < 0.85) {
+            outlierIndexes.push(...family.members.map(({ slide }) => slide.index));
+            continue;
+          }
+          for (const member of family.members) {
+            const projected = projectStructuralFamilyProfile(
+              representativeProfile, member.slide, member.elementIdMap, family.representative,
+            );
+            if (projected) {
+              batchResults.set(member.slide.index, projected);
+              reusedSlideCount += 1;
+            } else outlierIndexes.push(member.slide.index);
           }
         }
-      });
-      await Promise.all(workers);
-      if (firstFailure) throw firstFailure;
+        const actualOutlierPlan = outlierIndexes.length
+          ? planTemplateSemanticProfileBatches(templateIR, prompt.content, outlierIndexes)
+          : null;
+        // The maximum outlier plan reserved the aggregate request budget before
+        // representatives ran. Replace its conservative pending count with the
+        // actual fallback plan and spend only what is needed.
+        pendingInitialBatches = actualOutlierPlan?.batches.length ?? 0;
+        if (actualOutlierPlan) await runPlan(actualOutlierPlan);
+        if (firstFailure) throw firstFailure;
+        this.options.diagnostics?.increment('templateProfileReusedSlideCount', reusedSlideCount);
+        this.options.diagnostics?.increment('templateProfileOutlierCount', outlierIndexes.length);
+      }
       const mergedSlides: TemplateSemanticSlideProfile[] = [...batchResults.values()];
       const expectedIndexOrder = new Map(templateIR.slides.map((slide, index) => [slide.index, index]));
       mergedSlides.sort((left, right) => (expectedIndexOrder.get(left.sourceSlideIndex) ?? Number.MAX_SAFE_INTEGER)

@@ -168,6 +168,10 @@ export async function derivePlanningContentBudgets(input: {
   const families: Array<Omit<PlanningContentBudgetFamily, 'familyKey'>> = [];
 
   for (const profileSlide of profile.slides) {
+    // Structural reuse provides safe same-slide IDs to the renderer, but its
+    // neutral archetype and lack of modality evidence must not become a new
+    // planning family. The profiled representative already supplies it.
+    if (profileSlide.reasonCodes.includes('structural_family_reuse')) continue;
     const sourceSlide = nativeSlides[profileSlide.sourceSlideIndex - 1];
     const templateSlide = input.template.slides.find((slide) => slide.index === profileSlide.sourceSlideIndex);
     if (!sourceSlide || !templateSlide) continue;

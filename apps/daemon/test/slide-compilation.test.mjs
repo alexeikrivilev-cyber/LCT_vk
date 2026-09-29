@@ -36,6 +36,7 @@ import {
 import { PerformanceDiagnostics } from '../src/presentation/performance-diagnostics.ts';
 import { OfficeKitPptxRenderer } from '../src/presentation/adapters/office-kit-pptx-renderer.ts';
 import { OfficeKitPreviewAdapter } from '../src/presentation/adapters/office-kit-preview-adapter.ts';
+import { addTemplateMediaVisualFingerprints } from '../src/presentation/adapters/office-kit-template-media-fingerprint.ts';
 import { isValidTemplateSemanticProfile } from '../src/presentation/application/template-semantic-profiler.ts';
 import { findSlideLayoutByPartName, getShapeId, getShapeKind, getShapePlaceholderType, getShapePreset, getShapeStrokeArrow, getShapeText, getShapeRunFormatEffective, getShapeStrokeColor, getSlideCharts, getSlideLayoutPlaceholders, getSlideShapes, getSlides, hasShapeText, isShapePlaceholder, loadPresentation } from '@office-kit/pptx/node';
 import { briefHash } from '../src/presentation/domain/brief.ts';
@@ -129,6 +130,7 @@ async function familyExemplarFixture(root, fileName, options = {}) {
     filePath: fileName, originalName: fileName, sha256,
     compiledAt: '2026-09-25T00:00:00.000Z', compilerVersion: 'lct-template-compiler/1',
   });
+  await addTemplateMediaVisualFingerprints(templateIR, bytes);
   return { templatePath, templateIR, inspection };
 }
 
@@ -1178,7 +1180,10 @@ test('Office Kit duplicates an exemplar, preserves donor text style and decorati
   assert.equal(body?.type, 'shape');
   assert.ok(result.validationIssues.filter((issue) => issue.message.includes('paragraph-end formatting may not be retained')).length >= 2,
     'every replaced donor records the paragraph-end formatting limitation');
-  assert.deepEqual(title.style.font_sizes_pt, titleDonor.directStyles.fontSizesPt);
+  assert.ok(title.style.font_sizes_pt?.[0] <= titleDonor.directStyles.fontSizesPt[0],
+    'the donor title style can shrink to fit the generated title');
+  assert.ok(title.style.font_sizes_pt?.[0] >= titleDonor.directStyles.fontSizesPt[0] * 0.9,
+    'title fitting keeps at least 90% of the donor size');
   assert.equal(title.style.bold ?? null, titleDonor.directStyles.bold);
   assert.deepEqual(body.style.font_sizes_pt, bodyDonor.directStyles.fontSizesPt);
   assert.equal(body.style.bold ?? null, bodyDonor.directStyles.bold);
@@ -1199,6 +1204,246 @@ test('Office Kit duplicates an exemplar, preserves donor text style and decorati
   assert.equal(preview.slideCount, 1);
   assert.ok(preview.png.length > 0);
   assert.match(preview.svg, /Editable slides retain a source-backed visual/);
+});
+
+test('Office Kit preserves a full-canvas background shell while replacing the editable source copy', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-exemplar-full-background-shell-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await familyExemplarFixture(root, 'background-shell-template.pptx', { includeFullCanvasBackground: true });
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiled = compilePresentation(deckPlan, contentIR, template.templateIR, VARIANT_POLICIES[0]);
+  const compiledSlide = compiled.slides.at(-1);
+  assert.ok(compiledSlide);
+  const assessment = assessExemplarSelection(compiledSlide, template.templateIR);
+  assert.ok(assessment.selection, JSON.stringify(assessment.candidateDiagnostics.map(({ sourceSlideIndex, gate, rejectReason, visualClassification }) => ({ sourceSlideIndex, gate, rejectReason, visualClassification }))));
+  assert.ok(assessment.candidateDiagnostics.some((candidate) => candidate.visualClassification.some((item) => item.includes(':template-decoration:full-canvas image role recurs across the layout family'))));
+  const backgroundDonor = template.templateIR.slides.find((slide) => slide.sourcePart === assessment.selection.sourcePart);
+  assert.ok(backgroundDonor);
+  const backgroundDonorTitle = backgroundDonor.elements.find((element) => element.id === assessment.selection.slots.title.elementId);
+  const backgroundDonorBody = backgroundDonor.elements.find((element) => element.id === assessment.selection.slots.body.elementId);
+  assert.ok(backgroundDonorTitle && backgroundDonorBody);
+  assert.ok(classifyExemplarArchetype(backgroundDonor, template.templateIR, backgroundDonorTitle.id, backgroundDonorBody.id).visualAreaShare < 0.01,
+    'a preserved shell does not make a content composition appear visual-led');
+  const profileWithShellVisual = semanticProfileFor(template.templateIR);
+  const backgroundImage = backgroundDonor.elements.find((element) => ['image', 'picture'].includes(element.kind.toLowerCase()));
+  assert.ok(backgroundImage);
+  profileWithShellVisual.slides.find((profileSlide) => profileSlide.sourceSlideIndex === backgroundDonor.index).visualElementIds = [backgroundImage.id];
+  const profileConflictAssessment = assessExemplarSelection(compiledSlide, template.templateIR, profileWithShellVisual);
+  const profileConflict = profileConflictAssessment.candidateDiagnostics.find((candidate) => candidate.sourceSlideIndex === backgroundDonor.index);
+  assert.ok(profileConflict?.evidence.some((item) => item.includes('semantic profile lists') && item.includes('background shell evidence')),
+    'a profile visual-element overlap remains visible in candidate diagnostics');
+
+  const oneOffFullBleedTemplate = structuredClone(template.templateIR);
+  const familySource = oneOffFullBleedTemplate.slides[0];
+  assert.ok(familySource);
+  const repeatedFamily = Array.from({ length: 10 }, (_, index) => {
+    const clone = structuredClone(familySource);
+    clone.index = index + 1;
+    clone.id = `${familySource.id}_repeat_${index + 1}`;
+    clone.sourcePart = `ppt/slides/repeated-family-${index + 1}.xml`;
+    for (const relation of clone.relationships) relation.sourcePart = clone.sourcePart;
+    for (const element of clone.elements) element.id = `${element.id}_repeat_${index + 1}`;
+    return clone;
+  });
+  const outlierSlide = repeatedFamily.at(-1);
+  assert.ok(outlierSlide);
+  const outlierImage = outlierSlide.elements.find((element) => ['image', 'picture'].includes(element.kind.toLowerCase()));
+  assert.ok(outlierImage);
+  const outlierRelationship = outlierSlide.relationships.find((relationship) => outlierImage.relationshipIds.includes(relationship.id));
+  assert.ok(outlierRelationship?.targetPart);
+  const previousAsset = oneOffFullBleedTemplate.assets.find((asset) => asset.part === outlierRelationship.targetPart);
+  assert.ok(previousAsset?.visualFingerprint);
+  const newRelationshipId = `${outlierRelationship.id}_customer_photo`;
+  outlierImage.relationshipIds = outlierImage.relationshipIds.map((id) => id === outlierRelationship.id ? newRelationshipId : id);
+  outlierRelationship.id = newRelationshipId;
+  outlierRelationship.nativeId = `${outlierRelationship.nativeId}_customer_photo`;
+  outlierRelationship.target = '../media/customer-photo.png';
+  outlierRelationship.targetPart = 'ppt/media/customer-photo.png';
+  oneOffFullBleedTemplate.assets.push({
+    ...structuredClone(previousAsset), id: `${previousAsset.id}_customer_photo`, part: outlierRelationship.targetPart,
+    relationshipIds: [newRelationshipId], visualFingerprint: `rgb16x9-v1:${Buffer.alloc(16 * 9 * 3, 220).toString('base64')}`,
+  });
+  oneOffFullBleedTemplate.slides = repeatedFamily;
+  oneOffFullBleedTemplate.hash = sha256Json(templateIRHashPayload(oneOffFullBleedTemplate));
+  const oneOffAssessment = assessExemplarSelection(compiledSlide, oneOffFullBleedTemplate);
+  const oneOffCandidate = oneOffAssessment.candidateDiagnostics.find((candidate) => candidate.sourceSlideIndex === 10);
+  assert.equal(oneOffCandidate?.gate, 'visual-safety', 'a one-off full-slide image with different sampled appearance remains source-specific inside a recurring layout family');
+  assert.ok(oneOffCandidate?.visualClassification.some((item) => item.includes(':source-specific-content:')));
+  assert.ok(oneOffAssessment.candidateDiagnostics.filter((candidate) => candidate.sourceSlideIndex < 10)
+    .every((candidate) => candidate.visualClassification.some((item) => item.includes(':template-decoration:'))),
+  'the nine recurring sampled backgrounds still qualify as a shell');
+
+  const groupedBackgroundTemplate = structuredClone(template.templateIR);
+  const groupedBackgroundSlide = groupedBackgroundTemplate.slides[0];
+  assert.ok(groupedBackgroundSlide);
+  const groupedBackground = groupedBackgroundSlide.elements.find((element) => ['image', 'picture'].includes(element.kind.toLowerCase()));
+  assert.ok(groupedBackground);
+  groupedBackground.parentId = 'rotated-or-reflected-group';
+  groupedBackground.geometry.resolved = null;
+  groupedBackground.geometry.provenance = 'unknown';
+  groupedBackgroundTemplate.slides = [groupedBackgroundSlide];
+  for (const asset of groupedBackgroundTemplate.assets) delete asset.visualFingerprint;
+  await addTemplateMediaVisualFingerprints(groupedBackgroundTemplate, new Uint8Array(await readFile(template.templatePath)));
+  assert.ok(groupedBackgroundTemplate.assets.every((asset) => !asset.visualFingerprint),
+    'a full-canvas local picture with an unresolved ancestor group transform is never fingerprinted as a repeated shell');
+
+  const cropFixture = await familyExemplarFixture(root, 'crop-transform-background-template.pptx', { includeFullCanvasBackground: true });
+  const cropArchive = await JSZip.loadAsync(await readFile(cropFixture.templatePath));
+  const cropSlidePart = cropFixture.templateIR.slides[1]?.sourcePart;
+  assert.ok(cropSlidePart);
+  const cropSlideXml = await cropArchive.file(cropSlidePart)?.async('string');
+  assert.ok(cropSlideXml);
+  const croppedSlideXml = cropSlideXml.replace(/(<a:blip\b[^>]*>[\s\S]*?<\/a:blip>)/i, '$1<a:srcRect l="20000"/>');
+  assert.notEqual(croppedSlideXml, cropSlideXml, 'the fixture adds a visible source-rectangle crop to one background instance');
+  cropArchive.file(cropSlidePart, croppedSlideXml);
+  const croppedPptxPath = path.join(root, 'crop-transform-background-template-cropped.pptx');
+  const croppedPptxBytes = await cropArchive.generateAsync({ type: 'nodebuffer' });
+  await writeFile(croppedPptxPath, croppedPptxBytes);
+  const croppedInspection = await inspectPptx(croppedPptxPath);
+  const croppedTemplateIR = createTemplateIR(croppedInspection, {
+    filePath: path.basename(croppedPptxPath), originalName: path.basename(croppedPptxPath),
+    sha256: createHash('sha256').update(croppedPptxBytes).digest('hex'),
+    compiledAt: '2026-09-29T00:00:00.000Z', compilerVersion: 'lct-template-compiler/2',
+  });
+  await addTemplateMediaVisualFingerprints(croppedTemplateIR, croppedPptxBytes);
+  const croppedImage = croppedTemplateIR.slides[1]?.elements.find((element) => ['image', 'picture'].includes(element.kind.toLowerCase()));
+  const croppedRelationship = croppedTemplateIR.slides[1]?.relationships.find((relationship) => croppedImage?.relationshipIds.includes(relationship.id));
+  const croppedAsset = croppedTemplateIR.assets.find((asset) => asset.part === croppedRelationship?.targetPart);
+  assert.equal(croppedAsset?.visualFingerprint, undefined, 'an unmodeled per-picture crop makes raw-image fingerprints unavailable');
+  const cropCompiled = compilePresentation(deckPlan, contentIR, croppedTemplateIR, VARIANT_POLICIES[0]);
+  const cropAssessment = assessExemplarSelection(cropCompiled.slides.at(-1), croppedTemplateIR);
+  const croppedCandidate = cropAssessment.candidateDiagnostics.find((candidate) => candidate.sourceSlideIndex === 2);
+  assert.ok(croppedCandidate);
+  assert.ok(!croppedCandidate.visualClassification.some((item) =>
+    item.includes(':template-decoration:full-canvas image role recurs across the layout family')),
+  'a picture with a per-instance crop cannot inherit the repeated background-shell role');
+
+  // Reuse one media part with different DrawingML fill modes across slides.
+  // The raw asset pixels match, but a tiled instance must make that part
+  // ineligible as a repeated shell for every slide that references it.
+  const tiledArchive = await JSZip.loadAsync(await readFile(cropFixture.templatePath));
+  const firstBackgroundSlide = cropFixture.templateIR.slides[0];
+  const secondBackgroundSlide = cropFixture.templateIR.slides[1];
+  assert.ok(firstBackgroundSlide && secondBackgroundSlide);
+  const pictureRelationship = (slide) => {
+    const picture = slide.elements.find((element) => ['image', 'picture'].includes(element.kind.toLowerCase()));
+    return slide.relationships.find((relationship) => picture?.relationshipIds.includes(relationship.id));
+  };
+  const firstBackgroundRelationship = pictureRelationship(firstBackgroundSlide);
+  const secondBackgroundRelationship = pictureRelationship(secondBackgroundSlide);
+  assert.ok(firstBackgroundRelationship?.targetPart && secondBackgroundRelationship?.targetPart
+    && secondBackgroundRelationship.nativeId);
+  const secondRelsPart = `${path.posix.dirname(secondBackgroundSlide.sourcePart)}/_rels/${path.posix.basename(secondBackgroundSlide.sourcePart)}.rels`;
+  const secondRels = await tiledArchive.file(secondRelsPart)?.async('string');
+  const secondSlideXml = await tiledArchive.file(secondBackgroundSlide.sourcePart)?.async('string');
+  assert.ok(secondRels && secondSlideXml);
+  const escapedNativeId = secondBackgroundRelationship.nativeId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const relTagPattern = new RegExp(`<Relationship\\b(?=[^>]*\\bId=["']${escapedNativeId}["'])[^>]*\\/>`, 'i');
+  const originalRelTag = secondRels.match(relTagPattern)?.[0];
+  assert.ok(originalRelTag);
+  const sharedMediaTarget = path.posix.relative(path.posix.dirname(secondBackgroundSlide.sourcePart), firstBackgroundRelationship.targetPart);
+  const updatedRelTag = originalRelTag.replace(/(\bTarget=["'])[^"']+(["'])/i, `$1${sharedMediaTarget}$2`);
+  tiledArchive.file(secondRelsPart, secondRels.replace(originalRelTag, updatedRelTag));
+  const tiledSlideXml = secondSlideXml.replace(/<a:stretch\b[^>]*>[\s\S]*?<\/a:stretch>/i, '<a:tile/>');
+  assert.notEqual(tiledSlideXml, secondSlideXml, 'the second background uses tile while the first retains stretch');
+  tiledArchive.file(secondBackgroundSlide.sourcePart, tiledSlideXml);
+  const tiledPptxPath = path.join(root, 'same-media-tile-versus-stretch.pptx');
+  const tiledPptxBytes = await tiledArchive.generateAsync({ type: 'nodebuffer' });
+  await writeFile(tiledPptxPath, tiledPptxBytes);
+  const tiledInspection = await inspectPptx(tiledPptxPath);
+  const tiledTemplateIR = createTemplateIR(tiledInspection, {
+    filePath: path.basename(tiledPptxPath), originalName: path.basename(tiledPptxPath),
+    sha256: createHash('sha256').update(tiledPptxBytes).digest('hex'),
+    compiledAt: '2026-09-29T00:00:00.000Z', compilerVersion: 'lct-template-compiler/2',
+  });
+  await addTemplateMediaVisualFingerprints(tiledTemplateIR, tiledPptxBytes);
+  const sharedBackgroundAsset = tiledTemplateIR.assets.find((asset) => asset.part === firstBackgroundRelationship.targetPart);
+  assert.equal(sharedBackgroundAsset?.visualFingerprint, undefined,
+    'a tiled instance invalidates raw-image equivalence for every reference to the shared media part');
+  for (const [variantName, transform] of [
+    ['nonzero-fill-rect', (xml) => xml.replace(/<a:tile\s*\/>/i, '<a:stretch><a:fillRect l="10000"/></a:stretch>')],
+    ['rot-with-shape', (xml) => xml.replace(/<a:tile\s*\/>/i, '<a:stretch><a:fillRect/></a:stretch>')
+      .replace(/(<(?:[A-Za-z_][\w.-]*:)?blipFill\b[^>]*)(>)/i, '$1 rotWithShape="1"$2')],
+    ['nonrectangular-picture-mask', (xml) => xml.replace(/(<(?:[A-Za-z_][\w.-]*:)?prstGeom\b[^>]*\bprst=["'])rect(["'])/i, '$1ellipse$2')],
+    ['custom-picture-mask', (xml) => xml.replace(/<a:prstGeom\b[^>]*>[\s\S]*?<\/a:prstGeom>/i,
+      '<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="0" t="0" r="0" b="0"/><a:pathLst><a:path w="100" h="100"><a:moveTo><a:pt x="50" y="0"/></a:moveTo><a:lnTo><a:pt x="100" y="100"/></a:lnTo><a:lnTo><a:pt x="0" y="100"/></a:lnTo><a:close/></a:path></a:pathLst></a:custGeom>')],
+    ['picture-shape-effect', (xml) => xml.replace(/<a:tile\s*\/>/i, '<a:stretch><a:fillRect/></a:stretch>')
+      .replace(/<\/p:spPr>/i, '<a:effectLst><a:softEdge rad="100000"/></a:effectLst></p:spPr>')],
+  ]) {
+    const transformedArchive = await JSZip.loadAsync(tiledPptxBytes);
+    const currentXml = await transformedArchive.file(secondBackgroundSlide.sourcePart)?.async('string');
+    assert.ok(currentXml);
+    const transformedXml = transform(currentXml);
+    assert.notEqual(transformedXml, currentXml, `${variantName} fixture adds an unsupported picture fill transform`);
+    transformedArchive.file(secondBackgroundSlide.sourcePart, transformedXml);
+    const transformedBytes = await transformedArchive.generateAsync({ type: 'nodebuffer' });
+    const transformedPath = path.join(root, `${variantName}-same-media.pptx`);
+    await writeFile(transformedPath, transformedBytes);
+    const transformedIR = createTemplateIR(await inspectPptx(transformedPath), {
+      filePath: path.basename(transformedPath), originalName: path.basename(transformedPath),
+      sha256: createHash('sha256').update(transformedBytes).digest('hex'),
+      compiledAt: '2026-09-29T00:00:00.000Z', compilerVersion: 'lct-template-compiler/2',
+    });
+    await addTemplateMediaVisualFingerprints(transformedIR, transformedBytes);
+    const transformedAsset = transformedIR.assets.find((asset) => asset.part === firstBackgroundRelationship.targetPart);
+    assert.equal(transformedAsset?.visualFingerprint, undefined,
+      `${variantName} cannot share an untransformed raw-media fingerprint`);
+  }
+  const tiledAssessment = assessExemplarSelection(compiledSlide, tiledTemplateIR);
+  assert.ok(tiledAssessment.candidateDiagnostics.filter((candidate) => [1, 2].includes(candidate.sourceSlideIndex))
+    .every((candidate) => !candidate.visualClassification.some((item) =>
+      item.includes(':template-decoration:full-canvas image role recurs across the layout family'))),
+  'neither stretch nor tile may be promoted from shared raw pixels alone');
+
+  const underdocumentedTemplate = structuredClone(template.templateIR);
+  for (const sourceSlide of underdocumentedTemplate.slides) {
+    const editableText = sourceSlide.elements.filter((element) => element.kind.toLowerCase() === 'shape' && (element.text ?? '').trim().length > 0);
+    const keep = new Set(editableText.slice(0, 2).map((element) => element.id));
+    sourceSlide.elements = sourceSlide.elements.filter((element) => ['image', 'picture'].includes(element.kind.toLowerCase()) || keep.has(element.id));
+  }
+  underdocumentedTemplate.hash = sha256Json(templateIRHashPayload(underdocumentedTemplate));
+  const conservativeAssessment = assessExemplarSelection(compiledSlide, underdocumentedTemplate);
+  assert.equal(conservativeAssessment.selection, null, 'a full-bleed source image without enough independent editable copy remains fail-closed');
+  const underdocumentedCandidate = conservativeAssessment.candidateDiagnostics.find((candidate) => candidate.sourceSlideIndex === 1);
+  assert.equal(underdocumentedCandidate?.gate, 'visual-safety');
+  assert.ok(underdocumentedCandidate.visualClassification.some((item) => item.includes(':source-specific-content:')));
+
+  compiledSlide.title = 'Generated title designed to wrap across two lines in the narrow donor title box';
+  const sourceHash = createHash('sha256').update(await readFile(template.templatePath)).digest('hex');
+  const outputPath = path.join(root, 'output', 'background-shell-probe.pptx');
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const semanticProfile = semanticProfileFor(template.templateIR);
+  const result = await new OfficeKitPptxRenderer().render({
+    compiledPresentation: { ...compiled, id: `${compiled.id}_background_shell`, slides: [compiledSlide] },
+    contentIR, templateIR: template.templateIR, semanticProfile, templatePath: template.templatePath, outputPath,
+  });
+  assert.equal(result.reopenStatus, 'passed');
+  const reopened = await inspectPptx(outputPath);
+  const outputSlide = reopened.inspection.slides[0];
+  assert.ok(outputSlide.elements.some((element) => ['image', 'picture'].includes(String(element.type).toLowerCase())), 'the cloned donor retains its native full-canvas background image');
+  assert.ok(outputSlide.elements.some((element) => element.text.trim() === compiledSlide.title), 'generated title remains editable native text');
+  assert.ok(outputSlide.elements.some((element) => element.text.trim() === compiledSlide.body.join('\n').trim()), 'generated body remains editable native text');
+  assert.ok(outputSlide.elements.some((element) => element.text.trim() === 'SYNTHETIC BRAND'), 'independent repeated brand text remains intact');
+  const packageZip = await JSZip.loadAsync(await readFile(outputPath));
+  const outputMedia = await Promise.all(Object.values(packageZip.files)
+    .filter((entry) => !entry.dir && /^ppt\/media\//i.test(entry.name)).map((entry) => entry.async('nodebuffer')));
+  assert.ok(outputMedia.some((asset) => asset.equals(onePixelPng)), 'the exact source background asset survives unchanged');
+  const packageText = (await Promise.all(Object.values(packageZip.files)
+    .filter((entry) => !entry.dir).map((entry) => entry.async('string').catch(() => '')))).join('\n');
+  assert.ok(!packageText.includes('Original source headline'));
+  assert.ok(!packageText.includes('Original source body'));
+  assert.ok(!packageText.includes('Source only detail'));
+  assert.equal(createHash('sha256').update(await readFile(template.templatePath)).digest('hex'), sourceHash, 'the immutable source file is not changed');
+  const renderedPresentation = await loadPresentation(await readFile(outputPath));
+  const renderedSlide = getSlides(renderedPresentation)[0];
+  assert.ok(renderedSlide);
+  const renderedTitle = getSlideShapes(renderedSlide).find((shape) => getShapeText(shape).trim() === compiledSlide.title);
+  assert.ok(renderedTitle);
+  assert.ok(getShapeRunFormatEffective(renderedPresentation, renderedTitle, 0, 0).size < 30,
+    'a multi-line generated title gets a smaller native run size in its donor box');
+  const preview = await new OfficeKitPreviewAdapter().preview(new Uint8Array(await readFile(outputPath)), 0, 960);
+  assert.equal(preview.status, 'passed');
+  assert.equal(preview.textLayoutIssues.length, 0, 'the fitted long title passes the native text layout preview audit');
 });
 
 test('A/B/C selection deduplicates donor families after source text cleanup', async (t) => {
@@ -2094,10 +2339,16 @@ test('generic fallback derives readable text color from a dark template backgrou
   const reopened = await loadPresentation(await readFile(outputPath));
   const reopenedSlide = getSlides(reopened)[0];
   assert.ok(reopenedSlide);
+  const title = getSlideShapes(reopenedSlide).find((shape) => getShapeText(shape) === selectedTrack.title);
   const body = getSlideShapes(reopenedSlide).find((shape) => getShapeText(shape).includes('Проверить условия.'));
+  assert.ok(title, 'the title remains a native editable shape');
   assert.ok(body);
+  const titleForeground = getShapeRunFormatEffective(reopened, title, 0, 0).color?.toUpperCase();
   const foreground = getShapeRunFormatEffective(reopened, body, 0, 0).color?.toUpperCase();
+  assert.ok(titleForeground);
   assert.ok(foreground);
+  assert.equal(titleForeground, foreground,
+    'the title uses the contrast-checked theme foreground for its own measured dark region');
   assert.notEqual(foreground, '#172B4D', 'dark source body typography is not carried onto a dark template background');
   assert.ok([`#${template.templateIR.theme?.colors.lt1}`, '#F9FAFB'].some((color) => color.toUpperCase() === foreground),
     `foreground remains a template-derived light token for the measured dark backdrop, received ${foreground}`);

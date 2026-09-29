@@ -797,11 +797,14 @@ export class ProductWorkflowService {
       }
       catch { /* try packaged daemon prompt location */ }
       if (prompt === null) continue;
-      const digest = createHash('sha256').update(prompt).digest('hex');
+      // Git's prompt hash is platform-independent. Normalize checkout line
+      // endings before validating and sending the versioned prompt.
+      const canonicalPrompt = prompt.replace(/\r\n?/gu, '\n');
+      const digest = createHash('sha256').update(canonicalPrompt).digest('hex');
       if (digest !== CONTEXTUAL_AUDITOR_WORKFLOW.promptSha256) {
         throw new ProductWorkflowError('PROMPT_ASSET_VERSION_MISMATCH', 'Версия инструкции смысловой проверки не совпадает с контрактом.', 500);
       }
-      return prompt;
+      return canonicalPrompt;
     }
     throw new ProductWorkflowError('PROMPT_ASSET_UNAVAILABLE', 'Версия инструкции смысловой проверки отсутствует.', 500);
   }
