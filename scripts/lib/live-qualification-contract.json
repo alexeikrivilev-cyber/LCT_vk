@@ -1,10 +1,25 @@
 {
-  "schemaVersion": 7,
+  "schemaVersion": 8,
   "coreMaxSemanticRequests": 4,
+  "coreRetryMaxSemanticRequests": 3,
   "profilePreparationMaxSemanticRequests": 32,
-  "fullWorkflowMaxSemanticRequests": 36,
-  "profilerDiagnosticMaxSemanticRequests": 36,
+  "fullWorkflowMaxSemanticRequests": 39,
+  "profilerDiagnosticMaxSemanticRequests": 39,
   "maxProfilerRequests": 32,
+  "planningRetryPolicy": {
+    "operations": ["deck-plan", "plan-review", "deck-plan-revision"],
+    "maxRetriesPerOperation": 1,
+    "retryableErrorCodes": [
+      "INVALID_STRUCTURED_OUTPUT",
+      "SERVICE_UNAVAILABLE",
+      "ECONNRESET",
+      "ECONNREFUSED",
+      "EPIPE",
+      "ETIMEDOUT",
+      "EHOSTUNREACH",
+      "ENETUNREACH"
+    ]
+  },
   "requiredOperations": {
     "deck-plan": 1,
     "plan-review": 1,

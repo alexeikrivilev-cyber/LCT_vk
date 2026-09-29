@@ -65,6 +65,8 @@ export interface ProductWorkflowTelemetry {
   model: string;
   wallTimeMs: number;
   finishReason: string | null;
+  httpStatus?: number;
+  validationFailureCode?: string;
 }
 
 export interface ProductContextualAuditState {
@@ -220,7 +222,10 @@ function isSafeAuditState(value: unknown): value is ProductContextualAuditState 
   if (!legacy && !current && !retryableStaleFailure) return false;
   if (value.telemetry !== null && (!isRecord(value.telemetry) || typeof value.telemetry.model !== 'string' || value.telemetry.model.length > 160
       || !Number.isFinite(value.telemetry.wallTimeMs) || Number(value.telemetry.wallTimeMs) < 0
-      || !(value.telemetry.finishReason === null || typeof value.telemetry.finishReason === 'string' && value.telemetry.finishReason.length <= 64))) return false;
+      || !(value.telemetry.finishReason === null || typeof value.telemetry.finishReason === 'string' && value.telemetry.finishReason.length <= 64)
+      || !(value.telemetry.httpStatus === undefined || Number.isInteger(value.telemetry.httpStatus) && Number(value.telemetry.httpStatus) >= 100 && Number(value.telemetry.httpStatus) <= 599)
+      || !(value.telemetry.validationFailureCode === undefined || typeof value.telemetry.validationFailureCode === 'string'
+        && /^[A-Z][A-Z0-9_]{0,63}$/.test(value.telemetry.validationFailureCode)))) return false;
   if (value.status === 'ready' && (!Array.isArray(value.findings)
       || value.findings.length !== (legacy ? LEGACY_CONTEXTUAL_AUDIT_RULES.length : CONTEXTUAL_AUDIT_RULES.length)
       || value.failureCode !== null || value.telemetry === null)) return false;
@@ -807,13 +812,26 @@ export class ProductWorkflowService {
       if (!current || current.operationId !== operationId) return;
       const safe = safeFailureCode(error);
       const timestamp = this.now().toISOString();
+      let completedGeneration: PublicPresentationGeneration | null = null;
+      if (stage === 'contextual_audit' && current.generationId) {
+        completedGeneration = await this.options.generationService.getSnapshot(projectId).catch(() => null);
+      }
+      const preserveCompletedPresentation = Boolean(completedGeneration
+        && completedGeneration.generationId === current.generationId
+        && completedGeneration.status === 'completed'
+        && completedGeneration.slides.length > 0
+        && completedGeneration.slides.length === completedGeneration.readySlides
+        && completedGeneration.slides.every((pack) => ['A', 'B', 'C'].every((variant) =>
+          pack.variants[variant as keyof typeof pack.variants]?.status === 'ready')));
       const auditFailure: ProductContextualAuditState | null = stage === 'contextual_audit'
         ? {
           schemaVersion: CONTEXTUAL_AUDIT_SCHEMA_VERSION,
           ruleSetVersion: CONTEXTUAL_AUDIT_RULE_SET_VERSION,
           auditVersionFingerprint: CONTEXTUAL_AUDIT_VERSION_FINGERPRINT,
           status: 'failed',
-          deckFingerprint: sha256(`${current.inputFingerprint}:failed-audit:${timestamp}`),
+          deckFingerprint: preserveCompletedPresentation && completedGeneration
+            ? selectedDeckFingerprint(completedGeneration)
+            : sha256(`${current.inputFingerprint}:failed-audit:${timestamp}`),
           findings: null,
           telemetry: error instanceof SemanticInferenceError && error.telemetry ? summarizeTelemetry(error.telemetry) : null,
           checkedAt: timestamp,
@@ -822,9 +840,9 @@ export class ProductWorkflowService {
         : current.contextualAudit;
       const failed: StoredProductWorkflow = {
         ...current,
-        status: 'failed',
-        stage,
-        failure: { code: safe.code, stage, retryable: safe.status >= 500 || safe.status === 429 },
+        status: preserveCompletedPresentation ? 'ready' : 'failed',
+        stage: preserveCompletedPresentation ? 'ready' : stage,
+        failure: preserveCompletedPresentation ? null : { code: safe.code, stage, retryable: safe.status >= 500 || safe.status === 429 },
         contextualAudit: auditFailure,
         updatedAt: timestamp,
       };
@@ -833,7 +851,7 @@ export class ProductWorkflowService {
   }
 
   private async snapshotWithFreshness(projectId: string, saved: StoredProductWorkflow): Promise<ProductWorkflowSnapshot> {
-    if (saved.contextualAudit?.status === 'failed') return publicSnapshot(saved, true);
+    if (saved.contextualAudit?.status === 'failed') return publicSnapshot(saved);
     if (!saved.contextualAudit || saved.contextualAudit.status !== 'ready') return publicSnapshot(saved);
     try {
       const current = await this.options.generationService.getSnapshot(projectId);
@@ -896,5 +914,12 @@ export class ProductWorkflowService {
 }
 
 function summarizeTelemetry(value: SemanticInferenceTelemetry): ProductWorkflowTelemetry {
-  return { model: value.model.slice(0, 160), wallTimeMs: Math.max(0, value.wallTimeMs), finishReason: value.finishReason?.slice(0, 64) ?? null };
+  return {
+    model: value.model.slice(0, 160),
+    wallTimeMs: Math.max(0, value.wallTimeMs),
+    finishReason: value.finishReason?.slice(0, 64) ?? null,
+    ...(value.httpStatus === undefined ? {} : { httpStatus: value.httpStatus }),
+    ...(value.validationFailureCode && /^[A-Z][A-Z0-9_]{0,63}$/.test(value.validationFailureCode)
+      ? { validationFailureCode: value.validationFailureCode } : {}),
+  };
 }

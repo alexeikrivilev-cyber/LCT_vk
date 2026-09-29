@@ -907,7 +907,14 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
   t.after(() => removeTempDirectory(temp));
   const dataDir = path.join(temp, 'data');
   const projectId = 'one-click-workflow';
-  const endpoint = await startFakeSemanticEndpoint({ model: 'offline-fake-planner' });
+  let failFirstAudit = true;
+  const endpoint = await startFakeSemanticEndpoint({ model: 'offline-fake-planner', failure: (_role, operation) => {
+    if (operation === 'contextual-deck-audit' && failFirstAudit) {
+      failFirstAudit = false;
+      return 'http-524';
+    }
+    return undefined;
+  } });
   t.after(() => endpoint.close());
   const oldConfig = {
     baseUrl: process.env.LCT_SEMANTIC_BASE_URL,
@@ -975,8 +982,19 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(ready.stage, 'ready');
     assert.equal(ready.totalSlides, 3);
     assert.equal(ready.readySlides, 3);
-    assert.equal(ready.contextualAudit.status, 'ready');
-    assert.equal(ready.contextualAudit.findings.length, 11);
+    assert.equal(ready.failure, null, 'a failed optional contextual audit must not mark the completed presentation as failed');
+    assert.equal(ready.contextualAudit.status, 'failed');
+    assert.equal(ready.contextualAudit.failureCode, 'SERVICE_UNAVAILABLE');
+    assert.equal(ready.contextualAudit.findings, null);
+    const auditRetryResponse = await fetch(`${started.url}/api/projects/${projectId}/workflow/contextual-audit`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(auditRetryResponse.status, 200, await auditRetryResponse.clone().text());
+    const afterInitialAuditRetry = (await json(auditRetryResponse)).operation;
+    assert.equal(afterInitialAuditRetry.status, 'ready');
+    assert.equal(afterInitialAuditRetry.failure, null);
+    assert.equal(afterInitialAuditRetry.contextualAudit.status, 'ready');
+    assert.equal(afterInitialAuditRetry.contextualAudit.findings.length, 11);
     const workerRequest = endpoint.state.inference.find((entry) => entry.operation === 'deck-plan')?.request;
     assert.ok(workerRequest, 'the normal one-click plan uses the semantic Worker contract');
     const workerEvidence = JSON.parse(workerRequest.messages.at(-1).content);
@@ -1039,10 +1057,10 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(generation.slides.length, 3);
     assert.ok(generation.slides.every((pack) => ['A', 'B', 'C'].every((variant) => pack.variants[variant].status === 'ready')));
     assert.deepEqual(endpoint.state.inference.map((entry) => entry.operation).sort(), [
-      'contextual-deck-audit', 'contextual-deck-audit', 'deck-plan', 'plan-review', 'template-semantic-profile',
+      'contextual-deck-audit', 'contextual-deck-audit', 'contextual-deck-audit', 'deck-plan', 'plan-review', 'template-semantic-profile',
     ].sort());
-    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 2);
-    assert.equal(endpoint.state.inference.length, 5);
+    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 3);
+    assert.equal(endpoint.state.inference.length, 6);
     assert.equal(profilerCallsBeforeGenerate, 1, 'initial template preparation profiles once and repeated preparation uses the cache');
     assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'template-semantic-profile').length, profilerCallsBeforeGenerate,
       'Generate reuses the prepared profile and makes zero profiler requests');
@@ -1086,7 +1104,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     const afterReload = await getOperation();
     assert.equal(afterReload.operationId, first.operationId);
     assert.equal(afterReload.contextualAudit.stale, true, 'changing the selected deck makes the prior semantic review stale');
-    assert.equal(endpoint.state.inference.length, 5, 'only the initial prepared profile, planning and two audits infer; repeated compile, read and export add none');
+    assert.equal(endpoint.state.inference.length, 6, 'only the initial prepared profile, planning and three bounded audits infer; repeated compile, read and export add none');
 
     await closeStartedServer(started);
     started = await startServer({ host: '127.0.0.1', port: 0, dataDir, projectRoot: repoRoot,
@@ -1098,7 +1116,7 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     assert.equal(restoredGeneration.defaultTrack, 'C');
     assert.equal(restoredGeneration.slides[0].lockedVariant, 'C');
     assert.equal(restoredGeneration.exports.length, 6);
-    assert.equal(endpoint.state.inference.length, 5, 'restart reuses the prepared profile, plan, generation, and contextual review without new inference');
+    assert.equal(endpoint.state.inference.length, 6, 'restart reuses the prepared profile, plan, generation, and contextual review without new inference');
 
     const sourceProjectId = 'one-click-with-optional-source';
     await createProject(started, sourceProjectId);
@@ -1122,8 +1140,8 @@ test('one-click product workflow is idempotent, persisted, audits one selected d
     const sourcePlanning = await json(await fetch(`${started.url}/api/projects/${sourceProjectId}/planning`));
     assert.deepEqual(sourcePlanning.contentFiles, ['market-context.md']);
     assert.ok(sourcePlanning.contentIR.units.some((unit) => unit.text?.includes('three customer segments')));
-    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 3);
-    assert.equal(endpoint.state.inference.length, 9, 'each workflow prepares its template profile once; generation, audit recovery, and exports reuse persisted state');
+    assert.equal(endpoint.state.inference.filter((entry) => entry.operation === 'contextual-deck-audit').length, 4);
+    assert.equal(endpoint.state.inference.length, 10, 'each workflow prepares its template profile once; generation, audit recovery, and exports reuse persisted state');
 
     const recoveryDataDir = path.join(temp, 'recovery-data');
     const recoveryProjectId = 'one-click-recovery-during-generation';

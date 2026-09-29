@@ -191,6 +191,7 @@ type ProductWorkflowOperation = {
       repairable: boolean;
       suggestedActionCode: string | null;
     }> | null;
+    telemetry: { validationFailureCode?: string } | null;
     failureCode: string | null;
   } | null;
   failure: { code: string; stage: string; retryable: boolean } | null;
@@ -654,6 +655,7 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
     if (!response.ok) throw await errorMessage(response, 'generation');
     const body = await response.json() as { operation?: ProductWorkflowOperation | null };
     setProductOperation(body.operation ?? null);
+    if (body.operation?.status === 'ready') setProductWorkflowError(null);
     return body.operation ?? null;
   }, [projectId]);
 
@@ -1471,15 +1473,17 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                   : productOperation.status === 'ready' ? ru.workflow.stages.ready : ru.workflow.stages.failed}
             </span> : null}
           </div>
-          <ErrorNotice failure={productWorkflowError} className="error-banner product-workflow-error" onRetry={() => void generatePresentation()} />
-          {productOperation?.failure ? <ErrorNotice role="status" className="product-workflow-failure" failure={{
+          <ErrorNotice failure={productOperation?.status === 'ready' ? null : productWorkflowError} className="error-banner product-workflow-error" onRetry={() => void generatePresentation()} />
+          {productOperation?.status === 'failed' && productOperation.failure ? <ErrorNotice role="status" className="product-workflow-failure" failure={{
             message: friendlyErrorMessage(productOperation.failure.code, 500, 'generation'),
             code: productOperation.failure.code,
           }} onRetry={() => void generatePresentation()} /> : null}
           {productOperation?.contextualAudit ? <div className="product-contextual-audit" data-audit-source="contextual" role="status">
-            <strong>{ru.workflow.contextualAudit}: {ru.workflow.auditFindings(productOperation.contextualAudit.findings?.filter((finding) => finding.severity !== 'info').length ?? 0)}</strong>
+            <strong>{ru.workflow.contextualAudit}: {productOperation.contextualAudit.status === 'ready'
+              ? ru.workflow.auditFindings(productOperation.contextualAudit.findings?.filter((finding) => finding.severity !== 'info').length ?? 0)
+              : ru.workflow.auditFailed}</strong>
             {productOperation.contextualAudit.stale ? <p>{ru.workflow.auditStale}</p> : null}
-            {productOperation.contextualAudit.status === 'failed' ? <p>{ru.workflow.error}</p> : null}
+            {productOperation.contextualAudit.status === 'failed' ? <p>{friendlyErrorMessage(productOperation.contextualAudit.failureCode ?? undefined, 500, 'generic')}</p> : null}
             <p>{ru.workflow.suggestionsOnly}</p>
             {productOperation.contextualAudit.findings?.length ? <details>
               <summary>{ru.planning.reviewLabel}</summary>
@@ -1488,8 +1492,11 @@ function PresentationWorkspace({ projectId, onBack }: { projectId: string; onBac
                 {finding.suggestedActionCode ? <small>{ru.workflow.actionMessages[finding.suggestedActionCode as keyof typeof ru.workflow.actionMessages]}</small> : null}
                 <small>{finding.slideId ? ru.workflow.slideLabel(planningSlides.findIndex((slide) => stringValue(record(slide)?.id) === finding.slideId) + 1) : ru.workflow.deckLabel}</small>
               </li>)}</ul>
-            </details> : <p>{ru.workflow.auditClean}</p>}
-            {productOperation.contextualAudit.stale ? <button className="quiet" onClick={() => void repeatContextualAudit()} disabled={productWorkflowRunning}>{ru.workflow.auditRerun}</button> : null}
+            </details> : productOperation.contextualAudit.status === 'ready' ? <p>{ru.workflow.auditClean}</p> : null}
+            {productOperation.contextualAudit.status === 'failed' && productOperation.contextualAudit.telemetry?.validationFailureCode
+              ? <details><summary>{ru.errors.diagnostics}</summary><code>{ru.errors.code(productOperation.contextualAudit.telemetry.validationFailureCode)}</code></details> : null}
+            {productOperation.contextualAudit.stale || productOperation.contextualAudit.status === 'failed'
+              ? <button className="quiet" onClick={() => void repeatContextualAudit()} disabled={productWorkflowRunning}>{ru.workflow.auditRerun}</button> : null}
           </div> : null}
         </section> : null}
         {planning?.status === 'stale' ? <div className="planning-notice planning-notice-warning" role="status">{ru.planning.stale}</div> : null}

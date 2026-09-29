@@ -10,7 +10,7 @@ import { makeSyntheticPptx } from '../python-inspector-test-fixtures.mjs';
 register();
 const { startServer } = await import('../src/server.ts');
 const { SemanticInferenceError } = await import('../src/presentation/application/semantic-inference-port.ts');
-const { planningInputFingerprint } = await import('../src/presentation/application/planning-service.ts');
+const { assertBudgetRevisionPreservesPlan, inferPlanningRequestWithRetry, PlanningServiceError, planningInputFingerprint } = await import('../src/presentation/application/planning-service.ts');
 const { deckPlanHash } = await import('../src/presentation/domain/deck-plan.ts');
 const { AGENT_WORKFLOW_CONTRACT_SHA256, AGENT_WORKFLOW_VERSIONS } = await import('../src/presentation/application/workflow-versions.ts');
 
@@ -45,6 +45,89 @@ function planDraft(contentId, override = {}) {
     ...override,
   };
 }
+
+test('bounded text-fit revision may shorten wording but cannot change narrative structure or evidence refs', () => {
+  const original = planDraft('source-1');
+  original.slides[1].bodyPoints[0].evidenceRefs = ['source-1'];
+  const concise = structuredClone(original);
+  concise.slides[0].takeaway = 'Решение для роста';
+  concise.slides[1].bodyPoints[0].text = 'Удержание ограничивает рост.';
+  assert.doesNotThrow(() => assertBudgetRevisionPreservesPlan(original, concise));
+
+  const lostEvidence = structuredClone(concise);
+  lostEvidence.slides[1].bodyPoints[0].evidenceRefs = [];
+  assert.throws(() => assertBudgetRevisionPreservesPlan(original, lostEvidence), (error) => error.code === 'BUDGET_REPAIR_CHANGED_EVIDENCE');
+
+  const changedStructure = structuredClone(concise);
+  changedStructure.slides[1].contentRefs = [];
+  assert.throws(() => assertBudgetRevisionPreservesPlan(original, changedStructure), (error) => error.code === 'BUDGET_REPAIR_CHANGED_PLAN_STRUCTURE');
+});
+
+test('deck-plan, plan-review, and the single plan revision retry invalid structured output once with the exact request', async () => {
+  for (const operation of ['deck-plan', 'plan-review', 'deck-plan-revision']) {
+    let calls = 0;
+    const request = { operation, output: { name: 'same-strict-schema' } };
+    const adapter = { async infer(received) {
+      assert.equal(received, request);
+      calls += 1;
+      if (calls === 1) throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'bounded retry fixture');
+      return { value: { accepted: true }, telemetry: { operation } };
+    } };
+    const response = await inferPlanningRequestWithRetry(adapter, request);
+    assert.equal(response.value.accepted, true);
+    assert.equal(calls, 2, `${operation} must issue exactly one retry`);
+  }
+});
+
+test('planning retries one transient service failure, but never retries a second invalid response or unrelated operation', async () => {
+  const request = { operation: 'deck-plan', output: { name: 'same-strict-schema' } };
+  let calls = 0;
+  const availableAfterServiceFailure = await inferPlanningRequestWithRetry({ async infer() {
+    calls += 1;
+    if (calls === 1) throw new SemanticInferenceError('SERVICE_UNAVAILABLE', 'temporary service outage');
+    return { value: { accepted: true }, telemetry: { operation: 'deck-plan' } };
+  } }, request);
+  assert.equal(availableAfterServiceFailure.value.accepted, true);
+  assert.equal(calls, 2, 'SERVICE_UNAVAILABLE gets exactly one planning retry');
+
+  calls = 0;
+  const available = await inferPlanningRequestWithRetry({ async infer() {
+    calls += 1;
+    if (calls === 1) throw Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+    return { value: { accepted: true }, telemetry: { operation: 'deck-plan' } };
+  } }, request);
+  assert.equal(available.value.accepted, true);
+  assert.equal(calls, 2);
+
+  calls = 0;
+  await assert.rejects(inferPlanningRequestWithRetry({ async infer() {
+    calls += 1;
+    throw new SemanticInferenceError('INVALID_STRUCTURED_OUTPUT', 'still malformed');
+  } }, request), (error) => error.code === 'INVALID_STRUCTURED_OUTPUT');
+  assert.equal(calls, 2, 'a second invalid response is terminal');
+
+  calls = 0;
+  await assert.rejects(inferPlanningRequestWithRetry({ async infer() {
+    calls += 1;
+    throw new SemanticInferenceError('PROVIDER_ERROR', 'business/provider failure');
+  } }, request), (error) => error.code === 'PROVIDER_ERROR');
+  assert.equal(calls, 1, 'non-transient provider errors are not retried');
+
+  calls = 0;
+  const validationFailure = new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'deterministic content validation failure', 422);
+  await assert.rejects(inferPlanningRequestWithRetry({ async infer() {
+    calls += 1;
+    throw validationFailure;
+  } }, request), (error) => error === validationFailure);
+  assert.equal(calls, 1, 'deterministic planning validation failures are terminal');
+
+  calls = 0;
+  await assert.rejects(inferPlanningRequestWithRetry({ async infer() {
+    calls += 1;
+    throw new SemanticInferenceError('SERVICE_UNAVAILABLE', 'must not retry profiling');
+  } }, { operation: 'template-semantic-profile' }), (error) => error.code === 'SERVICE_UNAVAILABLE');
+  assert.equal(calls, 1, 'template profiling is outside the planning retry policy');
+});
 
 function reviewResult(checkpointVersion, mode) {
   if (mode === 'malformed') return { outcome: 'pass' };

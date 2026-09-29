@@ -345,6 +345,7 @@ export const ru = {
     unsupportedFile: 'Этот формат нельзя разобрать как текст. Его можно оставить как вложение или выбрать поддерживаемый файл.',
     template: 'Не удалось проанализировать структуру шаблона. Проверьте файл и повторите попытку.',
     semantic: 'Сервис анализа временно недоступен. Проверьте подключение и повторите попытку.',
+    structuredOutput: 'Сервис ответил, но результат не прошёл проверку формата. Проверка не завершена; попробуйте ещё раз.',
     plan: 'Не удалось составить план. Проверьте бриф и выбранные материалы.',
     variant: 'Этот вариант не создан: в шаблоне не найдено безопасной подходящей композиции.',
     render: 'Не удалось подготовить слайд или его предпросмотр. Готовые слайды сохранены.',
@@ -414,6 +415,7 @@ export const ru = {
     contextualAudit: 'Контекстуальная проверка',
     auditClean: 'Замечаний нет',
     auditFindings: (count: number) => `Замечаний: ${count}`,
+    auditFailed: 'Смысловая проверка не завершена. Результат не считается проверенным.',
     auditStale: 'Выбранные варианты изменились после смысловой проверки.',
     auditRerun: 'Проверить выбранные варианты',
     suggestionsOnly: 'Это подсказки для проверки. Они не меняют факты и не исправляют слайды автоматически.',
@@ -472,8 +474,10 @@ export function friendlyErrorMessage(code: string | undefined, status: number, o
   if (/UNSUPPORTED_FORMAT|UNSUPPORTED_FILE|INVALID_UTF8|NOT_PARSED/.test(normalized)) return ru.errors.unsupportedFile;
   if (/VARIANTS_NOT_DISTINCT|VARIANT_NOT_READY/.test(normalized)) return ru.errors.variant;
   if (/TEMPLATE_PROFILE_NOT_READY/.test(normalized)) return ru.template.prepareBeforeGenerate;
+  if (/PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET|BUDGET_REPAIR|PLAN_REVISION_BUDGET/.test(normalized)) return ru.errors.plan;
   if (/EXPORT|POWERPOINT_ASSEMBLY/.test(normalized) || operation === 'export') return ru.errors.export;
-  if (/SEMANTIC|INFERENCE|PROVIDER|TIMEOUT|DEADLINE|CONFIGURATION|STRUCTURED_OUTPUT|INVALID_JSON|EMPTY_RESPONSE|SERVICE_UNAVAILABLE|AUTH_ERROR|RATE_LIMIT/.test(normalized)
+  if (/INVALID_STRUCTURED_OUTPUT|INVALID_JSON/.test(normalized)) return ru.errors.structuredOutput;
+  if (/SEMANTIC|INFERENCE|PROVIDER|TIMEOUT|DEADLINE|CONFIGURATION|EMPTY_RESPONSE|SERVICE_UNAVAILABLE|AUTH_ERROR|RATE_LIMIT/.test(normalized)
       || status === 502 || status === 503 || status === 504) return ru.errors.semantic;
   if (/TEMPLATE|PPTX|OOXML/.test(normalized) || operation === 'template') return ru.errors.template;
   if (/PLAN|BRIEF|CONTENT|SUPERVISOR|SCHEMA/.test(normalized) || operation === 'planning') return ru.errors.plan;

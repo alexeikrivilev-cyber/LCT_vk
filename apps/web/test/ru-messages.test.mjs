@@ -146,6 +146,14 @@ test('workflow failures offer a safe retry and technical codes stay in details',
   assert.match(appSource, /<button className="quiet compact ui-error-retry" onClick=\{onRetry\}>\{ru\.errors\.retry\}/u);
   assert.match(appSource, /<details className="ui-error-details">[\s\S]*?ru\.errors\.code\(value\.code\)/u);
   assert.doesNotMatch(appSource, /failure\.code\s*\|\|\s*failure\.message/u);
+  assert.match(appSource, /if \(body\.operation\?\.status === 'ready'\) setProductWorkflowError\(null\)/u,
+    'a persisted successful backend state clears a stale transient UI failure');
+  assert.match(appSource, /productOperation\.contextualAudit\.status === 'ready'[\s\S]*?ru\.workflow\.auditFindings/u,
+    'only a completed audit can report a finding count');
+  assert.match(appSource, /productOperation\.contextualAudit\.status === 'ready' \? <p>\{ru\.workflow\.auditClean\}/u,
+    'a failed audit must never be displayed as clean');
+  assert.match(appSource, /productOperation\.contextualAudit\.stale \|\| productOperation\.contextualAudit\.status === 'failed'[\s\S]*?repeatContextualAudit\(\)/u,
+    'a failed contextual audit can be retried without restarting planning or generation');
 });
 
 test('visible dates use Russian locale formatting', () => {
@@ -166,6 +174,11 @@ test('API failures map to safe user messages without echoing raw server details'
   assert.match(friendlyErrorMessage('LIMIT_FILE_SIZE', 413, 'upload'), /файл превышает/i);
   assert.match(friendlyErrorMessage('PLANNING_CONTEXT_TOO_LARGE', 413, 'planning'), /план/i);
   assert.match(friendlyErrorMessage('DEADLINE_EXCEEDED', 504, 'planning'), /сервис анализа/i);
+  assert.equal(friendlyErrorMessage('INVALID_STRUCTURED_OUTPUT', 500), ru.errors.structuredOutput,
+    'a rejected model response is not described as an unavailable inference service');
+  assert.equal(friendlyErrorMessage('INVALID_JSON', 500), ru.errors.structuredOutput);
+  assert.equal(friendlyErrorMessage('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 422, 'planning'), ru.errors.plan,
+    'copy-fit planning failures are not mislabeled as template analysis failures');
   assert.match(friendlyErrorMessage('VARIANTS_NOT_DISTINCT', 422, 'generation'), /вариант не создан/i);
   assert.match(friendlyErrorMessage('EXPORT_FAILED', 500, 'export'), /презентацию/i);
   assert.match(friendlyErrorMessage('INTERNAL_ERROR', 500), /не удалось выполнить/i);

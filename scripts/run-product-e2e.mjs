@@ -36,9 +36,10 @@ const requiredOperationNames = ['deck-plan', 'plan-review', 'contextual-deck-aud
 const optionalOperationNames = ['deck-plan-revision'];
 const optionalOperationMaximumTotal = liveQualificationContract.optionalOperations
   && Object.values(liveQualificationContract.optionalOperations).reduce((total, limit) => total + limit.max, 0);
-if (liveQualificationContract.schemaVersion !== 7 || liveQualificationContract.coreMaxSemanticRequests !== 4
+if (liveQualificationContract.schemaVersion !== 8 || liveQualificationContract.coreMaxSemanticRequests !== 4
+    || liveQualificationContract.coreRetryMaxSemanticRequests !== 3
     || liveQualificationContract.profilePreparationMaxSemanticRequests !== 32
-    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 36
+    || liveQualificationContract.fullWorkflowMaxSemanticRequests !== 39
     || !Number.isSafeInteger(liveQualificationContract.profilerDiagnosticMaxSemanticRequests)
     || !Number.isSafeInteger(liveQualificationContract.maxProfilerRequests)
     || liveQualificationContract.maxProfilerRequests < 1 || liveQualificationContract.maxProfilerRequests > 32
@@ -57,10 +58,15 @@ if (liveQualificationContract.schemaVersion !== 7 || liveQualificationContract.c
     || liveQualificationContract.coreMaxSemanticRequests !== requiredOperationTotal + optionalOperationMaximumTotal
       + liveQualificationContract.generationSemanticRequests
     || liveQualificationContract.fullWorkflowMaxSemanticRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
-      + liveQualificationContract.coreMaxSemanticRequests) {
+      + liveQualificationContract.coreMaxSemanticRequests + liveQualificationContract.coreRetryMaxSemanticRequests
+    || liveQualificationContract.planningRetryPolicy?.maxRetriesPerOperation !== 1
+    || liveQualificationContract.planningRetryPolicy?.operations?.join(',') !== 'deck-plan,plan-review,deck-plan-revision'
+    || liveQualificationContract.planningRetryPolicy?.retryableErrorCodes?.length !== 8) {
   throw new TypeError('The versioned live qualification request budget contract is invalid.');
 }
 const CORE_MAX_SEMANTIC_REQUESTS = liveQualificationContract.coreMaxSemanticRequests;
+const CORE_RETRY_MAX_SEMANTIC_REQUESTS = liveQualificationContract.coreRetryMaxSemanticRequests;
+const MAX_CORE_PROVIDER_REQUESTS = CORE_MAX_SEMANTIC_REQUESTS + CORE_RETRY_MAX_SEMANTIC_REQUESTS;
 const PROFILE_PREPARATION_MAX_SEMANTIC_REQUESTS = liveQualificationContract.profilePreparationMaxSemanticRequests;
 const FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS = liveQualificationContract.fullWorkflowMaxSemanticRequests;
 const PROFILER_DIAGNOSTIC_MAX_SEMANTIC_REQUESTS = liveQualificationContract.profilerDiagnosticMaxSemanticRequests;
@@ -69,6 +75,8 @@ const CORE_OPERATION_LIMITS = Object.freeze({
   ...Object.fromEntries(Object.entries(liveQualificationContract.optionalOperations)
     .map(([operation, limit]) => [operation, limit.max])),
 });
+const PLANNING_RETRY_OPERATIONS = new Set(liveQualificationContract.planningRetryPolicy.operations);
+const PLANNING_RETRY_ERROR_CODES = new Set(liveQualificationContract.planningRetryPolicy.retryableErrorCodes);
 const DEFAULT_MODEL = 'Qwen/Qwen3.8-27B';
 const RUNNER_ENV_KEYS = [
   'LCT_SEMANTIC_BASE_URL', 'LCT_SEMANTIC_MODEL', 'LCT_SEMANTIC_API_KEY', 'LCT_SEMANTIC_ENABLE_THINKING',
@@ -142,7 +150,7 @@ export function helpText() {
     '  --slides <number>                Requested slide count, 1..30 (default 3)',
     '  --provider-label <label>         Manifest label only; does not change transport',
     '  --output-dir <directory>         New or empty output directory',
-    `  --max-semantic-requests <1..${FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS}>   Full qualification cap; core ${CORE_MAX_SEMANTIC_REQUESTS}, profile preparation ${PROFILE_PREPARATION_MAX_SEMANTIC_REQUESTS}; default ${FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS}`,
+    `  --max-semantic-requests <1..${FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS}>   Full cap; core ${CORE_MAX_SEMANTIC_REQUESTS} + up to ${CORE_RETRY_MAX_SEMANTIC_REQUESTS} bounded planning retries, profile preparation ${PROFILE_PREPARATION_MAX_SEMANTIC_REQUESTS}; default ${FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS}`,
     `  --enable-template-profiler       Accepted for compatibility; template profile preparation is part of the normal flow (up to ${liveQualificationContract.maxProfilerRequests} batches)`,
     '  --dry-run                        Validate inputs/config only; no daemon or network',
     '  --preflight-only                 External mode: GET /v1/models only; no chat completion',
@@ -279,11 +287,18 @@ export function createRequestBudgetAdapter(delegate, limit = FULL_WORKFLOW_MAX_S
           profilePreparationRequests += 1;
         } else {
           if (!profilePrepared) reject('Core generation requires a previously prepared READY semantic profile');
-          if (coreRequests >= CORE_MAX_SEMANTIC_REQUESTS) reject('Qualification core-generation semantic request budget exhausted before dispatch');
           const operationLimit = CORE_OPERATION_LIMITS[request.operation];
           if (!Number.isSafeInteger(operationLimit)) reject('Unexpected semantic operation is forbidden by the qualification contract');
           const operationCount = coreOperationCounts.get(request.operation) ?? 0;
-          if (operationCount >= operationLimit) reject('Qualification semantic operation limit exhausted before dispatch');
+          if (operationCount >= operationLimit) {
+            const previousAttempt = [...records].reverse().find((record) => record.operation === request.operation);
+            const retryAllowed = PLANNING_RETRY_OPERATIONS.has(request.operation)
+              && operationCount < operationLimit + liveQualificationContract.planningRetryPolicy.maxRetriesPerOperation
+              && previousAttempt?.status === 'error'
+              && PLANNING_RETRY_ERROR_CODES.has(previousAttempt.errorCode);
+            if (!retryAllowed) reject('Qualification semantic operation or bounded retry limit exhausted before dispatch');
+          }
+          if (coreRequests >= MAX_CORE_PROVIDER_REQUESTS) reject('Qualification core-generation semantic request budget exhausted before dispatch');
           coreStarted = true;
           coreRequests += 1;
           coreOperationCounts.set(request.operation, operationCount + 1);
@@ -362,6 +377,18 @@ function semanticCounts(records) {
   return counts;
 }
 
+function automaticPlanningRetryCount(records) {
+  const attemptsByOperation = new Map();
+  let retries = 0;
+  for (const record of records) {
+    const operation = record.operation;
+    const attempts = attemptsByOperation.get(operation) ?? 0;
+    if (PLANNING_RETRY_OPERATIONS.has(operation) && attempts >= (CORE_OPERATION_LIMITS[operation] ?? 0)) retries += 1;
+    attemptsByOperation.set(operation, attempts + 1);
+  }
+  return retries;
+}
+
 export function validateQualificationSemanticOperationAccounting(records) {
   if (!Array.isArray(records)) throw new TypeError('Qualification semantic operation records must be an array.');
   const rawOperationCounts = Object.fromEntries([...new Set(records.map((record) => record.operation))]
@@ -373,18 +400,36 @@ export function validateQualificationSemanticOperationAccounting(records) {
     && !Object.hasOwn(requiredOperations, operation) && !Object.hasOwn(optionalOperations, operation));
   const profileRequestCount = rawOperationCounts['template-semantic-profile'] ?? 0;
   const optionalOperationTotal = Object.entries(optionalOperations)
-    .reduce((total, [operation]) => total + (rawOperationCounts[operation] ?? 0), 0);
-  const optionalCountsValid = Object.entries(optionalOperations).every(([operation, limit]) => {
-    const count = rawOperationCounts[operation] ?? 0;
-    return count >= limit.min && count <= limit.max;
+    .reduce((total, [operation, limit]) => total + Math.min(rawOperationCounts[operation] ?? 0, limit.max), 0);
+  const retryPolicy = liveQualificationContract.planningRetryPolicy;
+  const retryableErrorCodes = new Set(retryPolicy.retryableErrorCodes);
+  const retryRequests = records.reduce((total, record, index) => {
+    const operation = record.operation;
+    const baseLimit = CORE_OPERATION_LIMITS[operation];
+    if (!Number.isSafeInteger(baseLimit)) return total;
+    const priorAttempts = records.slice(0, index).filter((attempt) => attempt.operation === operation);
+    if (priorAttempts.length < baseLimit) return total;
+    const previous = priorAttempts.at(-1);
+    if (!retryPolicy.operations.includes(operation) || priorAttempts.length >= baseLimit + retryPolicy.maxRetriesPerOperation
+        || previous?.status !== 'error' || !retryableErrorCodes.has(previous?.errorCode)) return total + liveQualificationContract.coreRetryMaxSemanticRequests + 1;
+    return total + 1;
+  }, 0);
+  const operationLimitEntries = [
+    ...Object.entries(requiredOperations).map(([operation, count]) => ({ operation, min: count, max: count })),
+    ...Object.entries(optionalOperations).map(([operation, limit]) => ({ operation, min: limit.min, max: limit.max })),
+  ];
+  const operationCountsValid = operationLimitEntries.every(({ operation, min, max }) => {
+      const count = rawOperationCounts[operation] ?? 0;
+      const maxRetryAttempts = retryPolicy.operations.includes(operation) ? retryPolicy.maxRetriesPerOperation : 0;
+      return count >= min && count <= max + maxRetryAttempts;
   });
   const expectedTotal = profileRequestCount + requiredOperationTotal + optionalOperationTotal
-    + liveQualificationContract.generationSemanticRequests;
+    + liveQualificationContract.generationSemanticRequests + retryRequests;
   if (unexpectedOperations.length || profileRequestCount < 1
       || profileRequestCount > liveQualificationContract.maxProfilerRequests
-      || Object.entries(requiredOperations).some(([operation, count]) => rawOperationCounts[operation] !== count)
-      || !optionalCountsValid
+      || !operationCountsValid
       || counts.generation !== liveQualificationContract.generationSemanticRequests
+      || retryRequests > liveQualificationContract.coreRetryMaxSemanticRequests
       || counts.total !== expectedTotal
       || counts.total > FULL_WORKFLOW_MAX_SEMANTIC_REQUESTS) {
     throw errorWithCode('SEMANTIC_OPERATION_ACCOUNTING_MISMATCH', 'One-click semantic request operation counts differ from the bounded qualification workflow.');
@@ -395,6 +440,7 @@ export function validateQualificationSemanticOperationAccounting(records) {
     profileRequestCount,
     coreRequestCount: counts.total - profileRequestCount,
     optionalOperationTotal,
+    retryRequestCount: retryRequests,
   };
 }
 
@@ -835,7 +881,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     manifest.semantic.requests = requestRecords(budget.records);
     manifest.semantic.operationCounts = semanticCounts(budget.records);
     manifest.semantic.budgetRejectedAttempts = budget.rejectedAttempts;
-    manifest.semantic.automaticRetries = 0;
+    manifest.semantic.automaticRetries = automaticPlanningRetryCount(budget.records);
     if (manifest.semantic.requestCount > options.maxSemanticRequests) throw errorWithCode('SEMANTIC_BUDGET_OVERRUN', 'Semantic request budget was exceeded.');
     const operationAccounting = validateQualificationSemanticOperationAccounting(budget.records);
     if (operationAccounting.operationCounts.total > options.maxSemanticRequests) {
@@ -857,7 +903,7 @@ async function runProductWorkflow(options, input, outputDir, dependencies = {}) 
     manifest.semantic.rawOperationCounts = Object.fromEntries([...new Set((budget?.records ?? []).map((record) => record.operation))]
       .map((operation) => [operation, budget.records.filter((record) => record.operation === operation).length]));
     manifest.semantic.budgetRejectedAttempts = budget?.rejectedAttempts ?? 0;
-    manifest.semantic.automaticRetries = 0;
+    manifest.semantic.automaticRetries = automaticPlanningRetryCount(budget?.records ?? []);
     manifest.timing.semanticTotalMs = (budget?.records ?? []).reduce((sum, request) => sum + (request.wallTimeMs ?? 0), 0);
     manifest.timing.deterministicTotalMs = Math.max(0, manifest.timing.totalMs - manifest.timing.semanticTotalMs);
     manifest.timing.totalMs = Math.round(performance.now() - flowStarted);

@@ -859,6 +859,32 @@ function asDraft(value: unknown, contentIR: ContentIR, brief: Brief): DeckPlanDr
   return validateDeckPlanDraft(value, allowedPlanningContentIds(contentIR), brief.requestedSlideCount, allowedMediaIds(contentIR), true);
 }
 
+function stableValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableValue).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableValue(value[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'undefined';
+}
+
+export function assertBudgetRevisionPreservesPlan(previous: DeckPlanDraft, revised: DeckPlanDraft): void {
+  if (previous.workingTitle !== revised.workingTitle || previous.narrativeSummary !== revised.narrativeSummary
+      || previous.slides.length !== revised.slides.length) {
+    throw new PlanningServiceError('BUDGET_REPAIR_CHANGED_PLAN_STRUCTURE', 'The fit repair changed the approved narrative structure.', 422);
+  }
+  for (let index = 0; index < previous.slides.length; index += 1) {
+    const before = previous.slides[index]!;
+    const after = revised.slides[index]!;
+    const unchangedFields = ['narrativeRole', 'purpose', 'contentRefs', 'mediaRefs', 'semanticVisualType', 'targetDensity'] as const;
+    if (unchangedFields.some((field) => stableValue(before[field]) !== stableValue(after[field]))) {
+      throw new PlanningServiceError('BUDGET_REPAIR_CHANGED_PLAN_STRUCTURE', `The fit repair changed slide ${index + 1} structure or evidence references.`, 422);
+    }
+    const beforeEvidence = (before.bodyPoints ?? []).flatMap((point) => point.evidenceRefs).sort();
+    const afterEvidence = (after.bodyPoints ?? []).flatMap((point) => point.evidenceRefs).sort();
+    if (stableValue(beforeEvidence) !== stableValue(afterEvidence)) {
+      throw new PlanningServiceError('BUDGET_REPAIR_CHANGED_EVIDENCE', `The fit repair changed slide ${index + 1} evidence references.`, 422);
+    }
+  }
+}
+
 function outcomeMessage(error: unknown): PlanningFailure {
   if (error instanceof PlanningServiceError) return { code: error.code, message: error.message };
   if (error instanceof SemanticInferenceError) {
@@ -874,6 +900,39 @@ function outcomeMessage(error: unknown): PlanningFailure {
     return { code: error.code.slice(0, 80), message: error.message.slice(0, 1000) };
   }
   return { code: 'PLANNING_FAILED', message: error instanceof Error ? error.message.slice(0, 1000) : 'Planning failed.' };
+}
+
+const RETRYABLE_PLANNING_OPERATIONS = new Set(['deck-plan', 'plan-review', 'deck-plan-revision']);
+const TRANSIENT_NETWORK_ERROR_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH']);
+
+function isTransientPlanningFailure(error: unknown): boolean {
+  if (error instanceof SemanticInferenceError) {
+    return error.code === 'INVALID_STRUCTURED_OUTPUT' || error.code === 'SERVICE_UNAVAILABLE';
+  }
+  let current: unknown = error;
+  for (let depth = 0; depth < 3 && isRecord(current); depth += 1) {
+    if (typeof current.code === 'string' && TRANSIENT_NETWORK_ERROR_CODES.has(current.code)) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+/** One strict, same-request retry for transient failures in the bounded planning flow only. */
+export async function inferPlanningRequestWithRetry<T>(
+  adapter: SemanticInferenceAdapter,
+  request: SemanticInferenceRequest<T>,
+  ensureActive: () => void = () => undefined,
+) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const response = await adapter.infer(request);
+      ensureActive();
+      return response;
+    } catch (error) {
+      if (attempt >= 1 || !RETRYABLE_PLANNING_OPERATIONS.has(request.operation) || !isTransientPlanningFailure(error)) throw error;
+      ensureActive();
+    }
+  }
 }
 
 export class PlanningService {
@@ -1075,12 +1134,43 @@ export class PlanningService {
         signal: operation.controller.signal,
         metadata: { projectId, generationId: this.createId() },
       };
-      const workerResponse = await adapter.infer(workerRequest);
-      ensureActive();
-      const workerDraft = asDraft(workerResponse.value, contentIR, brief);
+      const workerResponse = await inferPlanningRequestWithRetry(adapter, workerRequest, ensureActive);
+      let workerDraft = asDraft(workerResponse.value, contentIR, brief);
+      let revisionWorkerSummary: TelemetrySummary | undefined;
+      let revisionUsed = false;
       if (contentBudgets) {
-        try { validateDraftAgainstContentBudgets(workerDraft.slides, contentBudgets); }
-        catch (error) { throw new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'Generated slide copy exceeds all qualified template text regions. Shorten the copy in a new plan and retry.', 422, { cause: error }); }
+        try {
+          validateDraftAgainstContentBudgets(workerDraft.slides, contentBudgets);
+        } catch (error) {
+          if (!(error instanceof RangeError) || !error.message.includes('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET')) throw error;
+          const repairRequest: SemanticInferenceRequest<DeckPlanDraft> = {
+            ...workerRequest,
+            operation: 'deck-plan-revision',
+            messages: [
+              { role: 'system', content: `${promptAssets.worker}\n\nFIT REPAIR: The previous draft failed the supplied measured template text budgets. Return a revised draft with shorter, complete presentation wording that fits at least one role-compatible candidate family for every slide. Keep the same slide order, narrative roles, purpose, contentRefs, mediaRefs, visual types, density, and all evidenceRefs. Do not add, remove, or alter source-backed claims; only compress their wording. Do not shrink fonts or change the template. This is the only fit-repair attempt.` },
+              { role: 'user', content: JSON.stringify({
+                brief,
+                currentDraft: workerDraft,
+                contentIR: compactContentIR(contentIR),
+                presentationDesignSystem: designSystem,
+                contentBudgets,
+                requestedSlideCount: brief.requestedSlideCount ?? null,
+              }) },
+            ],
+            metadata: { projectId, generationId: this.createId() },
+          };
+          const repairResponse = await inferPlanningRequestWithRetry(adapter, repairRequest, ensureActive);
+          const repairedDraft = asDraft(repairResponse.value, contentIR, brief);
+          assertBudgetRevisionPreservesPlan(workerDraft, repairedDraft);
+          try {
+            validateDraftAgainstContentBudgets(repairedDraft.slides, contentBudgets);
+          } catch (repairError) {
+            throw new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'The bounded fit repair still exceeds the qualified template text budgets.', 422, { cause: repairError });
+          }
+          workerDraft = repairedDraft;
+          revisionWorkerSummary = telemetrySummary(repairResponse.telemetry);
+          revisionUsed = true;
+        }
       }
       const planId = `dp_${this.createId().replaceAll('-', '')}`;
       const checkpoint = canonicalizeDeckPlan(workerDraft, {
@@ -1128,14 +1218,15 @@ export class PlanningService {
         signal: operation.controller.signal,
         metadata: { projectId, checkpointId: checkpoint.id },
       };
-      const supervisorResponse = await adapter.infer(reviewRequest);
-      ensureActive();
+      const supervisorResponse = await inferPlanningRequestWithRetry(adapter, reviewRequest, ensureActive);
       const review = validatePlanReview(supervisorResponse.value, checkpoint, contentIR);
       let deckPlan = checkpoint;
-      let revisionWorkerSummary: TelemetrySummary | undefined;
       if (review.outcome === 'repair') {
         deckPlan = applyPlanRepair(checkpoint, review, contentIR, brief, fingerprint);
       } else if (review.outcome === 'local-replan') {
+        if (revisionUsed) {
+          throw new PlanningServiceError('PLAN_REVISION_BUDGET_EXHAUSTED', 'The plan already used its single bounded revision to fit the template.', 422);
+        }
         const revisionEvidenceText = JSON.stringify({
           brief,
           currentPlan: checkpoint,
@@ -1158,13 +1249,13 @@ export class PlanningService {
           signal: operation.controller.signal,
           metadata: { projectId, generationId: this.createId(), checkpointId: checkpoint.id },
         };
-        const revisionResponse = await adapter.infer(revisionRequest);
-        ensureActive();
+        const revisionResponse = await inferPlanningRequestWithRetry(adapter, revisionRequest, ensureActive);
         const revisedDraft = asDraft(revisionResponse.value, contentIR, brief);
         if (contentBudgets) {
           try { validateDraftAgainstContentBudgets(revisedDraft.slides, contentBudgets); }
           catch (error) { throw new PlanningServiceError('PLANNED_COPY_EXCEEDS_TEMPLATE_BUDGET', 'Revised slide copy exceeds all qualified template text regions. Generate a shorter plan and retry.', 422, { cause: error }); }
         }
+        revisionUsed = true;
         deckPlan = canonicalizeDeckPlan(revisedDraft, {
           id: checkpoint.id,
           version: checkpoint.version + 1,

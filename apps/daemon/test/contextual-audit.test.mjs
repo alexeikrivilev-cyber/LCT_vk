@@ -126,13 +126,13 @@ test('spelling and table/legend concerns use bounded actions and never request m
 test('contextual auditor agent, skill, prompt hash, schema, and rule set are explicitly versioned together', async () => {
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.agentVersion, 'contextual-audit-supervisor.v1');
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.skillVersion, 'presentation-contextual-audit.v1');
-  assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.promptVersion, 'contextual-deck-audit.v4');
+  assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.promptVersion, 'contextual-deck-audit.v5');
   assert.equal(CONTEXTUAL_AUDITOR_WORKFLOW.schemaVersion, 'contextual_deck_audit_v2');
   assert.match(CONTEXTUAL_AUDIT_VERSION_FINGERPRINT, /^[a-f0-9]{64}$/u);
-  assert.notEqual(buildContextualAuditVersionFingerprint({ auditor: { ...CONTEXTUAL_AUDITOR_WORKFLOW, promptVersion: 'contextual-deck-audit.v5' } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
+  assert.notEqual(buildContextualAuditVersionFingerprint({ auditor: { ...CONTEXTUAL_AUDITOR_WORKFLOW, promptVersion: 'contextual-deck-audit.v6' } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
   assert.notEqual(buildContextualAuditVersionFingerprint({ schema: { type: 'object', required: ['newField'] } }), CONTEXTUAL_AUDIT_VERSION_FINGERPRINT);
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-  const prompt = await readFile(path.join(repoRoot, 'apps/daemon/prompts/contextual-deck-audit.v4.md'));
+  const prompt = await readFile(path.join(repoRoot, 'apps/daemon/prompts/contextual-deck-audit.v5.md'));
   assert.equal(createHash('sha256').update(prompt).digest('hex'), CONTEXTUAL_AUDITOR_WORKFLOW.promptSha256);
   assert.match(prompt.toString('utf8'), /exactly 11 objects[\s\S]*never emit one finding per slide/u);
   await readFile(path.join(repoRoot, 'skills/presentation-contextual-audit/SKILL.md'));

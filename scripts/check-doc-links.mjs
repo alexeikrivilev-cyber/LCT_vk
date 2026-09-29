@@ -25,7 +25,7 @@ const requiredFiles = [
   'decisions/ADR-006-shared-plan-variant-strategies.md', 'decisions/ADR-007-native-editable-output.md',
   'decisions/ADR-008-fake-offline-inference.md', 'decisions/ADR-009-versioned-runtime-prompts.md',
   'apps/daemon/prompts/worker-deck-plan.v2.md', 'apps/daemon/prompts/worker-deck-plan.v3.md', 'apps/daemon/prompts/worker-deck-plan.v4.md', 'apps/daemon/prompts/worker-deck-plan.v5.md', 'apps/daemon/prompts/worker-deck-plan.v6.md', 'apps/daemon/prompts/worker-deck-plan.v7.md', 'apps/daemon/prompts/supervisor-plan-review.v1.md',
-  'apps/daemon/prompts/contextual-deck-audit.v4.md',
+  'apps/daemon/prompts/contextual-deck-audit.v5.md',
   'apps/daemon/prompts/template-profiler.v1.md',
   'apps/daemon/prompts/template-profiler.v2.md',
   'apps/daemon/prompts/template-profiler.v3.md',
@@ -76,13 +76,16 @@ const requiredSemanticRequests = Object.values(liveQualificationContract.require
   .reduce((total, count) => total + count, liveQualificationContract.generationSemanticRequests ?? 0);
 const optionalSemanticRequests = Object.values(liveQualificationContract.optionalOperations ?? {})
   .reduce((total, limit) => total + limit.max, 0);
-if (liveQualificationContract.schemaVersion !== 7
+if (liveQualificationContract.schemaVersion !== 8
     || liveQualificationContract.coreMaxSemanticRequests !== requiredSemanticRequests + optionalSemanticRequests
+    || liveQualificationContract.coreRetryMaxSemanticRequests !== 3
     || liveQualificationContract.optionalOperations?.['deck-plan-revision']?.min !== 0
     || liveQualificationContract.optionalOperations?.['deck-plan-revision']?.max !== 1
     || liveQualificationContract.profilePreparationMaxSemanticRequests !== 32
     || liveQualificationContract.fullWorkflowMaxSemanticRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests
-      + liveQualificationContract.coreMaxSemanticRequests
+      + liveQualificationContract.coreMaxSemanticRequests + liveQualificationContract.coreRetryMaxSemanticRequests
+    || liveQualificationContract.planningRetryPolicy?.maxRetriesPerOperation !== 1
+    || liveQualificationContract.planningRetryPolicy?.operations?.join(',') !== 'deck-plan,plan-review,deck-plan-revision'
     || liveQualificationContract.profilerDiagnosticMaxSemanticRequests !== liveQualificationContract.fullWorkflowMaxSemanticRequests
     || liveQualificationContract.maxProfilerRequests !== liveQualificationContract.profilePreparationMaxSemanticRequests) {
   failures.push('live qualification contract: core, profile-preparation, and full-workflow request budgets do not match the bounded operations');
@@ -96,9 +99,10 @@ if (profilerContract.maxBatches !== liveQualificationContract.maxProfilerRequest
   failures.push('template profiler batch limits differ from the hard request budget contract');
 }
 const liveQualificationGuide = await readFile(path.join(root, 'LIVE_QUALIFICATION.md'), 'utf8');
-if (!liveQualificationGuide.includes(`core cap \`${liveQualificationContract.coreMaxSemanticRequests}\``)
+if (!liveQualificationGuide.includes(`core operation cap \`${liveQualificationContract.coreMaxSemanticRequests}\``)
     || !liveQualificationGuide.includes(`profile preparation cap \`${liveQualificationContract.profilePreparationMaxSemanticRequests}\``)
     || !liveQualificationGuide.includes(`full workflow cap \`${liveQualificationContract.fullWorkflowMaxSemanticRequests}\``)
+    || !liveQualificationGuide.includes(`planning retry allowance \`${liveQualificationContract.coreRetryMaxSemanticRequests}\``)
     || !liveQualificationGuide.includes('profiler calls during Generate = `0`')) {
   failures.push('LIVE_QUALIFICATION.md: documented core/profile-preparation/full-workflow caps differ from the versioned contract');
 }
