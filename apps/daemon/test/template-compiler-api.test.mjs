@@ -513,6 +513,72 @@ test('template preparation returns PROCESSING before inference, survives client 
   }
 });
 
+test('a project waiting on shared preparation retries after the owner stores only a deterministic fallback', async (t) => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-shared-fallback-waiter-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  let releaseOwner;
+  const ownerGate = new Promise((resolve) => { releaseOwner = resolve; });
+  let ownerEnteredResolve;
+  const ownerEntered = new Promise((resolve) => { ownerEnteredResolve = resolve; });
+  let inferenceCalls = 0;
+  const started = await startServer({
+    host: '127.0.0.1', port: 0, dataDir: path.join(temp, 'data'), projectRoot: repoRoot,
+    serveWeb: false, returnServer: true, enableSemanticProfiling: true,
+    semanticInferenceCacheIdentity: 'offline-shared-fallback-waiter-v1',
+    semanticInferenceAdapter: { async infer(request) {
+      inferenceCalls += 1;
+      if (inferenceCalls === 1) {
+        ownerEnteredResolve();
+        await ownerGate;
+        throw new SemanticInferenceError('SERVICE_UNAVAILABLE', 'temporary fake outage');
+      }
+      return validProfileResponse(request);
+    } },
+  });
+  const ownerProject = 'shared-profile-owner';
+  const waiterProject = 'shared-profile-waiter';
+  try {
+    const template = await makeSyntheticPptx({ slideCount: 1, layoutCount: 2 });
+    for (const projectId of [ownerProject, waiterProject]) {
+      assert.equal((await fetch(`${started.url}/api/projects`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: projectId, name: projectId }),
+      })).status, 201);
+      const upload = new FormData();
+      upload.append('files', new Blob([template]), 'same-template.pptx');
+      assert.equal((await fetch(`${started.url}/api/projects/${projectId}/upload`, { method: 'POST', body: upload })).status, 200);
+    }
+
+    const ownerCompile = await fetch(`${started.url}/api/projects/${ownerProject}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'same-template.pptx' }),
+    });
+    assert.equal(ownerCompile.status, 202);
+    const ownerAccepted = await ownerCompile.json();
+    await ownerEntered;
+
+    const waiterCompile = await fetch(`${started.url}/api/projects/${waiterProject}/template/compile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'same-template.pptx' }),
+    });
+    assert.equal(waiterCompile.status, 202);
+    const waiterAccepted = await waiterCompile.json();
+    assert.equal(waiterAccepted.semanticProfile.status, 'processing');
+    assert.equal(waiterAccepted.templateIR.hash, ownerAccepted.templateIR.hash, 'both projects coordinate on the same content-addressed profile');
+    assert.equal(inferenceCalls, 1, 'the waiter does not duplicate successful in-flight work');
+
+    releaseOwner();
+    const ownerFinal = await waitForProfileState(started, ownerProject, ['degraded-ready']);
+    assert.equal(ownerFinal.semanticProfile.status, 'degraded-ready');
+    const waiterFinal = await waitForProfileState(started, waiterProject, ['ready', 'degraded-ready']);
+    assert.equal(waiterFinal.semanticProfile.status, 'ready', 'the waiter owns a retry after the owner fallback remains local');
+    assert.equal(inferenceCalls, 2);
+  } finally {
+    releaseOwner();
+    await closeStartedServer(started);
+  }
+});
+
 test('daemon restart resumes persisted processing and bounds repeated restart recovery with deterministic fallback', async (t) => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'lct-template-profile-restart-'));
   t.after(() => rm(temp, { recursive: true, force: true }));

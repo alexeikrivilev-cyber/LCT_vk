@@ -4,7 +4,7 @@
 
 import express from 'express';
 import multer from 'multer';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { assertLoopbackDaemonBindHost, DEFAULT_DAEMON_PORT, parseDaemonPort } from './daemon-bind-host.js';
@@ -50,8 +50,10 @@ import { PlanningService, PlanningServiceError } from './presentation/applicatio
 import { ProductWorkflowError, ProductWorkflowService } from './presentation/application/product-workflow-service.js';
 import {
   createDeterministicTemplateSemanticProfile,
+  layeredTemplateSemanticProfileCache,
   projectTemplateSemanticProfileCache,
   projectTemplateSemanticProfilePreparationStore,
+  sharedTemplateSemanticProfileCache,
   TemplateSemanticProfiler,
   type TemplateSemanticProfile,
   type TemplateSemanticProfilePreparationRecord,
@@ -80,6 +82,10 @@ export interface StartServerOptions {
   returnServer?: boolean;
   semanticInferenceAdapter?: SemanticInferenceAdapter;
   semanticInferenceAdapterFactory?: () => SemanticInferenceAdapter;
+  /** Explicit identity for injected inference adapters before enabling daemon-wide semantic cache reuse. */
+  semanticInferenceCacheIdentity?: string;
+  /** Offline qualification seam; defaults on when the semantic endpoint has a stable cache identity. */
+  enableStructuralProfileFamilyReuse?: boolean;
   /** Internal structural-only seam. The normal daemon enables prepared semantic profiles. */
   enableSemanticProfiling?: boolean;
   /** Replaceable bounded concurrency for template preparation; defaults to LCT_TEMPLATE_PROFILE_CONCURRENCY or 1. */
@@ -215,6 +221,16 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   const semanticConfig = !hasInjectedSemanticAdapter && configuredSemanticBaseUrl
     ? semanticInferenceConfigFromEnvironment()
     : null;
+  const semanticCacheIdentity = options.semanticInferenceCacheIdentity
+    ?? (semanticConfig ? createHash('sha256').update(JSON.stringify({
+      endpoint: semanticConfig.baseUrl,
+      model: semanticConfig.model,
+      enableThinking: semanticConfig.enableThinking ?? null,
+    })).digest('hex') : undefined);
+  if (options.semanticInferenceCacheIdentity !== undefined
+      && (!options.semanticInferenceCacheIdentity.trim() || options.semanticInferenceCacheIdentity.length > 512)) {
+    throw new TypeError('semanticInferenceCacheIdentity must be a non-empty string of at most 512 characters.');
+  }
   const backend = resolvePptxBackend();
   const renderer = options.presentationRenderer ?? createPptxRenderer(backend, options.performanceDiagnostics);
   const dataDir = resolveDataDir(projectRoot, options.dataDir);
@@ -229,12 +245,21 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
   const templateProfilers = new Map<string, TemplateSemanticProfiler>();
   const templatePreparationStores = new Map<string, ReturnType<typeof projectTemplateSemanticProfilePreparationStore>>();
   const activeTemplatePreparations = new Map<string, Promise<unknown>>();
+  const waitingTemplatePreparations = new Set<string>();
+  const sharedTemplateProfiles = semanticCacheIdentity ? sharedTemplateSemanticProfileCache(dataDir) : null;
   const lazyTemplateProfileAdapter: SemanticInferenceAdapter = { infer: (request) => getSemanticAdapter().infer(request) };
+  const preparationCoordinationKey = (projectId: string, profileCacheKey: string) =>
+    `${semanticCacheIdentity ? 'shared' : projectId}:${profileCacheKey}`;
   const profilerForProject = (projectId: string) => {
     let profiler = templateProfilers.get(projectId);
     if (!profiler) {
-      profiler = new TemplateSemanticProfiler(lazyTemplateProfileAdapter, projectTemplateSemanticProfileCache(projectsRoot, projectId), {
+      const projectCache = projectTemplateSemanticProfileCache(projectsRoot, projectId);
+      const cache = sharedTemplateProfiles ? layeredTemplateSemanticProfileCache(projectCache, sharedTemplateProfiles) : projectCache;
+      profiler = new TemplateSemanticProfiler(lazyTemplateProfileAdapter, cache, {
         concurrency: profileConcurrency,
+        ...(semanticCacheIdentity ? { cacheIdentity: semanticCacheIdentity } : {}),
+        familyReuse: options.enableStructuralProfileFamilyReuse ?? Boolean(semanticCacheIdentity),
+        ...(options.performanceDiagnostics ? { diagnostics: options.performanceDiagnostics } : {}),
       });
       templateProfilers.set(projectId, profiler);
     }
@@ -270,7 +295,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     try {
       const profiler = profilerForProject(projectId);
       const profileCacheKey = await profiler.profileCacheKey(snapshot.templateIR);
-      const key = `${projectId}:${profileCacheKey}`;
+      const key = preparationCoordinationKey(projectId, profileCacheKey);
       const record = await preparationStoreForProject(projectId).read(profileCacheKey);
       if (record?.templateIRHash === snapshot.templateIR.hash && record.status === 'processing') {
         return { status: 'processing', cached: false,
@@ -307,14 +332,15 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     projectId: string,
     snapshot: Awaited<ReturnType<typeof getTemplateCompilation>>,
     timing: { templateStructuralMs: number },
-    recovery: { recoveryCount?: number; fallbackOnly?: boolean } = {},
+    recovery: { recoveryCount?: number; fallbackOnly?: boolean; retryAfterSharedOwner?: boolean } = {},
   ): Promise<{ status: 'processing' | 'ready' | 'degraded-ready'; cached: boolean; templateSemanticProfileMs?: number }> => {
     if (snapshot.status !== 'ready' || !snapshot.templateIR || !snapshot.presentationDesignSystem) {
       throw new TypeError('A structurally ready TemplateIR and presentation design system are required for semantic profiling.');
     }
     const profiler = profilerForProject(projectId);
     const profileCacheKey = await profiler.profileCacheKey(snapshot.templateIR);
-    const key = `${projectId}:${profileCacheKey}`;
+    const key = preparationCoordinationKey(projectId, profileCacheKey);
+    const projectWaiterKey = JSON.stringify([projectId, profileCacheKey]);
     const store = preparationStoreForProject(projectId);
     const alreadyPrepared = await profiler.getPreparedTemplateProfile(snapshot.templateIR, snapshot.presentationDesignSystem);
     if (alreadyPrepared) {
@@ -325,16 +351,57 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
         ...timing, templateSemanticProfileMs: 0 });
       return { status: degraded ? 'degraded-ready' : 'ready', cached: true, templateSemanticProfileMs: 0 };
     }
+    if (waitingTemplatePreparations.has(projectWaiterKey) && !recovery.retryAfterSharedOwner) {
+      return { status: 'processing', cached: false };
+    }
     const existing = activeTemplatePreparations.get(key);
-    if (existing) return { status: 'processing', cached: false };
+    if (existing) {
+      waitingTemplatePreparations.add(projectWaiterKey);
+      try {
+        await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR.hash, profileCacheKey,
+          status: 'processing', updatedAt: new Date().toISOString(), templateStructuralMs: timing.templateStructuralMs,
+          recoveryCount: recovery.recoveryCount ?? 0 });
+      } catch (error) {
+        waitingTemplatePreparations.delete(projectWaiterKey);
+        throw error;
+      }
+      void existing.then(async () => {
+        waitingTemplatePreparations.delete(projectWaiterKey);
+        const sharedOrLocal = await profilerForProject(projectId).getPreparedTemplateProfile(snapshot.templateIR!, snapshot.presentationDesignSystem!);
+        if (sharedOrLocal) {
+          const degraded = profileHasDeterministicFallback(sharedOrLocal);
+          await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR!.hash, profileCacheKey,
+            status: degraded ? 'degraded-ready' : 'ready', profileOrigin: degraded ? 'deterministic-fallback' : 'semantic',
+            ...(degraded ? { degradationCode: 'SEMANTIC_PROFILE_DEGRADED' } : {}), updatedAt: new Date().toISOString(),
+            ...timing, templateSemanticProfileMs: 0 });
+          return;
+        }
+        // A fallback remains project-local. Once the shared owner settles,
+        // this project takes ownership and either retries inference or reaches
+        // its own bounded deterministic fallback.
+        await prepareTemplateProfile(projectId, snapshot, timing, { ...recovery, retryAfterSharedOwner: true });
+      }).catch(async (error) => {
+        waitingTemplatePreparations.delete(projectWaiterKey);
+        const failureCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+          && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : 'TEMPLATE_PROFILE_RETRY_FAILED';
+        await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR!.hash, profileCacheKey,
+          status: 'failed', failureCode, updatedAt: new Date().toISOString(), ...timing,
+          recoveryCount: recovery.recoveryCount ?? 0 });
+        console.error(JSON.stringify({ event: 'template.profile-shared-waiter', projectId, status: 'failed', errorCode: failureCode }));
+      });
+      return { status: 'processing', cached: false };
+    }
     // Reserve the key before the first asynchronous write so concurrent compile requests dedupe.
-    activeTemplatePreparations.set(key, Promise.resolve());
+    let releaseReservation!: () => void;
+    const reservation = new Promise<void>((resolve) => { releaseReservation = resolve; });
+    activeTemplatePreparations.set(key, reservation);
     try {
       await store.write({ schemaVersion: 1, templateIRHash: snapshot.templateIR.hash, profileCacheKey,
         status: 'processing', updatedAt: new Date().toISOString(), templateStructuralMs: timing.templateStructuralMs,
         recoveryCount: recovery.recoveryCount ?? 0 });
     } catch (error) {
       activeTemplatePreparations.delete(key);
+      releaseReservation();
       throw error;
     }
     const preparationQueuedAt = performance.now();
@@ -374,6 +441,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
         console.error(JSON.stringify({ event: 'template.profile-preparation', projectId, status: 'failed', errorCode: failureCode }));
       } finally {
         if (activeTemplatePreparations.get(key) === task) activeTemplatePreparations.delete(key);
+        releaseReservation();
       }
     });
     activeTemplatePreparations.set(key, task);
@@ -690,7 +758,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<str
     const preparationStartedAt = performance.now();
     try {
       const structuralStartedAt = performance.now();
-      const compiled = await compileTemplate(projectsRoot, req.params.id, filePath, addEffectivePlaceholderTypography);
+      const compiled = await compileTemplate(projectsRoot, req.params.id, filePath, addEffectivePlaceholderTypography, options.performanceDiagnostics);
       const templateStructuralMs = Math.max(0, Math.round(performance.now() - structuralStartedAt));
       if (!semanticProfilingEnabled) {
         res.json({ ...compiled, semanticProfile: { status: 'disabled', cached: false } });

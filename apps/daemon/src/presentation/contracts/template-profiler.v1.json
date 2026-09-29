@@ -1,5 +1,5 @@
 {
-  "configVersion": "template-profiler-config.v8",
+  "configVersion": "template-profiler-config.v10",
   "agentId": "template-profiler",
   "agentVersion": "template-profiler.v1",
   "skillId": "template-semantics",

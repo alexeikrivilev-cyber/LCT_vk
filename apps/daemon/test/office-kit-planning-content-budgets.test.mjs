@@ -49,6 +49,11 @@ test('planning budgets use same-slide structural regions when semantic roles are
       reasonCodes: ['synthetic-incomplete-profile'],
     })),
   };
+  const reusedProfile = semanticProfile.slides.at(-1);
+  assert.ok(reusedProfile);
+  reusedProfile.archetype = 'content';
+  reusedProfile.supportedContentModes = ['diagram', 'image', 'mixed'];
+  reusedProfile.reasonCodes = ['structural_family_reuse'];
 
   const budgets = await derivePlanningContentBudgets({
     projectsRoot, projectId, template, semanticProfile, requestedSlideCount: 10,
@@ -58,6 +63,9 @@ test('planning budgets use same-slide structural regions when semantic roles are
   assert.equal(budgets.slides.length, 10);
   assert.ok(budgets.candidateFamilies.every((family) => family.titleRegion.maxCharacters > 0
     && family.bodyRegions.length > 0 && family.body.maxCharacters > 0));
+  assert.ok(budgets.candidateFamilies.every((family) => !family.supportedContentModes.includes('diagram')
+    && !family.supportedContentModes.includes('image') && !family.supportedContentModes.includes('mixed')),
+  'a neutral reused profile cannot advertise visual modes to planning');
   assert.doesNotMatch(JSON.stringify(budgets), new RegExp(`${titleFromAnotherSlide}|${bodyFromAnotherSlide}`, 'u'),
     'foreign semantic IDs are not included in the planner budget contract');
 });
