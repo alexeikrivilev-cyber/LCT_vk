@@ -74,7 +74,8 @@ async function requestJson(baseUrl, route, options = {}, expectedStatus = 200) {
   let body;
   try { body = text ? JSON.parse(text) : null; }
   catch { throw new Error(`${route} returned non-JSON HTTP ${response.status}: ${text.slice(0, 500)}`); }
-  assert.equal(response.status, expectedStatus, `${route} returned HTTP ${response.status}: ${JSON.stringify(body)}`);
+  const expectedStatuses = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+  assert.ok(expectedStatuses.includes(response.status), `${route} returned HTTP ${response.status}: ${JSON.stringify(body)}`);
   return body;
 }
 
@@ -95,6 +96,18 @@ async function waitForGeneration(baseUrl, projectId, timeoutMs = 600_000) {
     await new Promise((resolve) => setTimeout(resolve, 400));
   }
   throw new Error(`generation did not finish within ${Math.round(timeoutMs / 1000)} seconds`);
+}
+
+async function waitForTemplatePreparation(baseUrl, projectId, timeoutMs = 240_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await requestJson(baseUrl, `/api/projects/${projectId}/template`);
+    const profileStatus = last.semanticProfile?.status;
+    if (['ready', 'degraded-ready', 'failed', 'disabled'].includes(profileStatus) || last.status === 'failed') return last;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`template preparation did not finish; last status was ${last?.semanticProfile?.status ?? 'unknown'}`);
 }
 
 async function main() {
@@ -169,12 +182,17 @@ async function main() {
     report.timingsMs.uploadAndList = Math.round(performance.now() - stageStartedAt);
 
     stageStartedAt = performance.now();
-    const templateResponse = await requestJson(daemon.url, `/api/projects/${projectId}/template/compile`, {
+    const preparationAccepted = await requestJson(daemon.url, `/api/projects/${projectId}/template/compile`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ filePath: templateName }),
-    });
+    }, [200, 202]);
+    assert.equal(preparationAccepted.status, 'ready', JSON.stringify(preparationAccepted.failure));
+    const templateResponse = ['ready', 'degraded-ready'].includes(preparationAccepted.semanticProfile?.status)
+      ? preparationAccepted
+      : await waitForTemplatePreparation(daemon.url, projectId);
     assert.equal(templateResponse.status, 'ready', JSON.stringify(templateResponse.failure));
-    assert.equal(templateResponse.semanticProfile?.status, 'ready', 'normal local product flow prepares the semantic profile before planning');
+    assert.ok(['ready', 'degraded-ready'].includes(templateResponse.semanticProfile?.status),
+      'normal local product flow prepares the semantic profile before planning');
     const preparedProfileRequestCount = fake.state.inference.filter((item) => item.operation === 'template-semantic-profile').length;
     assert.ok(preparedProfileRequestCount > 0);
     assert.ok(templateResponse.templateIR?.hash);

@@ -91,4 +91,44 @@
 - Тот же проект открыт повторно в браузере: UI восстановил все 10 слайдов, A/B/C previews, выбранный A и записи PPTX/PDF/HTML. Это подтверждает browser reload/open persistence.
 - В UI contextual audit по-прежнему показывает ошибку; persisted failure code `SERVICE_UNAVAILABLE`, telemetry wall time `178675 ms`, finish reason отсутствует. Deterministic audit виден как passed, но warning totals выше относятся к persisted generation audit report и остаются в отчёте. Повторная попытка из UI не дала наблюдаемого перехода в running/ready, поэтому дополнительных запусков не делаю.
 - Targeted tests завершились окончательно: `planning-api.test.mjs` + `slide-compilation.test.mjs` — 85/85 PASS, 0 skipped. PDF/HTML reopened checks PASS. Browser-level persistence PASS.
-- Следующее: сохранить summary артефакт; закоммитить/push проверенные planning/selector fixes в `final-integration`, интегрировать UI commits и generation-quality commits по одному, затем пройти полный offline gate/matrix. Contextual audit остаётся live blocker; main пока не менять.
+- Исторический следующий шаг на момент Phase A был интегрировать UI/generation-quality commits. Эти интеграции уже находятся в текущем HEAD и этот пункт superseded актуальной сводкой ниже.
+
+## Продолжение после Phase A и COST GUARD — 2026-09-29
+
+### Рабочая копия
+
+- Canonical repo: `C:\Projects\GitHub\LCT_vk`
+- Branch: `final-integration`
+- HEAD: `31664cb99e5cd72480a2de81db8157e1b3dd0b2e`
+- Исторический запрет на commit/push superseded пользовательским FINAL 40-MINUTE RELEASE SPRINT; разрешены только проверенные release изменения в `final-integration`.
+- Сохраняются изменения пользователя в `apps/daemon/test/presentation-generation-api.test.mjs` и `apps/web/next-env.d.ts`; текущие harness изменения: `scripts/run-local-product-smoke.mjs`, `scripts/run-unknown-template-qualification.mjs`, `scripts/unknown-template-qualification.test.mjs`.
+
+### Фактический offline прогресс
+
+- Full Node tests: 357/357 PASS; unknown-template tests 3/3 PASS.
+- `docs:check`, boundary, lint:craft, `git diff --check`: PASS.
+- Web/daemon typecheck и production build были PASS ранее после integration; после них изменялись только `.mjs` qualification scripts/tests и docs.
+- Offline fake runs: WorkSpace 10 slides PASS; Education 10 PASS; held-out AIOS 6 PASS с 8 profiler + deck-plan + plan-review; VK Tech 10 BLOCKED на `PREVIEW_LAYOUT_BLOCKED`.
+- Исправлены только qualification harness issues: принимать 202, bounded wait до terminal profile state, читать profiler cap из live contract и отдельно проверять ожидаемые core operations. Runtime/product generation behavior не менялся.
+
+### Live Phase A evidence (переиспользовано, без новых requests)
+
+- Существующий rehearsal unknown-template browser project `d3d1975a-cc28-4c2e-831a-d09eeca49f8b` на файле `kompaniya-napravleniya-i-klienty.pptx` (SHA-256 `7c34dd3f5b09607a9334b46898d1951b9a4217196109cffcd02e997e0b26414d`); generation `05aa55f4-35b4-4ce2-95ef-09a476b585e4`. Это не WorkSpace.
+- A/B/C: 10/10 каждый, 30/30; generation 6.755 s; profiler/planning calls during Generate: 0.
+- Deterministic audit: 0 errors, 21 warnings. Contextual audit один раз завершился `SERVICE_UNAVAILABLE` за 178.675 s; retry не был сделан.
+- PPTX/PDF/HTML есть и структурно проверены; PPTX 10 slides, native editable text, master/theme, no notes/package errors; PDF 10 pages; HTML 10 sections. Browser refresh восстановил проект и export records.
+- Ручной contact-sheet review выявил разреженную композицию; это не visual-quality PASS. Сохранённый артефакт зафиксировал `/health=200`, `/readiness=200`, semantic reachable на момент E2E; live flow release acceptance остаётся неполной из-за contextual audit failure и warnings.
+
+### Текущий запрет и следующий шаг
+
+RunPod баланс около $3; не тратить последние $2, зарезервированные для demo recording. До явного подтверждения пользователя запрещены любые новые live Qwen/RunPod semantic calls, включая audit retry, profiling, planning и duplicate requests. Не читать и не выводить credentials.
+
+Следующий контекстный audit retry и свежая held-out live qualification запрещены до отдельного подтверждения бюджета. В текущем final sprint модельные запросы не выполнять; для видео использовать только сохранённый E2E и новый короткий сценарий `docs/runbooks/FINAL_DEMO_RUNBOOK.md`.
+
+## FINAL 40-MINUTE RELEASE SPRINT — 2026-09-29
+
+- Реальные Phase A результаты принадлежат rehearsal unknown-template файлу `kompaniya-napravleniya-i-klienty.pptx`, а не WorkSpace. Число: 10 слайдов, A/B/C 30/30, детерминированный аудит 0 ошибок/21 предупреждение, contextual audit `SERVICE_UNAVAILABLE`, PPTX/PDF/HTML и refresh persistence PASS структурно.
+- Контактный лист: `.lct/final-tz-live-e2e/05aa55f4-35b4-4ce2-95ef-09a476b585e4/visual-review/00-final-live-test-10-слайдов/contact-sheet.png`; композиция разреженная, не объявлять visual quality PASS.
+- UI/generation-quality источники с исходными SHA не являются предками текущего HEAD, но их патчи уже интегрированы как `e642338`, `0a3d902`, `44cf193`, `31664cb`; patch-id совпадает с каждым исходным коммитом. Не cherry-pick повторно.
+- Никаких Qwen/RunPod inference в этом sprint не выполнять. Подтверждённый точный organizer attachment `VK Tech.pptx` отсутствует; похожий локальный файл не считать authoritative.
+- Проверенный 5-минутный сценарий: `docs/runbooks/FINAL_DEMO_RUNBOOK.md`; использовать только сохранённый project state, audit и export records.

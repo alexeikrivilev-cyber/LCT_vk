@@ -2,12 +2,14 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const smokeScript = path.join(repoRoot, 'scripts', 'run-local-product-smoke.mjs');
+const qualificationContract = JSON.parse(readFileSync(path.join(repoRoot, 'scripts', 'lib', 'live-qualification-contract.json'), 'utf8'));
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -77,13 +79,21 @@ export function isCompleteUnknownTemplateSmoke(report) {
     'generationReload', 'sourceImmutable',
   ];
   const tracks = report?.trackExports;
+  const requests = report?.fakeInferenceRequests;
+  const recordedCalls = Number.isSafeInteger(report?.fakeInferenceCallCount)
+    ? report.fakeInferenceCallCount : requests?.length;
+  const profileCallCount = Array.isArray(requests)
+    ? requests.filter((request) => request.operation === 'template-semantic-profile').length : 0;
+  const coreOperations = Array.isArray(requests)
+    ? requests.filter((request) => request.operation !== 'template-semantic-profile').map((request) => request.operation) : [];
   return report?.status === 'passed'
     && requiredGates.every((gate) => report.gates?.[gate] === 'passed')
     && report.audit?.errors === 0
     && report.export?.nativeTextShapes > 0
-    && report.fakeInferenceCallCount === 2
-    && Array.isArray(report.fakeInferenceRequests)
-    && report.fakeInferenceRequests.map((request) => request.operation).join(',') === 'deck-plan,plan-review'
+    && Array.isArray(requests)
+    && recordedCalls === requests.length
+    && profileCallCount > 0 && profileCallCount <= qualificationContract.maxProfilerRequests
+    && coreOperations.join(',') === 'deck-plan,plan-review'
     && (Number(report?.sourceResidueCheck?.forbiddenTermCount ?? 0) === 0 || report.sourceResidueCheck.status === 'passed')
     && Array.isArray(tracks) && tracks.length === 3
     && new Set(tracks.map((track) => track.mode)).size === 3
