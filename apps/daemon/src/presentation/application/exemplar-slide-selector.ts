@@ -1757,10 +1757,12 @@ export function templateDerivedCompositionSupported(
     }
   }
   if (compiled.imageRefs.length && !candidate.visualBox) return false;
+  const editableSequence = ['process', 'timeline', 'diagram'].includes(compiled.visualization.type)
+    && compiled.visualization.processSteps.length >= 2;
   const textComparison = compiled.visualization.type === 'comparison'
     && !compiled.visualization.tableData && !compiled.visualization.chartData && !compiled.visualization.kpi
     && compiled.body.length >= 2;
-  if (compiled.visualization.type !== 'none' && compiled.visualization.type !== 'process' && !textComparison) return false;
+  if (compiled.visualization.type !== 'none' && !editableSequence && !textComparison) return false;
   if ((compiled.visualization.chartData || compiled.visualization.tableData || compiled.visualization.kpi)
       && !candidate.visualBox && compiled.body.length) return false;
   if (compiled.visualization.processSteps.length >= 2) {

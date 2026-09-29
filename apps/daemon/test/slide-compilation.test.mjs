@@ -2302,6 +2302,74 @@ test('generic inferred-region fallback is the last resort and produces distinct 
     'the unknown template source remains immutable');
 });
 
+test('template-derived fallback accepts diagram and timeline when they resolve to safe editable steps', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-derived-sequence-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const template = await inferredRegionTemplateFixture(root);
+  const { contentIR, deckPlan } = await scenario(root, 1, Array(5).fill('none'));
+  const compiledTracks = VARIANT_POLICIES.map((policy) => compilePresentation(deckPlan, contentIR, template.templateIR, policy));
+  const tracks = compiledTracks.map((presentation) => {
+    const slide = presentation.slides[0];
+    assert.ok(slide);
+    slide.title = 'Путь от шаблона к файлу';
+    slide.body = ['Подготовить шаблон.', 'Собрать структуру.', 'Проверить результат.'];
+    slide.generatedBodyPoints = slide.body.map((text) => ({ text, origin: 'generated-from-brief', evidenceRefs: [] }));
+    slide.visualization = {
+      ...slide.visualization,
+      type: 'diagram',
+      status: 'generated',
+      processSteps: slide.body.map((text, generatedBodyPointIndex) => ({
+        text, origin: 'generated-from-brief', sourceRef: null, generatedBodyPointIndex,
+      })),
+    };
+    return slide;
+  });
+
+  for (const visualType of ['diagram', 'timeline']) {
+    for (const slide of tracks) {
+      slide.visualization.type = visualType;
+      const candidate = slide.layoutCandidates[slide.selectedCandidateIndex];
+      assert.ok(candidate);
+      assert.equal(templateDerivedCompositionSupported(slide, template.templateIR, candidate), true,
+        `${visualType} with measured editable steps should pass the same generic fit/chrome gate`);
+      assert.equal(templateDerivedCompositionSupported({
+        ...slide,
+        visualization: { ...slide.visualization, processSteps: [] },
+      }, template.templateIR, candidate), false, `${visualType} without editable steps remains fail-closed`);
+    }
+  }
+
+  const assessment = assessVariantCompositionDistinctnessRaw(tracks, template.templateIR, 'office-kit');
+  for (const variant of ['A', 'B', 'C']) {
+    assert.ok(assessment.safeOptionsByVariant[variant].some((option) => option.compositionKind === 'template-derived-fallback'),
+      `${variant} retains a measured template-derived sequence option`);
+  }
+  const fallbackOnly = Object.fromEntries(['A', 'B', 'C'].map((variant) => [variant,
+    [assessment.safeOptionsByVariant[variant].find((option) => option.compositionKind === 'template-derived-fallback')],
+  ]));
+  const assignments = assignDeckVariantCompositions([fallbackOnly]);
+  assert.ok(assignments, 'the deck-level resolver can use those safe sequence options');
+  assert.equal(new Set(['A', 'B', 'C'].map((variant) => assignments[variant][0].projectedCompositionSignature)).size, 3,
+    'the template-derived A/B/C strategies remain visibly distinct');
+  for (const variant of ['A', 'B', 'C']) {
+    const compiled = tracks.find((slide) => slide.variantId === variant);
+    const presentation = compiledTracks.find((item) => item.variantId === variant);
+    const assignment = assignments[variant][0];
+    assert.ok(compiled && presentation && assignment);
+    const assigned = applyVariantCompositionAssignment(compiled, assignment, template.templateIR);
+    const outputPath = path.join(root, 'output', `sequence-${variant}.pptx`);
+    await mkdir(path.dirname(outputPath), { recursive: true });
+    const rendered = await new OfficeKitPptxRenderer().render({
+      compiledPresentation: { ...presentation, slides: [assigned] },
+      contentIR, templateIR: template.templateIR, templatePath: template.templatePath, outputPath,
+    });
+    assert.equal(rendered.validationStatus, 'passed');
+    const preview = await new OfficeKitPreviewAdapter().preview(await readFile(outputPath), 0);
+    assert.equal(preview.status, 'passed', JSON.stringify({ variant, text: preview.textLayoutIssues, geometry: preview.geometryIssues }));
+    assert.ok(rendered.nativeShapeCount >= 3, 'editable process nodes and connectors are emitted as native shapes');
+  }
+});
+
 test('generic fallback derives readable text color from a dark template background', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'lct-template-derived-dark-'));
   t.after(() => rm(root, { recursive: true, force: true }));
