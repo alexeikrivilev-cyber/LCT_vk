@@ -458,7 +458,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .editor-variant-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; }
 .editor-variant-card { min-width:0; overflow:hidden; border:1px solid #363636; border-radius:6px; background:#202020; }
 .editor-variant-card.selected { border-color:#175fff; }
-.editor-variant-preview { display:grid; place-items:center; width:100%; aspect-ratio:16/9; padding:4px; border:0; background:#111; color:#888; font-size:9px; }
+.editor-variant-preview { display:grid; place-items:center; width:100%; aspect-ratio:16/9; padding:4px; border:0; background:#111; color:#888; font-size:9px; cursor:pointer; }
+.editor-variant-card:not(.selected):hover { border-color:#687f9d; }
 .editor-variant-preview img { width:100%; height:100%; object-fit:contain; }
 .editor-variant-card-footer { display:flex; align-items:center; flex-wrap:wrap; gap:5px; padding:7px; color:#ddd; font-size:10px; }
 .editor-variant-card-footer>button { width:100%; margin-top:3px; padding:6px 8px; font-size:10px; }

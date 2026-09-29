@@ -19,7 +19,7 @@ export type SavedGenerationState = {
 };
 
 export function hasCompleteSavedVariants(state: SavedGenerationState | null): boolean {
-  return Boolean(state && state.status === 'completed' && state.slides.length > 0
+  return Boolean(state && ['completed', 'stale'].includes(state.status) && state.slides.length > 0
     && state.readySlides === state.totalSlides
     && state.slides.every((slide) => ['A', 'B', 'C'].every((variant) => {
       const item = slide.variants[variant as SavedVariantId];

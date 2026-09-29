@@ -2219,7 +2219,9 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
         : null;
 
   const workflowFailure = productOperation?.status === 'failed' && !auditOnlyWorkflowFailure ? productOperation.failure : null;
-  const canSelectVariants = generation?.status === 'completed' && (currentGeneration ? canChooseTrack : canBrowseSavedResult);
+  const canSelectVariants = currentGeneration
+    ? generation?.status === 'completed' && canChooseTrack
+    : canBrowseSavedResult;
   const activePreviewUrl = activeVariant?.previewUrl ? activeVariant.previewUrl + '?v=' + activeVariant.version : null;
   const contextualFindings = productOperation?.contextualAudit?.findings ?? [];
   const contextualAudit = productOperation?.contextualAudit ?? null;
@@ -2317,8 +2319,9 @@ function PresentationGenerationPanel({ projectId, planningReady, inputFingerprin
                 const item = activePack.variants[variant];
                 const available = activePack.status === 'ready' && item.status === 'ready' && Boolean(item.previewUrl);
                 return <article className={'editor-variant-card' + (activePack.selectedVariant === variant ? ' selected' : '')} key={variant}>
-                  <button type="button" className="editor-variant-preview" disabled={!item.previewUrl}
-                    onClick={() => setActiveSlideId(activePack.slideId)} aria-label={ru.generation.slideVariantLabel(activePack.index, variant)}>
+                  <button type="button" className="editor-variant-preview" disabled={!available || !canSelectVariants || Boolean(busy)}
+                    onClick={() => chooseSlide(activePack, variant)} aria-label={ru.generation.slideVariantLabel(activePack.index, variant)}
+                    aria-pressed={activePack.selectedVariant === variant} title={ru.generation.choose(variant)}>
                     {item.previewUrl ? <img src={item.previewUrl + '?v=' + item.version} alt={ru.generation.previewAlt(activePack.index, variant)} />
                       : <span>{ru.workflow.slidePreviewUnavailable}</span>}
                   </button>

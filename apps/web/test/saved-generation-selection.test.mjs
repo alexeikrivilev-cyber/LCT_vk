@@ -17,8 +17,10 @@ function generation() {
 }
 
 test('complete saved A/B/C result remains browseable when its inputs are stale', () => {
-  assert.equal(hasCompleteSavedVariants(generation()), true);
-  const incomplete = generation();
+  const stale = generation();
+  stale.status = 'stale';
+  assert.equal(hasCompleteSavedVariants(stale), true);
+  const incomplete = { ...stale, slides: stale.slides.map((slide) => ({ ...slide, variants: { ...slide.variants } })) };
   incomplete.slides[1].variants.C.previewUrl = null;
   assert.equal(hasCompleteSavedVariants(incomplete), false);
 });
