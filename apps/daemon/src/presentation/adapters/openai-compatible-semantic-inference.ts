@@ -16,6 +16,8 @@ import {
 const DEFAULT_MODEL = 'Qwen/Qwen3.8-27B';
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 300_000;
+const DEFAULT_READINESS_TIMEOUT_MS = 30_000;
+const MAX_READINESS_TIMEOUT_MS = 120_000;
 const MAX_MESSAGES = 128;
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -50,18 +52,23 @@ export interface SemanticInferenceConfig {
   model: string;
   apiKey?: string;
   requestTimeoutMs?: number;
+  readinessTimeoutMs?: number;
   enableThinking?: boolean;
 }
 
 export type SemanticFetch = typeof fetch;
 
 export async function probeSemanticEndpoint(
-  config: Pick<SemanticInferenceConfig, 'baseUrl' | 'model' | 'apiKey'>,
+  config: Pick<SemanticInferenceConfig, 'baseUrl' | 'model' | 'apiKey' | 'readinessTimeoutMs'>,
   fetcher: SemanticFetch = globalThis.fetch,
 ): Promise<boolean> {
   const baseUrl = normalizeBaseUrl(config.baseUrl, config.apiKey);
+  const timeoutMs = config.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+  if (!isFiniteInteger(timeoutMs, 1, MAX_READINESS_TIMEOUT_MS)) {
+    throw configError(`Semantic readiness timeout must be between 1 and ${MAX_READINESS_TIMEOUT_MS} ms`);
+  }
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3_000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetcher(`${baseUrl}/models`, {
       method: 'GET',
@@ -89,6 +96,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isFiniteInteger(value: unknown, minimum: number, maximum: number): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum && value <= maximum;
+}
+
+function readinessTimeoutFromEnvironment(value: string | undefined): number {
+  if (value === undefined || value.trim() === '') return DEFAULT_READINESS_TIMEOUT_MS;
+  const normalized = value.trim();
+  if (!/^\d+$/.test(normalized)) {
+    throw configError(`LCT_SEMANTIC_READINESS_TIMEOUT_MS must be an integer between 1 and ${MAX_READINESS_TIMEOUT_MS}`);
+  }
+  const timeoutMs = Number(normalized);
+  if (!isFiniteInteger(timeoutMs, 1, MAX_READINESS_TIMEOUT_MS)) {
+    throw configError(`LCT_SEMANTIC_READINESS_TIMEOUT_MS must be an integer between 1 and ${MAX_READINESS_TIMEOUT_MS}`);
+  }
+  return timeoutMs;
 }
 
 function configError(message: string): SemanticInferenceError {
@@ -134,6 +154,7 @@ export function semanticInferenceConfigFromEnvironment(
     ...(apiKey ? { apiKey } : {}),
     ...(enableThinkingValue ? { enableThinking: enableThinkingValue === 'true' } : {}),
     requestTimeoutMs: DEFAULT_TIMEOUT_MS,
+    readinessTimeoutMs: readinessTimeoutFromEnvironment(environment.LCT_SEMANTIC_READINESS_TIMEOUT_MS),
   };
 }
 

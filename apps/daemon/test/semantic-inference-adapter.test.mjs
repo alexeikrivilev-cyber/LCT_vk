@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
   OpenAICompatibleSemanticInferenceAdapter,
+  probeSemanticEndpoint,
   semanticInferenceConfigFromEnvironment,
 } from '../src/presentation/adapters/openai-compatible-semantic-inference.ts';
 import { SemanticInferenceError } from '../src/presentation/application/semantic-inference-port.ts';
@@ -67,6 +68,20 @@ test('environment config requires an endpoint, pins a fixed model by default, an
   });
   assert.equal(config.baseUrl, 'https://inference.example.test/v1');
   assert.equal(config.model, model);
+  assert.equal(config.readinessTimeoutMs, 30_000);
+  assert.equal(config.requestTimeoutMs, 120_000);
+  const readinessOverride = semanticInferenceConfigFromEnvironment({
+    LCT_SEMANTIC_BASE_URL: 'https://inference.example.test/v1',
+    LCT_SEMANTIC_READINESS_TIMEOUT_MS: '45000',
+  });
+  assert.equal(readinessOverride.readinessTimeoutMs, 45_000);
+  assert.equal(readinessOverride.requestTimeoutMs, 120_000, 'readiness override must not change inference timeouts');
+  for (const invalid of ['0', '-1', '1.5', '120001', 'slow']) {
+    assert.throws(() => semanticInferenceConfigFromEnvironment({
+      LCT_SEMANTIC_BASE_URL: 'https://inference.example.test/v1',
+      LCT_SEMANTIC_READINESS_TIMEOUT_MS: invalid,
+    }), errorCode('CONFIGURATION_ERROR'));
+  }
   assert.equal(semanticInferenceConfigFromEnvironment({
     LCT_SEMANTIC_BASE_URL: 'https://inference.example.test/v1',
     LCT_SEMANTIC_ENABLE_THINKING: 'false',
@@ -82,6 +97,55 @@ test('environment config requires an endpoint, pins a fixed model by default, an
   assert.throws(() => semanticInferenceConfigFromEnvironment({
     LCT_SEMANTIC_BASE_URL: 'https://user:pass@inference.example.test/v1',
   }), errorCode('CONFIGURATION_ERROR'));
+});
+
+test('semantic readiness accepts a cold provider response within its configured timeout', async () => {
+  const startedAt = Date.now();
+  const reachable = await probeSemanticEndpoint({
+    baseUrl: 'https://inference.example.test/v1',
+    model,
+    readinessTimeoutMs: 5_000,
+  }, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 3_100));
+    return new Response(JSON.stringify({ data: [{ id: model }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  });
+  assert.equal(reachable, true);
+  assert.ok(Date.now() - startedAt >= 3_000, 'response must arrive later than the former 3-second timeout');
+});
+
+test('semantic readiness still rejects a provider that exceeds the configured timeout', async () => {
+  let aborted = false;
+  const reachable = await probeSemanticEndpoint({
+    baseUrl: 'https://inference.example.test/v1',
+    model,
+    readinessTimeoutMs: 35,
+  }, (_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener('abort', () => {
+      aborted = true;
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once: true });
+  }));
+  assert.equal(reachable, false);
+  assert.equal(aborted, true);
+});
+
+test('semantic readiness preserves fast success and treats auth/error responses as unreachable', async () => {
+  const fast = await probeSemanticEndpoint({ baseUrl: 'https://inference.example.test/v1', model }, async () => new Response(
+    JSON.stringify({ data: [{ id: model }] }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  ));
+  assert.equal(fast, true);
+
+  for (const status of [401, 403, 500]) {
+    const reachable = await probeSemanticEndpoint({ baseUrl: 'https://inference.example.test/v1', model }, async () => new Response(
+      JSON.stringify({ error: { message: 'redacted provider error' } }),
+      { status, headers: { 'content-type': 'application/json' } },
+    ));
+    assert.equal(reachable, false, `HTTP ${status} must remain unreachable`);
+  }
 });
 
 test('semantic telemetry logs role, operation, latency, and finish reason without request content or endpoint secrets', async (t) => {
